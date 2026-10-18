@@ -98,7 +98,8 @@ function Invoke-ControlledReboot {
     RestartAction.
     A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
     failure (hence -ErrorAction Stop). When it throws, a WARN is logged and FallbackRestartAction
-    (shutdown.exe /r /t 5 /f; a non-zero exit code is a failure) is tried. Either one succeeding
+    (shutdown.exe /r /t 5 /f; exit code 0 or 1190 "shutdown already scheduled" is success, anything
+    else a failure) is tried. Either one succeeding
     returns $true; the caller must then return straight away, because Windows is shutting down.
     When both fail: "Restart failed: ..." is appended to State.Errors, the state is saved, an ERROR
     is logged and $false is returned. RebootCount stays incremented and RebootCapHit stays $false,
@@ -112,7 +113,9 @@ function Invoke-ControlledReboot {
     [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
     [scriptblock]$FallbackRestartAction = {
       $shutdown = Start-Process -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -Wait -PassThru -NoNewWindow
-      if ($null -eq $shutdown -or $shutdown.ExitCode -ne 0) {
+      # 0 = restart scheduled; 1190 = ERROR_SHUTDOWN_IS_SCHEDULED: a restart is already pending, so
+      # the machine will reboot either way. Anything else is a failure.
+      if ($null -eq $shutdown -or $shutdown.ExitCode -notin 0, 1190) {
         throw ('shutdown.exe exited with code {0}' -f $(if ($null -ne $shutdown) { $shutdown.ExitCode } else { 'unknown' }))
       }
     }

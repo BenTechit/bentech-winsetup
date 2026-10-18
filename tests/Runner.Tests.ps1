@@ -272,7 +272,7 @@ Describe 'Restart failures (R10)' {
     $c.State.RebootCapHit | Should -BeFalse
     $c.State.Steps.b.Status | Should -Be 'Done'
   }
-  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats a non-zero exit code as failure' {
+  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats any other exit code than 0/1190 as failure' {
     $savedWindir = $env:windir
     $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
     try {
@@ -282,10 +282,23 @@ Describe 'Restart failures (R10)' {
       Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
         $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $Wait -and $PassThru -and $NoNewWindow
       }
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 1190 } }
+      Mock Start-Process { [pscustomobject]@{ ExitCode = 5 } }   # ERROR_ACCESS_DENIED
       $c = New-Ctx @('a')
       Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
-      @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*1190*' }).Count | Should -Be 1
+      @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*code 5*' }).Count | Should -Be 1
+    } finally { $env:windir = $savedWindir }
+  }
+  It 'Invoke-SetupRun: shutdown.exe exit code 1190 (a shutdown is already scheduled) counts as a restart' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    $savedWindir = $env:windir
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    try {
+      Mock Start-Process { [pscustomobject]@{ ExitCode = 1190 } }   # ERROR_SHUTDOWN_IS_SCHEDULED
+      $c = New-Ctx @('a','b')
+      Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -CountdownSeconds 0 | Should -Be 'Rebooting'
+      Should -Invoke Start-Process -Times 1 -Exactly
+      @($c.State.Errors).Count | Should -Be 0
+      $c.State.Steps.a.Status | Should -Be 'pending'; $c.State.RebootCapHit | Should -BeFalse
     } finally { $env:windir = $savedWindir }
   }
   It 'the default restart action throws on failure (Restart-Computer -Force -ErrorAction Stop)' {
