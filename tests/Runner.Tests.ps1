@@ -272,7 +272,7 @@ Describe 'Restart failures (R10)' {
     $c.State.RebootCapHit | Should -BeFalse
     $c.State.Steps.b.Status | Should -Be 'Done'
   }
-  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats any other exit code than 0/1190 as failure' {
+  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats any exit code other than 0/1115/1190 as failure' {
     $savedWindir = $env:windir
     $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
     try {
@@ -288,12 +288,16 @@ Describe 'Restart failures (R10)' {
       @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*code 5*' }).Count | Should -Be 1
     } finally { $env:windir = $savedWindir }
   }
-  It 'Invoke-SetupRun: shutdown.exe exit code 1190 (a shutdown is already scheduled) counts as a restart' {
+  It 'Invoke-SetupRun: shutdown.exe exit code <Code> (<Meaning>) counts as a restart' -ForEach @(
+    @{ Code = 1190; Meaning = 'ERROR_SHUTDOWN_IS_SCHEDULED' }
+    @{ Code = 1115; Meaning = 'ERROR_SHUTDOWN_IN_PROGRESS' }
+  ) {
     function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
     $savedWindir = $env:windir
     $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
     try {
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 1190 } }   # ERROR_SHUTDOWN_IS_SCHEDULED
+      $script:mockExitCode = $Code
+      Mock Start-Process { [pscustomobject]@{ ExitCode = $script:mockExitCode } }
       $c = New-Ctx @('a','b')
       Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -CountdownSeconds 0 | Should -Be 'Rebooting'
       Should -Invoke Start-Process -Times 1 -Exactly
@@ -306,6 +310,85 @@ Describe 'Restart failures (R10)' {
     if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $ast = $ast.Body }
     $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'RestartAction' }
     $param.DefaultValue.Extent.Text | Should -Be '{ Restart-Computer -Force -ErrorAction Stop }'
+  }
+}
+
+# Review round 1. The leak tests carry a runaway bound (the step returns Done after 20 calls,
+# OnProgress throws after 50) so that, before the fix, a leaked continue cannot loop forever.
+Describe 'Flow-control leaks, mixed results and interruptions' {
+  BeforeEach { $script:restarts = 0; $script:rs = { $script:restarts++ }; $script:n = 0; $script:progress = 0; $script:snap = $null }
+  It 'fails a step that uses break outside a loop, and does not leave it running' {
+    function Step-A { param($Context) $script:n++; if ($script:n -gt 20) { return New-StepResult -Status Done -Message 'runaway' }; break }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 1
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'step used break/continue outside a loop'
+    (Read-RunState -Root $c.Root).Steps.a.Status | Should -Be 'Failed'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'fails a step that uses continue outside a loop (inside ForEach-Object), invoking it once' {
+    function Step-A { param($Context) $script:n++; if ($script:n -gt 20) { return New-StepResult -Status Done -Message 'runaway' }; 1 | ForEach-Object { continue } }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 1; $c.State.Steps.a.Attempts | Should -Be 1
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'step used break/continue outside a loop'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'logs and ignores an OnProgress that uses continue outside a loop' {
+    function Step-A { param($Context) $script:n++; New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Initialize-SetupLog -LogDirectory $c.LogDir
+    try {
+      Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 -OnProgress { $script:progress++; if ($script:progress -gt 50) { throw 'runaway' }; continue } | Should -Be 'Completed'
+    } finally { $script:SetupLogPath = $null }
+    $progress | Should -Be 4; $n | Should -Be 1
+    $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.a.Attempts | Should -Be 1; $c.State.Steps.b.Status | Should -Be 'Done'
+    Get-Content (Join-Path $c.LogDir 'setup.log') -Raw | Should -Match 'break/continue'
+  }
+  It 'when a step emits several results, an earlier Failed wins over a later Done' {
+    function Step-A { param($Context) New-StepResult -Status Failed -Message 'precheck failed'; New-StepResult -Status Done -Message 'all good' }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'precheck failed'
+  }
+  It 'counts each time a step is found running as an interruption and a reboot, and still runs it' {
+    # The step snapshots state.json while it runs: that is what the next start finds if the machine
+    # restarts mid-step.
+    function Step-A { param($Context) $script:n++; $script:snap = Read-RunState -Root $Context.Root; New-StepResult -Status Done }
+    $c = New-Ctx @('a'); $c.State.Steps.a.Status = 'running'; $c.State.Steps.a.Attempts = 1
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $c2 = New-SetupContext -Config $c.Config -State $script:snap -Root $c.Root -ScriptPath $c.ScriptPath
+    Invoke-SetupRun -Context $c2 -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 2
+    $c2.State.Steps.a.Data.Interruptions | Should -Be 2; $c2.State.RebootCount | Should -Be 2
+    $c2.State.Steps.a.Status | Should -Be 'Done'
+    $disk = Read-RunState -Root $c.Root; $disk.Steps.a.Data.Interruptions | Should -Be 2; $disk.RebootCount | Should -Be 2
+  }
+  It 'fails a step found running for the third time without invoking it' {
+    function Step-A { param($Context) $script:n++; New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.a.Status = 'running'; $c.State.Steps.a.Attempts = 1; $c.State.Steps.a.Data = @{ Interruptions = 2 }
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 0
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'interrupted 3 times (crash or unexpected restart)'
+    $c.State.Steps.a.Data.Interruptions | Should -Be 3; $c.State.RebootCount | Should -Be 1
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'a Continue resets Attempts but not Interruptions, so repeated interruptions still hit the cap' {
+    function Step-A { param($Context) $script:n++
+      if ($script:n -eq 1) { New-StepResult -Status Continue } else { $script:snap = Read-RunState -Root $Context.Root; New-StepResult -Status Done } }
+    $c = New-Ctx @('a'); $c.State.Steps.a.Status = 'running'; $c.State.Steps.a.Attempts = 1; $c.State.Steps.a.Data = @{ Interruptions = 1 }
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $snap.Steps.a.Attempts | Should -Be 1                # reset by the Continue, then this round's attempt
+    $snap.Steps.a.Data.Interruptions | Should -Be 2      # untouched by the Continue
+    # That round was interrupted too: the next start resumes from what was on disk during it.
+    $c2 = New-SetupContext -Config $c.Config -State $snap -Root $c.Root -ScriptPath $c.ScriptPath
+    Invoke-SetupRun -Context $c2 -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 2
+    $c2.State.Steps.a.Status | Should -Be 'Failed'; $c2.State.Steps.a.Message | Should -Be 'interrupted 3 times (crash or unexpected restart)'
   }
 }
 

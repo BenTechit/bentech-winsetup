@@ -41,6 +41,8 @@ function Save-SetupProgress {
   # OnProgress is logged and ignored: the display must never stop the run. Its output is discarded
   # so it can never leak into Invoke-SetupRun's return value. A failed save is NOT caught: without
   # a persisted state the run cannot resume safely, so the entry point's crash handler must see it.
+  # The call runs inside a one-shot loop: try/catch does not stop break/continue, which would
+  # otherwise travel up the call stack into the runner's own loops.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Context,
@@ -49,18 +51,30 @@ function Save-SetupProgress {
 
   Save-RunState -State $Context.State -Root $Context.Root
   if ($null -eq $OnProgress) { return }
-  try {
-    & $OnProgress $Context | Out-Null
-  } catch {
-    Write-SetupLog -Level WARN -Message 'Progress display failed; continuing' -Data @{ error = $_.Exception.Message }
+  $finished = $false
+  foreach ($once in 1) {
+    try {
+      & $OnProgress $Context | Out-Null
+    } catch {
+      Write-SetupLog -Level WARN -Message 'Progress display failed; continuing' -Data @{ error = $_.Exception.Message }
+    }
+    $finished = $true
+  }
+  if (-not $finished) {
+    Write-SetupLog -Level WARN -Message 'Progress display used break/continue outside a loop; ignored'
   }
 }
 
 function Invoke-SetupStepFunction {
   # Private. Calls one step function and returns exactly one StepResult. Never throws.
-  # An exception becomes Failed(<exception message>), logged at ERROR. A step that leaks extra
-  # pipeline output (a classic PowerShell slip) still has its last StepResult used; a step that
-  # returns no StepResult at all becomes Failed('step returned no valid result').
+  # - An exception becomes Failed(<exception message>), logged at ERROR.
+  # - break/continue used outside a loop: try/catch does not stop them, so the call runs inside a
+  #   one-shot loop that absorbs them; the step becomes Failed('step used break/continue outside
+  #   a loop') instead of escaping into the runner's loops (re-running or abandoning the step).
+  # - Extra pipeline output (a classic PowerShell slip) is tolerated, with a WARN. When several
+  #   StepResults come out, the worst wins: the last Failed if there is one, otherwise the last
+  #   result, so a later Done can never hide a Failed.
+  # - No StepResult at all becomes Failed('step returned no valid result').
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Context,
@@ -68,26 +82,37 @@ function Invoke-SetupStepFunction {
     [Parameter(Mandatory)][string]$FunctionName
   )
 
-  try {
-    $output = @(& $FunctionName -Context $Context)
-  } catch {
-    $reason = $_.Exception.Message
-    Write-SetupLog -Level ERROR -Message 'Step failed' -Data @{ step = $StepId; error = $reason }
-    return New-StepResult -Status Failed -Message $reason
-  }
-
-  for ($i = $output.Count - 1; $i -ge 0; $i--) {
-    $item = $output[$i]
-    if ($null -eq $item -or $null -eq $item.PSObject.Properties['Status']) { continue }
-    if (([string]$item.Status) -notin 'Done', 'Skipped', 'Failed', 'Continue') { continue }
-    if ($output.Count -gt 1) {
-      Write-SetupLog -Level WARN -Message 'Step emitted extra output; using its last result' -Data @{ step = $StepId; extraItems = $output.Count - 1 }
+  $output = @()
+  $finished = $false
+  foreach ($once in 1) {
+    try {
+      $output = @(& $FunctionName -Context $Context)
+    } catch {
+      $reason = $_.Exception.Message
+      Write-SetupLog -Level ERROR -Message 'Step failed' -Data @{ step = $StepId; error = $reason }
+      return New-StepResult -Status Failed -Message $reason
     }
-    return $item
+    $finished = $true
+  }
+  if (-not $finished) {
+    Write-SetupLog -Level ERROR -Message 'Step used break/continue outside a loop' -Data @{ step = $StepId }
+    return New-StepResult -Status Failed -Message 'step used break/continue outside a loop'
   }
 
-  Write-SetupLog -Level ERROR -Message 'Step returned no valid result' -Data @{ step = $StepId; items = $output.Count }
-  return New-StepResult -Status Failed -Message 'step returned no valid result'
+  $results = @($output | Where-Object {
+      $null -ne $_ -and $null -ne $_.PSObject.Properties['Status'] -and
+      ([string]$_.Status) -in 'Done', 'Skipped', 'Failed', 'Continue'
+    })
+  if ($results.Count -eq 0) {
+    Write-SetupLog -Level ERROR -Message 'Step returned no valid result' -Data @{ step = $StepId; items = $output.Count }
+    return New-StepResult -Status Failed -Message 'step returned no valid result'
+  }
+  if ($output.Count -gt 1) {
+    Write-SetupLog -Level WARN -Message 'Step emitted extra output; using its worst result' -Data @{ step = $StepId; items = $output.Count; results = $results.Count }
+  }
+  $failed = @($results | Where-Object { ([string]$_.Status) -eq 'Failed' })
+  if ($failed.Count -gt 0) { return $failed[-1] }
+  return $results[-1]
 }
 
 function Add-StepResultMessages {
@@ -166,6 +191,10 @@ function Invoke-SetupRun {
     - Done / Skipped / Failed: skipped (already finished in an earlier process).
     - running with Attempts >= caps.maxStepAttempts (it crashed or was force-rebooted that often):
       Failed('attempt cap reached') without invoking it.
+    - Otherwise still running (interrupted: a crash or an unexpected restart): Data.Interruptions
+      (never reset, not even by Continue) and State.RebootCount go up by one; at Interruptions >=
+      caps.maxStepAttempts it is Failed('interrupted <n> times (crash or unexpected restart)')
+      without invoking it.
     - No catalog entry, or its function does not exist: Failed, without invoking it.
     - Otherwise: running + attempt, save, OnProgress; invoke; append Notes/Errors; merge Data.
       - Continue: pending with attempts reset, save. Reboot Now -> Invoke-ControlledReboot; when it
@@ -225,6 +254,22 @@ function Invoke-SetupRun {
     if ($status -eq 'running' -and [int]$stepState.Attempts -ge $maxAttempts) {
       Save-StepOutcome @outcome -StepId $stepId -Status Failed -Message 'attempt cap reached'
       continue
+    }
+
+    if ($status -eq 'running') {
+      # Found running on entry: the previous process never recorded a result (a crash, or a restart
+      # nobody asked for, e.g. a BIOS update forcing one). Attempts is reset by every Continue, so
+      # it cannot catch a multi-round step that keeps being interrupted; Interruptions never resets.
+      # The interruption also counts toward the total reboot cap. Saved with the next transition.
+      if ($stepState.Data -isnot [System.Collections.IDictionary]) { $stepState.Data = @{} }
+      $interruptions = [int]$stepState.Data['Interruptions'] + 1
+      $stepState.Data['Interruptions'] = $interruptions
+      $runState.RebootCount = [int]$runState.RebootCount + 1
+      Write-SetupLog -Level WARN -Message 'Step was interrupted (crash or unexpected restart)' -Data @{ step = $stepId; interruptions = $interruptions; rebootCount = $runState.RebootCount }
+      if ($interruptions -ge $maxAttempts) {
+        Save-StepOutcome @outcome -StepId $stepId -Status Failed -Message "interrupted $interruptions times (crash or unexpected restart)"
+        continue
+      }
     }
 
     $entry = $entries[$stepId]
