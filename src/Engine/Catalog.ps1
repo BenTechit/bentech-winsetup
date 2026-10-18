@@ -60,12 +60,13 @@ function Get-StepPlan {
     Vendor passes: DELL/LENOVO/HP only. Vendor app: laptop mode and a configured consumerApp.
     Business-updater cleanup: laptop mode and DELL/LENOVO/HP. A VM never gets a vendor step.
     The mode comes from Choices (what the technician picked), never from Machine.IsLaptop.
-    The result is emitted as ONE string[] object (so it stays an array whatever its length). Assign it
-    first (`$plan = Get-StepPlan ...`); `foreach ($id in Get-StepPlan ...)` or piping the call directly
-    would see a single item, the whole array.
+    The ids are emitted one by one, the normal PowerShell way, so `foreach`, the pipeline, `@(...)` and
+    a `[string[]]` parameter such as New-RunState -Plan all see every id. A real plan always has at
+    least 12 steps, so the single-element unrolling case cannot happen; the result is never wrapped
+    with the comma operator.
   #>
   [CmdletBinding()]
-  [OutputType([string[]])]
+  [OutputType([string])]
   param(
     [Parameter(Mandatory)][hashtable]$Machine,
     [Parameter(Mandatory)][hashtable]$Choices,
@@ -94,6 +95,5 @@ function Get-StepPlan {
     if ($include) { $plan.Add($step.Id) }
   }
 
-  # The comma keeps a one-element plan an array instead of letting PowerShell unroll it.
-  return , $plan.ToArray()
+  return $plan.ToArray()
 }

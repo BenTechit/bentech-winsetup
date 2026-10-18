@@ -55,7 +55,23 @@ Describe 'Get-StepPlan' {
   It 'HP and Lenovo laptops get passes, vendor app and cleanup' {
     foreach ($b in 'HP', 'LENOVO') { $p = P $b LAPTOP; $p | Should -Contain 'vendor-pass1'; $p | Should -Contain 'vendor-pass2'; $p | Should -Contain 'consumer-app'; $p | Should -Contain 'vendor-cleanup' }
   }
-  It 'returns a string[]' { (P DELL LAPTOP) -is [string[]] | Should -BeTrue }
+  It 'emits the ids as plain strings (not one wrapped array)' {
+    $p = P DELL LAPTOP
+    $p.Count | Should -Be 18
+    $p[0] | Should -BeOfType [string]; $p[0] | Should -Be 'prepare'; $p[17] | Should -Be 'finalize'
+  }
+  It 'the id list survives the caller patterns: @(), foreach, pipeline, New-RunState -Plan' {
+    $m = @{Brand='DELL'}; $c = @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'}
+    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg).Count | Should -Be 18
+    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg)[0] | Should -Be 'prepare'
+    $seen = 0; foreach ($id in Get-StepPlan -Machine $m -Choices $c -Config $cfg) { $seen++ }
+    $seen | Should -Be 18
+    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg | ForEach-Object { $_ }).Count | Should -Be 18
+    $state = New-RunState -Machine @{} -Choices $c -Plan (Get-StepPlan -Machine $m -Choices $c -Config $cfg) -Version 'v'
+    @($state.Plan).Count | Should -Be 18
+    $state.Plan[0] | Should -Be 'prepare'
+    $state.Steps.Count | Should -Be 18
+  }
   It 'Office HOME keeps the office step' { (P DELL LAPTOP $true 'HOME') | Should -Contain 'office' }
 }
 Describe 'Get-RunVerdict' {
