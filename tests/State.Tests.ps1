@@ -243,6 +243,60 @@ if ($won) { Start-Sleep -Seconds 3 }   # keep the owner alive until every racer 
     $results.Count | Should -Be 4
     @($results | Where-Object { $_ -eq 'True' }).Count | Should -Be 1
   }
+  It 'lets exactly one process take over a stale lock, round after round (post-reboot double start)' {
+    $repo = Split-Path -Parent $PSScriptRoot
+    $child = Join-Path $root 'child-stale.ps1'
+    $rounds = 8
+    @'
+param([string]$Repo, [string]$Root, [string]$Tag, [int]$Rounds)
+. (Join-Path $Repo 'src\Common\Logging.ps1')
+. (Join-Path $Repo 'src\State\State.ps1')
+New-Item -ItemType File (Join-Path $Root "ready-$Tag") | Out-Null
+foreach ($r in 1..$Rounds) {
+  while (-not (Test-Path (Join-Path $Root "go-$r"))) { Start-Sleep -Milliseconds 2 }
+  $won = Enter-RunLock -Root $Root
+  Set-Content (Join-Path $Root "result-$r-$Tag.txt") "$won"
+}
+# Stay alive until the parent has read every result: a winner that exits makes its lock look
+# stale to a racer that is still deciding, which would be a harness artifact, not a bug.
+$until = (Get-Date).AddSeconds(30)
+while (-not (Test-Path (Join-Path $Root 'finished')) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }
+'@ | Set-Content $child
+    $procs = @(1..4 | ForEach-Object {
+        Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$child`"", "`"$repo`"", "`"$root`"", "t$_", "$rounds"
+      })
+    $winnersPerRound = @()
+    try {
+      $deadline = (Get-Date).AddSeconds(60)
+      while (@(Get-ChildItem $root -Filter 'ready-*').Count -lt 4 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+      foreach ($r in 1..$rounds) {
+        '999999' | Set-Content "$root\run.lock"   # a stale lock: no process has this pid
+        New-Item -ItemType File "$root\go-$r" | Out-Null   # release all racers at once
+        $deadline = (Get-Date).AddSeconds(60)
+        while (@(Get-ChildItem $root -Filter "result-$r-*.txt").Count -lt 4 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20 }
+        $winnersPerRound += @(Get-ChildItem $root -Filter "result-$r-*.txt" | Where-Object { (Get-Content $_.FullName -Raw).Trim() -eq 'True' }).Count
+      }
+    } finally {
+      New-Item -ItemType File "$root\finished" -Force | Out-Null
+      $procs | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+      $procs | Where-Object { -not $_.HasExited } | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    ($winnersPerRound -join ',') | Should -Be ((1..$rounds | ForEach-Object { 1 }) -join ',')
+  }
+  It 'returns false and logs a WARN, without throwing, when a stale lock cannot be deleted' {
+    Initialize-SetupLog -LogDirectory "$root\Logs"
+    '999999' | Set-Content "$root\run.lock"
+    # An open handle without FileShare.Delete makes File.Delete fail with a sharing violation.
+    $holder = [IO.File]::Open("$root\run.lock", 'Open', 'Read', 'Read')
+    try {
+      $script:entered = 'not run'
+      { $script:entered = Enter-RunLock -Root $root } | Should -Not -Throw
+      $script:entered | Should -BeFalse
+    } finally { $holder.Dispose() }
+    (Get-Content "$root\Logs\setup.log" -Raw) | Should -Match '\[WARN\] could not take run\.lock'
+    Test-Path "$root\run.lock.$PID.tmp" | Should -BeFalse
+    Enter-RunLock -Root $root | Should -BeTrue   # and it recovers once the file is free
+  }
   It 'Exit-RunLock removes a lock that holds our pid' {
     Enter-RunLock -Root $root | Should -BeTrue
     Exit-RunLock -Root $root

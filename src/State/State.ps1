@@ -314,41 +314,85 @@ function Test-RunLockHeld {
   return $true
 }
 
+function Move-RunLockIntoPlace {
+  # Private. The check-takeover-move sequence behind Enter-RunLock; Enter-RunLock serializes callers
+  # around it with a named mutex. Returns $false (never throws) when the lock is held, cannot be
+  # taken over, or the file system refuses.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$Root)
+
+  $lock = Join-Path $Root 'run.lock'
+  $tmp = "$lock.$PID.tmp"
+  try {
+    [IO.File]::WriteAllText($tmp, "$PID", (New-Object Text.UTF8Encoding $false))
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+      try {
+        [IO.File]::Move($tmp, $lock)   # fails if run.lock exists, so it never overwrites a lock
+        return $true
+      } catch [IO.IOException] {
+        # A lock is already there: keep it if its owner is alive, otherwise it is stale.
+        if (Test-RunLockHeld -Root $Root) { return $false }
+        if ($attempt -ge 2) {
+          Write-SetupLog -Level WARN -Message 'could not create run.lock even after removing a stale one' -Data @{ error = $_.Exception.Message }
+          return $false
+        }
+        [IO.File]::Delete($lock)
+      }
+    }
+    return $false
+  } catch [IO.IOException], [UnauthorizedAccessException] {
+    Write-SetupLog -Level WARN -Message 'could not take run.lock' -Data @{ error = $_.Exception.Message }
+    return $false
+  } finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Enter-RunLock {
   <#
   .SYNOPSIS
     Takes <Root>\run.lock for this process. Returns $false when another live setup run holds it.
   .DESCRIPTION
-    The pid is written to a private temp file and moved into place. A move onto an existing file
-    fails, so the lock appears atomically with its content and a second starter that races us loses
-    with $false instead of overwriting the winner. If the move fails because a lock is already
-    there, that lock is kept when its owner is alive; a stale one (dead or reused pid, garbage) is
-    deleted and the move is tried once more. Two starters that both find the same stale lock within
-    microseconds of each other can still both win; a double-click is never that fast.
+    Everything runs inside the machine-wide named mutex Global\BenTechSetup-RunLock, so two
+    starters (for example the resume task and a double-click right after a reboot) can never both
+    inspect the same stale lock and both take it over. Inside the mutex the pid goes to a private
+    temp file that is moved onto run.lock; a move onto an existing file fails, so a live owner's
+    lock is never overwritten. A stale lock (dead or reused pid, garbage) is re-checked, deleted
+    and replaced. Returns $false, never throws, when the mutex is not obtained within 10 seconds
+    or the lock cannot be taken (the reason is logged as WARN). If the mutex itself cannot be
+    created (access denied), it continues without it, which protects against everything except
+    the stale-lock takeover race.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param([Parameter(Mandatory)][string]$Root)
 
   if (-not (Test-Path -LiteralPath $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
-  if (Test-RunLockHeld -Root $Root) { return $false }
 
-  $lock = Join-Path $Root 'run.lock'
-  $tmp = "$lock.$PID.tmp"
-  [IO.File]::WriteAllText($tmp, "$PID", (New-Object Text.UTF8Encoding $false))
+  $mutex = $null
+  $owned = $false
   try {
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-      try {
-        [IO.File]::Move($tmp, $lock)
-        return $true
-      } catch [IO.IOException] {
-        if ((Test-RunLockHeld -Root $Root) -or $attempt -ge 2) { return $false }
-        [IO.File]::Delete($lock)   # stale lock: remove it and try again
+    try {
+      $mutex = New-Object Threading.Mutex -ArgumentList $false, 'Global\BenTechSetup-RunLock'
+    } catch {
+      Write-SetupLog -Level WARN -Message 'run lock mutex unavailable; continuing without it' -Data @{ error = $_.Exception.Message }
+    }
+    if ($null -ne $mutex) {
+      try { $owned = $mutex.WaitOne(10000) }
+      catch [Threading.AbandonedMutexException] { $owned = $true }   # the previous owner died; we own it now
+      if (-not $owned) {
+        Write-SetupLog -Level WARN -Message 'run lock mutex not obtained within 10 seconds'
+        return $false
       }
     }
-    return $false
+    return (Move-RunLockIntoPlace -Root $Root)
   } finally {
-    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    if ($owned) {
+      try { $mutex.ReleaseMutex() }
+      catch { Write-SetupLog -Level WARN -Message 'could not release run lock mutex' -Data @{ error = $_.Exception.Message } }
+    }
+    if ($null -ne $mutex) { $mutex.Dispose() }
   }
 }
 
