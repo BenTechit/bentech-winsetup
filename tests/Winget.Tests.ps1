@@ -358,6 +358,50 @@ Describe 'Invoke-WingetUninstall' {
   }
 }
 
+Describe 'Test-WingetUsable' {
+  BeforeEach {
+    Mock Write-SetupLog {}
+    Mock Invoke-External {
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $script:extQueue.Dequeue()
+    }
+  }
+
+  It 'is $true when "winget --version" exits with 0, and runs exactly that with a one-minute limit' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeTrue
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].FilePath | Should -Be 'C:\fake\winget.exe'
+    $extCalls[0].ArgumentList | Should -Be '--version'
+    $extCalls[0].TimeoutMinutes | Should -Be 1
+    $extCalls[0].Capture | Should -BeTrue
+  }
+  It 'returns a [bool]' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeOfType [bool]
+  }
+  It 'is $false when the probe times out' {
+    Set-ExternalQueue @(New-ExternalResult $null $true)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeFalse
+  }
+  It 'is $false when the probe times out even if an exit code is reported' {
+    Set-ExternalQueue @(New-ExternalResult 0 $true)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeFalse
+  }
+  It 'is $false for a non-zero exit code (<code>)' -ForEach @(@{ code = 1 }, @{ code = -1 }, @{ code = 0x8A15000F }) {
+    Set-ExternalQueue @(New-ExternalResult $code)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeFalse
+  }
+  It 'is $false when there is no exit code and no timeout' {
+    Set-ExternalQueue @(New-ExternalResult $null $false)
+    Test-WingetUsable -Path 'C:\fake\winget.exe' | Should -BeFalse
+  }
+  It 'is $false, and does not throw, when the program cannot be started' {
+    Mock Invoke-External { throw 'Cannot start' }
+    { Test-WingetUsable -Path 'C:\stale\alias\winget.exe' } | Should -Not -Throw
+    Test-WingetUsable -Path 'C:\stale\alias\winget.exe' | Should -BeFalse
+  }
+}
 Describe 'Invoke-StepWinget' {
   BeforeEach {
     Mock Write-SetupLog {}
@@ -370,6 +414,8 @@ Describe 'Invoke-StepWinget' {
     $script:downloads = New-Object System.Collections.ArrayList
     # Get-WingetPath: $null until the bundle has been installed, unless a test overrides this.
     Mock Get-WingetPath { if ($script:bundleInstalled) { 'C:\found\winget.exe' } }
+    # The `winget --version` probe: working by default; the stale-alias tests override it.
+    Mock Test-WingetUsable { $true }
     # Never the real Add-AppxPackage.
     Mock Add-AppxPackage {
       [void]$script:appx.Add(@{ Register = [bool]$RegisterByFamilyName; Main = $MainPackage; Path = $Path })
@@ -478,5 +524,57 @@ Describe 'Invoke-StepWinget' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'winget unavailable'
     $downloads.Count | Should -Be 0
+  }
+
+  It 'does not trust a winget that exists but fails "--version": it keeps polling and ends Failed "winget unavailable"' {
+    Mock Get-WingetPath { 'C:\stale\alias\winget.exe' }
+    Mock Test-WingetUsable { $false }
+    $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'winget unavailable'
+    $appx.Count | Should -Be 2                      # registered, then the bundle: a stale alias is not "present"
+    $downloads.Count | Should -Be 1
+    Should -Invoke Test-WingetUsable -ParameterFilter { $Path -eq 'C:\stale\alias\winget.exe' } -Times 3   # the initial check, then at least one probe per poll
+  }
+  It 'keeps polling while the probe fails and is Done as soon as it passes' {
+    # Probe results: initial check fails, first poll fails, second poll passes.
+    Mock Get-WingetPath { 'C:\flaky\winget.exe' }
+    Mock Test-WingetUsable { $script:probeCalls++; $script:probeCalls -ge 3 }
+    $script:probeCalls = 0
+    $r = Invoke-StepWinget -Context (New-WingetContext -ReadyMinutes 1) -PollSeconds 0.01
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'winget ready: C:\flaky\winget.exe'
+    $script:probeCalls | Should -Be 3
+    $appx.Count | Should -Be 1                      # registration only; no bundle
+    $downloads.Count | Should -Be 0
+  }
+  It 'is Done after registration when the stale winget starts working' {
+    $script:registered = $false
+    Mock Get-WingetPath { 'C:\stale\alias\winget.exe' }
+    Mock Test-WingetUsable { $script:appx.Count -ge 1 }     # works only once App Installer has been registered
+    $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'winget ready: C:\stale\alias\winget.exe'
+    $appx.Count | Should -Be 1
+    $appx[0].Register | Should -BeTrue
+    $downloads.Count | Should -Be 0
+  }
+  It 'is Done after the bundle install when only then does the probe pass' {
+    Mock Get-WingetPath { 'C:\stale\alias\winget.exe' }
+    Mock Test-WingetUsable { [bool]$script:bundleInstalled }
+    $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
+    $r.Status | Should -Be 'Done'
+    $downloads.Count | Should -Be 1
+    @($appx | Where-Object { $_.Path }).Count | Should -Be 1
+  }
+  It 'does not run the probe at all when Get-WingetPath finds nothing' {
+    Mock Get-WingetPath { $null }
+    Invoke-StepWinget -Context $ctx -PollSeconds 0.01 | Out-Null
+    Should -Invoke Test-WingetUsable -Times 0 -Exactly
+  }
+  It 'probes the path it is about to report' {
+    Mock Get-WingetPath { 'C:\present\winget.exe' }
+    Invoke-StepWinget -Context $ctx | Out-Null
+    Should -Invoke Test-WingetUsable -ParameterFilter { $Path -eq 'C:\present\winget.exe' } -Times 1 -Exactly
   }
 }

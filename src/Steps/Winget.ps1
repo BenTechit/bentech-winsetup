@@ -302,12 +302,41 @@ function Invoke-WingetUninstall {
   Invoke-WingetOperation -Id $Id -Verb uninstall -ArgumentList (Get-WingetUninstallArgs -Id $Id) -Context $Context
 }
 
+function Test-WingetUsable {
+  <#
+  .SYNOPSIS
+    $true when `<Path> --version` runs, does not time out and exits with 0. Never throws.
+  .DESCRIPTION
+    A winget.exe that exists is not necessarily a winget that runs: a stale App Execution Alias
+    (alias file present, App Installer unregistered or broken) is found by Get-WingetPath but
+    cannot start, or starts and fails. The probe waits at most one minute (Invoke-External kills
+    the process tree on timeout). An exception, such as a program that cannot be started, is $false.
+    The output is captured so a console is not written to, and is never read.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    $run = Invoke-External -FilePath $Path -ArgumentList '--version' -TimeoutMinutes 1 -CaptureOutput
+    $usable = (-not $run.TimedOut) -and ($null -ne $run.ExitCode) -and ($run.ExitCode -eq 0)
+    if (-not $usable) {
+      Write-SetupLog -Message 'winget --version did not succeed' -Level WARN -Data @{ path = $Path; timedOut = [bool]$run.TimedOut; exitCode = $run.ExitCode }
+    }
+    return [bool]$usable
+  } catch {
+    Write-SetupLog -Message 'winget --version could not be run' -Level WARN -Data @{ path = $Path; error = $_.Exception.Message }
+    return $false
+  }
+}
+
 function Wait-WingetPath {
   <#
   .SYNOPSIS
-    Private. Polls Get-WingetPath every PollSeconds until it finds winget or TimeoutMinutes has
-    passed. Returns the path, or $null. Always checks at least once, and the last sleep is cut
-    short so the wait never overshoots the timeout.
+    Private. Polls every PollSeconds until Get-WingetPath finds winget AND Test-WingetUsable passes
+    for it, or TimeoutMinutes has passed. Returns the path, or $null. Always checks at least once,
+    and the last sleep is cut short so the wait does not overshoot the timeout (a probe that
+    hangs can add up to its own one-minute limit).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -319,7 +348,7 @@ function Wait-WingetPath {
   $clock = [Diagnostics.Stopwatch]::StartNew()
   while ($true) {
     $path = Get-WingetPath
-    if ($path) { return $path }
+    if ($path -and (Test-WingetUsable -Path $path)) { return $path }
     $remaining = $TimeoutMinutes * 60 - $clock.Elapsed.TotalSeconds
     if ($remaining -le 0) { return $null }
     Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000))
@@ -331,7 +360,9 @@ function Invoke-StepWinget {
   .SYNOPSIS
     Step 6: makes sure winget is usable. Done / Failed('winget unavailable').
   .DESCRIPTION
-    1. winget already there -> Done.
+    "Ready" always means Get-WingetPath finds winget.exe AND `winget --version` succeeds
+    (Test-WingetUsable), so a stale alias does not count. This is checked at every point below.
+    1. winget already there and working -> Done.
     2. Register the App Installer package that ships with Windows
        (Add-AppxPackage -RegisterByFamilyName), then poll for winget every PollSeconds (15) for up
        to timeoutsMinutes.wingetReady minutes.
@@ -352,12 +383,12 @@ function Invoke-StepWinget {
   )
 
   $present = Get-WingetPath
-  if ($present) { return New-StepResult -Status Done -Message "winget ready: $present" }
+  if ($present -and (Test-WingetUsable -Path $present)) { return New-StepResult -Status Done -Message "winget ready: $present" }
 
   $readyMinutes = [double]$Context.Config.timeoutsMinutes.wingetReady
   if ($null -ne $ReadyTimeoutMinutes) { $readyMinutes = [double]$ReadyTimeoutMinutes }
 
-  Write-SetupLog -Message 'winget not found; registering App Installer' -Data @{ readyMinutes = $readyMinutes }
+  Write-SetupLog -Message 'winget not found or not working; registering App Installer' -Data @{ readyMinutes = $readyMinutes; found = [string]$present }
   try {
     Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop | Out-Null
   } catch {
