@@ -29,6 +29,10 @@ function Get-ProcessTreeId {
   <#
   .SYNOPSIS
     Returns the process ID of RootId followed by every descendant, found through Win32_Process.ParentProcessId.
+  .DESCRIPTION
+    Breadth-first, so a parent always comes before its children. If the query for one process fails,
+    a WARN is logged and the walk does not descend from that process; everything already found (and
+    every other branch) is kept. Never throws because of a failed query.
   #>
   [CmdletBinding()]
   [OutputType([int[]])]
@@ -42,10 +46,15 @@ function Get-ProcessTreeId {
   while ($i -lt $order.Count) {
     $parent = $order[$i]
     $i++
-    # -ErrorAction Stop: a WMI failure must reach Stop-ProcessTree's catch (WARN + kill the root)
-    # instead of looking like "no children". The timeout stops a wedged WMI service from stalling
-    # the kill past the process timeout.
-    $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -OperationTimeoutSec 10 -ErrorAction Stop)
+    # -ErrorAction Stop makes a WMI failure visible (SilentlyContinue would look like "no children"
+    # and the children would survive unnoticed). -OperationTimeoutSec bounds each query, so a wedged
+    # WMI service delays the kill by at most 10 s per process in the tree, not indefinitely.
+    try {
+      $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -OperationTimeoutSec 10 -ErrorAction Stop)
+    } catch {
+      Write-SetupLog -Message "Could not enumerate children of ${parent}: $($_.Exception.Message)" -Level WARN -Data @{ processId = $parent }
+      continue
+    }
     foreach ($child in $children) {
       if ($seen.Add([int]$child.ProcessId)) { $order.Add([int]$child.ProcessId) }
     }
@@ -68,7 +77,9 @@ function Stop-ProcessTree {
   try {
     $ids = @(Get-ProcessTreeId -RootId $ProcessId)
   } catch {
-    Write-SetupLog -Message 'Could not enumerate child processes; killing the root only' -Level WARN -Data @{ processId = $ProcessId; error = $_.Exception.Message }
+    # Last resort: Get-ProcessTreeId handles failed queries itself, so this means something
+    # unexpected. The root must still be killed.
+    Write-SetupLog -Message "Could not walk the process tree; killing the root only: $($_.Exception.Message)" -Level WARN -Data @{ processId = $ProcessId }
     $ids = @($ProcessId)
   }
   # Root first, so it cannot start replacements while the children are being killed.

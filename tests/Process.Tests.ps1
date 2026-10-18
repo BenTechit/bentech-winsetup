@@ -10,6 +10,11 @@ BeforeAll {
     @(Get-CimInstance Win32_Process -Filter "Name='ping.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match "-n $Count " })
   }
+  # Same for the cmd.exe that was started with 'ping -n <count>' on its command line.
+  function Get-MarkedCmd([string]$Count) {
+    @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "ping -n $Count " })
+  }
 }
 
 Describe 'Invoke-External' {
@@ -121,8 +126,35 @@ Describe 'Invoke-External' {
       while ((Get-MarkedPing '51') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
       Get-MarkedPing '51' | Should -BeNullOrEmpty    # the root (ping.exe itself) was still killed
       $log = Get-Content "$d\setup.log" -Raw
-      $log | Should -Match '\[WARN\] Could not enumerate child processes'
-      $log | Should -Match 'WMI unavailable'
+      $log | Should -Match '\[WARN\] Could not enumerate children of \d+: .*WMI unavailable'
+    }
+    It 'keeps the partial tree when a child''s own query fails: the root and that child are both killed' {
+      # cmd.exe (root) -> ping.exe (child). The root's query returns the real ping; the ping's query fails.
+      Mock Get-CimInstance { & (Get-Command Get-CimInstance -CommandType Cmdlet) @PesterBoundParameters }
+      Mock Get-CimInstance {
+        $real = @(& (Get-Command Get-CimInstance -CommandType Cmdlet) @PesterBoundParameters)
+        if ($real.Count -eq 0) { Write-Error 'WMI unavailable for the child'; return }
+        $real
+      } -ParameterFilter { $Filter -like 'ParentProcessId=*' }
+      $d = Join-Path $TestDrive 'partialtree'
+      Initialize-SetupLog -LogDirectory $d
+      try {
+        $r = Invoke-External -FilePath 'cmd.exe' -ArgumentList '/c ping -n 53 127.0.0.1' -TimeoutMinutes 0.03
+        $r.TimedOut | Should -BeTrue
+        $deadline = (Get-Date).AddSeconds(5)
+        while (((Get-MarkedPing '53') -or (Get-MarkedCmd '53')) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        Get-MarkedCmd '53' | Should -BeNullOrEmpty    # the root
+        Get-MarkedPing '53' | Should -BeNullOrEmpty   # the child found by the root's query
+      } finally {
+        $script:SetupLogPath = $null
+        Get-MarkedPing '53' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Get-MarkedCmd '53' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+      }
+      $log = Get-Content "$d\setup.log" -Raw
+      $log | Should -Match '\[WARN\] Could not enumerate children of \d+: .*WMI unavailable for the child'
+      # The walk went past the root: at least the root query plus one failing child query (cmd.exe
+      # also has a conhost.exe child, so there can be more than two).
+      Should -Invoke Get-CimInstance -Times 2 -ParameterFilter { $Filter -like 'ParentProcessId=*' }
     }
     It 'bounds the process-tree CIM query with an operation timeout' {
       Mock Get-CimInstance { } -ParameterFilter { $Filter -like 'ParentProcessId=*' }
