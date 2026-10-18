@@ -29,6 +29,49 @@ Describe 'detached signature edge cases' {
     Test-DetachedSignature -Data ([byte[]]@()) -Signature ([byte[]]@()) -PublicKeyXml '' | Should -BeFalse
     Test-DetachedSignature -Data $data -Signature ([byte[]]@()) -PublicKeyXml $pub | Should -BeFalse
   }
+  # Fail closed at PARAMETER BINDING too. With typed params, a mistyped argument throws before the
+  # function body (so before its try/catch); under the default $ErrorActionPreference = 'Continue'
+  # that error is non-fatal and the caller's `if (-not (Test-DetachedSignature ...))` is never
+  # decided, so a check-then-run caller would carry on. The result must be a real [bool] $false.
+  It 'returns a real $false (no binding error, no $null) for a wrongly typed <Arg> under EAP <Eap>' -ForEach @(
+    foreach ($eap in 'Continue', 'Stop') {
+      @{ Arg = 'Data (string)';       Eap = $eap; Splat = @{ Data = 'abc' } }
+      @{ Arg = 'Data (hashtable)';    Eap = $eap; Splat = @{ Data = @{ a = 1 } } }
+      @{ Arg = 'Data (int)';          Eap = $eap; Splat = @{ Data = 5 } }
+      @{ Arg = 'Signature (string)';  Eap = $eap; Splat = @{ Signature = 'abc' } }
+      @{ Arg = 'Signature (hashtable)'; Eap = $eap; Splat = @{ Signature = @{ a = 1 } } }
+      @{ Arg = 'Signature (object[] of strings)'; Eap = $eap; Splat = @{ Signature = @('x', 'y') } }
+      @{ Arg = 'PublicKeyXml (hashtable)'; Eap = $eap; Splat = @{ PublicKeyXml = @{ a = 1 } } }
+    }
+  ) {
+    $args2 = @{ Data = $data; Signature = (New-DetachedSignature -Data $data -PrivateKeyXml $priv); PublicKeyXml = $pub }
+    foreach ($k in $Splat.Keys) { $args2[$k] = $Splat[$k] }
+    $prev = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = $Eap
+      # 2>&1 captures anything the call leaks to the error stream; a binding error would show up
+      # here as an ErrorRecord (Continue) or be thrown (Stop), instead of the single [bool].
+      $out = @(Test-DetachedSignature @args2 2>&1)
+    } finally { $ErrorActionPreference = $prev }
+    $out.Count | Should -Be 1 -Because 'exactly one output: the verdict, no leaked error record'
+    ($out[0] -is [bool]) | Should -BeTrue -Because 'a binding error would leave no verdict and the caller would not reject'
+    $out[0] | Should -Be $false
+  }
+  It 'returns false when an argument is omitted entirely, under EAP Stop' {
+    $prev = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = 'Stop'
+      $r1 = Test-DetachedSignature
+      $r2 = Test-DetachedSignature -Data $data
+      $r3 = Test-DetachedSignature -Data $data -Signature (New-DetachedSignature -Data $data -PrivateKeyXml $priv)
+    } finally { $ErrorActionPreference = $prev }
+    foreach ($r in $r1, $r2, $r3) { ($r -is [bool]) | Should -BeTrue; $r | Should -Be $false }
+  }
+  It 'still accepts a signature that arrives as an object[] of bytes (pipeline-unrolled)' {
+    $s = New-DetachedSignature -Data $data -PrivateKeyXml $priv
+    $unrolled = [object[]]@($s)
+    Test-DetachedSignature -Data $data -Signature $unrolled -PublicKeyXml $pub | Should -BeTrue
+  }
   It 'returns a real byte[] (not an object[])' {
     (New-DetachedSignature -Data $data -PrivateKeyXml $priv) -is [byte[]] | Should -BeTrue
   }
