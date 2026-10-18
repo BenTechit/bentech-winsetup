@@ -104,6 +104,31 @@ Describe 'Invoke-External' {
       while ((Get-MarkedPing '49') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
       Get-MarkedPing '49' | Should -BeNullOrEmpty
     }
+    It 'still kills the root, and logs a WARN, when the process tree cannot be enumerated' {
+      # A real WMI failure is a NON-terminating error. If the CIM call were made with
+      # -ErrorAction SilentlyContinue it would be swallowed: no WARN, and the children would survive.
+      # Pester has no fall-through to the real command, so forward every other call (Get-MarkedPing's).
+      Mock Get-CimInstance { & (Get-Command Get-CimInstance -CommandType Cmdlet) @PesterBoundParameters }
+      Mock Get-CimInstance { Write-Error 'WMI unavailable' } -ParameterFilter { $Filter -like 'ParentProcessId=*' }
+      $d = Join-Path $TestDrive 'enumfail'
+      Initialize-SetupLog -LogDirectory $d
+      try {
+        $r = Invoke-External -FilePath 'ping.exe' -ArgumentList '-n 51 127.0.0.1' -TimeoutMinutes 0.03
+      } finally { $script:SetupLogPath = $null }
+      $r.TimedOut | Should -BeTrue
+      $r.ExitCode | Should -BeNullOrEmpty
+      $deadline = (Get-Date).AddSeconds(5)
+      while ((Get-MarkedPing '51') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+      Get-MarkedPing '51' | Should -BeNullOrEmpty    # the root (ping.exe itself) was still killed
+      $log = Get-Content "$d\setup.log" -Raw
+      $log | Should -Match '\[WARN\] Could not enumerate child processes'
+      $log | Should -Match 'WMI unavailable'
+    }
+    It 'bounds the process-tree CIM query with an operation timeout' {
+      Mock Get-CimInstance { } -ParameterFilter { $Filter -like 'ParentProcessId=*' }
+      Invoke-External -FilePath 'ping.exe' -ArgumentList '-n 52 127.0.0.1' -TimeoutMinutes 0.02 | Out-Null
+      Should -Invoke Get-CimInstance -ParameterFilter { $Filter -like 'ParentProcessId=*' -and $OperationTimeoutSec -eq 10 }
+    }
     It 'does not stall when a detached grandchild keeps the output pipe open after the parent exits' {
       # cmd.exe starts a long-lived ping that inherits the redirected handles, then exits at once.
       $sw = [Diagnostics.Stopwatch]::StartNew()

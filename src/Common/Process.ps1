@@ -42,7 +42,10 @@ function Get-ProcessTreeId {
   while ($i -lt $order.Count) {
     $parent = $order[$i]
     $i++
-    $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -ErrorAction SilentlyContinue)
+    # -ErrorAction Stop: a WMI failure must reach Stop-ProcessTree's catch (WARN + kill the root)
+    # instead of looking like "no children". The timeout stops a wedged WMI service from stalling
+    # the kill past the process timeout.
+    $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -OperationTimeoutSec 10 -ErrorAction Stop)
     foreach ($child in $children) {
       if ($seen.Add([int]$child.ProcessId)) { $order.Add([int]$child.ProcessId) }
     }

@@ -133,6 +133,42 @@ Describe 'Test-FileSignature' {
   It 'returns a bool' {
     (Test-FileSignature -Path $ps -AllowedSigners @('Microsoft')) -is [bool] | Should -BeTrue
   }
+  Context 'the signature status must be Valid' {
+    # A tampered binary keeps its original certificate, so the signer subject still says Microsoft.
+    # Only the Status check can reject it. These mock Get-AuthenticodeSignature because a real
+    # tampered binary cannot be built portably.
+    BeforeAll {
+      function New-FakeSignature([string]$Status) {
+        [pscustomobject]@{
+          Status            = [Management.Automation.SignatureStatus]$Status
+          SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' }
+        }
+      }
+    }
+    It 'accepts the same mocked signer subject when the status is Valid (control: the mock path works)' {
+      $script:fakeStatus = 'Valid'
+      Mock Get-AuthenticodeSignature { New-FakeSignature $script:fakeStatus }
+      Test-FileSignature -Path $ps -AllowedSigners @('Microsoft Corporation') | Should -BeTrue
+    }
+    It 'rejects Status <status> even though the signer subject is an allowed one' -ForEach @(
+      @{ status = 'HashMismatch' }, @{ status = 'NotTrusted' }, @{ status = 'UnknownError' },
+      @{ status = 'NotSigned' }, @{ status = 'Incompatible' }, @{ status = 'NotSupportedFileFormat' }
+    ) {
+      $script:fakeStatus = $status
+      Mock Get-AuthenticodeSignature { New-FakeSignature $script:fakeStatus }
+      Test-FileSignature -Path $ps -AllowedSigners @('Microsoft Corporation') | Should -BeFalse
+    }
+    It 'logs the rejected status at WARN' {
+      $script:fakeStatus = 'HashMismatch'
+      Mock Get-AuthenticodeSignature { New-FakeSignature $script:fakeStatus }
+      $d = Join-Path $TestDrive 'siglog3'
+      Initialize-SetupLog -LogDirectory $d
+      try { Test-FileSignature -Path $ps -AllowedSigners @('Microsoft Corporation') | Out-Null } finally { $script:SetupLogPath = $null }
+      $log = Get-Content "$d\setup.log" -Raw
+      $log | Should -Match '\[WARN\]'
+      $log | Should -Match 'HashMismatch'
+    }
+  }
   It 'logs the actual status and subject at WARN when it rejects a signed file' {
     $d = Join-Path $TestDrive 'siglog'
     Initialize-SetupLog -LogDirectory $d
