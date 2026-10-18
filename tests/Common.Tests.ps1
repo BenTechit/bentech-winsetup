@@ -23,4 +23,15 @@ Describe 'Write-SetupLog' {
     Write-SetupLog -Message 'hello' -Level WARN -Data @{ step = 'x' }
     (Get-Content "$d\setup.log" -Raw) | Should -Match '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[WARN\] hello \{"step":"x"\}'
   }
+  It 'never throws when the log file is locked; it warns instead' {
+    $d = Join-Path $TestDrive 'locked'; Initialize-SetupLog -LogDirectory $d
+    $path = "$d\setup.log"
+    $lock = [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'None')
+    try {
+      { Write-SetupLog -Message 'x' 3>$null } | Should -Not -Throw
+      Write-SetupLog -Message 'y' -WarningVariable w -WarningAction SilentlyContinue
+      [string]$w[0].Message | Should -BeLike 'log write failed: *'
+    } finally { $lock.Dispose() }
+    (Get-Item -LiteralPath $path).Length | Should -Be 0
+  }
 }

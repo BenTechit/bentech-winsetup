@@ -20,6 +20,9 @@ function Write-SetupLog {
     Appends "yyyy-MM-dd HH:mm:ss [LEVEL] message {json}" to the setup log as UTF-8.
   .DESCRIPTION
     A no-op until Initialize-SetupLog has been called, so shared code can log unconditionally.
+  Never throws once the arguments have bound: logs are diagnostics, so a locked or unwritable
+  file must not turn a successful step into a failure. The append is retried once after 200 ms;
+  if it still fails, a warning is written and the call returns.
   #>
   [CmdletBinding()]
   param(
@@ -30,11 +33,19 @@ function Write-SetupLog {
 
   if (-not $script:SetupLogPath) { return }
 
-  # Invariant culture: ':' and digits must not depend on the machine's regional settings.
-  $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
-  $line = '{0} [{1}] {2}' -f $stamp, $Level, $Message
-  if ($Data -and $Data.Count -gt 0) {
-    $line += ' ' + (ConvertTo-Json -InputObject $Data -Compress -Depth 6)
+  foreach ($attempt in 1, 2) {
+    try {
+      # Invariant culture: ':' and digits must not depend on the machine's regional settings.
+      $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+      $line = '{0} [{1}] {2}' -f $stamp, $Level, $Message
+      if ($Data -and $Data.Count -gt 0) {
+        $line += ' ' + (ConvertTo-Json -InputObject $Data -Compress -Depth 6)
+      }
+      [IO.File]::AppendAllText($script:SetupLogPath, $line + "`r`n", (New-Object Text.UTF8Encoding $false))
+      return
+    } catch {
+      if ($attempt -eq 1) { Start-Sleep -Milliseconds 200 }
+      else { Write-Warning "log write failed: $($_.Exception.Message)" }
+    }
   }
-  [IO.File]::AppendAllText($script:SetupLogPath, $line + "`r`n", (New-Object Text.UTF8Encoding $false))
 }
