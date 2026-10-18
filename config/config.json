@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "defaults": { "sevenZip": true, "office": "BUSINESS" },
+  "caps": { "maxReboots": 12, "maxWuRounds": 6, "maxStepAttempts": 3, "wuFailuresBeforeHide": 2 },
+  "timeoutsMinutes": { "default": 30, "msi": 20, "office": 60, "vendor": 60, "wuRound": 90,
+                       "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2 },
+  "power": { "finalAcMonitorMinutes": 15 },
+  "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },
+  "signers": {
+    "google": ["Google LLC"], "anydesk": ["AnyDesk Software GmbH"], "microsoft": ["Microsoft Corporation"],
+    "dell": ["Dell Inc", "Dell Technologies"], "lenovo": ["Lenovo"], "hp": ["HP Inc"]
+  },
+  "winget": { "bundleUrl": "https://aka.ms/getwinget" },
+  "apps": {
+    "chrome": { "signer": "google", "msi": {
+      "x64": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi",
+      "ARM64": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi" } },
+    "anydesk": { "signer": "anydesk", "url": "https://download.anydesk.com/AnyDesk.exe",
+                 "installDir": "C:\\Program Files (x86)\\AnyDesk" },
+    "sevenZip": { "wingetId": "7zip.7zip" },
+    "office": {
+      "signer": "microsoft", "odtWingetId": "Microsoft.OfficeDeploymentTool",
+      "odtSetupPath": "C:\\Program Files\\OfficeDeploymentTool\\setup.exe",
+      "odtFallbackPage": "https://www.microsoft.com/en-us/download/details.aspx?id=49117",
+      "odtLinkPattern": "https://download\\.microsoft\\.com/download/[^\"' ]+/officedeploymenttool_[0-9-]+\\.exe",
+      "products": { "BUSINESS": "O365BusinessRetail", "HOME": "O365HomePremRetail" },
+      "languages": ["he-il", "en-us"], "excludeApps": ["Groove", "Lync"], "channel": "Current", "edition": "64"
+    }
+  },
+  "vendors": {
+    "DELL": { "tool": { "kind": "dcu", "wingetId": "Dell.CommandUpdate.Universal", "signer": "dell",
+              "exeCandidates": ["C:\\Program Files\\Dell\\CommandUpdate\\dcu-cli.exe",
+                                "C:\\Program Files (x86)\\Dell\\CommandUpdate\\dcu-cli.exe"] },
+              "consumerApp": { "source": "msstore", "id": "XPDCCXDN26VNBT", "name": "Dell SupportAssist" } },
+    "LENOVO": { "tool": { "kind": "lsu", "wingetId": "Lenovo.SystemUpdate", "signer": "lenovo",
+                "exeCandidates": ["C:\\Program Files (x86)\\Lenovo\\System Update\\tvsu.exe"] },
+                "consumerApp": { "source": "msstore", "id": "9WZDNCRFJ4MV", "name": "Lenovo Vantage" } },
+    "HP": { "tool": { "kind": "hpia", "signer": "hp",
+            "page": "https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html",
+            "linkPattern": "https://hpia\\.hpcloud\\.hp\\.com/downloads/hpia/hp-hpia-[0-9.]+\\.exe" },
+            "consumerApp": { "source": "winget", "id": "HP.SupportAssistant", "name": "HP Support Assistant" } },
+    "ASUS": { "consumerApp": { "source": "msstore", "id": "9N7R5S6B0ZZH", "name": "MyASUS" } },
+    "ACER": { "consumerApp": { "source": "msstore", "id": "9P8BB54NQNQ4", "name": "Acer Care Center S" } },
+    "MSI": { "consumerApp": { "source": "msstore", "id": "9NVMNJCR03XV", "name": "MSI Center" } },
+    "SURFACE": { "consumerApp": { "source": "msstore", "id": "9WZDNCRFJB8P", "name": "Surface" } }
+  },
+  "bloatware": {
+    "remove": ["Microsoft.MicrosoftSolitaireCollection", "king.com.*", "*CandyCrush*", "*TikTok*",
+               "SpotifyAB.SpotifyMusic", "*Disney*", "Clipchamp.Clipchamp", "Microsoft.BingNews",
+               "Microsoft.GetHelp", "Microsoft.Getstarted", "Microsoft.WindowsFeedbackHub",
+               "MicrosoftCorporationII.MicrosoftFamily", "Microsoft.PowerAutomateDesktop",
+               "Microsoft.Windows.DevHome", "MicrosoftTeams"],
+    "protect": ["Microsoft.WindowsStore", "Microsoft.DesktopAppInstaller", "Microsoft.Windows.Photos",
+                "Microsoft.WindowsCalculator", "Microsoft.WindowsNotepad", "Microsoft.Paint",
+                "Microsoft.ScreenSketch", "Microsoft.WindowsCamera", "Microsoft.ZuneMusic",
+                "Microsoft.WindowsTerminal", "Microsoft.OutlookForWindows", "Microsoft.MicrosoftEdge*",
+                "Microsoft.Copilot", "Microsoft.Xbox*", "Microsoft.GamingApp", "Microsoft.VCLibs*",
+                "Microsoft.UI.Xaml*", "Microsoft.NET.*", "Microsoft.WindowsAppRuntime*", "MSTeams"]
+  },
+  "nags": [
+    { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement",
+      "name": "ScoobeSystemSettingEnabled", "value": 0 },
+    { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "name": "SubscribedContent-310093Enabled", "value": 0 }
+  ]
+}

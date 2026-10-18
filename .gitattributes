@@ -1,0 +1,4 @@
+*.ps1 -text
+*.json -text
+*.cmd -text
+*.xml -text
