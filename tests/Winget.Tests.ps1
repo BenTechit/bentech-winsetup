@@ -18,6 +18,12 @@ BeforeAll {
     param($Code, [bool]$TimedOut = $false, [string]$Output = '')
     @{ ExitCode = $Code; TimedOut = $TimedOut; Output = $Output }
   }
+  # The command line a child powershell.exe was given: the text inside -EncodedCommand (Base64 of UTF-16LE).
+  function ConvertFrom-ChildArgument {
+    param([string]$ArgumentList)
+    if ($ArgumentList -notmatch '-EncodedCommand ([A-Za-z0-9+/=]+)$') { return $null }
+    [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
+  }
   # Queues the results the mocked Invoke-External hands back, one per call, and records the calls.
   function Set-ExternalQueue {
     param([hashtable[]]$Result)
@@ -254,7 +260,7 @@ Describe 'Invoke-WingetInstall' {
     $extCalls[0].ArgumentList | Should -Be (Get-WingetInstallArgs -Id '7zip.7zip')
     $extCalls[1].ArgumentList | Should -Be 'source reset --force'
     $extCalls[1].FilePath | Should -Be 'C:\fake\winget.exe'
-    $extCalls[1].TimeoutMinutes | Should -Be 5
+    $extCalls[1].TimeoutMinutes | Should -Be 7     # timeoutsMinutes.default, not a hard-coded 5
     $extCalls[2].ArgumentList | Should -Be (Get-WingetInstallArgs -Id '7zip.7zip')
   }
   It 'does not reset or retry a second time when the retry also returns 0x8A15000F' {
@@ -402,13 +408,71 @@ Describe 'Test-WingetUsable' {
     Test-WingetUsable -Path 'C:\stale\alias\winget.exe' | Should -BeFalse
   }
 }
+Describe 'ConvertTo-PowerShellLiteral' {
+  It 'wraps plain text in single quotes' {
+    ConvertTo-PowerShellLiteral -Text 'C:\BenTech\Setup\x.msixbundle' | Should -Be "'C:\BenTech\Setup\x.msixbundle'"
+  }
+  It 'doubles an apostrophe' {
+    ConvertTo-PowerShellLiteral -Text "C:\O'Brien\x" | Should -Be "'C:\O''Brien\x'"
+  }
+  It 'doubles the typographic single quotes PowerShell also reads as quotes (U+2018 U+2019 U+201A U+201B)' {
+    foreach ($c in 0x2018, 0x2019, 0x201A, 0x201B) {
+      $q = [string][char]$c
+      ConvertTo-PowerShellLiteral -Text "a${q}b" | Should -Be "'a${q}${q}b'"
+    }
+  }
+  It 'leaves Hebrew letters, spaces, double quotes and dollar signs alone' {
+    ConvertTo-PowerShellLiteral -Text 'C:\Users\בן גולדנברג\a "b" $x' | Should -Be ('''C:\Users\בן גולדנברג\a "b" $x''')
+  }
+  It 'quotes an empty string' {
+    ConvertTo-PowerShellLiteral -Text '' | Should -Be "''"
+  }
+}
+
+Describe 'Invoke-PowerShellChild' {
+  BeforeEach {
+    Mock Write-SetupLog {}
+    Mock Invoke-External {
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $script:extQueue.Dequeue()
+    }
+  }
+
+  It 'starts Windows PowerShell 5.1 with the fixed switches and the command as -EncodedCommand, with the given timeout' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 3.5 | Out-Null
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    $extCalls[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
+    $extCalls[0].TimeoutMinutes | Should -Be 3.5
+    $extCalls[0].Capture | Should -BeTrue
+    (ConvertFrom-ChildArgument $extCalls[0].ArgumentList) | Should -Match 'Get-Date$'
+  }
+  It 'carries any text unharmed, including quotes, Hebrew and spaces' {
+    $cmd = 'Add-AppxPackage -Path ''C:\Users\בן גולדנברג\O''''Brien\a b.msixbundle'' -ErrorAction Stop; "x" | Out-Null'
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-PowerShellChild -Command $cmd -TimeoutMinutes 1 | Out-Null
+    (ConvertFrom-ChildArgument $extCalls[0].ArgumentList).EndsWith($cmd) | Should -BeTrue
+  }
+  It 'passes the exit code, the timeout flag and the output back' {
+    Set-ExternalQueue @((New-ExternalResult 1 $false 'boom'), (New-ExternalResult $null $true 'partial'))
+    $a = Invoke-PowerShellChild -Command 'x' -TimeoutMinutes 1
+    $a.ExitCode | Should -Be 1
+    $a.TimedOut | Should -BeFalse
+    $a.Output | Should -Be 'boom'
+    $b = Invoke-PowerShellChild -Command 'x' -TimeoutMinutes 1
+    $b.ExitCode | Should -BeNullOrEmpty
+    $b.TimedOut | Should -BeTrue
+  }
+}
 Describe 'Invoke-StepWinget' {
   BeforeEach {
     Mock Write-SetupLog {}
     $script:pathCalls = 0
     $script:bundleInstalled = $false
-    $script:registerThrows = $false
-    $script:bundleInstallThrows = $false
+    $script:registerResult = @{ ExitCode = 0; TimedOut = $false }
+    $script:bundleResult = @{ ExitCode = 0; TimedOut = $false }
+    $script:childThrows = $false
     $script:downloadThrows = $false
     $script:appx = New-Object System.Collections.ArrayList
     $script:downloads = New-Object System.Collections.ArrayList
@@ -416,12 +480,22 @@ Describe 'Invoke-StepWinget' {
     Mock Get-WingetPath { if ($script:bundleInstalled) { 'C:\found\winget.exe' } }
     # The `winget --version` probe: working by default; the stale-alias tests override it.
     Mock Test-WingetUsable { $true }
-    # Never the real Add-AppxPackage.
-    Mock Add-AppxPackage {
-      [void]$script:appx.Add(@{ Register = [bool]$RegisterByFamilyName; Main = $MainPackage; Path = $Path })
-      if ($RegisterByFamilyName -and $script:registerThrows) { throw 'register boom' }
-      if ($Path -and $script:bundleInstallThrows) { throw 'bundle boom' }
-      if ($Path) { $script:bundleInstalled = $true }
+    # Add-AppxPackage must never run in this process: it has no timeout. Each call is a child
+    # powershell.exe started through Invoke-External, recorded here (decoded) instead of started.
+    Mock Add-AppxPackage { throw 'Add-AppxPackage must not be called in-process' }
+    Mock Invoke-External {
+      $cmd = ConvertFrom-ChildArgument $ArgumentList
+      $isRegister = [bool]($cmd -match '-RegisterByFamilyName')
+      $main = $null
+      if ($cmd -match '-MainPackage (\S+)') { $main = $Matches[1] }
+      $path = $null
+      if ($cmd -match "-Path '((?:[^']|'')*)'") { $path = $Matches[1].Replace("''", "'") }
+      [void]$script:appx.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput
+                                Command = $cmd; Register = $isRegister; Main = $main; Path = $path })
+      if ($script:childThrows) { throw 'Cannot start' }
+      $res = if ($isRegister) { $script:registerResult } else { $script:bundleResult }
+      if ($path -and -not $res.TimedOut -and $res.ExitCode -eq 0) { $script:bundleInstalled = $true }
+      @{ ExitCode = $res.ExitCode; TimedOut = $res.TimedOut; Output = '' }
     }
     Mock Get-RemoteFile {
       [void]$script:downloads.Add(@{ Url = $Url; Destination = $Destination })
@@ -496,12 +570,70 @@ Describe 'Invoke-StepWinget' {
     $r = Invoke-StepWinget -Context (New-WingetContext -ReadyMinutes 60) -ReadyTimeoutMinutes 0.002 -PollSeconds 0.01
     $r.Message | Should -Be 'winget unavailable'
   }
-  It 'logs a WARN and goes on to the bundle when registering throws' {
-    $script:registerThrows = $true
+  It 'logs a WARN and goes on to the bundle when registering <what>' -ForEach @(
+    @{ what = 'exits non-zero'; result = @{ ExitCode = 1; TimedOut = $false }; warn = 'Registering App Installer failed' },
+    @{ what = 'times out'; result = @{ ExitCode = $null; TimedOut = $true }; warn = 'Registering App Installer timed out' }
+  ) {
+    $script:registerResult = $result
     $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
     $r.Status | Should -Be 'Done'
     $downloads.Count | Should -Be 1
-    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 1
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -eq $warn } -Times 1 -Exactly
+  }
+  It 'logs a WARN and goes on to the bundle when the registration child cannot be started' {
+    $script:childThrows = $true
+    $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
+    $r.Status | Should -Be 'Failed'               # the bundle child cannot start either
+    $downloads.Count | Should -Be 1
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -match 'Registering App Installer failed' } -Times 1
+  }
+  It 'logs the exit code of a failed registration' {
+    $script:registerResult = @{ ExitCode = 7; TimedOut = $false }
+    Invoke-StepWinget -Context $ctx -PollSeconds 0.01 | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Data.exitCode -eq 7 } -Times 1
+  }
+
+  It 'runs the registration as a child Windows PowerShell with -EncodedCommand, limited to timeoutsMinutes.default' {
+    Mock Get-WingetPath { $script:pathCalls++; if ($script:pathCalls -ge 3) { 'C:\registered\winget.exe' } }
+    Invoke-StepWinget -Context (New-WingetContext -ReadyMinutes 1) -PollSeconds 0.01 | Out-Null
+    $appx.Count | Should -Be 1
+    $appx[0].FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    $appx[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
+    $appx[0].Command | Should -Match '-RegisterByFamilyName'
+    $appx[0].Command | Should -Match '-MainPackage Microsoft\.DesktopAppInstaller_8wekyb3d8bbwe'
+    $appx[0].Command | Should -Match '-ErrorAction Stop$'
+    $appx[0].TimeoutMinutes | Should -Be 7           # timeoutsMinutes.default; wingetReady is 1 here
+  }
+  It 'installs the bundle in a child too, with the same limit, and never runs Add-AppxPackage in-process' {
+    $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
+    $r.Status | Should -Be 'Done'
+    $appx.Count | Should -Be 2
+    $appx[1].FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    $appx[1].Command | Should -Match 'Add-AppxPackage -Path '
+    $appx[1].Command | Should -Match '-ErrorAction Stop$'
+    $appx[1].TimeoutMinutes | Should -Be 7
+    Should -Invoke Add-AppxPackage -Times 0 -Exactly
+  }
+  It 'escapes quotes in the bundle path so the decoded command parses back to exactly that path' {
+    $q = [string][char]0x2019
+    $ctx.DownloadDir = Join-Path $TestDrive "O'Brien ${q}s בן"
+    $expected = Join-Path $ctx.DownloadDir 'AppInstaller.msixbundle'
+    Invoke-StepWinget -Context $ctx -PollSeconds 0.01 | Out-Null
+    $cmd = $appx[1].Command
+    $cmd.Contains("O''Brien ${q}${q}s") | Should -BeTrue
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($cmd, [ref]$null, [ref]$errors)
+    $errors.Count | Should -Be 0
+    $command = $ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-AppxPackage' }, $true) | Select-Object -First 1
+    $elements = @($command.CommandElements)
+    $pathIndex = (0..($elements.Count - 1) | Where-Object { $elements[$_] -is [Management.Automation.Language.CommandParameterAst] -and $elements[$_].ParameterName -eq 'Path' })[0]
+    $elements[$pathIndex + 1].Value | Should -Be $expected
+  }
+  It 'never calls Add-AppxPackage in-process in any stage' {
+    Mock Get-WingetPath { $null }
+    Invoke-StepWinget -Context $ctx -PollSeconds 0.01 | Out-Null
+    $appx.Count | Should -Be 2
+    Should -Invoke Add-AppxPackage -Times 0 -Exactly
   }
   It 'is Failed "winget unavailable" when the download fails, without installing anything from it' {
     $script:downloadThrows = $true
@@ -511,11 +643,15 @@ Describe 'Invoke-StepWinget' {
     @($appx | Where-Object { $_.Path }).Count | Should -Be 0
     Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 1
   }
-  It 'is Failed "winget unavailable" when the bundle will not install' {
-    $script:bundleInstallThrows = $true
+  It 'is Failed "winget unavailable", after a WARN, when the bundle install <what>' -ForEach @(
+    @{ what = 'exits non-zero'; result = @{ ExitCode = 1; TimedOut = $false }; warn = 'Installing the App Installer bundle failed' },
+    @{ what = 'times out'; result = @{ ExitCode = $null; TimedOut = $true }; warn = 'Installing the App Installer bundle timed out' }
+  ) {
+    $script:bundleResult = $result
     $r = Invoke-StepWinget -Context $ctx -PollSeconds 0.01
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'winget unavailable'
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -eq $warn } -Times 1 -Exactly
   }
   It 'skips the bundle (and still ends Failed) when the config has no bundleUrl' {
     $noUrl = New-WingetContext -ReadyMinutes 0.002

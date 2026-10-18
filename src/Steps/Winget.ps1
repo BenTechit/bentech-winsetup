@@ -197,7 +197,7 @@ function Invoke-WingetOperation {
   .DESCRIPTION
     The timeout is timeoutsMinutes.default. Output is captured only so a short tail can be logged
     when the run fails; it is never parsed (Windows may be Hebrew). 0x8A15000F ("source data
-    missing") runs `winget source reset --force` once (5 minutes at most) and repeats the command
+    missing") runs `winget source reset --force` once (same timeout) and repeats the command
     once; a second 0x8A15000F is a failure. A "done, reboot needed" is Done with Reboot 'None': the
     Windows Update loop reboots. A program that cannot be started is a Failed result, not a throw.
   #>
@@ -230,7 +230,7 @@ function Invoke-WingetOperation {
       $resetDone = $true
       Write-SetupLog -Message "winget $Verb needs its sources reset; resetting once and retrying" -Level WARN -Data @{ id = $Id }
       try {
-        $reset = Invoke-External -FilePath $winget -ArgumentList 'source reset --force' -TimeoutMinutes 5 -CaptureOutput
+        $reset = Invoke-External -FilePath $winget -ArgumentList 'source reset --force' -TimeoutMinutes $timeout -CaptureOutput
         if ($reset.TimedOut -or $reset.ExitCode -ne 0) {
           Write-SetupLog -Message 'winget source reset did not succeed; retrying anyway' -Level WARN -Data @{ id = $Id; timedOut = [bool]$reset.TimedOut; exitCode = $reset.ExitCode; tail = (Get-OutputTail -Output $reset.Output) }
         }
@@ -302,6 +302,82 @@ function Invoke-WingetUninstall {
   Invoke-WingetOperation -Id $Id -Verb uninstall -ArgumentList (Get-WingetUninstallArgs -Id $Id) -Context $Context
 }
 
+function ConvertTo-PowerShellLiteral {
+  <#
+  .SYNOPSIS
+    Quotes text as a PowerShell single-quoted string literal.
+  .DESCRIPTION
+    Inside '...' the only special character is the single quote, which is doubled. PowerShell also
+    treats the typographic quotes U+2018, U+2019, U+201A and U+201B as single quotes, so those are
+    doubled too (a path with an apostrophe typed on a phone keyboard must not end the string).
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+  # The apostrophe and the four typographic quotes, written as code points so this file stays ASCII.
+  $quotes = -join ([char]0x27, [char]0x2018, [char]0x2019, [char]0x201A, [char]0x201B)
+  return "'" + [regex]::Replace($Text, "[$quotes]", '$0$0') + "'"
+}
+
+function Invoke-PowerShellChild {
+  <#
+  .SYNOPSIS
+    Runs a PowerShell command line in a child Windows PowerShell 5.1 process with a timeout.
+    Returns @{ ExitCode = <int|$null>; TimedOut = <bool>; Output = <string> }.
+  .DESCRIPTION
+    Used for cmdlets that have no timeout of their own (Add-AppxPackage). The process is started
+    through Invoke-External, which kills the whole tree on timeout. The command travels as
+    -EncodedCommand (Base64 of UTF-16LE text), so no quoting of the command, or of a path inside
+    it, can go wrong. $ProgressPreference is silenced so a captured pipe does not fill with
+    progress records. The child's exit code is 0 for a command that finished and 1 when it
+    stopped on an error, which is what callers should test. Output is never parsed.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][string]$Command,
+    [Parameter(Mandatory)][double]$TimeoutMinutes
+  )
+
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ProgressPreference = 'SilentlyContinue'; $Command"))
+  $exe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $run = Invoke-External -FilePath $exe -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded" -TimeoutMinutes $TimeoutMinutes -CaptureOutput
+  return @{ ExitCode = $run.ExitCode; TimedOut = [bool]$run.TimedOut; Output = [string]$run.Output }
+}
+
+function Invoke-AppxChild {
+  <#
+  .SYNOPSIS
+    Private. Runs an Add-AppxPackage command line in a child process (Invoke-PowerShellChild).
+    $true on exit code 0. A timeout, a non-zero exit code or a child that cannot be started is a
+    WARN in the log and $false; it never throws, so the caller goes on to its next stage.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][string]$What,
+    [Parameter(Mandatory)][string]$Command,
+    [Parameter(Mandatory)][double]$TimeoutMinutes
+  )
+
+  try {
+    $run = Invoke-PowerShellChild -Command $Command -TimeoutMinutes $TimeoutMinutes
+  } catch {
+    Write-SetupLog -Message "$What failed: the child process could not be started" -Level WARN -Data @{ error = $_.Exception.Message }
+    return $false
+  }
+  if ($run.TimedOut) {
+    Write-SetupLog -Message "$What timed out" -Level WARN -Data @{ timeoutMinutes = $TimeoutMinutes }
+    return $false
+  }
+  if ($null -eq $run.ExitCode -or $run.ExitCode -ne 0) {
+    Write-SetupLog -Message "$What failed" -Level WARN -Data @{ exitCode = $run.ExitCode; tail = (Get-OutputTail -Output $run.Output) }
+    return $false
+  }
+  return $true
+}
+
 function Test-WingetUsable {
   <#
   .SYNOPSIS
@@ -370,7 +446,10 @@ function Invoke-StepWinget {
        with Add-AppxPackage -Path (Windows enforces the package signature), then poll again.
     4. Otherwise Failed('winget unavailable'); the steps that need winget fail the same way and
        the direct-download steps still run.
-    A registration, download or install error is logged at WARN and the next stage is tried.
+    Both Add-AppxPackage calls run in a child powershell.exe (Invoke-PowerShellChild) limited to
+    timeoutsMinutes.default, so a hung deployment is killed rather than stalling the run. A
+    registration, download or install error, a non-zero exit or a timeout is logged at WARN and the
+    next stage is tried.
     PollSeconds and ReadyTimeoutMinutes exist so tests need not wait; by default they are 15 and
     the configured wingetReady.
   #>
@@ -388,12 +467,13 @@ function Invoke-StepWinget {
   $readyMinutes = [double]$Context.Config.timeoutsMinutes.wingetReady
   if ($null -ne $ReadyTimeoutMinutes) { $readyMinutes = [double]$ReadyTimeoutMinutes }
 
+  # Each Add-AppxPackage runs in a child powershell.exe so a hung deployment is killed at the
+  # default timeout instead of stalling the run; the same limit as any other installer.
+  $appxMinutes = [double]$Context.Config.timeoutsMinutes.default
+
   Write-SetupLog -Message 'winget not found or not working; registering App Installer' -Data @{ readyMinutes = $readyMinutes; found = [string]$present }
-  try {
-    Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop | Out-Null
-  } catch {
-    Write-SetupLog -Message 'Registering App Installer failed' -Level WARN -Data @{ error = $_.Exception.Message }
-  }
+  [void](Invoke-AppxChild -What 'Registering App Installer' -TimeoutMinutes $appxMinutes `
+      -Command 'Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop')
   $path = Wait-WingetPath -TimeoutMinutes $readyMinutes -PollSeconds $PollSeconds
   if ($path) { return New-StepResult -Status Done -Message "winget ready: $path" }
 
@@ -402,9 +482,13 @@ function Invoke-StepWinget {
     Write-SetupLog -Message 'winget still missing; installing the App Installer bundle' -Level WARN -Data @{ url = $bundleUrl }
     try {
       $bundle = Get-RemoteFile -Url $bundleUrl -Destination (Join-Path $Context.DownloadDir 'AppInstaller.msixbundle')
-      Add-AppxPackage -Path $bundle -ErrorAction Stop | Out-Null
     } catch {
-      Write-SetupLog -Message 'Installing the App Installer bundle failed' -Level WARN -Data @{ url = $bundleUrl; error = $_.Exception.Message }
+      $bundle = $null
+      Write-SetupLog -Message 'Downloading the App Installer bundle failed' -Level WARN -Data @{ url = $bundleUrl; error = $_.Exception.Message }
+    }
+    if ($bundle) {
+      [void](Invoke-AppxChild -What 'Installing the App Installer bundle' -TimeoutMinutes $appxMinutes `
+          -Command ("Add-AppxPackage -Path {0} -ErrorAction Stop" -f (ConvertTo-PowerShellLiteral -Text ([string]$bundle))))
     }
     $path = Wait-WingetPath -TimeoutMinutes $readyMinutes -PollSeconds $PollSeconds
     if ($path) { return New-StepResult -Status Done -Message "winget ready: $path" }
