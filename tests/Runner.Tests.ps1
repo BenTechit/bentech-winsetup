@@ -232,6 +232,70 @@ Describe 'Invoke-ControlledReboot' {
   }
 }
 
+# Ruling R10: a restart must never fail silently. Every test below injects BOTH restart actions (or
+# mocks Start-Process with WINDIR pointed at TestDrive), so no test can ever reach a real restart.
+Describe 'Restart failures (R10)' {
+  BeforeEach {
+    $script:restarts = 0; $script:fallbacks = 0
+    $script:throwRestart = { $script:restarts++; throw 'Access is denied' }
+    $script:okFallback = { $script:fallbacks++ }
+    $script:badFallback = { $script:fallbacks++; throw 'shutdown.exe exited with code 5' }
+  }
+  It 'Invoke-ControlledReboot: the fallback restarts when the primary action throws' {
+    $c = New-Ctx @('a')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart -FallbackRestartAction $okFallback | Should -BeTrue
+    $restarts | Should -Be 1; $fallbacks | Should -Be 1
+    $c.State.RebootCount | Should -Be 1; @($c.State.Errors).Count | Should -Be 0; $c.State.RebootCapHit | Should -BeFalse
+  }
+  It 'Invoke-ControlledReboot: both fail -> Errors gets "Restart failed:", saved, no cap flag, count kept' {
+    $c = New-Ctx @('a')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart -FallbackRestartAction $badFallback | Should -BeFalse
+    $restarts | Should -Be 1; $fallbacks | Should -Be 1
+    @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*' }).Count | Should -Be 1
+    $c.State.RebootCapHit | Should -BeFalse; $c.State.RebootCount | Should -Be 1
+    $disk = Read-RunState -Root $c.Root
+    @($disk.Errors | Where-Object { $_ -like 'Restart failed:*' }).Count | Should -Be 1; $disk.RebootCount | Should -Be 1
+  }
+  It 'Invoke-SetupRun: Continue+Now, primary throws, fallback succeeds -> Rebooting' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -FallbackRestartAction $okFallback -CountdownSeconds 0 | Should -Be 'Rebooting'
+    $fallbacks | Should -Be 1; $c.State.Steps.a.Status | Should -Be 'pending'; $c.State.RebootCount | Should -Be 1
+  }
+  It 'Invoke-SetupRun: Continue+Now, both fail -> step Failed(restart failed), error recorded, no cap flag' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -FallbackRestartAction $badFallback -CountdownSeconds 0 | Should -Be 'Completed'
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'restart failed'
+    @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*' }).Count | Should -Be 1
+    $c.State.RebootCapHit | Should -BeFalse
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats a non-zero exit code as failure' {
+    $savedWindir = $env:windir
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    try {
+      Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+      $c = New-Ctx @('a')
+      Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeTrue
+      Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+        $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $Wait -and $PassThru -and $NoNewWindow
+      }
+      Mock Start-Process { [pscustomobject]@{ ExitCode = 1190 } }
+      $c = New-Ctx @('a')
+      Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
+      @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*1190*' }).Count | Should -Be 1
+    } finally { $env:windir = $savedWindir }
+  }
+  It 'the default restart action throws on failure (Restart-Computer -Force -ErrorAction Stop)' {
+    $ast = (Get-Command Invoke-ControlledReboot).ScriptBlock.Ast
+    if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $ast = $ast.Body }
+    $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'RestartAction' }
+    $param.DefaultValue.Extent.Text | Should -Be '{ Restart-Computer -Force -ErrorAction Stop }'
+  }
+}
+
 Describe 'Get-PendingRebootSignals' {
   It 'returns the four signals as booleans without throwing (real registry)' {
     $s = Get-PendingRebootSignals

@@ -89,22 +89,33 @@ function Test-PendingReboot {
 function Invoke-ControlledReboot {
   <#
   .SYNOPSIS
-    Restarts the machine through the reboot cap. Returns $true when the restart was started.
+    Restarts the machine through the reboot cap. Returns $true when a restart was started.
   .DESCRIPTION
     At or above Config.caps.maxReboots: sets State.RebootCapHit, saves, logs a WARN and returns
     $false without restarting. Otherwise: increments State.RebootCount and saves *before* anything
     else, so a restart that happens sooner than expected still counts against the cap; then logs,
-    shows "Restarting in N s ..." once per second (only when CountdownSeconds is above 0), calls
-    RestartAction and returns $true. An exception from RestartAction propagates to the caller.
-    The production RestartAction is { Restart-Computer -Force }, which returns while Windows shuts
-    down, so the caller must return straight away.
+    shows "Restarting in N s ..." once per second (only when CountdownSeconds is above 0) and calls
+    RestartAction.
+    A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
+    failure (hence -ErrorAction Stop). When it throws, a WARN is logged and FallbackRestartAction
+    (shutdown.exe /r /t 5 /f; a non-zero exit code is a failure) is tried. Either one succeeding
+    returns $true; the caller must then return straight away, because Windows is shutting down.
+    When both fail: "Restart failed: ..." is appended to State.Errors, the state is saved, an ERROR
+    is logged and $false is returned. RebootCount stays incremented and RebootCapHit stays $false,
+    so the caller can tell a failed restart from the cap.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param(
     [Parameter(Mandatory)][hashtable]$Context,
     [int]$CountdownSeconds = 15,
-    [scriptblock]$RestartAction = { Restart-Computer -Force }
+    [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
+    [scriptblock]$FallbackRestartAction = {
+      $shutdown = Start-Process -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -Wait -PassThru -NoNewWindow
+      if ($null -eq $shutdown -or $shutdown.ExitCode -ne 0) {
+        throw ('shutdown.exe exited with code {0}' -f $(if ($null -ne $shutdown) { $shutdown.ExitCode } else { 'unknown' }))
+      }
+    }
   )
 
   $runState = $Context.State
@@ -127,6 +138,24 @@ function Invoke-ControlledReboot {
     Start-Sleep -Seconds 1
   }
 
-  & $RestartAction | Out-Null
-  return $true
+  try {
+    & $RestartAction | Out-Null
+    return $true
+  } catch {
+    $primaryError = $_.Exception.Message
+    Write-SetupLog -Level WARN -Message 'Restart failed; trying shutdown.exe' -Data @{ error = $primaryError }
+  }
+
+  try {
+    & $FallbackRestartAction | Out-Null
+    Write-SetupLog -Message 'Restart started by the fallback (shutdown.exe)'
+    return $true
+  } catch {
+    $fallbackError = $_.Exception.Message
+  }
+
+  $runState.Errors = @(@(@($runState.Errors) | Where-Object { $null -ne $_ }) + ('Restart failed: {0} (fallback: {1})' -f $primaryError, $fallbackError))
+  Save-RunState -State $runState -Root $Context.Root
+  Write-SetupLog -Level ERROR -Message 'Restart failed; the fallback failed too' -Data @{ error = $primaryError; fallbackError = $fallbackError; rebootCount = $runState.RebootCount }
+  return $false
 }

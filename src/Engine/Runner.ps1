@@ -169,11 +169,16 @@ function Invoke-SetupRun {
     - No catalog entry, or its function does not exist: Failed, without invoking it.
     - Otherwise: running + attempt, save, OnProgress; invoke; append Notes/Errors; merge Data.
       - Continue: pending with attempts reset, save. Reboot Now -> Invoke-ControlledReboot; when it
-        restarts, return 'Rebooting'; when the cap blocks it, Failed('reboot cap reached'). Without
-        a reboot, the step is called again; the 50th consecutive Continue without a reboot fails it
-        with 'step kept asking to continue', so the run can never loop forever.
+        restarts, return 'Rebooting'; when it is refused, Failed('reboot cap reached') if the cap
+        blocked it, otherwise Failed('restart failed') (the restart and its fallback both failed;
+        State.Errors already says why). Without a reboot, the step is called again; the 50th
+        consecutive Continue without a reboot fails it with 'step kept asking to continue', so the
+        run can never loop forever.
       - Done / Skipped / Failed: stored with the message, save. Reboot Now -> when the controlled
-        reboot starts, return 'Rebooting'; when the cap blocks it, go on with the next step.
+        reboot starts, return 'Rebooting'; when it is refused (cap or failed restart), go on with
+        the next step.
+    RestartAction / FallbackRestartAction are passed to Invoke-ControlledReboot only when given;
+    its defaults (Restart-Computer -ErrorAction Stop, then shutdown.exe) are the production ones.
     Every saved state transition is followed by OnProgress (called with the Context; a throwing
     OnProgress is logged and ignored). After the last step, returns 'Completed'.
   #>
@@ -183,7 +188,8 @@ function Invoke-SetupRun {
     [Parameter(Mandatory)][hashtable]$Context,
     [object[]]$Catalog = $script:StepCatalog,
     [scriptblock]$OnProgress,
-    [scriptblock]$RestartAction = { Restart-Computer -Force },
+    [scriptblock]$RestartAction,
+    [scriptblock]$FallbackRestartAction,
     [int]$CountdownSeconds = 15
   )
 
@@ -191,7 +197,11 @@ function Invoke-SetupRun {
   $runState = $Context.State
   $maxAttempts = [int]$Context.Config.caps.maxStepAttempts
   $outcome = @{ Context = $Context; OnProgress = $OnProgress }   # splatted into Save-StepOutcome
-  $reboot = @{ Context = $Context; CountdownSeconds = $CountdownSeconds; RestartAction = $RestartAction }
+  # The restart actions are passed on only when given, so their production defaults live in one
+  # place: Invoke-ControlledReboot.
+  $reboot = @{ Context = $Context; CountdownSeconds = $CountdownSeconds }
+  if ($PSBoundParameters.ContainsKey('RestartAction')) { $reboot['RestartAction'] = $RestartAction }
+  if ($PSBoundParameters.ContainsKey('FallbackRestartAction')) { $reboot['FallbackRestartAction'] = $FallbackRestartAction }
 
   $entries = @{}
   foreach ($entry in @($Catalog)) {
@@ -246,7 +256,9 @@ function Invoke-SetupRun {
         Save-StepOutcome @outcome -StepId $stepId -Status pending -Message $message -Data $data -ResetAttempts
         if ($rebootNow) {
           if (Invoke-ControlledReboot @reboot) { return 'Rebooting' }
-          Save-StepOutcome @outcome -StepId $stepId -Status Failed -Message 'reboot cap reached'
+          # Refused: either the cap (RebootCapHit set) or a restart that failed even with the fallback.
+          $refusal = if ($runState.RebootCapHit -eq $true) { 'reboot cap reached' } else { 'restart failed' }
+          Save-StepOutcome @outcome -StepId $stepId -Status Failed -Message $refusal
           break
         }
         $continueRounds++
