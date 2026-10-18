@@ -1,0 +1,279 @@
+﻿# tests/Runner.Tests.ps1
+BeforeAll {
+  foreach ($f in 'Common\StepResult','Common\Logging','State\State','Engine\Reboot','Engine\Runner') { . "$PSScriptRoot\..\src\$f.ps1" }
+  function New-Ctx([string[]]$plan) {
+    $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null
+    $st = New-RunState -Machine @{} -Choices @{} -Plan $plan -Version 'v'
+    $cfg = [pscustomobject]@{ caps = [pscustomobject]@{ maxReboots = 2; maxStepAttempts = 3 } }
+    New-SetupContext -Config $cfg -State $st -Root $root -ScriptPath "$root\setup.ps1"
+  }
+  $script:cat = @(@{Id='a';Title='A';Function='Step-A'}, @{Id='b';Title='B';Function='Step-B'})
+}
+Describe 'Invoke-SetupRun' {
+  BeforeEach { $script:calls = @(); $script:restarts = 0; $script:rs = { $script:restarts++ } }
+  It 'runs in order and completes' {
+    function Step-A { param($Context) $script:calls += 'a'; New-StepResult -Status Done }
+    function Step-B { param($Context) $script:calls += 'b'; New-StepResult -Status Skipped -Message 'n/a' }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $calls -join '' | Should -Be 'ab'; $c.State.Steps.b.Status | Should -Be 'Skipped'
+  }
+  It 'saves running + attempt before invoking' {
+    function Step-A { param($Context) $d = Get-Content "$($Context.Root)\state.json" -Raw | ConvertFrom-Json; $script:seen = $d.Steps.a; New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $seen.Status | Should -Be 'running'; $seen.Attempts | Should -Be 1
+  }
+  It 'turns an exception into Failed and continues' {
+    function Step-A { param($Context) throw 'boom' }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Match 'boom'; $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'fails a step stuck running at the attempt cap without invoking it' {
+    function Step-A { param($Context) $script:calls += 'a'; New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.a.Status = 'running'; $c.State.Steps.a.Attempts = 3
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $calls | Should -BeNullOrEmpty; $c.State.Steps.a.Message | Should -Be 'attempt cap reached'
+  }
+  It 'loops on Continue without reboot' {
+    $script:n = 0; function Step-A { param($Context) $script:n++; if ($script:n -lt 3) { New-StepResult -Status Continue } else { New-StepResult -Status Done } }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $n | Should -Be 3; $c.State.Steps.a.Status | Should -Be 'Done'
+  }
+  It 'reboots on Continue+Now and leaves the step pending' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Rebooting'
+    $restarts | Should -Be 1; $c.State.Steps.a.Status | Should -Be 'pending'; $c.State.RebootCount | Should -Be 1
+  }
+  It 'fails the step when the reboot cap is reached' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.RebootCount = 2
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $restarts | Should -Be 0; $c.State.RebootCapHit | Should -BeTrue; $c.State.Steps.a.Message | Should -Be 'reboot cap reached'
+  }
+}
+Describe 'Test-PendingReboot' {
+  It 'any signal' { Test-PendingReboot -Signals @{CbsRebootPending=$false;WuRebootRequired=$false;PendingFileRename=$false;ComputerRenamePending=$true} | Should -BeTrue }
+  It 'none' { Test-PendingReboot -Signals @{CbsRebootPending=$false;WuRebootRequired=$false;PendingFileRename=$false;ComputerRenamePending=$false} | Should -BeFalse }
+}
+
+# ---- Controller decisions (beyond the brief's tests) ----
+
+Describe 'Invoke-SetupRun results and robustness' {
+  BeforeEach { $script:calls = @(); $script:restarts = 0; $script:rs = { $script:restarts++ } }
+  It 'stores (no details) when a Skipped or Failed step gives no message' {
+    function Step-A { param($Context) New-StepResult -Status Skipped }
+    function Step-B { param($Context) New-StepResult -Status Failed }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Message | Should -Be '(no details)'; $c.State.Steps.b.Message | Should -Be '(no details)'
+  }
+  It 'keeps an empty message on a Done step' {
+    function Step-A { param($Context) New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done -Message 'ok' }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Message | Should -Be ''; $c.State.Steps.b.Message | Should -Be 'ok'
+  }
+  It 'fails a step whose function does not exist, and continues' {
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $missing = @(@{Id='a';Title='A';Function='Step-DoesNotExist'}, @{Id='b';Title='B';Function='Step-B'})
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $missing -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'step function not found: Step-DoesNotExist'
+    $c.State.Steps.a.Attempts | Should -Be 0
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'fails a plan id that has no catalog entry, and continues' {
+    function Step-A { param($Context) New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','zz','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $c.State.Steps.zz.Status | Should -Be 'Failed'; $c.State.Steps.zz.Message | Should -Be 'step not in catalog: zz'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'skips a plan id with no step entry instead of crashing' {
+    function Step-A { param($Context) $script:calls += 'a'; New-StepResult -Status Done }
+    function Step-B { param($Context) $script:calls += 'b'; New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.Remove('a')
+    { Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 } | Should -Not -Throw
+    $calls -join '' | Should -Be 'b'
+  }
+  It 'fails a step that keeps asking to continue after 50 rounds, and continues' {
+    $script:n = 0; function Step-A { param($Context) $script:n++; New-StepResult -Status Continue }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $n | Should -Be 50
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'step kept asking to continue'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+  It 'resets the attempts on Continue, so each round starts at attempt 1' {
+    $script:n = 0; function Step-A { param($Context) $script:n++; if ($script:n -lt 3) { New-StepResult -Status Continue -Message "round $script:n" } else { New-StepResult -Status Done } }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Attempts | Should -Be 1
+  }
+  It 'runs a step again after a crash below the attempt cap' {
+    function Step-A { param($Context) $script:calls += 'a'; New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.a.Status = 'running'; $c.State.Steps.a.Attempts = 2
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $calls -join '' | Should -Be 'a'; $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.a.Attempts | Should -Be 3
+  }
+  It 'appends Notes and Errors to the State, merges Data into the step, and saves them' {
+    function Step-A { param($Context) New-StepResult -Status Done -Notes @('n1', 'n2') -Errors @('e1') -Data @{ k = 'v' } }
+    function Step-B { param($Context) New-StepResult -Status Failed -Message 'broke' -Notes @('n3') }
+    $c = New-Ctx @('a','b'); $c.State.Notes = @('old'); $c.State.Steps.a.Data = @{ keep = 1 }
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    @($c.State.Notes) -join ',' | Should -Be 'old,n1,n2,n3'
+    @($c.State.Errors) -join ',' | Should -Be 'e1'   # a Failed message is not copied into Errors
+    $c.State.Steps.a.Data.k | Should -Be 'v'; $c.State.Steps.a.Data.keep | Should -Be 1
+    $disk = Read-RunState -Root $c.Root
+    @($disk.Notes) -join ',' | Should -Be 'old,n1,n2,n3'; @($disk.Errors) -join ',' | Should -Be 'e1'
+    $disk.Steps.a.Data.k | Should -Be 'v'; $disk.Steps.b.Status | Should -Be 'Failed'
+  }
+  It 'records the result of a step that also leaks other output' {
+    function Step-A { param($Context) 'stray output'; 42; New-StepResult -Status Done -Message 'ok' }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.a.Message | Should -Be 'ok'
+  }
+  It 'fails a step that returns no result' {
+    function Step-A { param($Context) }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Out-Null
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'step returned no valid result'
+  }
+}
+
+Describe 'Invoke-SetupRun default catalog' {
+  BeforeAll { . "$PSScriptRoot\..\src\Engine\Catalog.ps1" }
+  It 'uses $script:StepCatalog when -Catalog is not given (as the entry point calls it)' {
+    function Invoke-StepPrepare { param($Context) New-StepResult -Status Done -Message 'prepared' }
+    $c = New-Ctx @('prepare','bitlocker')
+    Invoke-SetupRun -Context $c -RestartAction { } -CountdownSeconds 0 | Should -Be 'Completed'
+    $c.State.Steps.prepare.Status | Should -Be 'Done'; $c.State.Steps.prepare.Message | Should -Be 'prepared'
+    $c.State.Steps.bitlocker.Message | Should -Be 'step function not found: Invoke-StepBitLocker'
+  }
+}
+
+Describe 'Invoke-SetupRun reboots' {
+  BeforeEach { $script:calls = @(); $script:restarts = 0; $script:rs = { $script:restarts++ } }
+  It 'reboots after Done + Now without running the next step' {
+    function Step-A { param($Context) New-StepResult -Status Done -Reboot Now }
+    function Step-B { param($Context) $script:calls += 'b'; New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Rebooting'
+    $restarts | Should -Be 1; $calls | Should -BeNullOrEmpty
+    $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.b.Status | Should -Be 'pending'
+    (Read-RunState -Root $c.Root).Steps.a.Status | Should -Be 'Done'
+  }
+  It 'moves on to the next step when the cap blocks a reboot after Done + Now' {
+    function Step-A { param($Context) New-StepResult -Status Done -Reboot Now -Message 'renamed' }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.RebootCount = 2
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 | Should -Be 'Completed'
+    $restarts | Should -Be 0; $c.State.RebootCapHit | Should -BeTrue
+    $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.a.Message | Should -Be 'renamed'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+  }
+}
+
+Describe 'Invoke-SetupRun OnProgress' {
+  BeforeEach { $script:restarts = 0; $script:rs = { $script:restarts++ }; $script:progress = 0 }
+  It 'is called after every saved transition and its output never leaks into the result' {
+    function Step-A { param($Context) New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 -OnProgress { $script:progress++; 'noise' } | Should -Be 'Completed'
+    $progress | Should -Be 4   # a running, a Done, b running, b Done
+  }
+  It 'logs and ignores an OnProgress that throws' {
+    function Step-A { param($Context) New-StepResult -Status Done }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b')
+    Initialize-SetupLog -LogDirectory $c.LogDir
+    try {
+      Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $rs -CountdownSeconds 0 -OnProgress { throw 'screen broke' } | Should -Be 'Completed'
+    } finally { $script:SetupLogPath = $null }
+    $c.State.Steps.a.Status | Should -Be 'Done'; $c.State.Steps.b.Status | Should -Be 'Done'
+    Get-Content (Join-Path $c.LogDir 'setup.log') -Raw | Should -Match 'screen broke'
+  }
+}
+
+Describe 'Invoke-ControlledReboot' {
+  BeforeEach { $script:restarts = 0 }
+  It 'saves the incremented RebootCount before calling the restart action' {
+    $c = New-Ctx @('a')
+    $action = { $script:restarts++; $script:countOnDisk = (Read-RunState -Root $c.Root).RebootCount }
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $action | Should -BeTrue
+    $restarts | Should -Be 1; $countOnDisk | Should -Be 1; $c.State.RebootCount | Should -Be 1
+  }
+  It 'at the cap: sets RebootCapHit, saves, and does not restart' {
+    $c = New-Ctx @('a'); $c.State.RebootCount = 2
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { $script:restarts++ } | Should -BeFalse
+    $restarts | Should -Be 0; $c.State.RebootCount | Should -Be 2
+    $disk = Read-RunState -Root $c.Root; $disk.RebootCapHit | Should -BeTrue; $disk.RebootCount | Should -Be 2
+  }
+  It 'shows the countdown once per second only when CountdownSeconds is above zero' {
+    Mock Write-Host {}
+    Mock Start-Sleep {}
+    $c = New-Ctx @('a')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { } | Out-Null
+    Should -Invoke Write-Host -Times 0 -Exactly
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 3 -RestartAction { } | Out-Null
+    Should -Invoke Write-Host -Times 3 -Exactly
+    Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 3 s ...' }
+    Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 1 s ...' }
+    Should -Invoke Start-Sleep -Times 3 -Exactly
+  }
+}
+
+Describe 'Get-PendingRebootSignals' {
+  It 'returns the four signals as booleans without throwing (real registry)' {
+    $s = Get-PendingRebootSignals
+    @($s.Keys | Sort-Object) -join ',' | Should -Be 'CbsRebootPending,ComputerRenamePending,PendingFileRename,WuRebootRequired'
+    foreach ($v in $s.Values) { $v | Should -BeOfType [bool] }
+  }
+  It 'reports each signal from the registry' {
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*Component Based Servicing\RebootPending' }
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*WindowsUpdate\Auto Update\RebootRequired' }
+    Mock Get-ItemProperty { [pscustomobject]@{ PendingFileRenameOperations = [string[]]@('\??\C:\Windows\Temp\x.tmp', '') } } -ParameterFilter { $Name -eq 'PendingFileRenameOperations' }
+    Mock Get-ItemProperty { [pscustomobject]@{ ComputerName = 'DELL-7HX2K93' } } -ParameterFilter { $LiteralPath -like '*\ComputerName\ComputerName' }
+    Mock Get-ItemProperty { [pscustomobject]@{ ComputerName = 'DESKTOP-AB12' } } -ParameterFilter { $LiteralPath -like '*\ComputerName\ActiveComputerName' }
+    $s = Get-PendingRebootSignals
+    $s.CbsRebootPending | Should -BeTrue; $s.WuRebootRequired | Should -BeTrue
+    $s.PendingFileRename | Should -BeTrue; $s.ComputerRenamePending | Should -BeTrue
+  }
+  It 'treats missing keys and values as false and never throws' {
+    Mock Test-Path { $false }
+    Mock Get-ItemProperty { throw 'Property does not exist' }
+    { Get-PendingRebootSignals } | Should -Not -Throw
+    $s = Get-PendingRebootSignals
+    $s.CbsRebootPending | Should -BeFalse; $s.WuRebootRequired | Should -BeFalse
+    $s.PendingFileRename | Should -BeFalse; $s.ComputerRenamePending | Should -BeFalse
+  }
+  It 'ignores an all-empty rename list and a name that differs only in case' {
+    Mock Test-Path { $false }
+    Mock Get-ItemProperty { [pscustomobject]@{ PendingFileRenameOperations = [string[]]@('', '') } } -ParameterFilter { $Name -eq 'PendingFileRenameOperations' }
+    Mock Get-ItemProperty { [pscustomobject]@{ ComputerName = 'DELL-7HX2K93' } } -ParameterFilter { $LiteralPath -like '*\ComputerName\ComputerName' }
+    Mock Get-ItemProperty { [pscustomobject]@{ ComputerName = 'dell-7hx2k93' } } -ParameterFilter { $LiteralPath -like '*\ComputerName\ActiveComputerName' }
+    $s = Get-PendingRebootSignals
+    $s.PendingFileRename | Should -BeFalse; $s.ComputerRenamePending | Should -BeFalse
+  }
+}
+
+Describe 'New-SetupContext' {
+  It 'builds the Context shape' {
+    $cfg = [pscustomobject]@{ caps = $null }; $st = @{ Plan = @() }
+    $c = New-SetupContext -Config $cfg -State $st -Root 'C:\BenTech\Setup' -ScriptPath 'C:\BenTech\Setup\setup.ps1'
+    @($c.Keys | Sort-Object) -join ',' | Should -Be 'Config,DownloadDir,LogDir,Root,ScriptPath,State,StatePath'
+    $c.Root | Should -Be 'C:\BenTech\Setup'; $c.LogDir | Should -Be 'C:\BenTech\Setup\Logs'
+    $c.DownloadDir | Should -Be 'C:\BenTech\Setup\Downloads'; $c.StatePath | Should -Be 'C:\BenTech\Setup\state.json'
+    $c.ScriptPath | Should -Be 'C:\BenTech\Setup\setup.ps1'
+    [object]::ReferenceEquals($c.State, $st) | Should -BeTrue; [object]::ReferenceEquals($c.Config, $cfg) | Should -BeTrue
+  }
+}
