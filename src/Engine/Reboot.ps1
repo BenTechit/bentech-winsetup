@@ -91,6 +91,11 @@ function Invoke-ControlledReboot {
   .SYNOPSIS
     Restarts the machine through the reboot cap. Returns $true when a restart was started.
   .DESCRIPTION
+    No resume task (State.ResumeTaskMissing is $true, set by the Prepare step when it could not
+    register the logon task): a restart would end the run for good, so nothing is restarted and
+    RebootCount is left alone. 'Restart skipped: no resume task' is added to State.Errors (once),
+    the state is saved, an ERROR is logged and $false is returned. RebootCapHit stays as it was,
+    so the runner reports 'restart failed' and carries on.
     At or above Config.caps.maxReboots: sets State.RebootCapHit, saves, logs a WARN and returns
     $false without restarting. Otherwise: increments State.RebootCount and saves *before* anything
     else, so a restart that happens sooner than expected still counts against the cap; then logs,
@@ -124,6 +129,15 @@ function Invoke-ControlledReboot {
   $runState = $Context.State
   $maxReboots = [int]$Context.Config.caps.maxReboots   # a missing cap reads as 0: fail closed, never reboot
   $rebootCount = [int]$runState.RebootCount
+
+  if ($runState.ResumeTaskMissing -eq $true) {
+    $skipMessage = 'Restart skipped: no resume task'
+    $knownErrors = @(@($runState.Errors) | Where-Object { $null -ne $_ })
+    if ($knownErrors -notcontains $skipMessage) { $runState.Errors = @($knownErrors + $skipMessage) }
+    Save-RunState -State $runState -Root $Context.Root
+    Write-SetupLog -Level ERROR -Message 'Restart skipped: the resume task was never registered' -Data @{ rebootCount = $rebootCount }
+    return $false
+  }
 
   if ($rebootCount -ge $maxReboots) {
     $runState.RebootCapHit = $true

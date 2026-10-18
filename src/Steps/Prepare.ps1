@@ -184,7 +184,9 @@ function Restore-FinalPowerSettings {
     Config.power.finalAcMonitorMinutes, and the lid action goes back to what it was.
     On battery (DC): every setting goes back to its original value.
     A value with no captured original is skipped with a WARN rather than guessed. Every write is
-    tried even if one fails. Returns $false if any write failed.
+    tried even if one fails. Returns $false if any write failed, or if a required setting could not
+    be restored because its original was never captured (it would stay at 0, i.e. never sleep, on
+    battery). A missing LIDACTION original does not count: a desktop has no lid.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -207,16 +209,22 @@ function Restore-FinalPowerSettings {
       'VIDEOIDLE'     { $acValue = $monitorSeconds }
       default         { if ($null -ne $was) { $acValue = [int]$was.AC } }
     }
+    # A required setting that cannot be put back is a failure, not a skip: it would stay at 0
+    # (never sleep) for good, so the caller must hear about it. Only LIDACTION is exempt.
+    $required = $entry.Name -notin $script:OptionalPowerSettings
+
     if ($null -ne $acValue) {
       if (-not (Set-PowerIndexValue -Kind AC -Entry $entry -Value $acValue)) { $allOk = $false }
     } else {
       Write-SetupLog -Message 'No original AC value to restore; skipped' -Level WARN -Data @{ setting = $entry.Name }
+      if ($required) { $allOk = $false }
     }
 
     if ($null -ne $was) {
       if (-not (Set-PowerIndexValue -Kind DC -Entry $entry -Value ([int]$was.DC))) { $allOk = $false }
     } else {
       Write-SetupLog -Message 'No original DC value to restore; skipped' -Level WARN -Data @{ setting = $entry.Name }
+      if ($required) { $allOk = $false }
     }
   }
   if (-not (Invoke-PowerCfg -ArgumentList '/setactive SCHEME_CURRENT').Ok) { $allOk = $false }
@@ -338,12 +346,17 @@ function Invoke-StepPrepare {
       6. NoAutoRebootWithLoggedOnUsers = 1 (Windows Update may not restart the machine by itself).
 
     Nothing in 1, 3, 4, 5 or 6 stops the step: each failure is logged and becomes a Note. A resume
-    task that cannot be registered is different, because the run could not survive a reboot: every
-    other stage still runs, but the result is Failed('Could not register the resume task').
+    task that cannot be registered is different, because the run could not survive a reboot. The
+    registration is tried twice (ResumeTaskRetrySeconds apart, 10 by default; a test passes 0). If
+    both fail, every other stage still runs, State.ResumeTaskMissing is set to $true, and the result
+    is Failed('Could not register the resume task'). Invoke-ControlledReboot then refuses to restart.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
-  param([Parameter(Mandatory)][hashtable]$Context)
+  param(
+    [Parameter(Mandatory)][hashtable]$Context,
+    [ValidateRange(0, 600)][int]$ResumeTaskRetrySeconds = 10
+  )
 
   $notes = New-Object 'System.Collections.Generic.List[string]'
   $errors = New-Object 'System.Collections.Generic.List[string]'
@@ -358,12 +371,23 @@ function Invoke-StepPrepare {
   if (-not $icacls.Ok) { & $addNote 'Working folder permissions could not be locked down' }
 
   # 2. Resume task
-  $taskRegistered = $true
-  try {
-    Register-ResumeTask -ScriptPath $Context.ScriptPath
-  } catch {
-    $taskRegistered = $false
-    Write-SetupLog -Message 'Resume task could not be registered' -Level ERROR -Data @{ error = $_.Exception.Message }
+  # A first failure is often transient (Task Scheduler still starting after a fresh logon), so it is
+  # retried once. No break/continue here: this runs inside the runner's loops.
+  $taskRegistered = $false
+  for ($attempt = 1; $attempt -le 2 -and -not $taskRegistered; $attempt++) {
+    try {
+      Register-ResumeTask -ScriptPath $Context.ScriptPath
+      $taskRegistered = $true
+    } catch {
+      $retrying = ($attempt -eq 1)
+      Write-SetupLog -Message $(if ($retrying) { 'Resume task could not be registered; retrying once' } else { 'Resume task could not be registered' }) `
+        -Level $(if ($retrying) { 'WARN' } else { 'ERROR' }) -Data @{ attempt = $attempt; error = $_.Exception.Message }
+      if ($retrying -and $ResumeTaskRetrySeconds -gt 0) { Start-Sleep -Seconds $ResumeTaskRetrySeconds }
+    }
+  }
+  if (-not $taskRegistered) {
+    # Read by Invoke-ControlledReboot: a restart now would end the run for good.
+    $Context.State.ResumeTaskMissing = $true
     $errors.Add('Could not register the resume task, so setup cannot continue on its own after a restart')
   }
 

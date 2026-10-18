@@ -61,7 +61,7 @@ BeforeAll {
     $script:regValues = New-Object System.Collections.ArrayList
     $script:failExternal = @()
     $script:throwExternal = @()
-    $script:throwRegisterTask = $false
+    $script:registerFailuresLeft = 0     # Register-ScheduledTask throws this many times, then succeeds
     $script:throwNewItemProperty = $false
     $script:existingKeys = @()
     $script:queryValues = @{}
@@ -83,10 +83,11 @@ BeforeAll {
     }
     Mock Register-ScheduledTask {
       [void]$script:calls.Add('task')
-      if ($script:throwRegisterTask) { throw 'Task Scheduler is not available' }
+      if ($script:registerFailuresLeft -gt 0) { $script:registerFailuresLeft--; throw 'Task Scheduler is not available' }
       $script:regTask = @{ TaskName = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings; Force = [bool]$Force }
     }
     Mock Unregister-ScheduledTask { [void]$script:calls.Add("unregister $TaskName") }
+    Mock Start-Sleep { [void]$script:calls.Add("sleep $Seconds") }      # no test ever really waits
     Mock Test-Path { return ($script:existingKeys -contains $LiteralPath) }
     Mock New-Item { [void]$script:calls.Add("regkey $Path"); [void]$script:regKeys.Add([string]$Path) }
     Mock New-ItemProperty {
@@ -346,13 +347,40 @@ Describe 'Restore-FinalPowerSettings' {
   }
   It 'skips what was never captured instead of inventing a value' {
     $state = @{ Power = @{ Original = @{ STANDBYIDLE = @{ AC = 1800; DC = 900 } } } }
-    Restore-FinalPowerSettings -State $state -Config (New-PrepareConfig) | Out-Null
+    Restore-FinalPowerSettings -State $state -Config (New-PrepareConfig) | Should -BeFalse     # three required originals are missing
     $dc = @(Get-PowercfgSet -Kind 'dc')
     $dc.Count | Should -Be 1
     $dc[0].Setting | Should -Be $script:PwrGuid.STANDBYIDLE.Setting
     $ac = @(Get-PowercfgSet -Kind 'ac')
     $ac.Count | Should -Be 3                                    # LIDACTION AC has no original to go back to
     $ac.Setting | Should -Not -Contain $script:PwrGuid.LIDACTION.Setting
+  }
+  It 'returns $false when a required original is missing (it would stay at 0 on battery), but writes everything else' {
+    $script:origState.Power.Original.Remove('STANDBYIDLE')
+    Restore-FinalPowerSettings -State $script:origState -Config (New-PrepareConfig) | Should -BeFalse
+    $ac = @(Get-PowercfgSet -Kind 'ac')
+    $dc = @(Get-PowercfgSet -Kind 'dc')
+    $ac.Count | Should -Be 4                                   # AC values do not depend on an original (except LIDACTION, present here)
+    $dc.Count | Should -Be 3
+    $dc.Setting | Should -Not -Contain $script:PwrGuid.STANDBYIDLE.Setting
+    foreach ($n in 'HIBERNATEIDLE', 'VIDEOIDLE', 'LIDACTION') { $dc.Setting | Should -Contain $script:PwrGuid[$n].Setting }
+    $script:ext[-1].Args | Should -Be '/setactive SCHEME_CURRENT'
+  }
+  It 'returns $false when any one required original is missing: <Name>' -ForEach @(
+    @{ Name = 'STANDBYIDLE' }, @{ Name = 'HIBERNATEIDLE' }, @{ Name = 'VIDEOIDLE' }
+  ) {
+    $script:origState.Power.Original.Remove($Name)
+    Restore-FinalPowerSettings -State $script:origState -Config (New-PrepareConfig) | Should -BeFalse
+  }
+  It 'returns $true when only the LIDACTION original is missing (a desktop has no lid)' {
+    $script:origState.Power.Original.Remove('LIDACTION')
+    Restore-FinalPowerSettings -State $script:origState -Config (New-PrepareConfig) | Should -BeTrue
+    @(Get-PowercfgSet -Kind 'dc').Count | Should -Be 3
+    @(Get-PowercfgSet -Kind 'ac').Count | Should -Be 3
+  }
+  It 'returns $false when nothing was ever captured' {
+    Restore-FinalPowerSettings -State @{ Power = @{ Original = @{} } } -Config (New-PrepareConfig) | Should -BeFalse
+    Restore-FinalPowerSettings -State @{} -Config (New-PrepareConfig) | Should -BeFalse
   }
   It 'reports failure but still does every other write when one fails' {
     $script:failExternal = @('^\S+ /setdcvalueindex SCHEME_CURRENT \S+ ' + [regex]::Escape($script:PwrGuid.VIDEOIDLE.Setting))
@@ -523,13 +551,59 @@ Describe 'Invoke-StepPrepare' {
       @($script:calls | Where-Object { $_ -like 'regvalue *' }).Count | Should -Be 4   # Hiberboot + 2 nags + NoAutoReboot
     }
     It 'a resume task that cannot be registered fails the step, but the machine is still prepared' {
-      $script:throwRegisterTask = $true
-      $r = Invoke-StepPrepare -Context (New-PrepareContext)
+      $script:registerFailuresLeft = 99
+      $r = Invoke-StepPrepare -Context (New-PrepareContext) -ResumeTaskRetrySeconds 0
       $r.Status | Should -Be 'Failed'
       $r.Message | Should -Be 'Could not register the resume task'
       @($r.Errors).Count | Should -BeGreaterThan 0
       (Get-CallIndex '^powercfg /setactive') | Should -BeGreaterThan -1
       @($script:regValues | Where-Object { $_.Name -eq 'NoAutoRebootWithLoggedOnUsers' }).Count | Should -Be 1
+    }
+  }
+
+  # Ruling R15: a failed registration is retried once, and a final failure is flagged for the reboot code.
+  Context 'resume task retry (R15)' {
+    It 'registers once, without waiting, when the first attempt works' {
+      $ctx = New-PrepareContext
+      $r = Invoke-StepPrepare -Context $ctx
+      $r.Status | Should -Be 'Done'
+      Should -Invoke Register-ScheduledTask -Times 1 -Exactly
+      Should -Invoke Start-Sleep -Times 0 -Exactly
+      $ctx.State.ContainsKey('ResumeTaskMissing') | Should -BeFalse
+    }
+    It 'first attempt throws, second works: Done, no ResumeTaskMissing' {
+      $script:registerFailuresLeft = 1
+      $ctx = New-PrepareContext
+      $r = Invoke-StepPrepare -Context $ctx -ResumeTaskRetrySeconds 0
+      $r.Status | Should -Be 'Done'
+      $r.Message | Should -Be 'Machine prepared'
+      @($r.Errors).Count | Should -Be 0
+      Should -Invoke Register-ScheduledTask -Times 2 -Exactly
+      $ctx.State.ContainsKey('ResumeTaskMissing') | Should -BeFalse
+      $script:regTask.TaskName | Should -Be 'BenTechSetup-Resume'          # the second call is the one that registered
+    }
+    It 'both attempts throw: Failed, ResumeTaskMissing is set, and the delay can be injected as 0' {
+      $script:registerFailuresLeft = 5
+      $ctx = New-PrepareContext
+      $r = Invoke-StepPrepare -Context $ctx -ResumeTaskRetrySeconds 0
+      $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be 'Could not register the resume task'
+      @($r.Errors).Count | Should -BeGreaterThan 0
+      Should -Invoke Register-ScheduledTask -Times 2 -Exactly               # one retry, no more
+      Should -Invoke Start-Sleep -Times 0 -Exactly
+      $ctx.State.ResumeTaskMissing | Should -BeTrue
+      (Get-CallIndex '^powercfg /setactive') | Should -BeGreaterThan -1       # the rest of the step still ran
+    }
+    It 'waits 10 seconds between the two attempts by default' {
+      $script:registerFailuresLeft = 1
+      Invoke-StepPrepare -Context (New-PrepareContext) | Out-Null
+      Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+      $first = Get-CallIndex '^task$'
+      $sleep = Get-CallIndex '^sleep 10$'
+      $first | Should -BeGreaterThan -1
+      $sleep | Should -BeGreaterThan $first
+      @($script:calls | Where-Object { $_ -eq 'task' }).Count | Should -Be 2
+      $script:calls.LastIndexOf('task') | Should -BeGreaterThan $sleep
     }
   }
 }

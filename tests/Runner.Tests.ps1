@@ -313,6 +313,64 @@ Describe 'Restart failures (R10)' {
   }
 }
 
+# Ruling R15: without the logon task a restart ends the run for good, so no restart is ever made.
+# Both restart actions are injected, so no test can reach a real restart.
+Describe 'No restart without a resume task (R15)' {
+  BeforeEach {
+    $script:restarts = 0; $script:fallbacks = 0
+    $script:countRestart = { $script:restarts++ }
+    $script:countFallback = { $script:fallbacks++ }
+  }
+  It 'Invoke-ControlledReboot: neither restart action runs, RebootCount is unchanged, the error is recorded and saved, result is $false' {
+    $c = New-Ctx @('a'); $c.State.ResumeTaskMissing = $true; $c.State.RebootCount = 1
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart -FallbackRestartAction $countFallback | Should -BeFalse
+    $restarts | Should -Be 0; $fallbacks | Should -Be 0
+    $c.State.RebootCount | Should -Be 1
+    $c.State.RebootCapHit | Should -BeFalse
+    @($c.State.Errors | Where-Object { $_ -eq 'Restart skipped: no resume task' }).Count | Should -Be 1
+    $disk = Read-RunState -Root $c.Root
+    $disk.RebootCount | Should -Be 1
+    @($disk.Errors | Where-Object { $_ -eq 'Restart skipped: no resume task' }).Count | Should -Be 1
+  }
+  It 'Invoke-ControlledReboot: asked twice, the error is added only once' {
+    $c = New-Ctx @('a'); $c.State.ResumeTaskMissing = $true
+    1..2 | ForEach-Object { Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart -FallbackRestartAction $countFallback | Should -BeFalse }
+    $restarts | Should -Be 0; $fallbacks | Should -Be 0
+    @($c.State.Errors | Where-Object { $_ -eq 'Restart skipped: no resume task' }).Count | Should -Be 1
+    $c.State.RebootCount | Should -Be 0
+  }
+  It 'Invoke-ControlledReboot: keeps the errors that were already there' {
+    $c = New-Ctx @('a'); $c.State.ResumeTaskMissing = $true; $c.State.Errors = @('Could not register the resume task')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart | Should -BeFalse
+    @($c.State.Errors).Count | Should -Be 2
+    $c.State.Errors | Should -Contain 'Could not register the resume task'
+  }
+  It 'Invoke-ControlledReboot: logs an ERROR' {
+    $c = New-Ctx @('a'); $c.State.ResumeTaskMissing = $true
+    Initialize-SetupLog -LogDirectory $c.LogDir
+    try { Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart | Out-Null } finally { $script:SetupLogPath = $null }
+    Get-Content (Join-Path $c.LogDir 'setup.log') -Raw | Should -Match '\[ERROR\] Restart skipped'
+  }
+  It 'Invoke-ControlledReboot: restarts as before when the flag is absent or false' {
+    $c = New-Ctx @('a')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart | Should -BeTrue
+    $c.State.ResumeTaskMissing = $false
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $countRestart | Should -BeTrue
+    $restarts | Should -Be 2; @($c.State.Errors).Count | Should -Be 0
+  }
+  It 'Invoke-SetupRun: Continue+Now ends the step Failed(restart failed), the run carries on and completes without rebooting' {
+    function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
+    function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.ResumeTaskMissing = $true
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $countRestart -FallbackRestartAction $countFallback -CountdownSeconds 0 | Should -Be 'Completed'
+    $restarts | Should -Be 0; $fallbacks | Should -Be 0
+    $c.State.RebootCount | Should -Be 0; $c.State.RebootCapHit | Should -BeFalse
+    $c.State.Steps.a.Status | Should -Be 'Failed'; $c.State.Steps.a.Message | Should -Be 'restart failed'
+    $c.State.Steps.b.Status | Should -Be 'Done'
+    @($c.State.Errors | Where-Object { $_ -eq 'Restart skipped: no resume task' }).Count | Should -Be 1
+  }
+}
+
 # Review round 1. The leak tests carry a runaway bound (the step returns Done after 20 calls,
 # OnProgress throws after 50) so that, before the fix, a leaked continue cannot loop forever.
 Describe 'Flow-control leaks, mixed results and interruptions' {
