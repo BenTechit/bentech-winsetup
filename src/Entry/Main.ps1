@@ -60,6 +60,66 @@ function Test-SetupMachineFresh {
   }
 }
 
+function Get-NoQuickEditConsoleMode {
+  # Pure. A console input mode with ENABLE_EXTENDED_FLAGS (0x80) set and ENABLE_QUICK_EDIT_MODE (0x40)
+  # cleared; every other bit is kept. (The extended flag must be set for the QuickEdit bit to count.)
+  [CmdletBinding()]
+  [OutputType([uint32])]
+  param([Parameter(Mandatory)][uint32]$Mode)
+
+  $result = [uint32]($Mode -bor [uint32]0x80)
+  if (($result -band [uint32]0x40) -ne 0) { $result = [uint32]($result - [uint32]0x40) }
+  return $result
+}
+
+function Disable-ConsoleQuickEdit {
+  <#
+  .SYNOPSIS
+    Turns QuickEdit off for this process's console. Returns $true when the console mode now has it off,
+    $false otherwise. Never throws.
+  .DESCRIPTION
+    Final review I3: in the classic console host QuickEdit is on by default, and one click into the
+    window starts a selection; every console write then blocks until Enter or Esc, so the run would stop
+    and wait (spec 4). GetStdHandle(STD_INPUT_HANDLE = -10), GetConsoleMode, then SetConsoleMode with
+    Get-NoQuickEditConsoleMode. Under Windows Terminal this changes nothing visible. No console (stdin is a
+    pipe or a file) is $false, logged at INFO; any other failure is a WARN. The P/Invoke type is
+    compiled once per process (BenTechSetup.ConsoleModeV1, a name nothing else uses).
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  try {
+    $type = 'BenTechSetup.ConsoleModeV1' -as [type]
+    if ($null -eq $type) {
+      Add-Type -Namespace 'BenTechSetup' -Name 'ConsoleModeV1' -ErrorAction Stop -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern System.IntPtr GetStdHandle(int nStdHandle);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+'@
+      $type = 'BenTechSetup.ConsoleModeV1' -as [type]
+    }
+    $handle = $type::GetStdHandle(-10)
+    $mode = [uint32]0
+    if (-not $type::GetConsoleMode($handle, [ref]$mode)) {
+      Write-SetupLog -Message 'No console input to change (QuickEdit left as it is)'
+      return $false
+    }
+    $wanted = Get-NoQuickEditConsoleMode -Mode $mode
+    if ($wanted -ne $mode -and -not $type::SetConsoleMode($handle, $wanted)) {
+      Write-SetupLog -Level WARN -Message 'Could not turn QuickEdit off; a click into the window can pause the run' -Data @{ mode = ('0x{0:X}' -f $mode) }
+      return $false
+    }
+    return $true
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Could not turn QuickEdit off; a click into the window can pause the run' -Data @{ error = $_.Exception.Message }
+    return $false
+  }
+}
+
 function Invoke-SetupWuRoundProcess {
   # Private. The -WuRound child process: one Windows Update round for the windows-update step. The parent
   # holds the run lock and owns the screen, so this takes no lock and shows nothing. Returns 0 when the
@@ -205,8 +265,10 @@ function Start-BenTechSetup {
     not (logged).
 
     Otherwise:
-      1. Logging: Initialize-SetupLog <Root>\Logs, a transcript in <Root>\Logs\transcript-<stamp>.txt
-         (best effort), and the start line with the version ('dev' when unbundled).
+      1. Logging: Initialize-SetupLog <Root>\Logs; QuickEdit turned off for this console
+         (Disable-ConsoleQuickEdit, best effort: a click into the window must not pause the run); a
+         transcript in <Root>\Logs\transcript-<stamp>.txt (best effort), and the start line with the
+         version ('dev' when unbundled).
       2. Lock: Enter-RunLock. Held by another live run: 'Setup is already running on this machine', 2.
       3. Not resuming: the previous run's summary, the machine facts, the fresh-install check, the start
          screen (Escape: a leftover resume task is removed (R27), nothing else changes, 0). Then the
@@ -264,8 +326,10 @@ function Start-BenTechSetup {
   $transcriptStarted = $false
   try {
     $null = Initialize-SetupLog -LogDirectory $logDir
+    # Final review I3: never on the -WuRound path above (that child has no screen of its own).
+    $null = Disable-ConsoleQuickEdit
     try {
-      $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+      $stamp =(Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
       $null = Start-Transcript -Path (Join-Path $logDir "transcript-$stamp.txt") -ErrorAction Stop
       $transcriptStarted = $true
     } catch {

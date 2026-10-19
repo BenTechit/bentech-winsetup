@@ -202,6 +202,72 @@ Describe 'Invoke-External' {
   }
 }
 
+Describe 'Invoke-External standard input (triage 153)' {
+  BeforeAll {
+    # Runs a script in a separate powershell.exe whose own stdin is a pipe that stays open and empty for the
+    # whole run - like a console nobody types into. Before the fix a child inherited that stdin (or read its
+    # own hidden console) and blocked until its timeout. Returns the host's stdout + stderr.
+    function Invoke-InHostWithOpenStdin {
+      param([Parameter(Mandatory)][string]$Script, [int]$TimeoutSeconds = 90)
+      $prefix = ". '{0}'; . '{1}'; " -f (Resolve-Path "$PSScriptRoot\..\src\Common\Logging.ps1").Path, (Resolve-Path "$PSScriptRoot\..\src\Common\Process.ps1").Path
+      $psi = New-Object Diagnostics.ProcessStartInfo
+      $psi.FileName = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
+      $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prefix + $Script))
+      $psi.UseShellExecute = $false
+      $psi.CreateNoWindow = $true
+      $psi.RedirectStandardInput = $true
+      $psi.RedirectStandardOutput = $true
+      $psi.RedirectStandardError = $true
+      $p = [Diagnostics.Process]::Start($psi)
+      try {
+        $out = $p.StandardOutput.ReadToEndAsync()
+        $err = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) { $p.Kill(); throw 'the test host did not finish' }
+        $p.WaitForExit()
+        return $out.Result + $err.Result
+      } finally {
+        $p.StandardInput.Close()      # only now: the host's stdin stayed open the whole time
+        $p.Dispose()
+      }
+    }
+  }
+  It 'gives a child that reads stdin an immediate end of file, with and without -CaptureOutput' {
+    # findstr reads stdin to the end; with no input it exits 1 at once. Before the fix: a 15 s timeout each.
+    $script = @'
+foreach ($capture in $true, $false) {
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  $r = Invoke-External -FilePath "$env:windir\System32\findstr.exe" -ArgumentList 'x' -TimeoutMinutes 0.25 -CaptureOutput:$capture
+  [Console]::Out.WriteLine(('RESULT capture={0} timedOut={1} exit={2} ms={3}' -f $capture, $r.TimedOut, $r.ExitCode, $clock.ElapsedMilliseconds))
+}
+'@
+    $text = Invoke-InHostWithOpenStdin -Script $script
+    $results = @([regex]::Matches($text, 'RESULT capture=(?<c>\w+) timedOut=(?<t>\w+) exit=(?<e>\d*) ms=(?<ms>\d+)'))
+    $results.Count | Should -Be 2
+    foreach ($m in $results) {
+      $m.Groups['t'].Value | Should -Be 'False'
+      $m.Groups['e'].Value | Should -Be '1'
+      [int]$m.Groups['ms'].Value | Should -BeLessThan 10000
+    }
+  }
+  It 'still keeps a child''s output off this console when it is not captured' {
+    # Redirecting stdin makes .NET hand the child this process's stdout unless stdout is redirected too.
+    $script = @'
+$r = Invoke-External -FilePath "$env:windir\System32\cmd.exe" -ArgumentList '/c echo LEAK-CHECK-153& echo LEAK-CHECK-ERR 1>&2'
+[Console]::Out.WriteLine(('RESULT exit={0} output=[{1}]' -f $r.ExitCode, $r.Output))
+'@
+    $text = Invoke-InHostWithOpenStdin -Script $script
+    $text | Should -Match 'RESULT exit=0 output=\[\]'
+    $text | Should -Not -Match 'LEAK-CHECK'
+  }
+  It 'drains a large output it does not capture, so the child never blocks on a full pipe' {
+    $script = '1..3000 | ForEach-Object { [Console]::Out.WriteLine(''o'' * 80); [Console]::Error.WriteLine(''e'' * 80) }'
+    $r = Invoke-External -FilePath 'powershell.exe' -ArgumentList "-NoProfile -NonInteractive -Command `"$script`"" -TimeoutMinutes 2
+    $r.TimedOut | Should -BeFalse
+    $r.ExitCode | Should -Be 0
+    $r.Output | Should -Be ''
+  }
+}
+
 Describe 'Convert-MsiExitCode' {
   It '<c> -> <r>' -ForEach @(@{c=0;r='Done'},@{c=3010;r='DoneReboot'},@{c=1641;r='DoneReboot'},@{c=1618;r='Retry'},@{c=1603;r='Failed'}) { Convert-MsiExitCode -ExitCode $c | Should -Be $r }
   It 'treats a null exit code (a timed-out run) as Failed, never Done' { Convert-MsiExitCode -ExitCode $null | Should -Be 'Failed' }

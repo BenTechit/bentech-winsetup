@@ -72,6 +72,7 @@ Describe 'Start-BenTechSetup' {
     Mock Complete-SetupFinalization { [pscustomobject]@{ Status = 'Done'; Message = 'Finalized' } }
     Mock Unregister-ResumeTask { }
     Mock Invoke-WuRound { }
+    Mock Disable-ConsoleQuickEdit { $true }       # never changes the console the tests run in
     Mock Register-ScheduledTask { throw 'blocked: Register-ScheduledTask' }
     Mock Unregister-ScheduledTask { throw 'blocked: Unregister-ScheduledTask' }
     Mock Restart-Computer { throw 'blocked: Restart-Computer' }
@@ -371,5 +372,99 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'ERROR' -and $Data.error -eq 'COM failure' }
       $crashes.Count | Should -Be 0    # no screen in the child process
     }
+    It 'never touches the console mode (the child has no screen of its own)' {
+      Mock Read-RunState { New-FakeState }
+      Invoke-Entry -WuRound $true -ResultPath (Join-Path $TestDrive 'r.json') | Should -Be 0
+      Should -Invoke Disable-ConsoleQuickEdit -Times 0 -Exactly
+    }
+  }
+
+  # Final review I3: in the classic console host one click into the window starts a QuickEdit selection,
+  # and every console write then blocks until Enter or Esc: the run would stop and wait.
+  Context 'QuickEdit' {
+    It 'is turned off once on a first run, after logging starts and before the lock and the start screen' {
+      $script:order = New-Object System.Collections.ArrayList
+      Mock Initialize-SetupLog { $null = $script:order.Add('log') }
+      Mock Disable-ConsoleQuickEdit { $null = $script:order.Add('quickedit'); $true }
+      Mock Enter-RunLock { $null = $script:order.Add('lock'); $true }
+      Mock Show-StartScreen { $null = $script:order.Add('start-screen'); $script:choices }
+      Invoke-Entry | Should -Be 0
+      Should -Invoke Disable-ConsoleQuickEdit -Times 1 -Exactly
+      @($script:order) | Should -Be @('log', 'quickedit', 'lock', 'start-screen')
+    }
+    It 'is turned off on a resume too' {
+      Mock Read-RunState { New-FakeState }
+      Invoke-Entry -Resume $true | Should -Be 0
+      Should -Invoke Disable-ConsoleQuickEdit -Times 1 -Exactly
+    }
+    It 'is turned off even when another run holds the lock (that window shows a message too)' {
+      Mock Enter-RunLock { $false }
+      Invoke-Entry | Should -Be 2
+      Should -Invoke Disable-ConsoleQuickEdit -Times 1 -Exactly
+    }
+    It 'a console mode that cannot be changed changes nothing else' {
+      Mock Disable-ConsoleQuickEdit { $false }
+      Invoke-Entry | Should -Be 0
+      Should -Invoke Invoke-SetupRun -Times 1 -Exactly
+      $crashes.Count | Should -Be 0
+    }
+  }
+}
+
+Describe 'Get-NoQuickEditConsoleMode' {
+  It 'sets ENABLE_EXTENDED_FLAGS (0x80) and clears ENABLE_QUICK_EDIT_MODE (0x40), keeping every other bit: <In> -> <Out>' -ForEach @(
+    @{ In = 0x1F7; Out = 0x1B7 }     # the console host default: processed, line, echo, insert, quickedit, extended, auto-position
+    @{ In = 0x0;   Out = 0x80 }
+    @{ In = 0x40;  Out = 0x80 }
+    @{ In = 0x87;  Out = 0x87 }
+    @{ In = 0x2C7; Out = 0x287 }      # 0x200 (virtual terminal input) is kept
+  ) {
+    $r = Get-NoQuickEditConsoleMode -Mode ([uint32]$In)
+    $r | Should -BeOfType [uint32]
+    $r | Should -Be ([uint32]$Out)
+  }
+}
+
+Describe 'Disable-ConsoleQuickEdit (in a child process, never in this console)' {
+  BeforeAll {
+    # Runs Disable-ConsoleQuickEdit in a child powershell.exe and returns what it wrote to a result file.
+    # -OwnConsole: the child gets its own hidden console (no redirection, CreateNoWindow), the same kind of
+    # console handle the real setup window has; otherwise its stdin is a pipe (no console mode at all).
+    function Invoke-QuickEditChild {
+      param([switch]$OwnConsole)
+      $resultFile = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.txt')
+      $src = (Resolve-Path "$PSScriptRoot\..\src").Path
+      $script = @"
+. '$src\Common\Logging.ps1'; . '$src\Entry\Main.ps1'
+`$first = Disable-ConsoleQuickEdit
+`$second = Disable-ConsoleQuickEdit
+`$mode = [uint32]0
+`$type = 'BenTechSetup.ConsoleModeV1' -as [type]
+`$read = if (`$null -ne `$type) { `$type::GetConsoleMode(`$type::GetStdHandle(-10), [ref]`$mode) } else { `$false }
+[IO.File]::WriteAllText('$resultFile', ('first={0} second={1} type={2} read={3} mode=0x{4:X}' -f `$first, `$second, (`$null -ne `$type), `$read, `$mode))
+"@
+      $psi = New-Object Diagnostics.ProcessStartInfo
+      $psi.FileName = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
+      $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+      $psi.UseShellExecute = $false
+      $psi.CreateNoWindow = $true
+      if (-not $OwnConsole) { $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true }
+      $p = [Diagnostics.Process]::Start($psi)
+      try {
+        if (-not $OwnConsole) { $p.StandardInput.Close(); $null = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync() }
+        if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'the child did not finish' }
+      } finally { $p.Dispose() }
+      return [IO.File]::ReadAllText($resultFile)
+    }
+  }
+  It 'clears QuickEdit on a real (hidden) console host console, and is safe to call twice' {
+    $r = Invoke-QuickEditChild -OwnConsole
+    $r | Should -Match '^first=True second=True type=True read=True mode=0x[0-9A-F]+$'
+    $mode = [Convert]::ToUInt32(($r -replace '^.*mode=0x', ''), 16)
+    ($mode -band 0x40) | Should -Be 0
+    ($mode -band 0x80) | Should -Be 0x80
+  }
+  It 'returns $false, and never throws, when stdin is not a console' {
+    Invoke-QuickEditChild | Should -Match '^first=False second=False type=True '
   }
 }

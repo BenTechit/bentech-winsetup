@@ -100,19 +100,24 @@ function Stop-ProcessTree {
 # that has no PowerShell runspace, and the parameterless WaitForExit() that flushes it waits for
 # end-of-file on the pipe forever when a detached grandchild (an installer's helper service, say)
 # inherited the pipe handles and outlives its parent. These helpers read with ReadAsync from the
-# calling thread and every wait on them is bounded.
+# calling thread and every wait on them is bounded. A -Discard reader reads the same way but keeps
+# nothing: it only keeps the pipe from filling up (output that is not captured).
 
 function New-PipeReader {
   [CmdletBinding()]
   [OutputType([hashtable])]
-  param([Parameter(Mandatory)][IO.StreamReader]$Stream)
+  param(
+    [Parameter(Mandatory)][IO.StreamReader]$Stream,
+    [switch]$Discard
+  )
 
   return @{
-    Stream = $Stream
-    Buffer = New-Object 'char[]' 8192
-    Sb     = New-Object Text.StringBuilder
-    Task   = $null
-    Done   = $false
+    Stream  = $Stream
+    Buffer  = New-Object 'char[]' 8192
+    Sb      = New-Object Text.StringBuilder
+    Task    = $null
+    Done    = $false
+    Discard = [bool]$Discard
   }
 }
 
@@ -135,7 +140,7 @@ function Update-PipeReader {
     }
     $count = $task.Result
     if ($count -le 0) { $Reader.Done = $true; return }    # end of file
-    [void]$Reader.Sb.Append($Reader.Buffer, 0, $count)
+    if (-not $Reader.Discard) { [void]$Reader.Sb.Append($Reader.Buffer, 0, $count) }
   }
 }
 
@@ -176,8 +181,13 @@ function Invoke-External {
   .DESCRIPTION
     Returns @{ ExitCode = <int|$null>; TimedOut = <bool>; Output = <string> }.
     - Uses System.Diagnostics.Process with UseShellExecute = $false and no console window.
-    - -CaptureOutput redirects stdout and stderr and reads both concurrently (no pipe deadlock).
-      Output is stdout followed by stderr; it is '' when output is not captured.
+    - Standard input is a pipe that is closed right after the start, so a child that reads stdin
+      (a prompt, a "press any key") gets end-of-file at once instead of waiting until its timeout,
+      and never reads the operator's keys (triage 153).
+    - stdout and stderr are always redirected and read concurrently (no pipe deadlock). They must be:
+      with only stdin redirected, .NET would hand the child this process's own stdout, and its text
+      would land on the setup screen. -CaptureOutput keeps what was read: Output is stdout followed
+      by stderr. Without it the text is read and thrown away, and Output is ''.
     - On timeout the process and every descendant are force-killed; ExitCode is $null, TimedOut is
       $true, and Output holds whatever was captured before the kill.
     - A .cmd or .bat file is started through cmd.exe, because a batch file cannot be started
@@ -220,10 +230,9 @@ function Invoke-External {
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
   if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
-  if ($CaptureOutput) {
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-  }
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
 
   $timeoutMs = [int][Math]::Min([Math]::Ceiling($TimeoutMinutes * 60000), [double][int]::MaxValue)
   $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -239,12 +248,16 @@ function Invoke-External {
       throw (New-Object InvalidOperationException ("Cannot start '$FilePath': $($_.Exception.Message)", $_.Exception))
     }
 
-    $readers = @()
-    if ($CaptureOutput) {
-      $stdout = New-PipeReader -Stream $proc.StandardOutput
-      $stderr = New-PipeReader -Stream $proc.StandardError
-      $readers = @($stdout, $stderr)
+    # End-of-file on stdin at once (triage 153). A failure here only costs that protection.
+    try {
+      $proc.StandardInput.Close()
+    } catch {
+      Write-SetupLog -Message 'Could not close the child''s standard input' -Level WARN -Data @{ file = $FilePath; error = $_.Exception.Message }
     }
+
+    $stdout = New-PipeReader -Stream $proc.StandardOutput -Discard:(-not $CaptureOutput)
+    $stderr = New-PipeReader -Stream $proc.StandardError -Discard:(-not $CaptureOutput)
+    $readers = @($stdout, $stderr)
 
     $timedOut = $false
     while (-not $proc.HasExited) {
@@ -265,7 +278,7 @@ function Invoke-External {
       $drainMs = $drainAfterExitMs
     }
 
-    if ($CaptureOutput -and -not (Complete-PipeReader -Reader $readers -GraceMilliseconds $drainMs)) {
+    if (-not (Complete-PipeReader -Reader $readers -GraceMilliseconds $drainMs)) {
       Write-SetupLog -Message 'Output pipes still open after the process ended (a detached child holds them); continuing' -Level WARN -Data @{ file = $FilePath; waitedMs = $drainMs }
     }
 
