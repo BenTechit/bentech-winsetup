@@ -5,8 +5,10 @@
 #     (Test-FinalRebootNeeded) and a restart is possible.
 #   Phase B (after that restart, or at once when none is needed or possible): the default-browser
 #     check, the temporary policies and files removed, activation and BitLocker checked, the resume
-#     task removed, the downloads and the pinned script deleted, EndedAt, and the report. The entry
-#     point (Task 17) then shows the final screen.
+#     task removed, the downloads and the pinned script deleted, EndedAt, and the report. This is
+#     Complete-SetupFinalization, which the entry point (Task 17) also calls on its own when a run
+#     ends with finalize not Done (the final restart failed), so no run is left without a report or
+#     with the resume task still registered (ruling R26). The entry point then shows the final screen.
 # Needs StepResult.ps1, Logging.ps1, State.ps1, Catalog.ps1 + Verdict.ps1, Reboot.ps1, Prepare.ps1,
 # Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1 and Report.ps1; the bundle holds every file.
 #
@@ -233,24 +235,17 @@ function Write-SetupReport {
   [IO.File]::WriteAllText($Path, (($Lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $true))
 }
 
-function Invoke-FinalizePhaseA {
+function Restore-PostSetupSettings {
   <#
   .SYNOPSIS
-    Private. Phase A. Returns $true when the final restart should happen now.
+    Private. Undoes what the run changed only for its own duration (Phase A steps 1-3). Saves nothing:
+    the caller does. Never throws.
   .DESCRIPTION
     1. Restore-FinalPowerSettings; $false (or a throw) -> Note 'Some power settings could not be restored'.
     2. The NoAutoRebootWithLoggedOnUsers VALUE is removed (the AU key stays).
-    3. FinalRebootDone = $true, saved, so the call after the restart goes straight to Phase B.
-    4. A restart is asked for only when Test-FinalRebootNeeded says so AND it can happen. A restart the
-       runner then refuses would mark this step Failed and leave Phase B (and the report) unrun, so
-       the refusals are decided here, recorded the way Invoke-ControlledReboot records them, and
-       Phase B runs at once instead:
-         - no resume task (State.ResumeTaskMissing): Error 'Restart skipped: no resume task' (once);
-         - RebootCount at caps.maxReboots: State.RebootCapHit = $true (the verdict says 'Reboot limit
-           reached').
+    3. FinalRebootDone = $true.
   #>
   [CmdletBinding()]
-  [OutputType([bool])]
   param([Parameter(Mandatory)][hashtable]$Context)
 
   $runState = $Context.State
@@ -266,6 +261,30 @@ function Invoke-FinalizePhaseA {
   Remove-RegistryValueIfPresent -Path $script:WindowsUpdatePolicyKey -Name $script:NoAutoRebootValueName
 
   $runState.FinalRebootDone = $true
+}
+
+function Invoke-FinalizePhaseA {
+  <#
+  .SYNOPSIS
+    Private. Phase A. Returns $true when the final restart should happen now.
+  .DESCRIPTION
+    1-3. Restore-PostSetupSettings: final power settings, the NoAutoRebootWithLoggedOnUsers value
+       removed, FinalRebootDone = $true. Then the state is saved (a failed save throws: the restart
+       must not happen without it), so the call after the restart goes straight to Phase B.
+    4. A restart is asked for only when Test-FinalRebootNeeded says so AND it can happen. A restart the
+       runner then refuses would mark this step Failed and leave Phase B (and the report) unrun, so
+       the refusals are decided here, recorded the way Invoke-ControlledReboot records them, and
+       Phase B runs at once instead:
+         - no resume task (State.ResumeTaskMissing): Error 'Restart skipped: no resume task' (once);
+         - RebootCount at caps.maxReboots: State.RebootCapHit = $true (the verdict says 'Reboot limit
+           reached').
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][hashtable]$Context)
+
+  $runState = $Context.State
+  Restore-PostSetupSettings -Context $Context
   Save-RunState -State $runState -Root $Context.Root
 
   if (-not (Test-FinalRebootNeeded -Signals (Get-PendingRebootSignals) -State $runState)) {
@@ -286,12 +305,23 @@ function Invoke-FinalizePhaseA {
   return $true
 }
 
-function Invoke-FinalizePhaseB {
+function Complete-SetupFinalization {
   <#
   .SYNOPSIS
-    Private. Phase B. Returns Done('Finalized'), or Failed('Setup report could not be written').
+    Phase B: finishes the run and writes the report. Never restarts the machine. Returns
+    Done('Finalized'), or Failed('Setup report could not be written').
   .DESCRIPTION
-    In order:
+    Invoke-StepFinalize calls it for Phase B. The entry point also calls it on its own (ruling R26)
+    when a run returns 'Completed' with the finalize step not Done (the final restart failed, or
+    finalize ended Failed or stuck), so the resume task is still removed and the report still
+    written. For that case:
+      - FinalRebootDone not $true: Restore-PostSetupSettings first (final power settings, the
+        no-auto-reboot value), but never a restart.
+      - finalize found Failed: Note 'Finalize completed after an earlier failure: <its message>', so
+        the run can never look green after a failure. A failed restart also keeps its 'Restart
+        failed: ...' Error, so that run stays red.
+      - the state is saved at the end (a failed save is a WARN; the runner saves again anyway).
+    Then, in order:
       1. Chrome installed but not the default browser -> Note 'Chrome is not the default browser'
          (checked before its policy is removed).
       2. The DefaultAssociationsConfiguration policy value removed (the key stays), the XML deleted,
@@ -306,7 +336,8 @@ function Invoke-FinalizePhaseB {
          Logs\ stay.
       9. State.EndedAt = now.
      10. Steps['finalize'] marked Done('Finalized') first, so the verdict cannot call this step "did
-         not finish"; then the verdict, and the report in <LogDir>\Setup-Report.txt.
+         not finish"; then the verdict, and the report in <LogDir>\Setup-Report.txt. A report that
+         cannot be written marks finalize Failed('Setup report could not be written') instead.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -314,6 +345,16 @@ function Invoke-FinalizePhaseB {
 
   $runState = $Context.State
   $machine = if ($runState.Machine -is [System.Collections.IDictionary]) { $runState.Machine } else { @{} }
+  $hasFinalizeStep = ($runState.Steps -is [hashtable] -and $runState.Steps.ContainsKey($script:FinalizeStepId))
+  $earlierStatus = if ($hasFinalizeStep) { [string]$runState.Steps[$script:FinalizeStepId].Status } else { '' }
+  Write-SetupLog -Message 'Completing the setup' -Data @{ finalizeStatus = $earlierStatus; finalRebootDone = ($runState.FinalRebootDone -eq $true) }
+
+  if ($runState.FinalRebootDone -ne $true) { Restore-PostSetupSettings -Context $Context }
+  if ($earlierStatus -eq 'Failed') {
+    $earlierMessage = [string]$runState.Steps[$script:FinalizeStepId].Message
+    if ([string]::IsNullOrWhiteSpace($earlierMessage)) { $earlierMessage = '(no details)' }
+    Add-FinalizeMessage -State $runState -Field Notes -Text "Finalize completed after an earlier failure: $earlierMessage"
+  }
 
   if ((Test-ChromeInstalled) -and ((Get-DefaultBrowserProgId) -ne 'ChromeHTML')) {
     Add-FinalizeMessage -State $runState -Field Notes -Text 'Chrome is not the default browser'
@@ -347,20 +388,27 @@ function Invoke-FinalizePhaseB {
 
   $runState.EndedAt = Get-StateTimestamp
 
-  if ($runState.Steps -is [hashtable] -and $runState.Steps.ContainsKey($script:FinalizeStepId)) {
-    Set-StepState -State $runState -StepId $script:FinalizeStepId -Status Done -Message 'Finalized'
-  }
+  if ($hasFinalizeStep) { Set-StepState -State $runState -StepId $script:FinalizeStepId -Status Done -Message 'Finalized' }
   $verdict = Get-RunVerdict -State $runState
   $reportPath = Join-Path $Context.LogDir $script:SetupReportFileName
   try {
     $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions)
     Write-SetupReport -Path $reportPath -Lines $lines
+    Write-SetupLog -Message 'Setup report written' -Data @{ path = $reportPath; result = $verdict.Color }
+    $result = New-StepResult -Status Done -Message 'Finalized'
   } catch {
     Write-SetupLog -Message 'Setup report could not be written' -Level ERROR -Data @{ path = $reportPath; error = $_.Exception.Message }
-    return New-StepResult -Status Failed -Message 'Setup report could not be written'
+    $result = New-StepResult -Status Failed -Message 'Setup report could not be written'
+    if ($hasFinalizeStep) { Set-StepState -State $runState -StepId $script:FinalizeStepId -Status Failed -Message $result.Message }
   }
-  Write-SetupLog -Message 'Setup report written' -Data @{ path = $reportPath; result = $verdict.Color }
-  return New-StepResult -Status Done -Message 'Finalized'
+
+  # Called on its own, nobody else saves this; through the runner it is saved again right after.
+  try {
+    Save-RunState -State $runState -Root $Context.Root
+  } catch {
+    Write-SetupLog -Message 'The run state could not be saved after finalizing' -Level WARN -Data @{ error = $_.Exception.Message }
+  }
+  return $result
 }
 
 function Invoke-StepFinalize {
@@ -371,8 +419,9 @@ function Invoke-StepFinalize {
     FinalRebootDone $false: Phase A. When it asks for the final restart, returns
     Continue('Restarting to finish setup') with Reboot 'Now'; the runner restarts, and the next call
     runs Phase B. Otherwise Phase B runs in this same call. FinalRebootDone $true: Phase B.
-    Phase B returns Done('Finalized'), or Failed('Setup report could not be written').
-    The results never carry Notes or Errors: they are already in the State (see the file header).
+    Phase B is Complete-SetupFinalization: Done('Finalized'), or Failed('Setup report could not be
+    written'). The results never carry Notes or Errors: they are already in the State (see the file
+    header).
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -383,5 +432,5 @@ function Invoke-StepFinalize {
       return New-StepResult -Status Continue -Message 'Restarting to finish setup' -Reboot Now
     }
   }
-  return Invoke-FinalizePhaseB -Context $Context
+  return Complete-SetupFinalization -Context $Context
 }

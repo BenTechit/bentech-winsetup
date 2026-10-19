@@ -108,6 +108,20 @@ function Format-ReportDate {
   return $When.ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Format-StepDuration {
+  # Private. How long a step took: m:ss below an hour (minutes not padded), h:mm:ss from an hour on
+  # (ruling R25). A negative span (a clock correction) counts as zero.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][timespan]$Span)
+
+  if ($Span -lt [timespan]::Zero) { $Span = [timespan]::Zero }
+  if ($Span.TotalHours -ge 1) {
+    return ('{0}:{1:00}:{2:00}' -f [int][math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds)
+  }
+  return ('{0}:{1:00}' -f [int][math]::Floor($Span.TotalMinutes), $Span.Seconds)
+}
+
 function Format-SetupReport {
   <#
   .SYNOPSIS
@@ -121,8 +135,11 @@ function Format-SetupReport {
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, hidden: <titles, or ids, or 'none'>
-      Steps: '  <Status padded to 8> <Title> - <Message>' per plan step (' - <Message>' left out
-             when there is no message)
+      Steps: '  <Status padded to 8> <Title> - <Message> (<time>)' per plan step. ' - <Message>' is
+             left out when there is no message. ' (<time>)' (m:ss, or h:mm:ss from an hour on) is
+             added only when the step has both StartedAt and EndedAt (ruling R25). The runner sets
+             StartedAt again on every call, so a step that ran in several calls (Windows Update
+             rounds, Finalize across its restart) shows the time of its last call.
       Failures: / Notes: from the verdict, each section only when it has entries.
     Dates are dd/MM/yyyy HH:mm; a missing or unreadable time is 'unknown' (and so is the duration).
     Times may be ISO strings or [datetime] (state.json read back by ConvertFrom-Json).
@@ -195,6 +212,11 @@ function Format-SetupReport {
     $message = if ($step -is [System.Collections.IDictionary]) { ConvertTo-ScreenText $step['Message'] } else { '' }
     $line = '  {0} {1}' -f $status.PadRight(8), (ConvertTo-ScreenText (Get-StepTitle -Id $id))
     if ($message -ne '') { $line += ' - ' + $message }
+    if ($step -is [System.Collections.IDictionary]) {
+      $stepStarted = ConvertFrom-StateTime $step['StartedAt']
+      $stepEnded = ConvertFrom-StateTime $step['EndedAt']
+      if ($null -ne $stepStarted -and $null -ne $stepEnded) { $line += ' (' + (Format-StepDuration -Span ($stepEnded - $stepStarted)) + ')' }
+    }
     $lines.Add($line)
   }
 

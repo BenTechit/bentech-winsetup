@@ -189,7 +189,10 @@ Describe 'Format-SetupReport content' {
     $script:rs = New-RunState -Machine $m -Choices @{ Mode = 'DESKTOP'; SevenZip = $true; Office = 'OFF' } -Plan @('prepare', 'windows-update', 'vendor-pass1') -Version '2026.10.18.1'
     $rs.StartedAt = '2026-10-18T22:50:00'; $rs.EndedAt = '2026-10-19T01:05:00'
     $rs.Steps['prepare'].Status = 'Done'; $rs.Steps['prepare'].Message = 'Machine prepared'
+    $rs.Steps['prepare'].EndedAt = '2026-10-18T22:52:00'   # no StartedAt: no time on its line
     $rs.Steps['windows-update'].Status = 'Done'; $rs.Steps['windows-update'].Message = 'Installed 7 updates in 3 rounds'
+    $rs.Steps['windows-update'].StartedAt = '2026-10-18T23:00:00'; $rs.Steps['windows-update'].EndedAt = '2026-10-18T23:41:07'
+    $rs.Steps['vendor-pass1'].StartedAt = '2026-10-18T22:50:00'; $rs.Steps['vendor-pass1'].EndedAt = '2026-10-18T23:52:03'
     $rs.Steps['windows-update'].Data = @{ Rounds = 3; Installed = 7; FailedTitles = @{ 'id-1' = "Cumulative Update KB5050001 $script:Hebrew"; 'id-3' = 'Not hidden' } }
     $rs.HiddenUpdateIds = @('id-1', 'id-2')
     $rs.Steps['vendor-pass1'].Status = 'Failed'; $rs.Steps['vendor-pass1'].Message = "DCU exited 3001 $script:Hebrew"
@@ -236,12 +239,38 @@ Describe 'Format-SetupReport content' {
     $red | Should -Contain 'Windows Update: 3 rounds, 7 installed, hidden: Cumulative Update KB5050001 ????, id-2'
     $green | Should -Contain 'Windows Update: 0 rounds, 0 installed, hidden: none'
   }
-  It 'lists every plan step with its padded status, title and message' {
+  It 'lists every plan step with its padded status, title, message and time' {
     $i = [array]::IndexOf($red, 'Steps:')
     $red[$i + 1] | Should -Be '  Done     Prepare machine - Machine prepared'
-    $red[$i + 2] | Should -Be '  Done     Windows Update - Installed 7 updates in 3 rounds'
-    $red[$i + 3] | Should -Be '  Failed   Vendor drivers + BIOS (pass 1) - DCU exited 3001 ????'
+    $red[$i + 2] | Should -Be '  Done     Windows Update - Installed 7 updates in 3 rounds (41:07)'
+    $red[$i + 3] | Should -Be '  Failed   Vendor drivers + BIOS (pass 1) - DCU exited 3001 ???? (1:02:03)'
     $green | Should -Contain '  Done     Google Chrome'
+  }
+  It 'adds m:ss to a step with a start and an end, also without a message' {
+    $copy = $st.Clone(); $copy.Steps = @{ chrome = $st.Steps.chrome.Clone() }
+    $copy.Steps.chrome.StartedAt = '2026-10-18T09:10:00'; $copy.Steps.chrome.EndedAt = '2026-10-18T09:10:45'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome (0:45)'
+    $copy.Steps.chrome.Message = 'Installed'; $copy.Steps.chrome.EndedAt = '2026-10-18T10:09:59'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome - Installed (59:59)'
+  }
+  It 'uses h:mm:ss from one hour on' {
+    $copy = $st.Clone(); $copy.Steps = @{ chrome = $st.Steps.chrome.Clone() }
+    $copy.Steps.chrome.StartedAt = '2026-10-18T09:10:00'; $copy.Steps.chrome.EndedAt = '2026-10-18T10:10:00'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome (1:00:00)'
+    $copy.Steps.chrome.EndedAt = '2026-10-19T11:15:09'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome (26:05:09)'
+  }
+  It 'leaves the line unchanged when the start or the end is missing' {
+    $copy = $st.Clone(); $copy.Steps = @{ chrome = $st.Steps.chrome.Clone() }
+    $copy.Steps.chrome.Message = 'Installed'; $copy.Steps.chrome.StartedAt = '2026-10-18T09:10:00'; $copy.Steps.chrome.EndedAt = $null
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome - Installed'
+    $copy.Steps.chrome.StartedAt = 'not a time'; $copy.Steps.chrome.EndedAt = '2026-10-18T09:10:45'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome - Installed'
+  }
+  It 'reads step times that came back from JSON as [datetime]' {
+    $copy = $st.Clone(); $copy.Steps = @{ chrome = $st.Steps.chrome.Clone() }
+    $copy.Steps.chrome.StartedAt = [datetime]'2026-10-18T09:10:00'; $copy.Steps.chrome.EndedAt = [datetime]'2026-10-18T09:51:07'
+    (Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) | Should -Contain '  Done     Google Chrome (41:07)'
   }
   It 'adds Failures and Notes sections only when there are some' {
     $red | Should -Contain 'Failures:'
@@ -763,6 +792,78 @@ Describe 'Invoke-StepFinalize phase B' {
   }
 }
 
+Describe 'Complete-SetupFinalization on its own (ruling R26)' {
+  BeforeEach { Initialize-FinalizeMocks }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+
+  It 'finishes a run whose final restart failed, without ever asking for a restart' {
+    $script:signals.ComputerRenamePending = $true   # a restart is pending, and must still not be asked for
+    $script:regPresent[$script:AuKey] = @{ NoAutoRebootWithLoggedOnUsers = 1 }
+    $ctx = New-FinalizeContext
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $ctx.State.Errors = @('Restart failed: Access denied (fallback: shutdown.exe exited with code 5)')
+
+    $r = Complete-SetupFinalization -Context $ctx
+
+    $r.Status | Should -Be 'Done'
+    $r.Reboot | Should -Be 'None'
+    $script:restoreCalls | Should -Be 1
+    @($script:regRemoved | Where-Object { $_.Path -eq $script:AuKey -and $_.Name -eq 'NoAutoRebootWithLoggedOnUsers' }).Count | Should -Be 1
+    $ctx.State.FinalRebootDone | Should -BeTrue
+    $script:unregisterCalls | Should -Be 1
+    $ctx.State.EndedAt | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+    $ctx.State.Steps['finalize'].Status | Should -Be 'Done'
+    $v = Get-RunVerdict -State $ctx.State
+    $v.Color | Should -Be 'RED'
+    @($v.Failures | Where-Object { $_ -like '*did not finish*' }).Count | Should -Be 0
+    $lines = Get-ReportLines -Context $ctx
+    $lines | Should -Contain 'Result       : COMPLETED WITH ERRORS'
+    $lines | Should -Contain '  Restart failed: Access denied (fallback: shutdown.exe exited with code 5)'
+    $lines | Should -Contain '  Finalize completed after an earlier failure: restart failed'
+    ($lines -join "`n") | Should -Not -Match 'did not finish'
+  }
+  It 'saves what it did, because nobody else saves it when it is called on its own' {
+    $ctx = New-FinalizeContext
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    Complete-SetupFinalization -Context $ctx | Out-Null
+    $saved = Read-RunState -Root $ctx.Root
+    $saved.EndedAt | Should -Not -BeNullOrEmpty
+    $saved.FinalRebootDone | Should -BeTrue
+    $saved.Steps['finalize'].Status | Should -Be 'Done'
+  }
+  It 'does not restore the power settings again when Phase A already ran' {
+    $ctx = New-FinalizeContext -PhaseB
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    (Complete-SetupFinalization -Context $ctx).Status | Should -Be 'Done'
+    $script:restoreCalls | Should -Be 0
+  }
+  It 'is never green after an earlier finalize failure that left no error' {
+    $ctx = New-FinalizeContext -PhaseB
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'attempt cap reached'
+    Complete-SetupFinalization -Context $ctx | Out-Null
+    (Get-RunVerdict -State $ctx.State).Color | Should -Be 'YELLOW'
+    $ctx.State.Notes | Should -Contain 'Finalize completed after an earlier failure: attempt cap reached'
+  }
+  It 'adds no such note on the normal path (finalize running)' {
+    $ctx = New-FinalizeContext -PhaseB
+    Complete-SetupFinalization -Context $ctx | Out-Null
+    @($ctx.State.Notes).Count | Should -Be 0
+    (Get-RunVerdict -State $ctx.State).Color | Should -Be 'GREEN'
+  }
+  It 'marks finalize Failed, and saves it, when the report cannot be written' {
+    $ctx = New-FinalizeContext -PhaseB
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $ctx.LogDir = Join-Path $ctx.Root 'state.json\Logs'   # a folder under a file cannot exist
+    $r = Complete-SetupFinalization -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Setup report could not be written'
+    $ctx.State.Steps['finalize'].Status | Should -Be 'Failed'
+    $ctx.State.Steps['finalize'].Message | Should -Be 'Setup report could not be written'
+    (Read-RunState -Root $ctx.Root).Steps['finalize'].Status | Should -Be 'Failed'
+    $script:unregisterCalls | Should -Be 1
+  }
+}
+
 Describe 'Invoke-StepFinalize through the runner' {
   BeforeEach { Initialize-FinalizeMocks }
   AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
@@ -805,5 +906,27 @@ Describe 'Invoke-StepFinalize through the runner' {
     $script:unregisterCalls | Should -Be 1
     $resumed.State.RebootCount | Should -Be 1
     Test-Path -LiteralPath (Join-Path $ctx.LogDir 'Setup-Report.txt') | Should -BeTrue
+  }
+  It 'leaves a failed final restart to Complete-SetupFinalization, which finishes the run red' {
+    $script:signals.ComputerRenamePending = $true
+    $ctx = New-FinalizeContext
+    $ctx.State.Steps['finalize'].Status = 'pending'
+    Invoke-SetupRun -Context $ctx -CountdownSeconds 0 -RestartAction { throw 'Access denied' } -FallbackRestartAction { throw 'shutdown.exe exited with code 5' } |
+      Should -Be 'Completed'
+    # What the entry point finds: finalize Failed, no report, the resume task still registered.
+    $ctx.State.Steps['finalize'].Status | Should -Be 'Failed'
+    $ctx.State.Steps['finalize'].Message | Should -Be 'restart failed'
+    Test-Path -LiteralPath (Join-Path $ctx.LogDir 'Setup-Report.txt') | Should -BeFalse
+    $script:unregisterCalls | Should -Be 0
+
+    $r = Complete-SetupFinalization -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Reboot | Should -Be 'None'
+    $script:restoreCalls | Should -Be 1   # Phase A already restored the power settings
+    $script:unregisterCalls | Should -Be 1
+    (Get-RunVerdict -State $ctx.State).Color | Should -Be 'RED'
+    $lines = Get-ReportLines -Context $ctx
+    $lines | Should -Contain 'Result       : COMPLETED WITH ERRORS'
+    $lines | Should -Contain '  Restart failed: Access denied (fallback: shutdown.exe exited with code 5)'
   }
 }
