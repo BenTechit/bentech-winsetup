@@ -72,6 +72,7 @@ Describe 'Start-BenTechSetup' {
     Mock Complete-SetupFinalization { [pscustomobject]@{ Status = 'Done'; Message = 'Finalized' } }
     Mock Unregister-ResumeTask { }
     Mock Invoke-WuRound { }
+    Mock Test-OnACPower { $true }                 # the -WuRound child reads the power status; never the real one here
     Mock Disable-ConsoleQuickEdit { $true }       # never changes the console the tests run in
     Mock Register-ScheduledTask { throw 'blocked: Register-ScheduledTask' }
     Mock Unregister-ScheduledTask { throw 'blocked: Unregister-ScheduledTask' }
@@ -384,6 +385,19 @@ Describe 'Start-BenTechSetup' {
       Mock Read-RunState { New-FakeState }
       Invoke-Entry -WuRound $true -ResultPath (Join-Path $TestDrive 'r.json') | Should -Be 0
       Should -Invoke Disable-ConsoleQuickEdit -Times 0 -Exactly
+    }
+    # Spec 9.2: firmware is installed only on mains power, read at the start of every round.
+    It '-WuRound reads the power and passes -OnAC; a failed read counts as battery' {
+      Mock Test-OnACPower { $true }; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $OnAC -eq $true }
+      Mock Test-OnACPower { throw 'no power status' }; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $OnAC -eq $false }
+    }
+    It '-WuRound on battery passes -OnAC $false; a failed read is a WARN, not a failed round' {
+      Mock Test-OnACPower { $false }; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $OnAC -is [bool] -and $OnAC -eq $false }
+      Mock Test-OnACPower { throw 'no power status' }; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
+      Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.error -eq 'no power status' }
     }
   }
 

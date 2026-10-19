@@ -125,6 +125,9 @@ function Invoke-SetupWuRoundProcess {
   # holds the run lock and owns the screen, so this takes no lock and shows nothing. Returns 0 when the
   # round ran (its outcome is in the result JSON Invoke-WuRound writes) and 1 when it could not run (the
   # error is logged; the parent treats a missing result JSON as a failed round).
+  # Spec 9.2: the power status is read at the start of every round (each round is its own process) and
+  # passed as -OnAC, so firmware is flashed only on mains power. A failed read counts as battery (WARN):
+  # firmware is never flashed on a guess.
   [CmdletBinding()]
   [OutputType([int])]
   param(
@@ -142,9 +145,16 @@ function Invoke-SetupWuRoundProcess {
     if ($null -ne $runState -and $runState['Machine'] -is [System.Collections.IDictionary]) {
       $isWindows10 = ($runState['Machine']['IsWindows10'] -eq $true)
     }
+    $onAC = $false
+    try {
+      $onAC = [bool](Test-OnACPower)
+    } catch {
+      $onAC = $false
+      Write-SetupLog -Level WARN -Message 'Power status could not be read; treating the machine as on battery (firmware updates are left alone)' -Data @{ error = $_.Exception.Message }
+    }
     # A missing state is not checked here: Invoke-WuRound reports it in the result JSON.
     $null = Invoke-WuRound -StatePath (Join-Path $Root 'state.json') -ResultPath $ResultPath `
-      -FailuresBeforeHide ([int]$config.caps.wuFailuresBeforeHide) -IsWindows10 $isWindows10 -SearchOnly:$SearchOnly
+      -FailuresBeforeHide ([int]$config.caps.wuFailuresBeforeHide) -IsWindows10 $isWindows10 -SearchOnly:$SearchOnly -OnAC $onAC
     return 0
   } catch {
     Write-SetupLog -Level ERROR -Message 'Windows Update round process failed' -Data @{ error = $_.Exception.Message; resultPath = $ResultPath }
@@ -260,9 +270,9 @@ function Start-BenTechSetup {
     The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound
     child) or 2 (another run holds the lock).
   .DESCRIPTION
-    -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide and the
-    state's Machine.IsWindows10; no lock, no transcript, no screen. 0 when the round ran, 1 when it could
-    not (logged).
+    -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide, the
+    state's Machine.IsWindows10 and the power status read now (-OnAC; a failed read is battery); no lock,
+    no transcript, no screen. 0 when the round ran, 1 when it could not (logged).
 
     Otherwise:
       1. Logging: Initialize-SetupLog <Root>\Logs; QuickEdit turned off for this console

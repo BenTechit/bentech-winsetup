@@ -29,6 +29,10 @@ $script:UpgradesCategoryId = '3689bdc8-b205-4af4-8d4a-a63924c5e9d5'
 
 $script:WuStepId = 'windows-update'
 
+# Spec 9.2: the Note of a round that left firmware for later because the machine is on battery. The exact
+# text of Vendor.ps1's $script:BatteryNote, so the verdict's exact-match de-duplication (M1) shows it once.
+$script:WuBatteryNote = 'On battery: BIOS/firmware updates skipped'
+
 # Ruling R23: WUA error codes the parent step retries instead of failing. Matched on the numeric code,
 # never on the (localized) message text.
 #   0x80240016 WU_E_INSTALL_NOT_ALLOWED (another installation is in progress)
@@ -127,15 +131,22 @@ function Get-WuSearchCriteria {
 function ConvertTo-WuUpdateInfo {
   <#
   .SYNOPSIS
-    Turns a WUA IUpdate into [pscustomobject]@{ Id; Title; KBs; CategoryIds; CanRequestUserInput }.
+    Turns a WUA IUpdate into [pscustomobject]@{ Id; Title; KBs; CategoryIds; CanRequestUserInput;
+    IsDriver; DriverClass }.
   .DESCRIPTION
     Id is Identity.UpdateID. KBs and CategoryIds are string arrays (possibly empty), read from the COM
     collections with Count/Item(i). Only the category GUIDs (CategoryID) are kept: names are localized.
     A CanRequestUserInput that cannot be read counts as $false.
+    -Type is the search that found the update (spec 9.2): IsDriver is $true for 'Driver'. DriverClass
+    (IWindowsDriverUpdate.DriverClass, the INF setup class such as 'Firmware'; not localized) is read
+    only for drivers, in a try; it is '' for software or when it cannot be read.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
-  param([Parameter(Mandatory)]$Update)
+  param(
+    [Parameter(Mandatory)]$Update,
+    [ValidateSet('Software', 'Driver')][string]$Type = 'Software'
+  )
 
   $categoryIds = [string[]]@(foreach ($category in @(Get-WuCollectionItems -Collection $Update.Categories)) {
       if ($null -eq $category) { continue }
@@ -152,6 +163,15 @@ function ConvertTo-WuUpdateInfo {
   } catch {
     $userInput = $false
   }
+  $isDriver = ($Type -eq 'Driver')
+  $driverClass = ''
+  if ($isDriver) {
+    try {
+      $driverClass = [string]$Update.DriverClass
+    } catch {
+      $driverClass = ''
+    }
+  }
 
   [pscustomobject]@{
     Id                  = [string]$Update.Identity.UpdateID
@@ -159,23 +179,30 @@ function ConvertTo-WuUpdateInfo {
     KBs                 = $kbs
     CategoryIds         = $categoryIds
     CanRequestUserInput = $userInput
+    IsDriver            = $isDriver
+    DriverClass         = $driverClass
   }
 }
 
 function Select-WuUpdates {
   <#
   .SYNOPSIS
-    Sorts the found updates into @{ Install; Hide; Skip; OnlyDefinitions }.
+    Sorts the found updates into @{ Install; Hide; Skip; Deferred; OnlyDefinitions }.
   .DESCRIPTION
     In this order:
-      Skip    CanRequestUserInput, or IsWindows10 and the Upgrades category (the Windows 11 upgrade
-              offer is never taken on Windows 10; on Windows 11 the 25H2/26H2 enablement package is
-              installed like any other update).
-      Hide    FailureCounts[Id] -ge FailuresBeforeHide.
-      Install everything else, in the order found.
+      Skip     A software update (not IsDriver) with CanRequestUserInput, or IsWindows10 and the
+               Upgrades category (the Windows 11 upgrade offer is never taken on Windows 10; on
+               Windows 11 the 25H2/26H2 enablement package is installed like any other update).
+               Drivers are installed even when they can ask for input (spec 9.2): the installer runs
+               with ForceQuiet and no source prompts, and the round timeout is the backstop.
+      Deferred A driver whose DriverClass is 'Firmware' (any letter case) while not OnAC: firmware is
+               flashed only on mains power. It is not installed, never hidden, and its failure count is
+               left alone.
+      Hide     FailureCounts[Id] -ge FailuresBeforeHide.
+      Install  everything else, in the order found.
     OnlyDefinitions is $true only when Install is not empty and every Install item has the Defender
-    definition-updates category. Categories are matched by GUID only. Install, Hide and Skip are always
-    arrays (never $null), and hold the same objects that came in.
+    definition-updates category. Categories are matched by GUID only. Install, Hide, Skip and Deferred
+    are always arrays (never $null), and hold the same objects that came in.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -183,21 +210,27 @@ function Select-WuUpdates {
     [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Updates,
     [AllowNull()][System.Collections.IDictionary]$FailureCounts,
     [Parameter(Mandatory)][ValidateRange(1, 1000)][int]$FailuresBeforeHide,
-    [Parameter(Mandatory)][bool]$IsWindows10
+    [Parameter(Mandatory)][bool]$IsWindows10,
+    [bool]$OnAC = $true
   )
 
   $install = New-Object 'System.Collections.Generic.List[object]'
   $hide = New-Object 'System.Collections.Generic.List[object]'
   $skip = New-Object 'System.Collections.Generic.List[object]'
+  $deferred = New-Object 'System.Collections.Generic.List[object]'
 
   foreach ($update in @(ConvertTo-WuList -Value $Updates)) {
     $categories = @(ConvertTo-WuList -Value $update.CategoryIds)
     $id = [string]$update.Id
+    $isDriver = ($update.IsDriver -eq $true)
     $failures = 0
     if ($null -ne $FailureCounts -and $id -and $FailureCounts.Contains($id)) { $failures = [int]$FailureCounts[$id] }
 
-    if ([bool]$update.CanRequestUserInput -or ($IsWindows10 -and $categories -contains $script:UpgradesCategoryId)) {
+    if ((-not $isDriver -and [bool]$update.CanRequestUserInput) -or ($IsWindows10 -and $categories -contains $script:UpgradesCategoryId)) {
       $skip.Add($update)
+    } elseif ($isDriver -and ([string]$update.DriverClass).Trim() -eq 'Firmware' -and -not $OnAC) {
+      # -eq on strings ignores case in PowerShell: 'firmware' and 'FIRMWARE' match too.
+      $deferred.Add($update)
     } elseif ($failures -ge $FailuresBeforeHide) {
       $hide.Add($update)
     } else {
@@ -217,6 +250,7 @@ function Select-WuUpdates {
     Install         = $install.ToArray()
     Hide            = $hide.ToArray()
     Skip            = $skip.ToArray()
+    Deferred        = $deferred.ToArray()
     OnlyDefinitions = $onlyDefinitions
   }
 }
@@ -445,7 +479,7 @@ function Invoke-WuRound {
     One Windows Update round, run in the child process the parent step starts with -WuRound. Always
     writes ResultPath:
       { Installed: [{Id,Title,IsDefinition}], Failed: [{Id,Title,ResultCode}], Hidden: [Id],
-        HideFailed: [Id], OnlyDefinitions, RebootRequired, Error, ErrorCode }
+        HideFailed: [Id], OnlyDefinitions, RebootRequired, Error, ErrorCode, FirmwareDeferred }
   .DESCRIPTION
     1. Reads state.json (Read-RunState on StatePath's folder; read-only use): WuFailureCounts,
        PreviousHiddenUpdateIds and Steps['windows-update'].Data.Rounds (the parent saved the new
@@ -454,7 +488,9 @@ function Invoke-WuRound {
     3. Round 1 only: un-hides the updates the previous run hid (PreviousHiddenUpdateIds), found with
        the search 'IsHidden=1', so they get another chance.
     4. Searches Software, then Driver (Get-WuSearchCriteria), and sorts the result with
-       Select-WuUpdates. Skipped updates are logged.
+       Select-WuUpdates (each update converted with -Type of the search that found it, and -OnAC as
+       given: spec 9.2). Skipped updates are logged (WARN); deferred ones (firmware on battery) are
+       logged at INFO and counted in FirmwareDeferred: they are neither installed nor failed.
     5. Hides the Hide set (they failed FailuresBeforeHide times; the parent reports them in red). Each
        hide is tried on its own (ruling R24b): one that throws (a mandatory update cannot be hidden)
        is logged with its code and listed in HideFailed, and the round goes on.
@@ -475,6 +511,9 @@ function Invoke-WuRound {
     -SearchOnly (smoke test only, WhatIf-style): changes nothing on the machine. It does not register
     Microsoft Update (it is an Error when it is not registered), does not un-hide, hide, download or
     install; it searches, writes the Install selection as Installed, and reads SystemInfo.
+
+    -OnAC (spec 9.2): whether the machine is on mains power; the -WuRound entry reads it at the start
+    of the round. On battery, firmware driver updates are deferred.
   #>
   [CmdletBinding()]
   param(
@@ -482,7 +521,8 @@ function Invoke-WuRound {
     [Parameter(Mandatory)][string]$ResultPath,
     [Parameter(Mandatory)][ValidateRange(1, 1000)][int]$FailuresBeforeHide,
     [Parameter(Mandatory)][bool]$IsWindows10,
-    [switch]$SearchOnly
+    [switch]$SearchOnly,
+    [bool]$OnAC = $true
   )
 
   $installed = New-Object 'System.Collections.Generic.List[object]'
@@ -493,6 +533,8 @@ function Invoke-WuRound {
   $rebootRequired = $false
   $errorText = $null
   $errorCode = $null
+  # Set once the selection exists; a round that fails before it deferred nothing.
+  $firmwareDeferred = 0
 
   try {
     $state = Read-RunState -Root (Split-Path -Parent $StatePath)
@@ -501,7 +543,7 @@ function Invoke-WuRound {
     if ($failureCounts -isnot [System.Collections.IDictionary]) { $failureCounts = @{} }
     $previousHidden = @(ConvertTo-WuList -Value $state['PreviousHiddenUpdateIds'] | ForEach-Object { [string]$_ } | Where-Object { $_ })
     $round = Get-WuRoundNumber -State $state
-    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10 }
+    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10; onAC = $OnAC }
 
     $session = New-WuSession
     if ($SearchOnly) {
@@ -527,19 +569,23 @@ function Invoke-WuRound {
     foreach ($type in 'Software', 'Driver') {
       foreach ($update in @(Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type $type))) {
         if ($null -eq $update) { continue }
-        $info = ConvertTo-WuUpdateInfo -Update $update
+        $info = ConvertTo-WuUpdateInfo -Update $update -Type $type
         if ($byId.ContainsKey($info.Id)) { continue }
         $byId[$info.Id] = $update
         $infos.Add($info)
       }
     }
 
-    $selection = Select-WuUpdates -Updates $infos.ToArray() -FailureCounts $failureCounts -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10
+    $selection = Select-WuUpdates -Updates $infos.ToArray() -FailureCounts $failureCounts -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -OnAC $OnAC
     $onlyDefinitions = [bool]$selection.OnlyDefinitions
+    $firmwareDeferred = @($selection.Deferred).Count
     foreach ($info in $selection.Skip) {
       Write-SetupLog -Message 'Windows update skipped (needs user input, or the Windows 11 upgrade on Windows 10)' -Level WARN -Data @{ id = $info.Id; title = $info.Title; userInput = [bool]$info.CanRequestUserInput }
     }
-    Write-SetupLog -Message 'Windows Update search finished' -Data @{ found = $infos.Count; install = @($selection.Install).Count; hide = @($selection.Hide).Count; skip = @($selection.Skip).Count; onlyDefinitions = $onlyDefinitions }
+    foreach ($info in $selection.Deferred) {
+      Write-SetupLog -Message 'Firmware update left for later: on battery' -Data @{ id = $info.Id; title = $info.Title; driverClass = $info.DriverClass }
+    }
+    Write-SetupLog -Message 'Windows Update search finished' -Data @{ found = $infos.Count; install = @($selection.Install).Count; hide = @($selection.Hide).Count; skip = @($selection.Skip).Count; deferred = $firmwareDeferred; onlyDefinitions = $onlyDefinitions }
 
     if ($SearchOnly) {
       foreach ($info in $selection.Install) { $installed.Add((New-WuInstalledEntry -Info $info)) }
@@ -629,17 +675,18 @@ function Invoke-WuRound {
   }
 
   $result = [ordered]@{
-    Installed       = $installed.ToArray()
-    Failed          = $failed.ToArray()
-    Hidden          = $hidden.ToArray()
-    HideFailed      = $hideFailed.ToArray()
-    OnlyDefinitions = $onlyDefinitions
-    RebootRequired  = $rebootRequired
-    Error           = $errorText
-    ErrorCode       = $errorCode
+    Installed        = $installed.ToArray()
+    Failed           = $failed.ToArray()
+    Hidden           = $hidden.ToArray()
+    HideFailed       = $hideFailed.ToArray()
+    OnlyDefinitions  = $onlyDefinitions
+    RebootRequired   = $rebootRequired
+    Error            = $errorText
+    ErrorCode        = $errorCode
+    FirmwareDeferred = $firmwareDeferred
   }
   Write-WuRoundResult -Path $ResultPath -Result $result
-  Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; hideFailed = $hideFailed.Count; rebootRequired = $rebootRequired; error = $errorText; errorCode = $errorCode }
+  Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; hideFailed = $hideFailed.Count; firmwareDeferred = $firmwareDeferred; rebootRequired = $rebootRequired; error = $errorText; errorCode = $errorCode }
 }
 
 # --- the parent step --------------------------------------------------------------------------
@@ -824,6 +871,9 @@ function Invoke-StepWindowsUpdate {
     8. Get-WuRoundOutcome: Done -> Done('Installed <total> updates in <rounds> rounds'), with the Note
        'Some Windows updates failed: <up to 3 titles>' when the round still listed failed updates
        (ruling R24d); Continue -> Continue, Reboot 'Now' when RebootRequired.
+    Spec 9.2: a round whose FirmwareDeferred is above 0 (firmware left alone on battery) carries the
+    Note $script:WuBatteryNote on its Continue or Done result. Deferred updates are neither installed
+    nor failed, so they never keep the loop going; the verdict shows the Note once (exact match, M1).
     Data = @{ Rounds; Installed; InstalledIds; FailedTitles } (shallow: the report prints hidden
     updates by title). Installed counts distinct updates; a re-offer is counted as a failure instead
     (ruling R24c, see Update-WuRunState).
@@ -876,23 +926,27 @@ function Invoke-StepWindowsUpdate {
   $installedNow = @(ConvertTo-WuList -Value $result.Installed).Count
   $failedNow = @(ConvertTo-WuList -Value $result.Failed).Count
   $rebootNow = ($result.RebootRequired -eq $true)
-  Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; rebootRequired = $rebootNow; error = [string]$result.Error; errorCode = $errorCode }
+  # Spec 9.2. -as never throws: a result without the field (or an odd value) deferred nothing.
+  $deferredNow = [int]($result.FirmwareDeferred -as [int])
+  $batteryNotes = @()
+  if ($deferredNow -gt 0) { $batteryNotes = @($script:WuBatteryNote) }
+  Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; firmwareDeferred = $deferredNow; rebootRequired = $rebootNow; error = [string]$result.Error; errorCode = $errorCode }
 
   # Ruling R23: codes that mean "not now" are retried; the round still counts toward the cap.
   # Ruling R24a: 0x80240016 also means "a mandatory restart is pending"; when the machine says a
   # restart is required, restart now instead of waiting for something only a restart can clear.
   if ($isBusy -and $rebootNow) {
     Write-SetupLog -Message 'Windows Update agent is busy and a restart is pending; restarting' -Level WARN -Data @{ round = $round; errorCode = $errorCode; cap = $cap }
-    return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), restart pending" -Reboot Now -Data (Get-WuResultData -Data $data)
+    return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), restart pending" -Reboot Now -Notes $batteryNotes -Data (Get-WuResultData -Data $data)
   }
   if ($isBusy) {
     Write-SetupLog -Message 'Windows Update agent is busy; waiting, then retrying' -Level WARN -Data @{ round = $round; errorCode = $errorCode; waitSeconds = $BusyWaitSeconds; cap = $cap }
     Start-Sleep -Seconds $BusyWaitSeconds
-    return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), retrying" -Data (Get-WuResultData -Data $data)
+    return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), retrying" -Notes $batteryNotes -Data (Get-WuResultData -Data $data)
   }
   if ($isRebootPending) {
     Write-SetupLog -Message 'Windows Update needs a restart to finish earlier updates; restarting' -Level WARN -Data @{ round = $round; errorCode = $errorCode; cap = $cap }
-    return New-StepResult -Status Continue -Message "Windows Update round ${round}: restart needed to finish earlier updates ($errorCode)" -Reboot Now -Data (Get-WuResultData -Data $data)
+    return New-StepResult -Status Continue -Message "Windows Update round ${round}: restart needed to finish earlier updates ($errorCode)" -Reboot Now -Notes $batteryNotes -Data (Get-WuResultData -Data $data)
   }
 
   if (Test-WuResultError -Result $result) {
@@ -909,9 +963,10 @@ function Invoke-StepWindowsUpdate {
     $failedItems = @(ConvertTo-WuList -Value $result.Failed)
     $notes = @()
     if ($failedItems.Count -gt 0) { $notes = @(Format-WuFailedNote -Failed $failedItems) }
+    $notes = @($notes) + $batteryNotes
     return New-StepResult -Status Done -Message "Installed $([int]$data['Installed']) updates in $round rounds" -Notes $notes -Data (Get-WuResultData -Data $data)
   }
   $reboot = if ($rebootNow) { 'Now' } else { 'None' }
   $message = "Windows Update round ${round}: $installedNow installed, $failedNow failed"
-  return New-StepResult -Status Continue -Message $message -Reboot $reboot -Data (Get-WuResultData -Data $data)
+  return New-StepResult -Status Continue -Message $message -Reboot $reboot -Notes $batteryNotes -Data (Get-WuResultData -Data $data)
 }

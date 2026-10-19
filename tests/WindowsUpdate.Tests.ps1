@@ -10,6 +10,17 @@ Describe 'Select-WuUpdates' {
   It 'installs the enablement package on Windows 11' { (Select-WuUpdates -Updates @((U up @($upg))) -FailureCounts @{} -FailuresBeforeHide 2 -IsWindows10 $false).Install.Id | Should -Be @('up') }
   It 'flags definitions-only rounds' { (Select-WuUpdates -Updates @((U d @($defs))) -FailureCounts @{} -FailuresBeforeHide 2 -IsWindows10 $false).OnlyDefinitions | Should -BeTrue }
 }
+Describe 'Select-WuUpdates: drivers and firmware (spec 9.2)' {
+  BeforeAll { function D($id, [string]$class = 'System', [bool]$ui = $true) { [pscustomobject]@{ Id = $id; Title = $id; KBs = @(); CategoryIds = @(); CanRequestUserInput = $ui; IsDriver = $true; DriverClass = $class } } }
+  It 'installs a driver that can ask for input' { (Select-WuUpdates -Updates @((D drv)) -FailureCounts @{} -FailuresBeforeHide 2 -IsWindows10 $false).Install.Id | Should -Be @('drv') }
+  It 'still skips a software update that can ask for input' { (Select-WuUpdates -Updates @((U sw @() $true)) -FailureCounts @{} -FailuresBeforeHide 2 -IsWindows10 $false).Skip.Id | Should -Be @('sw') }
+  It 'installs firmware on AC' { (Select-WuUpdates -Updates @((D fw 'Firmware')) -FailureCounts @{} -FailuresBeforeHide 2 -IsWindows10 $false -OnAC $true).Install.Id | Should -Be @('fw') }
+  It 'defers firmware on battery: not installed, not hidden even after failures' {
+    $r = Select-WuUpdates -Updates @((D fw 'firmware'), (D net 'Net')) -FailureCounts @{ fw = 5 } -FailuresBeforeHide 2 -IsWindows10 $false -OnAC $false
+    $r.Deferred.Id | Should -Be @('fw'); @($r.Hide).Count | Should -Be 0; $r.Install.Id | Should -Be @('net')
+  }
+  It 'a driver that failed too often is still hidden (R24)' { (Select-WuUpdates -Updates @((D bad)) -FailureCounts @{ bad = 2 } -FailuresBeforeHide 2 -IsWindows10 $false).Hide.Id | Should -Be @('bad') }
+}
 Describe 'Get-WuRoundOutcome' {
   It 'done when nothing happened' { Get-WuRoundOutcome -Result ([pscustomobject]@{Installed=@();Failed=@();OnlyDefinitions=$false;Error=$null}) | Should -Be 'Done' }
   It 'done when only definitions were installed' { Get-WuRoundOutcome -Result ([pscustomobject]@{Installed=@(@{Id='d'});Failed=@();OnlyDefinitions=$true;Error=$null}) | Should -Be 'Done' }
@@ -96,9 +107,9 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # Runs the child round against a state file and returns its parsed result JSON.
     function Invoke-TestRound {
-      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly)
+      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly, [bool]$OnAC = $true)
       $script:roundResultPath = Join-Path (Split-Path -Parent $StatePath) 'Logs\wu-round.json'
-      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly
+      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly -OnAC $OnAC
       return ([IO.File]::ReadAllText($script:roundResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
     }
 
@@ -503,6 +514,25 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r.PSObject.Properties['ErrorCode'] | Should -Not -BeNullOrEmpty
       $r.ErrorCode | Should -BeNullOrEmpty
     }
+
+    # Spec 9.2: drivers are installed even when they can ask for input; firmware only on AC.
+    It 'installs driver updates that can ask for input; software ones stay skipped' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'sw' -Ui $true)); $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'drv' -Ui $true))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $script:installCalls[0] | Should -Be @('drv'); @($r.Installed.Id) | Should -Be @('drv')
+    }
+    It 'leaves firmware alone on battery and counts it' {
+      $fw = New-FakeUpdate -Id 'fw' -Ui $true; $fw | Add-Member NoteProperty DriverClass 'Firmware'
+      $script:searchResults[$script:DriverCriteria] = @($fw, (New-FakeUpdate -Id 'net'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -FailureCounts @{ fw = 3 }) -OnAC $false
+      $script:installCalls[0] | Should -Be @('net'); $script:hideCalls.Count | Should -Be 0; $r.FirmwareDeferred | Should -Be 1
+    }
+    It 'reads DriverClass only from driver search results' {
+      $sw = New-FakeUpdate -Id 'sw'; $sw | Add-Member NoteProperty DriverClass 'Firmware'
+      $script:searchResults[$script:SoftwareCriteria] = @($sw)
+      $r = Invoke-TestRound -StatePath (New-WuStateFile) -OnAC $false
+      @($r.Installed.Id) | Should -Be @('sw'); $r.FirmwareDeferred | Should -Be 0
+    }
   }
 
   Context 'Invoke-StepWindowsUpdate (parent step, child process mocked)' {
@@ -821,6 +851,22 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r.Status | Should -Be 'Continue'
       $script:ctx.State.WuFailureCounts['f1'] | Should -Be 1
     }
+
+    # Spec 9.2: firmware left for later on battery carries the vendor pass's battery Note.
+    It 'adds the battery Note when the round left firmware for later' {
+      $script:ctx = New-WuContext; $res = New-ChildResult; $res['FirmwareDeferred'] = 2; $script:childResult = $res
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'; $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+    }
+    It 'adds the battery Note on a Continue round too, and none when nothing was deferred' {
+      $script:ctx = New-WuContext; $res = New-ChildResult -Installed @([ordered]@{ Id = 'a'; Title = 'A'; IsDefinition = $false }); $res['FirmwareDeferred'] = 1; $script:childResult = $res
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'; @($r.Notes) | Should -Be @('On battery: BIOS/firmware updates skipped')
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'b'; Title = 'B'; IsDefinition = $false })
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'; @($r.Notes).Count | Should -Be 0
+    }
+    It 'uses the vendor pass''s exact battery text' { . "$PSScriptRoot\..\src\Steps\Vendor.ps1"; $script:WuBatteryNote | Should -BeExactly $script:BatteryNote }
   }
 }
 
