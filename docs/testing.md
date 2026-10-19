@@ -193,6 +193,7 @@ A real run changes the machine for good and there is no checkpoint to roll back 
 - [ ] If the drive was encrypted at the start: decryption finishes before any BIOS update, or BitLocker is suspended for one reboot as a backstop. Afterwards the drive is not encrypted.
 - [ ] A forced reboot by a vendor tool in the middle of a step resumes the run, and the step is not repeated more than 3 times.
 - [ ] The vendor tool's logs and reports are in `Logs\`.
+- [ ] **Child processes get an empty stdin and piped output (triage 153).** Every program setup starts now has its stdin closed at once and its stdout/stderr read through pipes (the output stays off the screen). In `setup.log`, note any `Output pipes still open after the process ended` WARN for a vendor tool, an installer or a Windows Update round: it costs 5 s each time (a helper process it started kept the pipe), and a tool that misbehaves with piped output would show up here.
 - [ ] On a laptop where the consumer app installed, the business updater is gone afterwards; where the consumer app was skipped or failed, the updater is still installed.
 - [ ] The final screen is readable on the laptop's own display from across the room, and the colour matches the verdict.
 
