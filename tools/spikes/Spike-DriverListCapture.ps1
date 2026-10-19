@@ -8,7 +8,8 @@
 # What it does, on a Dell:   runs dcu-cli.exe /scan (Dell Command Update), which writes a report of
 #                            the applicable updates, then copies the newest Dell update logs.
 # What it does, on an HP:    downloads HP Image Assistant (a portable tool, extracted under %TEMP%),
-#                            runs it with /Action:List, then copies its logs.
+#                            runs it with /Action:List, then copies its logs. Nothing is deleted, so
+#                            %TEMP%\BenTechCapture stays behind: delete it by hand afterwards.
 # On any other brand:        says so and stops.
 # Always (read-only):        an inventory of the brand's services, Start-menu shortcuts and Store
 #                            packages. With -InventoryOnly that is ALL it does (use that for the
@@ -384,36 +385,34 @@ function Invoke-HpCapture {
 
   if (-not (Test-Path -LiteralPath $HpWorkDir)) { [void](New-Item -ItemType Directory -Path $HpWorkDir -Force) }
   $installer = Join-Path $HpWorkDir 'hp-hpia.exe'
+
+  # Every run extracts into its own fresh folder, so nothing is ever deleted (this runs elevated, and a
+  # recursive delete in a user-writable folder could follow a planted junction) and every log copied
+  # later belongs to this run. The folders are left behind in %TEMP%\BenTechCapture.
+  $extractStamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+  $extractDir = Join-Path $HpWorkDir ('HPIA-' + $extractStamp)
+  $n = 2
+  while (Test-Path -LiteralPath $extractDir) {
+    $extractDir = Join-Path $HpWorkDir ('HPIA-' + $extractStamp + '-' + $n)
+    $n = $n + 1
+  }
+  $extractArgs = '/s /e /f "' + $extractDir + '"'
+
   Write-Host ('Downloading ' + $url + ' ...')
   Save-WebFile -Url $url -Path $installer -Minutes $TimeoutMinutes
+  $installerBytes = (Get-Item -LiteralPath $installer).Length
 
+  # The signature check and the launch are back to back on purpose: nothing happens in between, which
+  # keeps the window for swapping the file as short as it can be.
+  Write-Host 'Checking the signature and extracting HP Image Assistant...'
   $sig = Get-SignatureInfo -Path $installer
-  $tool.Installer = [ordered]@{
-    Path            = $installer
-    Bytes           = (Get-Item -LiteralPath $installer).Length
-    SignatureStatus = $sig.Status
-    SignerSubject   = $sig.Subject
-  }
   if ($sig.Status -ne 'Valid' -or [string]$sig.Subject -notmatch 'HP Inc') {
+    $tool.Installer = [ordered]@{ Path = $installer; Bytes = $installerBytes; SignatureStatus = $sig.Status; SignerSubject = $sig.Subject }
     Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
     throw ('The downloaded HP Image Assistant was deleted unused: its Authenticode signature is "' + $sig.Status + '" with signer "' + $sig.Subject + '" (it must be Valid and signed by HP Inc).')
   }
-
-  # Start from an empty extraction folder so the logs copied later are all from this run.
-  $extractDir = Join-Path $HpWorkDir 'HPIA'
-  if (Test-Path -LiteralPath $extractDir) {
-    $isLink = (((Get-Item -LiteralPath $extractDir).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq [IO.FileAttributes]::ReparsePoint)
-    if ($isLink) { throw ($extractDir + ' is a link; it was left alone and nothing was run.') }
-    try {
-      Remove-Item -LiteralPath $extractDir -Recurse -Force
-    } catch {
-      throw ('Could not clear the old ' + $extractDir + ': ' + $_.Exception.Message)
-    }
-  }
-
-  $extractArgs = '/s /e /f "' + $extractDir + '"'
-  Write-Host 'Extracting HP Image Assistant...'
   $r = Invoke-Proc -FilePath $installer -ArgumentList $extractArgs -TimeoutMinutes $TimeoutMinutes
+  $tool.Installer = [ordered]@{ Path = $installer; Bytes = $installerBytes; SignatureStatus = $sig.Status; SignerSubject = $sig.Subject }
   $tool.Extract = New-RunRecord -CommandLine ('"' + $installer + '" ' + $extractArgs) -Result $r
   if ($r.TimedOut) { throw ('The HP Image Assistant extraction did not finish within ' + $TimeoutMinutes + ' minutes and was stopped.') }
 
@@ -445,15 +444,17 @@ function Invoke-HpCapture {
     Add-CaptureNote ('Could not read the logs under ' + $extractDir + ': ' + $_.Exception.Message)
   }
 
+  Write-Host ('HP Image Assistant was left in ' + $HpWorkDir + '. Delete that folder when you are done.')
   if ($r.TimedOut) { throw ('HP Image Assistant did not finish within ' + $TimeoutMinutes + ' minutes and was stopped.') }
 }
 
 # --- Inventory (read-only) -------------------------------------------------------------------
-# Matches the brand's names. HP is matched at the start of a word so that "Chp" is not a hit.
+# Plain, case-insensitive "contains" matching on the brand's terms. A few unrelated names may match
+# (that is only noise); a missed vendor name would cost more, because these names become the verify values.
 function Get-InventoryPattern {
   param([string]$Brand)
   if ($Brand -eq 'DELL') { return '(?i)Dell|SupportAssist' }
-  return '(?i)(?<![A-Za-z])HP|Hewlett'
+  return '(?i)HP|Hewlett'
 }
 
 function Get-Inventory {

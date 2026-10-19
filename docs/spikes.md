@@ -140,7 +140,7 @@ It installs Lenovo System Update if it isn't there, then runs it in **search-onl
 powershell -ExecutionPolicy Bypass -File E:\spikes\Spike-DriverListCapture.ps1
 ```
 - On a **Dell without Dell Command Update**, add `-InstallTool`. The script then installs `Dell.CommandUpdate.Universal` with winget (the package the setup tool installs anyway). Without the switch it stops and prints how to run it again.
-- On an **HP**, nothing needs installing: HP Image Assistant is portable. The script downloads it, checks the HP signature, extracts it under `%TEMP%\BenTechCapture` and runs it from there.
+- On an **HP**, nothing needs installing: HP Image Assistant is portable. The script downloads it, checks the HP signature, extracts it under `%TEMP%\BenTechCapture` and runs it from there. The script deletes nothing (each run extracts into a fresh `HPIA-<date and time>` folder), so delete `%TEMP%\BenTechCapture` by hand when you are done.
 - It works out the brand itself and stops with a message on any other laptop.
 - It takes about **5 minutes** (Dell Command Update's scan and HP Image Assistant's analysis each take a few minutes). Every run is cut off after `-TimeoutMinutes` (20 by default). Nothing asks a question, so you can walk away.
 
