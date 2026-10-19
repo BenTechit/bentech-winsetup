@@ -426,6 +426,15 @@ Describe 'Save-OriginalPowerSettings' {
     Restore-FinalPowerSettings -State $state -Config (New-PrepareConfig) | Should -BeFalse
     @(Get-PowercfgSet -Kind 'dc').Count | Should -Be 0
   }
+  It 'also treats the leftovers of a run that could not restore them as suspect (display off on AC only)' {
+    # A run whose capture was suspect restores nothing on battery; its Finalize still applies the AC policy,
+    # so the next re-run sees VIDEOIDLE AC = 15 min and every other value still 0. That is not the user's either.
+    foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 0; DC = 0 } }
+    $script:queryValues[$script:PwrGuid.VIDEOIDLE.Setting] = @{ AC = 900; DC = 0 }
+    $state = @{ Power = @{ Original = @{} } }
+    Save-OriginalPowerSettings -State $state | Should -BeTrue
+    $state.Power.Original.Count | Should -Be 0
+  }
   It 'keeps a capture that is not all zero: <Case>' -ForEach @(
     @{ Case = 'the lid does something'; Name = 'LIDACTION'; AC = 1; DC = 1 }
     @{ Case = 'the screen turns off on battery'; Name = 'VIDEOIDLE'; AC = 0; DC = 300 }

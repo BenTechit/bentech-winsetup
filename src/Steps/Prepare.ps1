@@ -109,10 +109,13 @@ function Save-OriginalPowerSettings {
     not count.
     Backstop (final review I2): a capture in which every required setting (STANDBYIDLE, HIBERNATEIDLE,
     VIDEOIDLE) is AC 0 / DC 0 AND LIDACTION is AC 0 / DC 0 is exactly the setup values, i.e. an earlier
-    unfinished run's leftovers, not the user's settings. It is logged as a WARN and nothing is
-    recorded, so Restore-FinalPowerSettings returns $false at the end (Finalize's Note) instead of
-    putting "never sleep, lid does nothing" back on battery. That case still returns $true: nothing
-    failed here.
+    unfinished run's leftovers, not the user's settings. VIDEOIDLE's AC value is not looked at: a run
+    that hit this backstop restores nothing on battery but still sets the final AC display timeout, and
+    its leftovers (everything 0 except that) must not become the next re-run's "originals" either. It is
+    logged as a WARN and nothing is recorded, so Restore-FinalPowerSettings returns $false at the end
+    (Finalize's Note) instead of putting "never sleep, lid does nothing" back on battery. That case still
+    returns $true: nothing failed here. (A user who really had all of this gets the same final settings
+    plus the Note.)
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -142,11 +145,13 @@ function Save-OriginalPowerSettings {
     if (-not $captured -and $entry.Name -notin $script:OptionalPowerSettings) { $allOk = $false }
   }
 
-  # Every mapped setting (LIDACTION included) captured, and every one AC 0 / DC 0: the setup values.
+  # Every mapped setting (LIDACTION included) captured, and every one AC 0 / DC 0 (VIDEOIDLE AC aside):
+  # the setup values, or what a run that could not restore them left behind.
   $looksLikeSetupValues = $true
   foreach ($entry in $script:PowerSettingMap) {
     $value = $capture[$entry.Name]
-    if ($null -eq $value -or [int]$value.AC -ne 0 -or [int]$value.DC -ne 0) { $looksLikeSetupValues = $false }
+    $acCounts = $entry.Name -ne 'VIDEOIDLE'
+    if ($null -eq $value -or ($acCounts -and [int]$value.AC -ne 0) -or [int]$value.DC -ne 0) { $looksLikeSetupValues = $false }
   }
   if ($looksLikeSetupValues) {
     Write-SetupLog -Message 'The captured power settings are the setup values (never sleep, lid does nothing), left by an earlier unfinished run; not recording them as the originals' -Level WARN
