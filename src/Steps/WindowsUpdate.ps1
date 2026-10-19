@@ -489,8 +489,9 @@ function Invoke-WuRound {
        the search 'IsHidden=1', so they get another chance.
     4. Searches Software, then Driver (Get-WuSearchCriteria), and sorts the result with
        Select-WuUpdates (each update converted with -Type of the search that found it, and -OnAC as
-       given: spec 9.2). Skipped updates are logged (WARN); deferred ones (firmware on battery) are
-       logged at INFO and counted in FirmwareDeferred: they are neither installed nor failed.
+       given: spec 9.2). Each driver update found is logged at INFO with its driverClass. Skipped
+       updates are logged (WARN); deferred ones (firmware on battery) are logged at INFO and counted
+       in FirmwareDeferred: they are neither installed nor failed.
     5. Hides the Hide set (they failed FailuresBeforeHide times; the parent reports them in red). Each
        hide is tried on its own (ruling R24b): one that throws (a mandatory update cannot be hidden)
        is logged with its code and listed in HideFailed, and the round goes on.
@@ -573,6 +574,11 @@ function Invoke-WuRound {
         if ($byId.ContainsKey($info.Id)) { continue }
         $byId[$info.Id] = $update
         $infos.Add($info)
+        # Spec 9.2: every driver's class goes to setup.log, so a normal run on the charger proves what
+        # DriverClass the firmware updates really report (the firmware rule matches 'Firmware').
+        if ($info.IsDriver) {
+          Write-SetupLog -Message 'Windows Update driver found' -Data @{ id = $info.Id; title = $info.Title; driverClass = $info.DriverClass }
+        }
       }
     }
 

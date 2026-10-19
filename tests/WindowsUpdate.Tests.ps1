@@ -527,6 +527,17 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r = Invoke-TestRound -StatePath (New-WuStateFile -FailureCounts @{ fw = 3 }) -OnAC $false
       $script:installCalls[0] | Should -Be @('net'); $script:hideCalls.Count | Should -Be 0; $r.FirmwareDeferred | Should -Be 1
     }
+    # Spec 9.2 "to prove on a real machine": every driver's class is in setup.log, on AC too.
+    It 'logs each driver update found at INFO with its driverClass, and no such line for software' {
+      $drv = New-FakeUpdate -Id 'drv' -Title 'Dell Firmware'; $drv | Add-Member NoteProperty DriverClass 'Firmware'
+      $sw = New-FakeUpdate -Id 'sw'; $sw | Add-Member NoteProperty DriverClass 'Firmware'
+      $script:searchResults[$script:SoftwareCriteria] = @($sw); $script:searchResults[$script:DriverCriteria] = @($drv)
+      $null = Invoke-TestRound -StatePath (New-WuStateFile)
+      $found = @($script:logs | Where-Object { $_.Message -eq 'Windows Update driver found' })
+      $found.Count | Should -Be 1
+      $found[0].Level | Should -Not -BeIn @('WARN', 'ERROR')    # INFO is the default level, which a mock does not bind
+      $found[0].Data.id | Should -Be 'drv'; $found[0].Data.title | Should -Be 'Dell Firmware'; $found[0].Data.driverClass | Should -Be 'Firmware'
+    }
     It 'reads DriverClass only from driver search results' {
       $sw = New-FakeUpdate -Id 'sw'; $sw | Add-Member NoteProperty DriverClass 'Firmware'
       $script:searchResults[$script:SoftwareCriteria] = @($sw)
