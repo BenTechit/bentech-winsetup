@@ -1,6 +1,6 @@
 # bentech-winsetup v2: see what it is doing, faster Office
 
-**Status:** APPROVED by Ben, 20/10/2026 (with the five builder-check calls marked "my call", and build order A)
+**Status:** APPROVED by Ben, 20/10/2026 (with the five builder-check calls marked "my call", and build order A). §9 and §10 added the same day from the first real-machine test and Ben's answers Q6 A and Q7 A.
 **Date:** 20/10/2026
 **Amends:** [2026-10-18-bentech-winsetup-design.md](2026-10-18-bentech-winsetup-design.md). That spec stays binding wherever this document does not change it.
 
@@ -318,3 +318,101 @@ The driver-list readers (Dell scan XML, HP list report, vendor log lines) need r
 
 - **A. Build the rest now.** The start screen, the tick and screen, the activity feed, Office, the shortcuts and the Windows Update list are built and published after a VM test. Ben runs a 5-minute capture script (`tools\spikes\`) on one Dell and one HP laptop when they come through the shop. Each brand's driver list is built from what that script captured. Until then, driver passes show the tool's live log line and the timer, not a list.
 - **B. Capture first.** Ben runs the capture script on a Dell and an HP before any building starts. Everything ships in one go.
+
+## 9. Fixes from the first real-machine test (20/10/2026)
+
+**Machine:** Dell Pro 15 Essential, Windows 11 Home 25H2 in Hebrew, release `v2026.10.19.1`. The evidence is the copied `C:\BenTech\Setup` folder (setup.log, transcripts, wu-round*.json, Setup-Report.txt). These fixes are built **first** and may ship as their own release before the rest of v2. Ben approves each publish.
+
+### 9.1 Final screen colours (the "white screen")
+
+**Cause:**
+- Windows ships a console profile for `powershell.exe` (`HKCU\Console\%SystemRoot%_System32_WindowsPowerShell_v1.0_powershell.exe`) that remaps two palette entries:
+  - 5 (DarkMagenta) to `#012456`, the PowerShell blue
+  - 6 (DarkYellow) to `#EEEDF0`, near white
+- The YELLOW verdict painted DarkYellow, which was near white, and wrote White text on it. The screen looked empty except for the cursor.
+- The transcript shows the full final screen was drawn.
+
+**Rule from now on:**
+- No screen uses `DarkYellow` or `DarkMagenta`, as foreground or background.
+- Every screen line sets its foreground **and** background explicitly.
+- Verdict colours:
+
+  | Verdict | Background | Text |
+  |---|---|---|
+  | YELLOW | `Yellow` | `Black` |
+  | GREEN | `DarkGreen` | `White` |
+  | RED | `DarkRed` | `White` |
+
+- The v2 start and progress screens draw on `Black`.
+- A test scans `src\UI` (and any other drawing code) for `DarkYellow` and `DarkMagenta`.
+
+### 9.2 Driver updates skipped by Windows Update
+
+**Cause:** v1 skipped every update whose `InstallationBehavior.CanRequestUserInput` is true. On the Dell, all 9 driver and firmware updates had that flag, so both rounds skipped them. Windows then installed them by itself after the run, which left "restart pending".
+
+**New rule:**
+- Updates of type **Driver** are installed even when `CanRequestUserInput` is true. The installer already runs with `ForceQuiet` and without source prompts, and the round timeout stays the backstop.
+- Software updates keep the v1 rule.
+
+**Firmware:**
+- A driver update whose `DriverClass` (from `IWindowsDriverUpdate`; not localized) is `Firmware` is installed only on mains power. Power is read at the start of each round.
+- On battery, firmware updates are left alone: not hidden, and not counted as failures. The step adds the existing battery Note.
+
+**To prove on a real machine:** the `DriverClass` value of the Dell firmware updates.
+
+### 9.3 Vendor app: check it is really there
+
+- winget reported success for Dell SupportAssist after 7.5 minutes, but Ben did not see the app.
+- **New check:** after a successful install, the step checks that the app is present, using a `verify` entry per vendor in `config.json` (file paths and/or service names). Found → Done. Not found → Failed `<app> was not found after install`.
+- **Unknown values:** while a vendor's values are not known yet, `verify` is left out and v1 behaviour stays. Ben's check of the Dell's Start menu, plus the capture script (Task 1), supply the values.
+- An activity line says which check passed.
+
+### 9.4 Chrome as default browser: the check ran too early
+
+**Cause:** after the final restart, the check ran **one second** after sign-in. Finalize then removed the policy value and the XML at once, probably before Windows had applied them.
+
+**New behaviour:**
+- After the final restart, Finalize polls for `ChromeHTML` for up to **120 s**, ticking.
+- It removes the policy value and the XML only after Chrome is confirmed as default, or after the wait ends.
+- Still not default after the wait → the existing yellow Note and the **B** hint.
+
+**To prove on a real machine:** whether the policy is honoured on Windows 11 **Home**.
+
+### 9.5 Small items
+
+- **Report text:** `ConvertTo-ScreenText` strips Unicode direction and format marks (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069) before the ASCII filter. Hebrew Windows put `??` before `Microsoft Windows 11 Home`.
+- **Windows activation (Ben's Q7, A):**
+  - In Finalize, before the final restart: when Windows is not activated and a product key is installed, ask Windows to activate, by calling the `Activate` method of the Windows `SoftwareLicensingProduct` entry. This runs in a child PowerShell through `Invoke-External` with a 3-minute timeout.
+  - The report reads the status afterwards, as before.
+  - A failed attempt is logged, and the Note stays `Windows not activated`.
+
+## 10. No leftover folder (Ben's Q6, A)
+
+The tool keeps `C:\BenTech` **while it runs**. It restarts several times, and the elevated resume task has to run its own verified copy. A USB stick can't hold that safely: FAT/exFAT has no permissions, and the stick moves between 5–7 laptops. Cleanup happens when the technician **finishes** the final screen.
+
+1. **Finishing the final screen:** `Enter` finishes (my call: a stray key must not throw the logs away). `B` and `R` work as before, and other keys are ignored. The screen gains one live line, re-checked every second:
+   - `USB stick found (E:) - logs will be saved there`
+   - or `No BenTech USB stick - plug it in now to keep the logs`
+2. **Finding the stick:**
+   - On a new run (not a resume), `setup.ps1` records the launcher's path from `$env:BT_SELF`, plus that drive's volume serial number, in `state.json`. The launcher does not change.
+   - At the end, the stick is the drive with that serial. If it isn't plugged in, the stick is any other drive (not the system drive) holding `BenTechSetup.cmd` in its root.
+3. **Saving the logs:** copy `C:\BenTech\Setup\Logs` to `<stick>\BenTech-Logs\<PC name>\`.
+   - Before copying, the folder for that PC name is deleted, so a re-run replaces it.
+   - The PC name is the new name, for example `DELL-J0C7QK4`.
+   - A failed copy shows on screen. Deletion still goes ahead after the technician presses Enter once more.
+4. **Deleting the Desktop launcher:** if the run started from the user's or the public Desktop, that launcher copy is deleted. A launcher on a removable drive, or anywhere else, is never deleted.
+5. **Deleting `C:\BenTech`:**
+   - First stop the transcript and logging, release the run lock and mutex, and move out of the folder.
+   - Then delete it with `cmd.exe /c rd /s /q` through `Invoke-External`. `rd` removes junctions without following them. PowerShell 5.1's `Remove-Item -Recurse` would follow them.
+   - Also remove `C:\ProgramData\BenTech` if it is empty.
+   - **If deletion fails:** retry 3 times, 2 s apart, then show `Could not delete C:\BenTech - delete it by hand` and wait for a key.
+6. **Esc on the start screen** (cancel) also deletes `C:\BenTech`, because nothing ran. A **crash** leaves everything in place for diagnosis, as in v1.
+7. **What's lost:**
+   - **"Previous run":** the start screen's `Previous run:` line now only appears after an unfinished run, because a finished run leaves nothing behind. Earlier results live in the stick's `BenTech-Logs` folder.
+   - **Re-runs:** there is no state to archive on a re-run after a finished run.
+
+**To prove on a real machine:**
+- the stick detection
+- the copy to exFAT
+- the deletion while the final process still runs from `C:\BenTech\Setup\setup.ps1`
+- the Desktop-launcher deletion
