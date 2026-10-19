@@ -24,7 +24,9 @@ BeforeAll {
   # test can change a timeout or a tool entry without touching the others.
   $script:ConfigJson = [IO.File]::ReadAllText("$PSScriptRoot\..\config\config.json", [Text.Encoding]::UTF8)
   $script:HpiaHtml = [IO.File]::ReadAllText("$PSScriptRoot\fixtures\hpia.html", [Text.Encoding]::UTF8)
+  # The policy goes into both registry views (ruling R19): tvsu.exe is 32-bit.
   $script:LenovoPolicyKey = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
+  $script:LenovoWowPolicyKey = 'HKLM:\SOFTWARE\WOW6432Node\Policies\Lenovo\System Update\UserSettings\General'
 
   function New-VendorContext {
     param([string]$Brand = 'DELL', [string]$Mode = 'LAPTOP')
@@ -71,6 +73,9 @@ BeforeAll {
   #                          $script:wingetInstalls the paths that exist once it has run
   #   $script:uninstallCalls one id per Invoke-WingetUninstall call; $script:uninstallResult is its answer
   #   $script:waitCalls      one TimeoutMinutes per Wait-BitLockerDecrypted call
+  #   $script:onAC           what Test-OnACPower answers; $script:onACSeq, when set, answers call by call
+  #                          (the last one repeats); $script:acCalls counts the calls
+  #   $script:regWriteThrowsFor / $script:regRemoveThrowsFor   registry paths whose write / removal throws
   #   $script:regKeys / $script:regValues / $script:regRemoved   New-Item paths / New-ItemProperty / Remove-ItemProperty calls
   #   $script:regPresent     registry path -> hashtable of values for Get-ItemProperty
   #   $script:procPolls      Get-Process calls so far; it reports $script:procList while procPolls <= $script:procRunningPolls
@@ -101,12 +106,16 @@ BeforeAll {
     $script:bitlockerDecrypted = $true
     $script:suspendOk = $true
     $script:onAC = $true
+    $script:onACSeq = $null
+    $script:acCalls = 0
     $script:waitCalls = New-Object System.Collections.ArrayList
     $script:regKeys = New-Object System.Collections.ArrayList
     $script:regValues = New-Object System.Collections.ArrayList
     $script:regWriteThrows = $false
+    $script:regWriteThrowsFor = @()
     $script:regRemoved = New-Object System.Collections.ArrayList
     $script:regRemoveThrows = $false
+    $script:regRemoveThrowsFor = @()
     $script:regPresent = @{}
     $script:procPolls = 0
     $script:procRunningPolls = 0
@@ -163,10 +172,15 @@ BeforeAll {
       return $script:bitlockerDecrypted
     }
     Mock Suspend-BitLockerOnce { [void]$script:order.Add('Suspend-BitLockerOnce'); return $script:suspendOk }
-    Mock Test-OnACPower { [void]$script:order.Add('Test-OnACPower'); return $script:onAC }
+    Mock Test-OnACPower {
+      [void]$script:order.Add('Test-OnACPower')
+      $script:acCalls++
+      if ($null -ne $script:onACSeq) { return [bool]$script:onACSeq[[Math]::Min($script:acCalls - 1, $script:onACSeq.Count - 1)] }
+      return $script:onAC
+    }
     Mock New-Item { [void]$script:regKeys.Add([string]$Path); $script:existing += [string]$Path }
     Mock New-ItemProperty {
-      if ($script:regWriteThrows) { throw 'Requested registry access is not allowed' }
+      if ($script:regWriteThrows -or ($script:regWriteThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
     }
     Mock Get-ItemProperty {
@@ -175,7 +189,7 @@ BeforeAll {
       return [pscustomobject]$values
     }
     Mock Remove-ItemProperty {
-      if ($script:regRemoveThrows) { throw 'Requested registry access is not allowed' }
+      if ($script:regRemoveThrows -or ($script:regRemoveThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
       [void]$script:regRemoved.Add(@{ Path = [string]$LiteralPath; Name = @($Name) })
     }
     Mock Remove-Item { [void]$script:removed.Add([string]$LiteralPath) }
@@ -333,9 +347,16 @@ Describe 'Convert-LenovoUpdateRecords' {
     Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Installed'), (New-FakeLenovoUpdate 'Installed, reboot required')) | Should -Be 'DoneReboot'
     Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Restart pending')) | Should -Be 'DoneReboot'
   }
-  It 'any failed record is Failed, whatever the order and even next to a reboot' {
-    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Install failed'), (New-FakeLenovoUpdate 'Reboot required')) | Should -Be 'Failed'
-    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Reboot required'), (New-FakeLenovoUpdate 'Download FAILED')) | Should -Be 'Failed'
+  It 'a failed record without any restart is Failed, whatever the order' {
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Install failed'), (New-FakeLenovoUpdate 'Installed')) | Should -Be 'Failed'
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Installed'), (New-FakeLenovoUpdate 'Download FAILED')) | Should -Be 'Failed'
+  }
+  It 'a failure next to a restart is FailedReboot, whatever the order' {
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Install failed'), (New-FakeLenovoUpdate 'Reboot required')) | Should -Be 'FailedReboot'
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Reboot required'), (New-FakeLenovoUpdate 'Download FAILED')) | Should -Be 'FailedReboot'
+  }
+  It 'one record that both failed and needs a restart is FailedReboot' {
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Install failed, restart required')) | Should -Be 'FailedReboot'
   }
   It 'matches the status text case-insensitively' {
     Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'REBOOT')) | Should -Be 'DoneReboot'
@@ -400,34 +421,51 @@ Describe 'Invoke-VendorPass: BitLocker and power gate' {
     $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
     @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:noBiosArgs
   }
-  It 'on battery and suspend failed: both Notes, no BIOS' {
+  It 'on battery: the BitLocker gate is skipped entirely, even when the drive is not decrypted (R20)' {
     $script:onAC = $false
     $script:bitlockerDecrypted = $false
     $script:suspendOk = $false
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
-    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
-    $r.Notes | Should -Contain 'BitLocker could not be suspended: BIOS/firmware updates skipped'
+    $r.Status | Should -Be 'Done'
+    Should -Invoke -CommandName Wait-BitLockerDecrypted -Times 0 -Exactly
+    Should -Invoke -CommandName Suspend-BitLockerOnce -Times 0 -Exactly
+    @($r.Notes) | Should -Be @('On battery: BIOS/firmware updates skipped')
     @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:noBiosArgs
+    $script:acCalls | Should -Be 1
   }
-  It 'reads the power state after the BitLocker wait and before the tool runs' {
+  It 'on AC: reads the power state first, runs the gate, then reads it again right before the tool' {
     $script:bitlockerDecrypted = $false
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $firstPower = $script:order.IndexOf('Test-OnACPower')
     $wait = $script:order.IndexOf('Wait-BitLockerDecrypted')
     $suspend = $script:order.IndexOf('Suspend-BitLockerOnce')
-    $power = $script:order.IndexOf('Test-OnACPower')
+    $lastPower = $script:order.LastIndexOf('Test-OnACPower')
     $tool = $script:order.IndexOf('Invoke-External')
-    $wait | Should -BeGreaterOrEqual 0
+    $firstPower | Should -Be 0
+    $wait | Should -BeGreaterThan $firstPower
     $suspend | Should -BeGreaterThan $wait
-    $power | Should -BeGreaterThan $suspend
-    $tool | Should -BeGreaterThan $power
+    $lastPower | Should -BeGreaterThan $suspend
+    $tool | Should -BeGreaterThan $lastPower
+    $script:acCalls | Should -Be 2
   }
-  It 'Lenovo: a failed suspend leaves type 5 out of AdminCommandLine' {
+  It 'charger pulled during the BitLocker wait: no BIOS, with the battery Note' {
+    $script:onACSeq = @($true, $false)
+    $script:bitlockerDecrypted = $false
+    $script:suspendOk = $true
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    Should -Invoke -CommandName Wait-BitLockerDecrypted -Times 1 -Exactly
+    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+    @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:noBiosArgs
+  }
+  It 'Lenovo: a failed suspend leaves type 5 out of AdminCommandLine, in both registry views' {
     $script:ctx = New-VendorContext -Brand LENOVO
     $script:existing = @([string]$script:ctx.Config.vendors.LENOVO.tool.exeCandidates[0])
     $script:bitlockerDecrypted = $false
     $script:suspendOk = $false
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
-    $script:regValues[0].Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false)
+    $script:regValues.Count | Should -Be 2
+    foreach ($v in $script:regValues) { $v.Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false) }
   }
   It 'HP: on battery HPIA gets /Category:Drivers,Software' {
     $script:ctx = New-VendorContext -Brand HP
@@ -588,14 +626,27 @@ Describe 'Dell Command Update' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Dell Command Update could not be started'
   }
-  It 'service not running (3000-3005): starts the Dell service and retries once' {
+  It 'service not running (3000-3005): starts the Dell service, waits 30 s and retries once' {
     Set-ToolCodes -Codes @(3001, 0) -OtherPattern '^/configure'
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
     @(Get-ToolRuns).Count | Should -Be 2
     $script:serviceStarts.Count | Should -Be 1
     $script:serviceStarts[0] | Should -Be 'DellClientManagementService'
+    $script:sleeps.Count | Should -Be 1
+    $script:sleeps[0].Seconds | Should -Be 30
     $r.Data.ExitCode | Should -Be 0
+  }
+  It 'does not wait when no retry is needed' {
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:sleeps.Count | Should -Be 0
+  }
+  It 'makes the wait before the Dell retry injectable' {
+    Set-ToolCodes -Codes @(3004, 0) -OtherPattern '^/configure'
+    $o = Invoke-DellUpdate -Context $script:ctx -Tool $script:ctx.Config.vendors.DELL.tool -OnAC $true -Pass 1 -RetrySeconds 3
+    $o.Outcome | Should -Be 'Done'
+    $script:sleeps.Count | Should -Be 1
+    $script:sleeps[0].Seconds | Should -Be 3
   }
   It 'service code again on the retry: Failed with the exit code' {
     Set-ToolCodes -Codes @(3005) -OtherPattern '^/configure'
@@ -605,12 +656,13 @@ Describe 'Dell Command Update' {
     @(Get-ToolRuns).Count | Should -Be 2
     $script:serviceStarts.Count | Should -Be 1
   }
-  It 'still retries when the service cannot be started' {
+  It 'still waits and retries when the service cannot be started' {
     $script:serviceThrows = $true
     Set-ToolCodes -Codes @(3000, 500) -OtherPattern '^/configure'
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
     @(Get-ToolRuns).Count | Should -Be 2
+    $script:sleeps.Count | Should -Be 1
   }
 }
 
@@ -666,25 +718,35 @@ Describe 'Lenovo System Update' {
     $script:ext.Count | Should -Be 0
     $script:regValues.Count | Should -Be 0
   }
-  It 'writes AdminCommandLine as REG_SZ, creating the policy key when it is missing' {
+  It 'writes AdminCommandLine as REG_SZ into both registry views, creating each key when it is missing (R19)' {
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
     $script:regKeys | Should -Contain $script:LenovoPolicyKey
-    $script:regValues.Count | Should -Be 1
-    $script:regValues[0].Path | Should -Be $script:LenovoPolicyKey
-    $script:regValues[0].Name | Should -Be 'AdminCommandLine'
-    $script:regValues[0].Type | Should -Be 'String'
-    $script:regValues[0].Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $true)
+    $script:regKeys | Should -Contain $script:LenovoWowPolicyKey
+    $script:regValues.Count | Should -Be 2
+    @($script:regValues | ForEach-Object { $_.Path }) | Should -Be @($script:LenovoPolicyKey, $script:LenovoWowPolicyKey)
+    foreach ($v in $script:regValues) {
+      $v.Name | Should -Be 'AdminCommandLine'
+      $v.Type | Should -Be 'String'
+      $v.Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $true)
+    }
   }
-  It 'does not recreate a policy key that exists' {
+  It 'does not recreate policy keys that exist' {
+    $script:existing += @($script:LenovoPolicyKey, $script:LenovoWowPolicyKey)
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    Should -Invoke -CommandName New-Item -Times 0 -Exactly
+    $script:regValues.Count | Should -Be 2
+  }
+  It 'creates only the key that is missing' {
     $script:existing += $script:LenovoPolicyKey
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
-    $script:regKeys | Should -Not -Contain $script:LenovoPolicyKey
-    $script:regValues.Count | Should -Be 1
+    @($script:regKeys) | Should -Be @($script:LenovoWowPolicyKey)
+    $script:regValues.Count | Should -Be 2
   }
-  It 'on battery the policy leaves type 5 (BIOS/firmware) out' {
+  It 'on battery the policy leaves type 5 (BIOS/firmware) out, in both views' {
     $script:onAC = $false
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
-    $script:regValues[0].Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false)
+    $script:regValues.Count | Should -Be 2
+    foreach ($v in $script:regValues) { $v.Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false) }
     $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
   }
   It 'fails, and never runs tvsu, when the policy cannot be written' {
@@ -692,6 +754,14 @@ Describe 'Lenovo System Update' {
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Lenovo System Update settings could not be written'
+    $script:ext.Count | Should -Be 0
+  }
+  It 'fails, and never runs tvsu, when only the <View> view cannot be written' -ForEach @(@{ View = 'native' }, @{ View = '32-bit (WOW6432Node)' }) {
+    $script:regWriteThrowsFor = if ($View -eq 'native') { @($script:LenovoPolicyKey) } else { @($script:LenovoWowPolicyKey) }
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Lenovo System Update settings could not be written'
+    $script:regValues.Count | Should -Be 1
     $script:ext.Count | Should -Be 0
   }
   It 'runs tvsu.exe /CM with the vendor timeout' {
@@ -782,11 +852,19 @@ Describe 'Lenovo System Update' {
     $r.Message | Should -Be 'No Lenovo updates reported'
     $r.Reboot | Should -Be 'None'
   }
-  It 'a failed record: Failed' {
+  It 'a failed record: Failed, without a reboot' {
     $script:lenovoRecords = @((New-FakeLenovoUpdate 'Installed'), (New-FakeLenovoUpdate 'Install failed'))
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Lenovo System Update reported failed updates'
+    $r.Reboot | Should -Be 'None'
+  }
+  It 'a failed record next to one that needs a restart: Failed WITH Reboot Now' {
+    $script:lenovoRecords = @((New-FakeLenovoUpdate 'Install failed'), (New-FakeLenovoUpdate 'Installed, reboot required'))
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Lenovo System Update reported failed updates'
+    $r.Reboot | Should -Be 'Now'
   }
   It 'a record that needs a restart: Done with Reboot Now' {
     $script:lenovoRecords = @((New-FakeLenovoUpdate 'Installed'), (New-FakeLenovoUpdate 'Installed, reboot required'))
@@ -1089,35 +1167,47 @@ Describe 'Invoke-StepVendorCleanup' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Dell.CommandUpdate.Universal: winget 0x8A150001'
   }
-  It 'Lenovo: uninstalls Lenovo.SystemUpdate, then removes only the AdminCommandLine value' {
+  It 'Lenovo: uninstalls Lenovo.SystemUpdate, then removes only the AdminCommandLine value, from both views (R19)' {
     $script:regPresent[$script:LenovoPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
+    $script:regPresent[$script:LenovoWowPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
     $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand LENOVO)
     $r.Status | Should -Be 'Done'
     $r.Message | Should -Be 'Lenovo System Update removed'
     $script:uninstallCalls[0] | Should -Be 'Lenovo.SystemUpdate'
-    $script:regRemoved.Count | Should -Be 1
-    $script:regRemoved[0].Path | Should -Be $script:LenovoPolicyKey
-    @($script:regRemoved[0].Name) | Should -Be @('AdminCommandLine')
+    $script:regRemoved.Count | Should -Be 2
+    @($script:regRemoved | ForEach-Object { $_.Path }) | Should -Be @($script:LenovoPolicyKey, $script:LenovoWowPolicyKey)
+    foreach ($removal in $script:regRemoved) { @($removal.Name) | Should -Be @('AdminCommandLine') }
     Should -Invoke -CommandName Remove-Item -Times 0 -Exactly
   }
-  It 'Lenovo: removes the value when System Update was already gone' {
+  It 'Lenovo: removes the values when System Update was already gone' {
     $script:regPresent[$script:LenovoPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
+    $script:regPresent[$script:LenovoWowPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
     $script:uninstallResult = New-StepResult -Status Skipped -Message 'Lenovo.SystemUpdate: not installed, nothing to remove'
     $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand LENOVO)
     $r.Status | Should -Be 'Done'
-    $script:regRemoved.Count | Should -Be 1
+    $script:regRemoved.Count | Should -Be 2
   }
-  It 'Lenovo: leaves the registry alone when the value is not there' {
+  It 'Lenovo: removes the value only from the view that has it' {
+    $script:regPresent[$script:LenovoWowPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
+    $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand LENOVO)
+    $r.Status | Should -Be 'Done'
+    $script:regRemoved.Count | Should -Be 1
+    $script:regRemoved[0].Path | Should -Be $script:LenovoWowPolicyKey
+  }
+  It 'Lenovo: leaves the registry alone when the value is in neither view' {
     $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand LENOVO)
     $r.Status | Should -Be 'Done'
     $script:regRemoved.Count | Should -Be 0
   }
-  It 'Lenovo: a value that cannot be removed is a WARN, not a failure' {
+  It 'Lenovo: a value that cannot be removed is a WARN, and the other view is still cleaned' {
     $script:regPresent[$script:LenovoPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
-    $script:regRemoveThrows = $true
+    $script:regPresent[$script:LenovoWowPolicyKey] = @{ AdminCommandLine = '/CM -search A' }
+    $script:regRemoveThrowsFor = @($script:LenovoPolicyKey)
     $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand LENOVO)
     $r.Status | Should -Be 'Done'
     @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -BeGreaterThan 0
+    $script:regRemoved.Count | Should -Be 1
+    $script:regRemoved[0].Path | Should -Be $script:LenovoWowPolicyKey
   }
   It 'HP: nothing to uninstall, HPIA goes with Downloads' {
     $r = Invoke-StepVendorCleanup -Context (New-CleanupContext -Brand HP)

@@ -9,9 +9,11 @@
 # they recommend for the model (Q18), BIOS and firmware included. A BIOS flash on battery, or on a drive
 # that BitLocker still protects, can leave a laptop dead or asking for a recovery key. So every pass
 # first decides whether firmware is allowed at all (Invoke-VendorPass):
-#   - BitLocker: decrypted (or absent) is fine. Still encrypted: it is suspended for one restart; if
-#     that fails, firmware is NOT allowed.
-#   - Power: read right before the tool runs. On battery, firmware is NOT allowed.
+#   - Power, first: on battery, firmware is NOT allowed and the BitLocker gate is skipped (ruling R20).
+#   - BitLocker (on AC only): decrypted (or absent) is fine. Still encrypted: it is suspended for one
+#     restart; if that fails, firmware is NOT allowed.
+#   - Power again, right before the tool: the BitLocker wait can be long and the charger may have been
+#     pulled meanwhile.
 # When it is not allowed, the argument builders leave BIOS/firmware out (Review Focus #3).
 #
 # No vendor output text is ever parsed (Windows may be Hebrew). DCU and HPIA report through exit codes;
@@ -26,7 +28,12 @@ $script:DcuConfigureArgs = '/configure -silent -autoSuspendBitLocker=enable'
 $script:DcuConfigureTimeoutMinutes = 5
 $script:DcuServiceName = 'DellClientManagementService'
 
-$script:LenovoPolicyKey = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
+# tvsu.exe is a 32-bit program and this script runs as 64-bit PowerShell, so the policy is written to
+# both registry views, the native one and the WOW6432Node one (ruling R19).
+$script:LenovoPolicyKeys = @(
+  'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
+  'HKLM:\SOFTWARE\WOW6432Node\Policies\Lenovo\System Update\UserSettings\General'
+)
 $script:LenovoPolicyValueName = 'AdminCommandLine'
 $script:LenovoProcessNames = @('tvsu', 'Tvsukernel')
 
@@ -185,18 +192,24 @@ function Test-ShouldRemoveBusinessTool {
 function Convert-LenovoUpdateRecords {
   <#
   .SYNOPSIS
-    Turns the Lenovo_Updates records System Update exported to WMI into 'Done', 'DoneReboot' or 'Failed'.
+    Turns the Lenovo_Updates records System Update exported to WMI into 'Done', 'DoneReboot', 'Failed'
+    or 'FailedReboot'.
   .DESCRIPTION
     Provisional until SPIKE#4 shows the real property names and values (the spike dumps every
-    property): a record whose Status text contains "fail" makes the result Failed, whatever else the
-    other records say; otherwise a Status containing "reboot" or "restart" makes it DoneReboot;
-    otherwise (no records included) Done. Matching is case-insensitive. $null records and records
-    without a Status are ignored. Accepts CimInstances, plain objects and hashtables.
+    property). Every record is looked at: a Status text containing "fail" marks a failure, one
+    containing "reboot" or "restart" marks a needed restart (one record can mark both).
+      failure and restart -> FailedReboot (the updates that did install still get their restart)
+      failure only        -> Failed
+      restart only        -> DoneReboot
+      neither, or no records -> Done
+    Matching is case-insensitive. $null records and records without a Status are ignored. Accepts
+    CimInstances, plain objects and hashtables.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param([AllowNull()][AllowEmptyCollection()][object[]]$Records)
 
+  $failed = $false
   $reboot = $false
   foreach ($record in @($Records)) {
     if ($null -eq $record) { continue }
@@ -208,9 +221,11 @@ function Convert-LenovoUpdateRecords {
       if ($null -ne $property) { $status = $property.Value }
     }
     $text = [string]$status
-    if ($text -match 'fail') { return 'Failed' }
+    if ($text -match 'fail') { $failed = $true }
     if ($text -match 'reboot|restart') { $reboot = $true }
   }
+  if ($failed -and $reboot) { return 'FailedReboot' }
+  if ($failed) { return 'Failed' }
   if ($reboot) { return 'DoneReboot' }
   return 'Done'
 }
@@ -242,13 +257,13 @@ function New-VendorOutcome {
     Private. What one vendor tool run came to, before Invoke-VendorPass turns it into a StepResult:
     @{ Outcome; ExitCode = <int|$null>; Message = <string|$null> }.
   .DESCRIPTION
-    Outcome is Done, DoneReboot, DoneWarning, Skipped, Failed or TimedOut. A Message replaces the
-    default text for that outcome (see ConvertTo-VendorStepResult).
+    Outcome is Done, DoneReboot, DoneWarning, Skipped, Failed, FailedReboot or TimedOut. A Message
+    replaces the default text for that outcome (see ConvertTo-VendorStepResult).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
-    [Parameter(Mandatory)][ValidateSet('Done', 'DoneReboot', 'DoneWarning', 'Skipped', 'Failed', 'TimedOut')][string]$Outcome,
+    [Parameter(Mandatory)][ValidateSet('Done', 'DoneReboot', 'DoneWarning', 'Skipped', 'Failed', 'FailedReboot', 'TimedOut')][string]$Outcome,
     $ExitCode = $null,
     [string]$Message
   )
@@ -268,6 +283,7 @@ function ConvertTo-VendorStepResult {
     Skipped     -> Skipped('<tool> does not support this model')
     TimedOut    -> Failed('<tool> timed out')
     Failed      -> Failed('<tool> failed (exit <code>)')
+    FailedReboot -> the same Failed, with Reboot 'Now' (the runner restarts after a Failed + Now too)
     The outcome's own Message, when it has one, replaces the text above (not for TimedOut).
   #>
   [CmdletBinding()]
@@ -307,7 +323,8 @@ function ConvertTo-VendorStepResult {
     $code = if ($null -ne $Outcome.ExitCode) { "exit $($Outcome.ExitCode)" } else { 'no exit code' }
     $text = "$Name failed ($code)"
   }
-  return New-StepResult -Status Failed -Message $text -Notes $allNotes.ToArray() -Data $data
+  $reboot = if ($kind -eq 'FailedReboot') { 'Now' } else { 'None' }
+  return New-StepResult -Status Failed -Message $text -Reboot $reboot -Notes $allNotes.ToArray() -Data $data
 }
 
 function Find-VendorToolExe {
@@ -384,8 +401,9 @@ function Invoke-DellUpdate {
        exit, timeout, cannot start) is only a WARN: the apply still runs.
     3. `/applyUpdates` (Get-DcuApplyArgs; OnAC $false = no BIOS/firmware) with the log
        <Logs>\dcu-pass<Pass>.log and timeoutsMinutes.vendor.
-    4. Exit codes 3000-3005 (the Dell service is not running or busy): Start-Service
-       DellClientManagementService and apply once more; a second such code is Failed.
+    4. Exit codes 3000-3005 (the Dell service is not running, busy or updating itself): Start-Service
+       DellClientManagementService, wait RetrySeconds (30) so a service that is starting or updating
+       can settle, and apply once more; a second such code is Failed.
     A timeout is TimedOut; a dcu-cli that cannot be started is Failed('Dell Command Update could not
     be started').
   #>
@@ -395,7 +413,8 @@ function Invoke-DellUpdate {
     [Parameter(Mandatory)][hashtable]$Context,
     [Parameter(Mandatory)]$Tool,
     [Parameter(Mandatory)][bool]$OnAC,
-    [Parameter(Mandatory)][ValidateRange(1, 9)][int]$Pass
+    [Parameter(Mandatory)][ValidateRange(1, 9)][int]$Pass,
+    [ValidateRange(0, 3600)][int]$RetrySeconds = 30
   )
 
   $name = $script:VendorToolNames['dcu']
@@ -426,12 +445,13 @@ function Invoke-DellUpdate {
 
     $mapped = Convert-DcuExitCode -ExitCode $run.ExitCode
     if ($mapped -eq 'RetryService' -and $try -lt $maxTries) {
-      Write-SetupLog -Message 'The Dell service is not ready; starting it and applying once more' -Level WARN -Data @{ exitCode = $run.ExitCode; service = $script:DcuServiceName }
+      Write-SetupLog -Message 'The Dell service is not ready; starting it, waiting and applying once more' -Level WARN -Data @{ exitCode = $run.ExitCode; service = $script:DcuServiceName; waitSeconds = $RetrySeconds }
       try {
         Start-Service -Name $script:DcuServiceName -ErrorAction Stop
       } catch {
         Write-SetupLog -Message 'The Dell service could not be started; retrying anyway' -Level WARN -Data @{ service = $script:DcuServiceName; error = $_.Exception.Message }
       }
+      Start-Sleep -Seconds $RetrySeconds
       continue
     }
     if ($mapped -eq 'RetryService') { $mapped = 'Failed' }
@@ -442,22 +462,27 @@ function Invoke-DellUpdate {
 # --- Lenovo System Update ---------------------------------------------------------------------
 
 function Set-LenovoAdminCommandLine {
-  # Private. Writes the AdminCommandLine policy (REG_SZ), creating the key when it is missing. $true on
-  # success; $false (and an ERROR in the log) when the write is refused. New-Item runs only for a
-  # missing key: -Force on an existing key could clear what it holds.
+  # Private. Writes the AdminCommandLine policy (REG_SZ) into BOTH registry views (ruling R19), creating
+  # each key when it is missing. $true only when both writes succeeded; any refused write is an ERROR
+  # in the log and makes it $false, because a view left with an older value could still allow a BIOS
+  # flash. Both views are always tried. New-Item runs only for a missing key: -Force on an existing
+  # key could clear what it holds.
   [CmdletBinding()]
   [OutputType([bool])]
   param([Parameter(Mandatory)][string]$Value)
 
-  try {
-    if (-not (Test-Path -LiteralPath $script:LenovoPolicyKey)) { New-Item -Path $script:LenovoPolicyKey -Force | Out-Null }
-    New-ItemProperty -LiteralPath $script:LenovoPolicyKey -Name $script:LenovoPolicyValueName -Value $Value -PropertyType String -Force | Out-Null
-    Write-SetupLog -Message 'Lenovo System Update policy written' -Data @{ key = $script:LenovoPolicyKey; value = $Value }
-    return $true
-  } catch {
-    Write-SetupLog -Message 'Lenovo System Update policy could not be written' -Level ERROR -Data @{ key = $script:LenovoPolicyKey; error = $_.Exception.Message }
-    return $false
+  $allOk = $true
+  foreach ($key in $script:LenovoPolicyKeys) {
+    try {
+      if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+      New-ItemProperty -LiteralPath $key -Name $script:LenovoPolicyValueName -Value $Value -PropertyType String -Force | Out-Null
+      Write-SetupLog -Message 'Lenovo System Update policy written' -Data @{ key = $key; value = $Value }
+    } catch {
+      Write-SetupLog -Message 'Lenovo System Update policy could not be written' -Level ERROR -Data @{ key = $key; error = $_.Exception.Message }
+      $allOk = $false
+    }
   }
+  return $allOk
 }
 
 function Wait-LenovoProcessExit {
@@ -549,15 +574,17 @@ function Invoke-LenovoUpdate {
     Runs Lenovo System Update for one pass. Returns a vendor outcome (see New-VendorOutcome).
   .DESCRIPTION
     1. tvsu.exe through Get-VendorToolExe (exeCandidates, else winget Tool.wingetId; Lenovo signer).
-    2. The AdminCommandLine policy = Get-LenovoAdminCommandLine (OnAC $false = no type 5). If it
-       cannot be written, tvsu does NOT run (an older value could still allow a BIOS flash): Failed.
+    2. The AdminCommandLine policy = Get-LenovoAdminCommandLine (OnAC $false = no type 5), in both
+       registry views. If either write fails, tvsu does NOT run (an older value could still allow a
+       BIOS flash): Failed.
     3. `tvsu.exe /CM` with timeoutsMinutes.vendor, then Wait-LenovoProcessExit for whatever is left of
        that same budget, polling every PollSeconds (10). Either running out is TimedOut, after every
        tvsu/Tvsukernel process left has been killed.
     4. Logs\lenovo-pass<Pass>\ gets a copy of System Update's logs (best effort, also after a timeout).
     5. The result comes from root\Lenovo Lenovo_Updates (SPIKE#4 will refine this): no record ->
        Done('No Lenovo updates reported'); otherwise Convert-LenovoUpdateRecords decides Done,
-       DoneReboot or Failed('Lenovo System Update reported failed updates').
+       DoneReboot, or Failed('Lenovo System Update reported failed updates'), the latter with a
+       restart (FailedReboot) when another record needs one.
     A BIOS (type 5) update forces its own restart in the middle of this; the runner re-runs the step
     after it. If SPIKE#4 shows that consumer models are not covered, LSUClient replaces steps 1-5 here
     and this function keeps its signature (spec 9.2).
@@ -607,7 +634,9 @@ function Invoke-LenovoUpdate {
   if ($records.Count -eq 0) { return New-VendorOutcome -Outcome Done -Message 'No Lenovo updates reported' }
 
   $verdict = Convert-LenovoUpdateRecords -Records $records
-  if ($verdict -eq 'Failed') { return New-VendorOutcome -Outcome Failed -Message "$name reported failed updates" }
+  if ($verdict -eq 'Failed' -or $verdict -eq 'FailedReboot') {
+    return New-VendorOutcome -Outcome $verdict -Message "$name reported failed updates"
+  }
   return New-VendorOutcome -Outcome $verdict
 }
 
@@ -742,13 +771,16 @@ function Invoke-VendorPass {
   .DESCRIPTION
     1. Config.vendors.<Brand>.tool missing -> Skipped('No vendor tool for <Brand>'), before anything
        else runs (the plan already leaves those brands out). An unknown tool kind is Failed.
-    2. BitLocker gate: Wait-BitLockerDecrypted (timeoutsMinutes.bitlockerDecrypt). Not decrypted ->
-       Suspend-BitLockerOnce: success is the Note 'BitLocker still decrypting: suspended for BIOS
-       update'; failure is the Note 'BitLocker could not be suspended: BIOS/firmware updates skipped'
-       and firmware is not allowed.
-    3. $onAC = Test-OnACPower, read now, right before the tool. On battery: the Note 'On battery:
-       BIOS/firmware updates skipped'.
-    4. The tool runs with -OnAC ($onAC -and BitLocker ok): Invoke-DellUpdate (dcu),
+    2. Test-OnACPower FIRST (ruling R20). On battery: the Note 'On battery: BIOS/firmware updates
+       skipped', no BitLocker wait or suspension at all (no BIOS is flashed, so there is nothing to
+       protect), and the tool runs without BIOS/firmware.
+    3. On AC, the BitLocker gate: Wait-BitLockerDecrypted (timeoutsMinutes.bitlockerDecrypt). Not
+       decrypted -> Suspend-BitLockerOnce: success is the Note 'BitLocker still decrypting: suspended
+       for BIOS update'; failure is the Note 'BitLocker could not be suspended: BIOS/firmware updates
+       skipped' and firmware is not allowed. Then Test-OnACPower once more, right before the tool:
+       the wait can take up to two hours and the charger may have been pulled meanwhile (that is the
+       same battery Note and no BIOS/firmware).
+    4. The tool runs with -OnAC (on AC at both reads, and BitLocker ok): Invoke-DellUpdate (dcu),
        Invoke-LenovoUpdate (lsu) or Invoke-HpUpdate (hpia).
     5. ConvertTo-VendorStepResult maps the outcome (DoneReboot -> Done + Reboot 'Now'; Skipped ->
        '<tool> does not support this model'; DoneWarning -> Done + Note). Data = @{ Pass; ExitCode }.
@@ -770,20 +802,30 @@ function Invoke-VendorPass {
   }
 
   $notes = New-Object 'System.Collections.Generic.List[string]'
-  $bitlockerOk = [bool](Wait-BitLockerDecrypted -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.bitlockerDecrypt))
-  if (-not $bitlockerOk) {
-    if (Suspend-BitLockerOnce) {
-      $notes.Add('BitLocker still decrypting: suspended for BIOS update')
-      $bitlockerOk = $true
-    } else {
-      $notes.Add('BitLocker could not be suspended: BIOS/firmware updates skipped')
+  $batteryNote = 'On battery: BIOS/firmware updates skipped'
+  $allowFirmware = $false
+  $gate = 'skipped (on battery)'
+  if (-not [bool](Test-OnACPower)) {
+    $notes.Add($batteryNote)
+  } else {
+    $bitlockerOk = [bool](Wait-BitLockerDecrypted -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.bitlockerDecrypt))
+    $gate = 'decrypted'
+    if (-not $bitlockerOk) {
+      if (Suspend-BitLockerOnce) {
+        $notes.Add('BitLocker still decrypting: suspended for BIOS update')
+        $bitlockerOk = $true
+        $gate = 'suspended'
+      } else {
+        $notes.Add('BitLocker could not be suspended: BIOS/firmware updates skipped')
+        $gate = 'not suspended'
+      }
     }
+    # Read again right before the tool: the wait above can be long.
+    $stillOnAC = [bool](Test-OnACPower)
+    if (-not $stillOnAC) { $notes.Add($batteryNote) }
+    $allowFirmware = $stillOnAC -and $bitlockerOk
   }
-
-  $onAC = [bool](Test-OnACPower)
-  if (-not $onAC) { $notes.Add('On battery: BIOS/firmware updates skipped') }
-  $allowFirmware = $onAC -and $bitlockerOk
-  Write-SetupLog -Message 'Vendor pass starting' -Data @{ tool = $name; pass = $Pass; onAC = $onAC; bitlockerOk = $bitlockerOk; firmware = $allowFirmware }
+  Write-SetupLog -Message 'Vendor pass starting' -Data @{ tool = $name; pass = $Pass; bitlocker = $gate; firmware = $allowFirmware }
 
   if ($kind -eq 'dcu') {
     $outcome = Invoke-DellUpdate -Context $Context -Tool $tool -OnAC $allowFirmware -Pass $Pass
@@ -862,18 +904,21 @@ function Invoke-StepConsumerApp {
 # --- step 16: remove the business updater -----------------------------------------------------
 
 function Remove-LenovoAdminCommandLine {
-  # Private. Removes ONLY the AdminCommandLine value, never the policy key (other software or an
-  # administrator may keep settings there). Absent is fine; a refused removal is a WARN. Never throws.
+  # Private. Removes ONLY the AdminCommandLine value, from both registry views (ruling R19), never a
+  # policy key (other software or an administrator may keep settings there). Each view is handled on
+  # its own: absent is fine, a refused removal is a WARN and the other view is still done. Never throws.
   [CmdletBinding()]
   param()
 
-  try {
-    $present = Get-ItemProperty -LiteralPath $script:LenovoPolicyKey -Name $script:LenovoPolicyValueName -ErrorAction SilentlyContinue
-    if ($null -eq $present) { return }
-    Remove-ItemProperty -LiteralPath $script:LenovoPolicyKey -Name $script:LenovoPolicyValueName -ErrorAction Stop
-    Write-SetupLog -Message 'Lenovo System Update policy value removed' -Data @{ key = $script:LenovoPolicyKey; name = $script:LenovoPolicyValueName }
-  } catch {
-    Write-SetupLog -Message 'Lenovo System Update policy value could not be removed' -Level WARN -Data @{ key = $script:LenovoPolicyKey; error = $_.Exception.Message }
+  foreach ($key in $script:LenovoPolicyKeys) {
+    try {
+      $present = Get-ItemProperty -LiteralPath $key -Name $script:LenovoPolicyValueName -ErrorAction SilentlyContinue
+      if ($null -eq $present) { continue }
+      Remove-ItemProperty -LiteralPath $key -Name $script:LenovoPolicyValueName -ErrorAction Stop
+      Write-SetupLog -Message 'Lenovo System Update policy value removed' -Data @{ key = $key; name = $script:LenovoPolicyValueName }
+    } catch {
+      Write-SetupLog -Message 'Lenovo System Update policy value could not be removed' -Level WARN -Data @{ key = $key; error = $_.Exception.Message }
+    }
   }
 }
 
@@ -886,7 +931,8 @@ function Invoke-StepVendorCleanup {
     Test-ShouldRemoveBusinessTool false -> Skipped('Kept: consumer app not installed'), nothing removed.
     DCU / Lenovo System Update: winget uninstall of the tool's wingetId. Done -> Done('<tool> removed');
     Skipped (not installed) counts as Done('<tool> was not installed'); a failure is winget's Failed.
-    Lenovo: the AdminCommandLine policy value is removed after the uninstall, whatever its result.
+    Lenovo: the AdminCommandLine policy value is removed from both registry views after the
+    uninstall, whatever its result; the keys stay.
     HPIA: Done('HPIA is portable; removed with Downloads') (Finalize deletes Downloads).
   #>
   [CmdletBinding()]
