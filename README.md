@@ -129,20 +129,47 @@ The next launcher run downloads that release. Machines already running keep thei
 
 - **Private key:** `%USERPROFILE%\.bentech-winsetup\signing-key.dpapi`. It is protected with DPAPI for the current Windows user, so only this user on this PC can read it. It is never in the repo (`*.dpapi` is ignored).
 - **Public key:** `keys\public-key.xml`, committed, and built into every launcher.
-- **Backup:** the key can be lost with the PC or the Windows profile. Generate it with a backup, move that plain-text XML into the **password manager**, then delete the file:
+- **The backup must be in the password manager before the first publish.** The DPAPI file is the only working copy and it dies with the PC or the Windows profile. A plain-text copy on disk is a leaked key, so the password manager is the only place the key may rest.
 
-  ```
-  powershell -File tools\New-SigningKey.ps1 -BackupPath "$env:USERPROFILE\Desktop\bentech-signing-key-BACKUP.xml"
-  ```
-- **Restore on a new PC or profile** (same key, so no launcher change): put the XML from the password manager in a file, then store it DPAPI-protected for the new user:
+### Back up the existing key (do this once, before the first publish)
+
+Run from the repo root. Nothing below needs the key to be printed on screen.
+
+1. **Get the XML into the password manager** (a secure note, named for example `bentech-winsetup signing key`):
+   - If `%USERPROFILE%\Desktop\bentech-signing-key-BACKUP.xml` exists (`New-SigningKey` wrote it when the key was created), open it in Notepad, select all, copy, paste it into the password manager entry, and close Notepad.
+   - If it does not exist, export the key from the DPAPI file straight to the clipboard. This uses `Read-PrivateKeyXml -Path` from `tools\Signing.ps1` and writes nothing to disk:
+
+     ```
+     . tools\Signing.ps1
+     Read-PrivateKeyXml -Path "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi" | Set-Clipboard
+     ```
+
+     Paste into the password manager entry.
+2. **Verify the stored copy.** Copy the entry's text back out of the password manager (to the clipboard), then check it is exactly the working key. It must print `True`:
+
+   ```
+   . tools\Signing.ps1
+   (Read-PrivateKeyXml -Path "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi").Trim() -ceq (Get-Clipboard -Raw).Trim()
+   ```
+3. **Delete the plain-text file permanently:** select `bentech-signing-key-BACKUP.xml` and press **Shift+Delete** (not the Recycle Bin; if it already went there, empty the Recycle Bin). Clear the clipboard with `Set-Clipboard -Value $null`, and clear Windows clipboard history (Win+V) if it is turned on.
+4. **For any future `-BackupPath`**, use a folder that is not synced and not the Desktop, for example `$env:LOCALAPPDATA\bentech-key-backup\signing-key-BACKUP.xml` (never the Desktop, Documents or anything OneDrive covers). Move the XML into the password manager, verify it as in step 2, then delete the file permanently as in step 3.
+
+If the plain-text file was ever in a synced folder (OneDrive, a cloud-backed Desktop), shared, committed or pasted into a chat, treat the key as exposed and rotate it ("If the key is lost" below). Before the first release that costs only a new `keys\public-key.xml`.
+
+### Restore and other key tasks
+
+- **Restore on a new PC or profile** (same key, so no launcher change). **Only when no `signing-key.dpapi` exists there: `Save-PrivateKeyXml` overwrites whatever is at the path.** Copy the entry's text out of the password manager to the clipboard, then:
 
   ```
   . tools\Signing.ps1
-  Save-PrivateKeyXml -Path "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi" -PrivateKeyXml (Get-Content <backup.xml> -Raw)
+  $keyPath = "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi"
+  if (Test-Path -LiteralPath $keyPath) { throw "A signing key already exists at $keyPath; not overwriting it." }
+  Save-PrivateKeyXml -Path $keyPath -PrivateKeyXml (Get-Clipboard -Raw)
+  Set-Clipboard -Value $null
   ```
 
-  Delete the plain-text file afterwards. A `Publish.ps1 -DryRun` proves the restored key matches `keys\public-key.xml` (it verifies both signatures).
-- **If the key is lost:** no new release can be signed for the existing launchers. Run `tools\New-SigningKey.ps1 -BackupPath ...` again (it refuses to overwrite, so move any old `signing-key.dpapi` away and delete `keys\public-key.xml` yourself first), commit the new public key, publish a release, and copy the **new launcher to every USB stick**. Old launchers will refuse every new release with exit 3; that is the design.
+  A `Publish.ps1 -DryRun` then proves the restored key matches `keys\public-key.xml` (it verifies both signatures).
+- **If the key is lost or exposed:** a lost key cannot sign new releases for the existing launchers, and an exposed one must stop being trusted. Run `tools\New-SigningKey.ps1 -BackupPath <non-synced folder, see step 4 above>` again (it refuses to overwrite, so move any old `signing-key.dpapi` away and delete `keys\public-key.xml` yourself first), commit the new public key, publish a release, and copy the **new launcher to every USB stick**. Old launchers will refuse every new release with exit 3; that is the design. After an exposure, also delete the old launcher from every stick: it still trusts the old key.
 
 ## Changing apps and lists
 

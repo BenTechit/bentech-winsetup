@@ -165,13 +165,24 @@ Each list adds to section 1; run section 1 on all three VMs.
 
 One each of Dell, Lenovo, HP and ASUS before calling v1 done. A VM cannot test any of this.
 
+### 3.0 Safety preconditions (read before every laptop run)
+
+A real run changes the machine for good and there is no checkpoint to roll back to. Tick every box before you start.
+
+- [ ] **Shop stock or lab hardware only. Never a customer's machine.**
+- [ ] **Fresh OOBE:** a new local account with no password, no Microsoft account, and nothing on the drive you want to keep.
+- [ ] **Start on AC power**, with the charger connected for the whole run. The only exceptions are the two battery tests in 3.1, and each says exactly when the charger may come out.
+- [ ] You know what the run does: it decrypts BitLocker, renames the PC, removes apps, installs and uninstalls software, changes power settings and policies, restarts many times, and **may flash the BIOS or firmware**. There is no rollback. A BIOS or firmware flash that loses power or is interrupted can leave the laptop unbootable.
+- [ ] **Never remove the charger, close the lid, press the power button or pull the battery** while a vendor tool is running, while a `Restarting in N s ...` countdown is showing, during a restart, or on any "do not turn off" firmware update screen. A BIOS or firmware package can be staged to apply at the next restart, so a restart is also a flash window.
+- [ ] A Windows install USB and the vendor's recovery option are within reach.
+
 ### 3.1 Every laptop
 
 - [ ] The start screen says `Detected : LAPTOP` and shows the right manufacturer, model and serial. Mode is LAPTOP; the name is `<BRAND>-<SERIAL>` (at most 15 characters).
-- [ ] **(h) Close the lid** mid-run (while a step is running) for a few minutes: the laptop does not sleep, `setup.log` keeps advancing, and after Finalize the original lid action is back.
-- [ ] **On battery:** unplug the charger at the start screen. The yellow `ON BATTERY` line shows. Run a vendor pass on battery: the vendor log shows **no BIOS or firmware package** applied and the step message says so. The BitLocker wait is skipped.
-- [ ] **Charger pulled mid-run:** the run continues, and the next vendor pass is the battery variant.
-- [ ] **Charger plugged in from the start:** BIOS and firmware updates are allowed in pass 1.
+- [ ] **(h) Close the lid** mid-run for a few minutes, **only while the Windows Update loop is running** (the progress screen shows Windows Update as the running step, no vendor tool is running, no restart countdown): the laptop does not sleep, `setup.log` keeps advancing, and after Finalize the original lid action is back. Open the lid again before the run reaches a restart.
+- [ ] **Charger connected from the start:** BIOS and firmware updates are allowed in pass 1.
+- [ ] **Battery run (a separate run, battery at 80% or more):** unplug the charger at the **start screen**, before anything has started, so the whole vendor pass runs on battery and no flash can be in progress. The yellow `ON BATTERY` line shows. In pass 1 the vendor log shows **no BIOS or firmware package** applied and the step message says so. The BitLocker wait is skipped. As soon as pass 1 is finished (the progress screen shows pass 1 as `[OK]` or skipped and Windows Update running, and no vendor tool process is left: `Get-Process dcu-cli, HPImageAssistant, tvsu, Tvsukernel -ErrorAction SilentlyContinue` prints nothing), **plug the charger back in** for the rest of the run.
+- [ ] **Charger pulled mid-run** (a separate check, and the charger goes back in): pull it **only while the Windows Update loop is running**, and only after confirming in the vendor log (`Logs\`) that pass 1 applied **no** BIOS or firmware package, that no flash is running, and that no restart is pending (the progress screen shows no countdown; no vendor tool process is running, as in the check above). If pass 1 did install a BIOS or firmware package, skip this check on that laptop. Plug the charger back in within two minutes, and before the run reaches a restart. Expected: the run keeps going without a stall, and `setup.log` continues. Don't leave the laptop unplugged into vendor pass 2.
 - [ ] If the drive was encrypted at the start: decryption finishes before any BIOS update, or BitLocker is suspended for one reboot as a backstop. Afterwards the drive is not encrypted.
 - [ ] A forced reboot by a vendor tool in the middle of a step resumes the run, and the step is not repeated more than 3 times.
 - [ ] The vendor tool's logs and reports are in `Logs\`.
@@ -196,7 +207,7 @@ Result sheet to fill per laptop:
 - [ ] Run on a **ThinkPad** and an **IdeaPad or Yoga** (SPIKE#4).
 - [ ] System Update installs through winget; its `tvsu.exe` signature is checked.
 - [ ] **WMI result fields.** After pass 1 run `Get-CimInstance -Namespace root\Lenovo -ClassName Lenovo_Updates | Format-List *` and keep the output. The result parsing in `Convert-LenovoUpdateRecords` is provisional (it matches `fail`, `reboot` and `restart` in a `Status` text): record the real property names and values, whether stale records from pass 1 show up in pass 2, and whether the `Status` text is English on a Hebrew-display Windows.
-- [ ] **`-packagetypes` acceptance.** On battery the tool runs with `-packagetypes 1,2` (apps and drivers only). Does `tvsu /CM` accept it? If it rejects it, the Lenovo battery run fails visibly (red) instead of flashing. Also check which reboot types BIOS and firmware packages use on this model.
+- [ ] **`-packagetypes` acceptance.** On battery the tool runs with `-packagetypes 1,2` (apps and drivers only; this is seen in the battery run of 3.1). Does `tvsu /CM` accept it? If it rejects it, the Lenovo battery run fails visibly (red) instead of flashing. Also check which reboot types BIOS and firmware packages use on this model.
 - [ ] **32-bit registry view.** `AdminCommandLine` is written to both `HKLM\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General` and the `WOW6432Node` copy. With Process Monitor (filter `tvsu.exe`, operation `RegQueryValue`, path contains `AdminCommandLine`) record which one `tvsu` reads.
 - [ ] A type 5 (BIOS) package forces a restart after Lenovo's own countdown. The run resumes afterwards and the step finishes. No type 4 (forced shutdown) package is installed.
 - [ ] `AdminCommandLine` is gone from both views after every pass and again after Finalize.
