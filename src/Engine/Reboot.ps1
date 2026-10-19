@@ -151,7 +151,7 @@ function Invoke-ControlledReboot {
   Write-SetupLog -Message 'Restarting the computer' -Data @{ rebootCount = $runState.RebootCount; maxReboots = $maxReboots }
 
   for ($remaining = $CountdownSeconds; $remaining -gt 0; $remaining--) {
-    Write-Host "Restarting in $remaining s ..."
+    Write-Host "Restarting in $remaining s ..." -ForegroundColor White -BackgroundColor Black
     Start-Sleep -Seconds 1
   }
 

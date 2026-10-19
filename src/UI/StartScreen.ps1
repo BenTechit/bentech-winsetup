@@ -12,17 +12,24 @@
 
 $script:StartCountdownSeconds = 10
 $script:OfficeChoices = @('OFF', 'BUSINESS', 'HOME')
+# The direction and format marks Hebrew Windows adds around some values (spec 9.5): U+200E, U+200F,
+# U+202A-U+202E and U+2066-U+2069, as a regex character class built from the code points so that this
+# file stays ASCII.
+$script:DirectionMarksPattern = '[' + (-join (@(0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069) | ForEach-Object { [char]$_ })) + ']'
 
 function ConvertTo-ScreenText {
-  # One line of plain ASCII: line breaks and tabs become a space, every other character outside
-  # 0x20-0x7E becomes '?'. Used for every free-text value that reaches a screen (model names,
-  # step messages), because a Hebrew Windows can put Hebrew into those.
+  # One line of plain ASCII: direction marks are dropped, line breaks and tabs become a space, every
+  # other character outside 0x20-0x7E becomes '?'. Used for every free-text value that reaches a
+  # screen (model names, step messages), because a Hebrew Windows can put Hebrew into those.
+  # The direction marks go first, so they cannot turn into '?': Hebrew Windows wraps some values in
+  # them (the Windows caption came out as '??Microsoft Windows 11 Home').
   [CmdletBinding()]
   [OutputType([string])]
   param([AllowNull()][AllowEmptyString()]$Text)
 
   if ($null -eq $Text) { return '' }
-  $flat = [regex]::Replace([string]$Text, '[\r\n\t]+', ' ')
+  $clean = [regex]::Replace([string]$Text, $script:DirectionMarksPattern, '')
+  $flat = [regex]::Replace($clean, '[\r\n\t]+', ' ')
   return ([regex]::Replace($flat, '[^\x20-\x7E]', '?')).Trim()
 }
 
@@ -194,16 +201,18 @@ function Format-StartScreen {
 }
 
 function Write-StartScreenLines {
-  # Production writer for the start screen: clear, then the lines; the two warnings in yellow (spec 8.1).
+  # Production writer for the start screen: clear, then the lines in gray on black; the two warnings in
+  # yellow on black (spec 8.1, 9.1). Both colours are named on every line, so no line depends on the
+  # palette the console happens to have.
   [CmdletBinding()]
   param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
 
   Clear-Host
   foreach ($line in $Lines) {
     if ($line -like '*ON BATTERY: plug in*' -or $line -like "*doesn't look like a fresh install*") {
-      Write-Host $line -ForegroundColor Yellow
+      Write-Host $line -ForegroundColor Yellow -BackgroundColor Black
     } else {
-      Write-Host $line
+      Write-Host $line -ForegroundColor Gray -BackgroundColor Black
     }
   }
 }

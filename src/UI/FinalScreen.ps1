@@ -1,6 +1,8 @@
 ﻿# src/UI/FinalScreen.ps1
 # The final screen (spec 8.6): the whole console turns green, yellow or red, the AnyDesk ID is shown
-# in big digits (Ben reads it from across the room) and the screen waits for a key.
+# in big digits (Ben reads it from across the room) and the screen waits for a key. Every colour is
+# named outright, foreground and background (spec 9.1): the powershell.exe console profile remaps
+# DarkYellow to near white, so a YELLOW screen of white text on DarkYellow could not be read.
 #
 # Format-BigDigits and Format-FinalScreen are pure. Show-FinalScreen reaches the console, the keyboard
 # and the launcher only through injectable script blocks with production defaults, so the tests drive
@@ -170,6 +172,22 @@ function Format-FinalScreen {
   return $lines.ToArray()
 }
 
+function Get-VerdictColors {
+  # The console colours of a verdict colour (spec 9.1): YELLOW is Black on Yellow, GREEN is White on
+  # DarkGreen, and anything else (RED, or a name nobody expected) is White on DarkRed, so an unknown
+  # verdict can never look green by accident. Neither DarkYellow nor DarkMagenta is ever used: the
+  # powershell.exe console profile remaps both.
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([AllowNull()][AllowEmptyString()][string]$Color)
+
+  switch ($Color) {
+    'YELLOW' { return @{ Background = 'Yellow'; Foreground = 'Black' } }
+    'GREEN'  { return @{ Background = 'DarkGreen'; Foreground = 'White' } }
+    default  { return @{ Background = 'DarkRed'; Foreground = 'White' } }
+  }
+}
+
 function Show-FinalScreen {
   <#
   .SYNOPSIS
@@ -183,9 +201,10 @@ function Show-FinalScreen {
 
     The seams (production defaults shown):
       -ReadKey    waits for a key and returns its [ConsoleKey] name (nothing = treated as "any key")
-      -SetColor   sets the console background to a colour name
+      -SetColor   sets the console colours: param($background, $foreground), colour names
       -ResetColor puts the console colours back (runs when the screen closes, also after an error)
-      -Write      clears and draws the lines (the last one without a newline)
+      -Write      clears and draws the lines in the given colours: param($lines, $foreground, $background)
+                  (the last line without a newline)
       -Launch     starts a program or opens a URI: param($target, $arguments)
       -FlushInput throws away waiting key presses
   #>
@@ -195,14 +214,14 @@ function Show-FinalScreen {
     [Parameter(Mandatory)][hashtable]$Verdict,
     [Parameter(Mandatory)][string]$ReportPath,
     [scriptblock]$ReadKey = { [Console]::ReadKey($true).Key.ToString() },
-    [scriptblock]$SetColor = { param($c) $Host.UI.RawUI.BackgroundColor = $c },
+    [scriptblock]$SetColor = { param($background, $foreground) $Host.UI.RawUI.BackgroundColor = $background; $Host.UI.RawUI.ForegroundColor = $foreground },
     [scriptblock]$ResetColor = { [Console]::ResetColor() },
     [scriptblock]$Write = {
-      param($lines)
+      param($lines, $foreground, $background)
       Clear-Host
       $all = @($lines)
       # The last line has no newline: a full 30-line screen in a 30-row window must not scroll.
-      for ($i = 0; $i -lt $all.Count; $i++) { Write-Host $all[$i] -ForegroundColor White -NoNewline:($i -eq $all.Count - 1) }
+      for ($i = 0; $i -lt $all.Count; $i++) { Write-Host $all[$i] -ForegroundColor $foreground -BackgroundColor $background -NoNewline:($i -eq $all.Count - 1) }
     },
     [scriptblock]$Launch = {
       param($target, $arguments)
@@ -213,18 +232,13 @@ function Show-FinalScreen {
   )
 
   $isChrome = if (Test-ChromeInstalled) { (Get-DefaultBrowserProgId) -eq 'ChromeHTML' } else { $true }
-  $background = switch ([string]$Verdict['Color']) {
-    'GREEN'  { 'DarkGreen' }
-    'YELLOW' { 'DarkYellow' }
-    default  { 'DarkRed' }   # RED, and anything unexpected: never look green by accident
-  }
+  $colors = Get-VerdictColors -Color ([string]$Verdict['Color'])
   $lines = @(Format-FinalScreen -State $State -Verdict $Verdict -ReportPath $ReportPath -DefaultBrowserIsChrome $isChrome)
 
   # Colours, input flushing and launching are conveniences: a failure there must not stop the
   # screen from showing the AnyDesk ID.
   $paint = {
-    param($color)
-    try { $null = & $SetColor $color }
+    try { $null = & $SetColor $colors.Background $colors.Foreground }
     catch { Write-SetupLog -Message 'Could not set the console colour for the final screen' -Level WARN -Data @{ error = $_.Exception.Message } }
   }
   $open = {
@@ -234,8 +248,8 @@ function Show-FinalScreen {
   }
 
   try {
-    & $paint $background
-    $null = & $Write $lines
+    & $paint
+    $null = & $Write $lines $colors.Foreground $colors.Background
     try { $null = & $FlushInput }
     catch { Write-SetupLog -Message 'Could not empty the console key buffer' -Level WARN -Data @{ error = $_.Exception.Message } }
 

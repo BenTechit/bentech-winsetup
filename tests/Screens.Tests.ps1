@@ -45,6 +45,7 @@ BeforeAll {
     $script:keyQueue = New-Object System.Collections.Queue
     foreach ($k in $Keys) { $script:keyQueue.Enqueue($k) }
     $script:colors = New-Object System.Collections.ArrayList
+    $script:fores = New-Object System.Collections.ArrayList
     $script:drawn = New-Object System.Collections.ArrayList
     $script:launched = New-Object System.Collections.ArrayList
     $script:events = New-Object System.Collections.ArrayList
@@ -53,11 +54,24 @@ BeforeAll {
     $verdict = @{ Color = $Color; Banner = 'COMPLETE - CHECK NOTES'; Failures = $Failures; Notes = $Notes }
     Show-FinalScreen -State $st -Verdict $verdict -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' `
       -ReadKey { $null = $script:events.Add('read'); if ($script:keyQueue.Count -gt 0) { $script:keyQueue.Dequeue() } } `
-      -SetColor { param($c) $null = $script:events.Add('color'); $null = $script:colors.Add($c) } `
+      -SetColor { param($b, $f) $null = $script:events.Add('color'); $null = $script:colors.Add($b); $null = $script:fores.Add($f) } `
       -Write { param($lines) $null = $script:events.Add('write'); $null = $script:drawn.Add(($lines -join "`n")) } `
       -ResetColor { $null = $script:events.Add('reset') } `
       -FlushInput { $null = $script:events.Add('flush') } `
       -Launch { param($target, $arguments) $null = $script:launched.Add(@{ Target = $target; Arguments = $arguments }); if ($script:launchBody) { & $script:launchBody $target $arguments } }
+  }
+}
+
+Describe 'ConvertTo-ScreenText' {
+  It 'strips direction and format marks before the ASCII filter (spec 9.5)' {
+    $marks = 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069
+    ConvertTo-ScreenText ((-join ($marks | ForEach-Object { [char]$_ })) + 'Microsoft Windows 11 Home') | Should -BeExactly 'Microsoft Windows 11 Home'
+    ConvertTo-ScreenText ('Home ' + [char]0x05D1) | Should -BeExactly 'Home ?'
+  }
+  It 'still turns line breaks and tabs into a space and other non-ASCII into ?' {
+    ConvertTo-ScreenText "a`r`nb`tc" | Should -BeExactly 'a b c'
+    ConvertTo-ScreenText ([string][char]0x00E9) | Should -BeExactly '?'
+    ConvertTo-ScreenText $null | Should -BeExactly ''
   }
 }
 
@@ -266,18 +280,20 @@ Describe 'Show-StartScreen' {
     $r | Should -Not -BeNullOrEmpty
     $screens.Count | Should -Be 10
   }
-  It 'the production writer clears the screen, writes every line (blank ones too) and paints the warnings yellow' {
+  It 'the production writer clears the screen, writes every line (blank ones too) in gray on black and paints the warnings yellow on black' {
     $script:cleared = 0
     $script:hostCalls = New-Object System.Collections.ArrayList
     Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor }) }
+    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor; Back = $BackgroundColor }) }
     Write-StartScreenLines -Lines @('   MODE', '', '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', "   This doesn't look like a fresh install: press Enter to run anyway")
     $cleared | Should -Be 1
     $hostCalls.Count | Should -Be 4
     $hostCalls[1].Text | Should -Be ''
-    $hostCalls[0].Color | Should -BeNullOrEmpty
+    $hostCalls[0].Color | Should -Be 'Gray'
+    $hostCalls[1].Color | Should -Be 'Gray'
     $hostCalls[2].Color | Should -Be 'Yellow'
     $hostCalls[3].Color | Should -Be 'Yellow'
+    @($hostCalls | Where-Object { $_.Back -ne 'Black' }).Count | Should -Be 0
   }
   It 'draws through the production writer when no -Write seam is given' {
     $script:cleared = 0
@@ -421,12 +437,15 @@ Describe 'Show-ProgressScreen' {
     $script:cleared = 0
     $script:hostCalls = New-Object System.Collections.ArrayList
     Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add([string]$Object) }
+    $script:hostColors = New-Object System.Collections.ArrayList
+    Mock Write-Host { $null = $script:hostCalls.Add([string]$Object); $null = $script:hostColors.Add(@{ F = $ForegroundColor; B = $BackgroundColor }) }
     $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('finalize'); Steps = @{ finalize = @{ Status = 'Done' } } }
     Show-ProgressScreen -State $st -Now { [datetime]'2026-10-18T09:00:05' }
     $cleared | Should -Be 1
     $hostCalls | Should -Contain '  [OK] Finalize'
     $hostCalls | Should -Contain ''
+    $hostColors.Count | Should -BeGreaterThan 0
+    @($hostColors | Where-Object { $_.F -ne 'Gray' -or $_.B -ne 'Black' }).Count | Should -Be 0
   }
   It 'uses the step catalog when none is passed' {
     $script:progressDrawn = $null
@@ -604,14 +623,38 @@ Describe 'Show-FinalScreen' {
     Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
     Mock Get-ChromeRegisteredAppName { 'Google Chrome' }
   }
-  It 'paints the console DarkGreen, DarkYellow or DarkRed by verdict colour' {
-    Invoke-FinalScreen -Color 'GREEN'; $colors[0] | Should -Be 'DarkGreen'
-    Invoke-FinalScreen -Color 'YELLOW'; $colors[0] | Should -Be 'DarkYellow'
-    Invoke-FinalScreen -Color 'RED'; $colors[0] | Should -Be 'DarkRed'
+  It 'paints Black on Yellow, White on DarkGreen and White on DarkRed (spec 9.1)' {
+    Invoke-FinalScreen -Color 'YELLOW'; $colors[0] | Should -Be 'Yellow'; $fores[0] | Should -Be 'Black'
+    Invoke-FinalScreen -Color 'GREEN'; $colors[0] | Should -Be 'DarkGreen'; $fores[0] | Should -Be 'White'
+    Invoke-FinalScreen -Color 'RED'; $colors[0] | Should -Be 'DarkRed'; $fores[0] | Should -Be 'White'
     $colors.Count | Should -Be 1
   }
-  It 'paints an unexpected colour name red, never green' {
-    Invoke-FinalScreen -Color 'PURPLE'; $colors[0] | Should -Be 'DarkRed'
+  It 'paints an unexpected colour name white on red, never green' {
+    Invoke-FinalScreen -Color 'PURPLE'; $colors[0] | Should -Be 'DarkRed'; $fores[0] | Should -Be 'White'
+  }
+  It 'Get-VerdictColors maps YELLOW, GREEN and everything else' {
+    $y = Get-VerdictColors -Color 'YELLOW'; $y.Background | Should -Be 'Yellow'; $y.Foreground | Should -Be 'Black'
+    $g = Get-VerdictColors -Color 'GREEN'; $g.Background | Should -Be 'DarkGreen'; $g.Foreground | Should -Be 'White'
+    foreach ($other in 'RED', 'PURPLE', '', $null) {
+      $r = Get-VerdictColors -Color $other; $r.Background | Should -Be 'DarkRed'; $r.Foreground | Should -Be 'White'
+    }
+  }
+  It 'the production writer sets both colours on every line' {
+    $script:hostCalls = New-Object System.Collections.ArrayList; Mock Clear-Host { }
+    Mock Write-Host { $null = $script:hostCalls.Add(@{ F = $ForegroundColor; B = $BackgroundColor }) }
+    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
+      -Verdict @{ Color = 'YELLOW'; Banner = 'COMPLETE - CHECK NOTES'; Failures = @(); Notes = @('n') } -ReportPath 'C:\r.txt' `
+      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+    $hostCalls.Count | Should -BeGreaterThan 10
+    @($hostCalls | Where-Object { $_.F -ne 'Black' -or $_.B -ne 'Yellow' }).Count | Should -Be 0
+  }
+  It 'the production colour setter sets both the background and the foreground of the console' {
+    # $Host cannot be replaced, so read the -SetColor default out of the param block.
+    $param = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'SetColor' }
+    $text = $param.DefaultValue.Extent.Text
+    $text | Should -Match 'param\(\$background, \$foreground\)'
+    $text | Should -Match 'RawUI\.BackgroundColor = \$background'
+    $text | Should -Match 'RawUI\.ForegroundColor = \$foreground'
   }
   It 'puts the console colours back last, when the screen closes' {
     Invoke-FinalScreen -Keys 'R', 'Q'
@@ -639,17 +682,17 @@ Describe 'Show-FinalScreen' {
     $drawn[0] | Should -Not -Match 'press B'
     Should -Invoke Get-DefaultBrowserProgId -Times 0 -Exactly
   }
-  It 'clears the screen and writes the lines in white when no -Write seam is given' {
+  It 'clears the screen and writes the lines in white on dark green when no -Write seam is given' {
     $script:cleared = 0
     $script:hostCalls = New-Object System.Collections.ArrayList
     Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor }) }
+    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor; Back = $BackgroundColor }) }
     Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
       -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($c) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
     $cleared | Should -Be 1
     @($hostCalls | Where-Object { $_.Text -match 'SETUP COMPLETE' }).Count | Should -Be 1
-    @($hostCalls | Where-Object { $_.Color -ne 'White' }).Count | Should -Be 0
+    @($hostCalls | Where-Object { $_.Color -ne 'White' -or $_.Back -ne 'DarkGreen' }).Count | Should -Be 0
   }
   It 'writes the last line without a newline, so a screen of exactly 30 lines does not scroll its top line away' {
     $script:hostCalls = New-Object System.Collections.ArrayList
@@ -657,7 +700,7 @@ Describe 'Show-FinalScreen' {
     Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; NoNewline = [bool]$NoNewline }) }
     Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
       -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($c) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
     $hostCalls.Count | Should -BeGreaterThan 10
     $hostCalls[$hostCalls.Count - 1].Text | Should -Match '^  Report: '
     $hostCalls[$hostCalls.Count - 1].NoNewline | Should -BeTrue
@@ -703,15 +746,17 @@ Describe 'Show-FinalScreen' {
   }
   It 'restores the console colour even when the key read throws' {
     $script:colors = New-Object System.Collections.ArrayList
+    $script:fores = New-Object System.Collections.ArrayList
     $script:resets = 0
     {
       Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
         -Verdict @{ Color = 'RED'; Banner = 'COMPLETED WITH ERRORS'; Failures = @('F'); Notes = @() } -ReportPath 'C:\r.txt' `
-        -ReadKey { throw 'console went away' } -SetColor { param($c) $null = $script:colors.Add($c) } -ResetColor { $script:resets++ } `
+        -ReadKey { throw 'console went away' } -SetColor { param($b, $f) $null = $script:colors.Add($b); $null = $script:fores.Add($f) } -ResetColor { $script:resets++ } `
         -Write { param($lines) } -FlushInput { } -Launch { param($t, $a) }
     } | Should -Throw '*console went away*'
     $colors.Count | Should -Be 1
     $colors[0] | Should -Be 'DarkRed'
+    $fores[0] | Should -Be 'White'
     $resets | Should -Be 1
   }
   It 'survives a launch failure and keeps waiting' {
@@ -723,7 +768,7 @@ Describe 'Show-FinalScreen' {
     $script:drawn = New-Object System.Collections.ArrayList
     Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
       -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($c) throw 'cannot set colour' } -ResetColor { throw 'cannot reset colour' } `
+      -ReadKey { 'Q' } -SetColor { param($b, $f) throw 'cannot set colour' } -ResetColor { throw 'cannot reset colour' } `
       -Write { param($lines) $null = $script:drawn.Add(($lines -join "`n")) } -FlushInput { throw 'cannot flush' } -Launch { param($t, $a) }
     $drawn.Count | Should -Be 1
     $drawn[0] | Should -Match 'SETUP COMPLETE'

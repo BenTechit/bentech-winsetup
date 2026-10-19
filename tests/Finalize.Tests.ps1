@@ -295,6 +295,13 @@ Describe 'Format-SetupReport content' {
     $red | Should -Contain 'Windows      : Windows 11 Pro ???? 25H2 (26200) x64'
     foreach ($line in $red) { $line | Should -Match '^[\x20-\x7E]*$' }
   }
+  It 'shows the Windows caption without the direction marks Hebrew Windows adds' {
+    $marked = $script:st.Clone(); $marked.Machine = $script:fm.Clone()
+    $marked.Machine.OsCaption = [string][char]0x200F + [string][char]0x200E + 'Microsoft Windows 11 Home'
+    $marked.Machine.OsDisplayVersion = '25H2'; $marked.Machine.OsBuild = 26200; $marked.Machine.Arch = 'x64'
+    $l = @(Format-SetupReport -State $marked -Verdict (Get-RunVerdict -State $marked) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{})
+    $l | Should -Contain 'Windows      : Microsoft Windows 11 Home 25H2 (26200) x64'
+  }
   It 'reads times that came back from JSON as [datetime]' {
     $copy = $st.Clone(); $copy.StartedAt = [datetime]'2026-10-18T09:05:00'; $copy.EndedAt = [datetime]'2026-10-18T10:17:00'
     $lines = Format-SetupReport -State $copy -Verdict (Get-RunVerdict -State $copy) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}

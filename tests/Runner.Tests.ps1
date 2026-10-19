@@ -226,6 +226,7 @@ Describe 'Invoke-ControlledReboot' {
     Should -Invoke Write-Host -Times 0 -Exactly
     Invoke-ControlledReboot -Context $c -CountdownSeconds 3 -RestartAction { } | Out-Null
     Should -Invoke Write-Host -Times 3 -Exactly
+    Should -Invoke Write-Host -Times 3 -Exactly -ParameterFilter { $ForegroundColor -eq 'White' -and $BackgroundColor -eq 'Black' }
     Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 3 s ...' }
     Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 1 s ...' }
     Should -Invoke Start-Sleep -Times 3 -Exactly

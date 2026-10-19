@@ -101,7 +101,7 @@ Describe 'Start-BenTechSetup' {
       Mock Enter-RunLock { $false }
       Invoke-Entry | Should -Be 2
       Should -Invoke Enter-RunLock -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
-      Should -Invoke Write-Host -ParameterFilter { "$Object" -eq 'Setup is already running on this machine' }
+      Should -Invoke Write-Host -ParameterFilter { "$Object" -eq 'Setup is already running on this machine' -and $ForegroundColor -eq 'Yellow' -and $BackgroundColor -eq 'Black' }
       Should -Invoke Read-SetupConfig -Times 0 -Exactly
       Should -Invoke Read-RunState -Times 0 -Exactly
       Should -Invoke Show-StartScreen -Times 0 -Exactly
@@ -321,6 +321,14 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Unregister-ResumeTask -Times 0 -Exactly    # the next logon retries (caps bound only crashes inside a step)
       Should -Invoke Show-FinalScreen -Times 0 -Exactly
       Should -Invoke Stop-Transcript -Times 1 -Exactly
+    }
+    It 'the production crash screen paints White on DarkRed (spec 9.1)' {
+      # It would repaint the console running the tests, so read the -CrashScreen default out of the param block.
+      $param = (Get-Command Start-BenTechSetup).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'CrashScreen' }
+      $text = $param.DefaultValue.Extent.Text
+      $text | Should -Match "RawUI\.BackgroundColor = 'DarkRed'"
+      $text | Should -Match "RawUI\.ForegroundColor = 'White'"
+      $text | Should -Match "-ForegroundColor White -BackgroundColor DarkRed"
     }
     It 'a machine detection failure is a crash before anything is saved' {
       Mock Get-MachineInfo { throw 'CIM is broken' }

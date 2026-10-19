@@ -305,11 +305,12 @@ function Start-BenTechSetup {
       param($text)
       try {
         $Host.UI.RawUI.BackgroundColor = 'DarkRed'
+        $Host.UI.RawUI.ForegroundColor = 'White'
         Clear-Host
       } catch {
         Write-SetupLog -Level WARN -Message 'Could not paint the crash screen red' -Data @{ error = $_.Exception.Message }
       }
-      Write-Host $text -ForegroundColor White
+      Write-Host $text -ForegroundColor White -BackgroundColor DarkRed
     },
     [switch]$NoWait
   )
@@ -339,7 +340,7 @@ function Start-BenTechSetup {
 
     if (-not (Enter-RunLock -Root $Root)) {
       Write-SetupLog -Level WARN -Message 'Setup is already running on this machine; exiting'
-      Write-Host 'Setup is already running on this machine' -ForegroundColor Yellow
+      Write-Host 'Setup is already running on this machine' -ForegroundColor Yellow -BackgroundColor Black
       $exitCode = 2
     } else {
       $lockHeld = $true

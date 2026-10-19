@@ -79,7 +79,7 @@ function Show-ProgressScreen {
     [Parameter(Mandatory)][hashtable]$State,
     [object[]]$Catalog = $script:StepCatalog,
     [scriptblock]$Now = { Get-Date },
-    [scriptblock]$Write = { param($lines) Clear-Host; $lines | ForEach-Object { Write-Host $_ } }
+    [scriptblock]$Write = { param($lines) Clear-Host; $lines | ForEach-Object { Write-Host $_ -ForegroundColor Gray -BackgroundColor Black } }
   )
 
   $lines = @(Format-ProgressScreen -State $State -Catalog $Catalog -Now ([datetime](& $Now)))
