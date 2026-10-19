@@ -5,7 +5,9 @@
 # SAFETY:
 # - Every signature here uses a throwaway RSA key made in this file, never Ben's real signing key.
 # - Launchers are built into $TestDrive, read their "release" from a file:/// folder in $TestDrive and
-#   install into $TestDrive, always with -SkipAcl. Nothing touches C:\BenTech\Setup.
+#   install into $TestDrive, with -SkipAcl. Nothing touches C:\BenTech. The one exception to -SkipAcl is
+#   the exit-5 test: not elevated, the real "icacls <TestDrive folder> /setowner" is refused and changes
+#   nothing (the test is skipped when elevated). The folder lockdown itself is tested with mocks.
 # - Publish.ps1 only runs as a -DryRun in a stubbed copy under $TestDrive, with a fake gh first on PATH,
 #   an invalid GH_TOKEN and a repo that does not exist.
 BeforeAll {
@@ -137,7 +139,9 @@ Describe 'launcher polyglot through cmd' {
     # non-elevated test run. Everything else, including the cmd -> PowerShell hand-off, is unchanged.
     $lines = [IO.File]::ReadAllText("$TestDrive\BenTechSetup.cmd") -split "`r`n"
     $script:cmdPath = Join-Path $TestDrive 'NoElevate.cmd'
-    [IO.File]::WriteAllText($cmdPath, (@($lines | Where-Object { $_ -notmatch '^fltmc ' }) -join "`r`n"), (New-Object Text.ASCIIEncoding))
+    $kept = @($lines | Where-Object { $_ -notmatch 'fltmc\.exe' })
+    $kept.Count | Should -Be ($lines.Count - 1)
+    [IO.File]::WriteAllText($cmdPath, ($kept -join "`r`n"), (New-Object Text.ASCIIEncoding))
   }
   It 'passes the arguments through cmd and returns the PowerShell exit code (lock held -> 2)' {
     $d = Join-Path $TestDrive 'c1'; New-Item -ItemType Directory $d | Out-Null; "$PID" | Set-Content "$d\run.lock"
@@ -170,16 +174,21 @@ Describe 'launcher file layout' {
     $built | Should -Not -Match "(?<!`r)`n"
     $built | Should -Not -Match "`r(?!`n)"
   }
-  It 'starts with the fixed polyglot header' {
+  It 'starts with the fixed polyglot header (R30: full paths, so nothing planted next to the .cmd can run)' {
     $expected = @(
       '@echo off'
       'setlocal'
-      'fltmc >nul 2>&1 || ( powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath ''%~f0'' -Verb RunAs" & exit /b )'
-      'powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText(''%~f0''); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf(''#__PS__'')))) %*"'
+      '"%SystemRoot%\System32\fltmc.exe" >nul 2>&1 || ( "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath ''%~f0'' -Verb RunAs" & exit /b )'
+      '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText(''%~f0''); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf(''#__PS__'')))) %*"'
       'exit /b %errorlevel%'
       '#__PS__'
     )
     @($built -split "`r`n")[0..5] | Should -Be $expected
+  }
+  It 'never starts a bare program name in the cmd part (cmd looks in the .cmd''s own folder first)' {
+    $cmdPart = $built.Substring(0, $built.IndexOf("`r`n#__PS__`r`n"))
+    $cmdPart | Should -Not -Match '(?m)(^|[\s(|&])(powershell|fltmc|cmd|icacls)(\.exe)?\s'
+    $cmdPart | Should -Match '"%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe" -NoProfile'
   }
   It 'has the marker once on its own line, and the PowerShell section never repeats it' {
     ([regex]::Matches($built, '(?m)^#__PS__\r?$')).Count | Should -Be 1
@@ -212,13 +221,19 @@ Describe 'launcher mirrors stay in step with src' {
     $tok = $null; $err = $null
     $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)
     foreach ($fn in $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-      if ($fn.Name -in 'Test-ReleaseSignature', 'Test-SetupLockHeld', 'Get-LauncherAclArgs') { . ([ScriptBlock]::Create($fn.Extent.Text)) }
+      if ($fn.Name -in 'Test-ReleaseSignature', 'Test-SetupLockHeld', 'Get-LauncherAclCommands') { . ([ScriptBlock]::Create($fn.Extent.Text)) }
     }
   }
-  It 'builds the same icacls arguments as Get-SetupFolderAclArgs (src/Steps/Prepare.ps1)' {
+  It 'builds the same icacls commands as Get-SetupFolderAclCommands (src/Steps/Prepare.ps1), and refuses the same bad paths' {
     . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
-    foreach ($p in 'C:\BenTech\Setup', 'C:\BenTech\Setup\', 'D:\Some Dir\x') {
-      Get-LauncherAclArgs -Path $p | Should -Be (Get-SetupFolderAclArgs -Path $p)
+    foreach ($p in 'C:\BenTech', 'C:\BenTech\', 'D:\Some Dir\x') {
+      $mine = @(Get-LauncherAclCommands -Parent $p)
+      $mine.Count | Should -Be 3
+      $mine | Should -Be @(Get-SetupFolderAclCommands -Parent $p)
+    }
+    foreach ($bad in 'C:\', 'C:', 'BenTech', '\BenTech', ' ') {
+      { Get-LauncherAclCommands -Parent $bad } | Should -Throw
+      { Get-SetupFolderAclCommands -Parent $bad } | Should -Throw
     }
   }
   It 'accepts a valid signature and returns a real $false for anything else (like Test-DetachedSignature)' {
@@ -249,6 +264,107 @@ Describe 'launcher mirrors stay in step with src' {
     # A powershell that started more than 5 s after the lock was written cannot own it (pid reuse).
     (Get-Item "$d\run.lock").LastWriteTimeUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().AddMinutes(-1)
     Test-SetupLockHeld -Root $d | Should -BeFalse
+  }
+}
+
+Describe 'launcher folder lockdown (R28)' {
+  # Protect-LauncherFolder runs here in this process with Start-Process, Get-Item and New-Item mocked:
+  # no real icacls, no real junction, nothing under C:\BenTech is read or changed.
+  BeforeAll {
+    $tok = $null; $err = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)
+    foreach ($fn in $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+      if ($fn.Name -in 'Get-LauncherAclCommands', 'Test-LauncherReparsePoint', 'Protect-LauncherFolder') { . ([ScriptBlock]::Create($fn.Extent.Text)) }
+    }
+    $script:icaclsExe = "$env:windir\System32\icacls.exe"
+  }
+  BeforeEach {
+    $script:icacls = New-Object System.Collections.ArrayList   # one hashtable per Start-Process call
+    $script:steps = New-Object System.Collections.ArrayList    # ordered: 'icacls' / 'mkdir <path>'
+    $script:failIcaclsAt = 0                                   # 1-based icacls call that exits 1307; 0 = none
+    $script:folders = @('C:\BenTech', 'C:\BenTech\Setup')
+    $script:reparse = @()
+    $script:reparseAfterIcacls = @()
+    Mock Start-Process {
+      [void]$script:icacls.Add(@{ File = $FilePath; Args = (@($ArgumentList) -join ' '); Wait = [bool]$Wait; PassThru = [bool]$PassThru; Window = [string]$WindowStyle })
+      [void]$script:steps.Add('icacls')
+      [pscustomobject]@{ ExitCode = $(if ($script:icacls.Count -eq $script:failIcaclsAt) { 1307 } else { 0 }) }
+    }
+    Mock Get-Item {
+      if ($script:folders -notcontains $LiteralPath) { return $null }
+      $attributes = [IO.FileAttributes]::Directory
+      if ($script:reparse -contains $LiteralPath) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      if ($script:reparseAfterIcacls -contains $LiteralPath -and $script:icacls.Count -ge 3) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      [pscustomobject]@{ FullName = $LiteralPath; Attributes = $attributes }
+    }
+    Mock New-Item { [void]$script:steps.Add("mkdir $Path") }
+  }
+
+  It 'runs the three icacls commands in order on C:\BenTech, by full path, hidden and waited for' {
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeTrue
+    @($script:icacls | ForEach-Object { $_.Args }) | Should -Be @(
+      '"C:\BenTech" /setowner *S-1-5-32-544 /T'
+      '"C:\BenTech" /reset /T'
+      '"C:\BenTech" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F'
+    )
+    foreach ($c in $script:icacls) { $c.File | Should -Be $icaclsExe; $c.Wait | Should -BeTrue; $c.PassThru | Should -BeTrue; $c.Window | Should -Be 'Hidden' }
+  }
+  It 'creates a missing C:\BenTech before icacls, and the working folder only after it (so it inherits the lockdown)' {
+    $script:folders = @()
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeTrue
+    @($script:steps) | Should -Be @('mkdir C:\BenTech', 'icacls', 'icacls', 'icacls', 'mkdir C:\BenTech\Setup')
+  }
+  It 'refuses when <Which> is a junction or symlink, before running anything' -ForEach @(
+    @{ Which = 'C:\BenTech' }, @{ Which = 'C:\BenTech\Setup' }
+  ) {
+    $script:reparse = @($Which)
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    @($script:steps) | Should -BeNullOrEmpty
+  }
+  It 'refuses a junction swapped in before the lockdown (checked again after icacls)' {
+    $script:reparseAfterIcacls = @('C:\BenTech\Setup')
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    $script:icacls.Count | Should -Be 3
+  }
+  It 'stops at the first icacls command that fails (call <At>)' -ForEach @(@{ At = 1 }, @{ At = 2 }, @{ At = 3 }) {
+    $script:failIcaclsAt = $At
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    $script:icacls.Count | Should -Be $At
+  }
+  It 'treats an icacls without an exit code as a failure' {
+    Mock Start-Process { [void]$script:icacls.Add(@{}); [pscustomobject]@{ ExitCode = $null } }
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+  }
+  It 'refuses a target directly under a drive root without touching anything' {
+    Protect-LauncherFolder -TargetDir 'C:\Setup' | Should -BeFalse
+    @($script:steps) | Should -BeNullOrEmpty
+  }
+  It 'never throws (an icacls that cannot be started is a refusal)' {
+    Mock Start-Process { throw 'cannot start icacls' }
+    { Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' } | Should -Not -Throw
+    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+  }
+}
+
+Describe 'launcher exit 5 (R28)' {
+  It 'exits 5, says so, and writes nothing when the folder cannot be secured (real icacls, refused when not elevated)' {
+    $principal = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      Set-ItResult -Skipped -Because 'elevated: icacls /setowner would succeed here, so it cannot be the failure under test'
+      return
+    }
+    # Not elevated, "icacls <folder> /setowner *S-1-5-32-544" is refused (exit 1307) and changes nothing.
+    SignAll; $parent = Join-Path $TestDrive 's5'; $d = Join-Path $parent 'Setup'
+    try {
+      $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TestDrive\launcher.ps1" -TargetDir $d -NoPause 2>&1 | Out-String
+      $LASTEXITCODE | Should -Be 5
+      $out | Should -Match ([regex]::Escape("Cannot secure $parent - nothing was run."))
+      $d | Should -Not -Exist
+    } finally {
+      # If a regression ever did lock the folder down, this user still owns it: give access back so
+      # Pester can delete $TestDrive.
+      if (Test-Path -LiteralPath $parent) { & "$env:windir\System32\icacls.exe" $parent /reset /T /C 2>&1 | Out-Null }
+    }
   }
 }
 
@@ -325,6 +441,71 @@ Describe 'Publish.ps1' {
     (Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw) | Should -Not -Match 'Start-Process[^\r\n]*\bgh\b'
   }
 
+  It 'uploads exactly the four signed files, never the launcher (R29), and targets HEAD' {
+    $tok = $null; $err = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+    $assign = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$releaseNames' }, $true))
+    $assign.Count | Should -Be 1
+    $names = @($assign[0].Right.FindAll({ $args[0] -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+    $names | Should -Be @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig')
+    $ghArgs = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$ghArgs' }, $true))
+    $ghArgs.Count | Should -Be 1
+    $ghArgs[0].Right.Extent.Text | Should -Match '\$releaseAssets'
+    $ghArgs[0].Right.Extent.Text | Should -Match "'--target', \`$source\.Head"
+    $ghArgs[0].Right.Extent.Text | Should -Not -Match 'BenTechSetup|launcher'
+  }
+
+  It 'refuses a dirty or unpushed tree unless -DryRun, which only warns' {
+    $text = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw
+    $text | Should -Match 'if \(\$source\.Problems\.Count -gt 0 -and -not \$DryRun\) \{\s*throw'
+  }
+
+  Context 'Get-PublishSource (git mocked)' {
+    BeforeAll {
+      $tok = $null; $err = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+      $fn = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-PublishSource' }, $true))
+      $fn.Count | Should -Be 1
+      . ([ScriptBlock]::Create($fn[0].Extent.Text))
+    }
+    BeforeEach {
+      $script:git = @{ StatusCode = 0; Status = @(); Head = 'aaaa1111'; UpCode = 0; Up = 'aaaa1111' }
+      $script:gitCalls = New-Object System.Collections.ArrayList
+      Mock git {
+        $line = $args -join ' '
+        [void]$script:gitCalls.Add($line)
+        if ($line -match 'status --porcelain$') { $global:LASTEXITCODE = $script:git.StatusCode; return $script:git.Status }
+        if ($line -match 'rev-parse HEAD$') { $global:LASTEXITCODE = 0; return $script:git.Head }
+        if ($line -match 'rev-parse @\{u\}$') { $global:LASTEXITCODE = $script:git.UpCode; return $script:git.Up }
+        $global:LASTEXITCODE = 99
+      }
+    }
+    It 'has no problems for a clean tree whose HEAD is pushed, and returns HEAD' {
+      $s = Get-PublishSource -RepoRoot 'C:\repo'
+      @($s.Problems) | Should -BeNullOrEmpty
+      $s.Head | Should -Be 'aaaa1111'
+      @($script:gitCalls | Where-Object { $_ -notmatch '^-C C:\\repo ' }) | Should -BeNullOrEmpty
+    }
+    It 'reports uncommitted or untracked changes' {
+      $script:git.Status = @(' M src/x.ps1', '?? new.ps1')
+      @((Get-PublishSource -RepoRoot 'C:\repo').Problems | Where-Object { $_ -match 'uncommitted' }).Count | Should -Be 1
+    }
+    It 'reports a HEAD that is not pushed' {
+      $script:git.Up = 'bbbb2222'
+      @((Get-PublishSource -RepoRoot 'C:\repo').Problems | Where-Object { $_ -match 'not pushed' }).Count | Should -Be 1
+    }
+    It 'reports a branch with no upstream' {
+      $script:git.UpCode = 128; $script:git.Up = @()
+      @((Get-PublishSource -RepoRoot 'C:\repo').Problems | Where-Object { $_ -match 'no upstream' }).Count | Should -Be 1
+    }
+    It 'reports a folder that is not a git repository' {
+      $script:git.StatusCode = 128
+      $s = Get-PublishSource -RepoRoot 'C:\repo'
+      @($s.Problems).Count | Should -Be 1
+      $s.Head | Should -BeNullOrEmpty
+    }
+  }
+
   Context 'run as -DryRun in a stubbed copy of the repo' {
     BeforeAll {
       $script:pr = Join-Path $TestDrive 'pubrepo'
@@ -349,23 +530,60 @@ Describe 'Publish.ps1' {
       "@echo off`r`necho %*> `"%~dp0gh-called.txt`"`r`nexit /b 0`r`n" | Set-Content "$ghDir\gh.cmd" -Encoding ASCII -NoNewline
       function RunPublish {
         Remove-Item -LiteralPath "$pr\dist" -Recurse -Force -ErrorAction SilentlyContinue
-        $oldPath = $env:PATH; $oldToken = $env:GH_TOKEN
+        $oldPath = $env:PATH; $oldToken = $env:GH_TOKEN; $oldCeiling = $env:GIT_CEILING_DIRECTORIES
         try {
-          $env:PATH = "$ghDir;$oldPath"; $env:GH_TOKEN = 'invalid-test-token'
+          # The stub repo is not a git repository; the ceiling stops git from finding one above $TestDrive.
+          $env:PATH = "$ghDir;$oldPath"; $env:GH_TOKEN = 'invalid-test-token'; $env:GIT_CEILING_DIRECTORIES = $TestDrive
           $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pr\tools\Publish.ps1" -Version 2026.10.18.7 -DryRun 2>&1 | Out-String
           @{ Code = $LASTEXITCODE; Out = $out }
-        } finally { $env:PATH = $oldPath; $env:GH_TOKEN = $oldToken }
+        } finally { $env:PATH = $oldPath; $env:GH_TOKEN = $oldToken; $env:GIT_CEILING_DIRECTORIES = $oldCeiling }
       }
+      $script:hashFile = Join-Path $pr 'keys\launcher.sha256'
     }
     AfterEach { "$ghDir\gh-called.txt" | Should -Not -Exist }
 
-    It 'builds the five release files and never calls gh' {
+    It 'builds the four signed files plus the launcher, never calls gh, and would upload only the four' {
       $r = RunPublish
       $r.Code | Should -Be 0
       @(Get-ChildItem -LiteralPath "$pr\dist" -File | ForEach-Object { $_.Name } | Sort-Object) |
         Should -Be @('BenTechSetup.cmd', 'config.json', 'config.json.sig', 'setup.ps1', 'setup.ps1.sig')
       [IO.File]::ReadAllText("$pr\dist\BenTechSetup.cmd") | Should -Match ([regex]::Escape("'https://github.com/example-invalid/not-a-real-repo/releases/latest/download'"))
-      $r.Out | Should -Match 'DRY RUN'
+      $line = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^DRY RUN - not run: gh ' })
+      $line.Count | Should -Be 1
+      $tokens = @(($line[0] -replace '^DRY RUN - not run: gh ', '') -split ' ')
+      $tokens[0..2] | Should -Be @('release', 'create', 'v2026.10.18.7')
+      $tokens[3..6] | Should -Be @("$pr\dist\setup.ps1", "$pr\dist\setup.ps1.sig", "$pr\dist\config.json", "$pr\dist\config.json.sig")
+      $tokens[7] | Should -Be '--repo'
+      $line[0] | Should -Match ' --target \S+ '
+      $line[0] | Should -Not -Match 'BenTechSetup\.cmd'
+    }
+    It 'warns, but goes on, when the source cannot be verified under -DryRun (no git repository here)' {
+      $r = RunPublish
+      $r.Code | Should -Be 0
+      $r.Out | Should -Match 'WARNING: .*git'
+    }
+    It 'prints the launcher SHA-256 and records it in keys\launcher.sha256' {
+      Remove-Item -LiteralPath $hashFile -ErrorAction SilentlyContinue
+      $r = RunPublish
+      $r.Code | Should -Be 0
+      $hash = (Get-FileHash -LiteralPath "$pr\dist\BenTechSetup.cmd" -Algorithm SHA256).Hash.ToLowerInvariant()
+      $r.Out | Should -Match "Launcher SHA-256: $hash"
+      (([IO.File]::ReadAllText($hashFile).Trim()) -split '\s+')[0] | Should -Be $hash
+      $r.Out | Should -Not -Match 'WARNING: the launcher changed'
+    }
+    It 'warns when the launcher differs from keys\launcher.sha256, then records the new hash' {
+      [IO.File]::WriteAllText($hashFile, ('0' * 64) + "  BenTechSetup.cmd`r`n")
+      $r = RunPublish
+      $r.Code | Should -Be 0
+      $r.Out | Should -Match 'WARNING: the launcher changed'
+      $hash = (Get-FileHash -LiteralPath "$pr\dist\BenTechSetup.cmd" -Algorithm SHA256).Hash.ToLowerInvariant()
+      (([IO.File]::ReadAllText($hashFile).Trim()) -split '\s+')[0] | Should -Be $hash
+    }
+    It 'does not warn when the launcher is unchanged' {
+      RunPublish | Out-Null
+      $r = RunPublish
+      $r.Code | Should -Be 0
+      $r.Out | Should -Not -Match 'WARNING: the launcher changed'
     }
     It 'stops before building when the tests fail' {
       $stub = "$pr\tools\Invoke-Tests.ps1"; $saved = [IO.File]::ReadAllBytes($stub)

@@ -293,20 +293,103 @@ function Unregister-ResumeTask {
   }
 }
 
-function Get-SetupFolderAclArgs {
+function Get-SetupFolderAclCommands {
   <#
   .SYNOPSIS
-    The icacls arguments that leave only Administrators and SYSTEM in the working folder's ACL.
+    The three icacls argument strings, in order, that make <Parent> (C:\BenTech) and everything under it
+    admin-only (R28). The launcher holds a mirror of this function; keep the two in step.
   .DESCRIPTION
-    `*S-1-5-32-544` and `*S-1-5-18` are the well-known SIDs of Administrators and SYSTEM. Group NAMES
-    are localized (Hebrew Windows has other names), so a name must never be used here. The path is
-    quoted, and a trailing backslash is dropped because \" would escape the closing quote.
+      1. /setowner *S-1-5-32-544 /T   Administrators own the parent and everything below. An owner keeps
+                                      the right to change the ACL, so a folder pre-created by a standard
+                                      user would otherwise stay theirs.
+      2. /reset /T                    Every ACL below goes back to inherited-only, which drops ACEs planted
+                                      there (for example Everyone:M, which /grant:r leaves in place).
+      3. /inheritance:r /grant:r ...  The parent stops inheriting from C:\ (which gives Authenticated Users
+                                      Modify) and grants only Administrators and SYSTEM, to it and to
+                                      everything below.
+    `*S-1-5-32-544` and `*S-1-5-18` are the well-known SIDs of Administrators and SYSTEM. Group NAMES are
+    localized (Hebrew Windows has other names), so a name must never be used here.
+    No /C: with /C icacls exits 0 even when it failed on every file, so a failure would go unnoticed.
+    Without it, icacls stops at the first error with a non-zero exit code.
+    The path is quoted, and a trailing backslash is dropped because \" would escape the closing quote.
+    Throws unless <Parent> is an absolute path below a drive root ("C:\x"): a recursive owner change
+    on "C:\" or on a relative path (resolved against the working directory) would wreck the system.
   #>
   [CmdletBinding()]
-  [OutputType([string])]
+  [OutputType([string[]])]
+  param([Parameter(Mandatory)][string]$Parent)
+
+  $path = $Parent.Trim().TrimEnd('\')
+  if ($path -notmatch '^[A-Za-z]:\\[^\\]') { throw "Refusing to lock down '$Parent': expected an absolute folder below a drive root, such as C:\BenTech." }
+  @(
+    "`"$path`" /setowner *S-1-5-32-544 /T"
+    "`"$path`" /reset /T"
+    "`"$path`" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F"
+  )
+}
+
+function Test-SetupReparsePoint {
+  # Private. $true when Path exists and is a junction, symlink or other reparse point. Missing is $false.
+  [CmdletBinding()]
+  [OutputType([bool])]
   param([Parameter(Mandatory)][string]$Path)
 
-  "`"$($Path.TrimEnd('\'))`" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F"
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  return ($null -ne $item -and (([IO.FileAttributes]$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))
+}
+
+function Protect-SetupFolder {
+  <#
+  .SYNOPSIS
+    Private. Makes the working folder's parent (C:\BenTech) admin-only, fail closed (R28). $true only when
+    every stage worked. Never throws.
+  .DESCRIPTION
+    The same sequence as the launcher's Protect-LauncherFolder, which normally did this already; this
+    re-asserts it.
+      1. Refuse when the parent or the working folder is a reparse point (a junction would redirect the
+         lockdown and the setup files somewhere else).
+      2. Create the parent if it is missing.
+      3. The three Get-SetupFolderAclCommands calls to icacls, stopping at the first failure.
+      4. Create the working folder if it is missing (it inherits the lockdown).
+      5. The reparse check again: one swapped in before the lockdown is refused too. After it, only
+         administrators can change anything under the parent.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][double]$TimeoutMinutes
+  )
+
+  try {
+    $parent = Split-Path -Parent $Root
+    $commands = Get-SetupFolderAclCommands -Parent $parent
+    foreach ($path in $parent, $Root) {
+      if (Test-SetupReparsePoint -Path $path) {
+        Write-SetupLog -Level ERROR -Message 'Working folder is a junction or symlink; refusing to use it' -Data @{ path = $path }
+        return $false
+      }
+    }
+    if ($null -eq (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    foreach ($arguments in $commands) {
+      $run = Invoke-PrepareTool -FilePath (Join-Path $env:windir 'System32\icacls.exe') -ArgumentList $arguments -TimeoutMinutes $TimeoutMinutes
+      if (-not $run.Ok) {
+        Write-SetupLog -Level ERROR -Message 'Working folder could not be locked down (icacls failed)' -Data @{ args = $arguments }
+        return $false
+      }
+    }
+    if ($null -eq (Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
+    foreach ($path in $parent, $Root) {
+      if (Test-SetupReparsePoint -Path $path) {
+        Write-SetupLog -Level ERROR -Message 'Working folder became a junction or symlink during the lockdown; refusing to use it' -Data @{ path = $path }
+        return $false
+      }
+    }
+    return $true
+  } catch {
+    Write-SetupLog -Level ERROR -Message 'Working folder could not be locked down' -Data @{ root = $Root; error = $_.Exception.Message }
+    return $false
+  }
 }
 
 function Set-RegistryDword {
@@ -337,7 +420,10 @@ function Invoke-StepPrepare {
     Step 0: prepares the machine for an unattended run. Returns Done('Machine prepared').
   .DESCRIPTION
     In order:
-      1. icacls: the working folder keeps only Administrators and SYSTEM.
+      1. Protect-SetupFolder (R28): the working folder's parent (C:\BenTech) is owned by Administrators
+         and only Administrators and SYSTEM can open it or anything below. Fail closed: a junction or
+         symlink in the way, or any failing icacls, is Failed('Working folder could not be secured')
+         with an Error. That message wins over the resume task's, and every other stage still runs.
       2. The logon task that resumes the run after a reboot.
       3. Power: remember the original settings (first run only), then never sleep, hibernate or turn
          the display off, and ignore the lid, on AC and on battery.
@@ -345,7 +431,7 @@ function Invoke-StepPrepare {
       5. The first-logon nag switches from Config.nags (current user).
       6. NoAutoRebootWithLoggedOnUsers = 1 (Windows Update may not restart the machine by itself).
 
-    Nothing in 1, 3, 4, 5 or 6 stops the step: each failure is logged and becomes a Note. A resume
+    Nothing in 3, 4, 5 or 6 stops the step: each failure is logged and becomes a Note. A resume
     task that cannot be registered is different, because the run could not survive a reboot. The
     registration is tried twice (ResumeTaskRetrySeconds apart, 10 by default; a test passes 0). If
     both fail, every other stage still runs, State.ResumeTaskMissing is set to $true, and the result
@@ -365,10 +451,11 @@ function Invoke-StepPrepare {
     if (-not $notes.Contains($Text)) { $notes.Add($Text) }
   }
 
-  # 1. Working folder
-  $icacls = Invoke-PrepareTool -FilePath (Join-Path $env:windir 'System32\icacls.exe') `
-    -ArgumentList (Get-SetupFolderAclArgs -Path $Context.Root) -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.default)
-  if (-not $icacls.Ok) { & $addNote 'Working folder permissions could not be locked down' }
+  # 1. Working folder (R28): its parent admin-only, fail closed
+  $folderSecured = Protect-SetupFolder -Root $Context.Root -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.default)
+  if (-not $folderSecured) {
+    $errors.Add("Could not make $(Split-Path -Parent $Context.Root) admin-only (icacls failed, or a junction or symlink is in the way), so non-admin users may be able to change the setup files")
+  }
 
   # 2. Resume task
   # A first failure is often transient (Task Scheduler still starting after a fresh logon), so it is
@@ -415,6 +502,9 @@ function Invoke-StepPrepare {
   if (-not (Set-RegistryDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoRebootWithLoggedOnUsers' -Value 1)) { $registryOk = $false }
   if (-not $registryOk) { & $addNote 'Some Windows settings could not be applied' }
 
+  if (-not $folderSecured) {
+    return New-StepResult -Status Failed -Message 'Working folder could not be secured' -Notes $notes.ToArray() -Errors $errors.ToArray()
+  }
   if (-not $taskRegistered) {
     return New-StepResult -Status Failed -Message 'Could not register the resume task' -Notes $notes.ToArray() -Errors $errors.ToArray()
   }
