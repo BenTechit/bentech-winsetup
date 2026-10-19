@@ -5,15 +5,17 @@
 # zone and language list and remove apps. Nothing here may do any of that. Every test that reaches a
 # system command runs after Initialize-SystemMocks (each Describe calls it from BeforeEach), which
 # replaces EVERY command the five steps can use with a recorder: CIM, the registry cmdlets, time zone,
-# services, language list, Appx, Rename-Computer, Invoke-External, and also Stop-Process, Start-Process
-# and Restart-Computer so that "no Explorer restart / no reboot" can be asserted. The only code that
+# services, language list, Appx (the in-process cmdlets, and Invoke-PowerShellChild, the only way the
+# bloatware step reaches the Appx and DISM cmdlets), Rename-Computer, Invoke-External, and also
+# Stop-Process, Start-Process and Restart-Computer so that "no Explorer restart / no reboot" can be asserted. The only code that
 # really runs is in-memory: the CimInstance and WinUserLanguage objects are built without touching
 # WMI or the language settings, and Start-Sleep is real but only for a few milliseconds.
 BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   # Set-RegistryDword (the "create the key if missing, then write the DWord" helper) lives in
-  # Prepare.ps1. The bundle holds every file, so the steps below use it directly.
-  foreach ($f in 'Prepare', 'BitLocker', 'Region', 'Desktop', 'Bloatware', 'Rename') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
+  # Prepare.ps1, and Bloatware.ps1 runs its Appx calls through Invoke-PowerShellChild from Winget.ps1.
+  # The bundle holds every file, so the steps below use them directly.
+  foreach ($f in 'Prepare', 'Winget', 'BitLocker', 'Region', 'Desktop', 'Bloatware', 'Rename') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
   # Loads the WinUserLanguage type used to build fake language lists. Read-only.
   Import-Module International -ErrorAction Stop
 
@@ -33,7 +35,10 @@ BeforeAll {
     )
     $state = if ($NoMachine) { @{} } else { @{ Machine = @{ NewName = $NewName } } }
     @{
-      Config      = [pscustomobject]@{ bloatware = [pscustomobject]@{ remove = $Remove; protect = $Protect } }
+      Config      = [pscustomobject]@{
+        timeoutsMinutes = [pscustomobject]@{ default = 7 }
+        bloatware       = [pscustomobject]@{ remove = $Remove; protect = $Protect }
+      }
       State       = $state
       Root        = 'C:\BenTech\Setup'
       LogDir      = 'C:\BenTech\Setup\Logs'
@@ -47,6 +52,16 @@ BeforeAll {
   # so a pscustomobject would not bind to the mock.
   function New-FakeVolume {
     [Microsoft.Management.Infrastructure.CimInstance]::new('Win32_EncryptableVolume', $script:BitLockerNs)
+  }
+
+  # A real CimException (built in memory) carrying the NativeErrorCode that Get-CimInstance reports
+  # ('InvalidNamespace', 'InvalidClass', 'AccessDenied'...). The property is read-only on the real type,
+  # so the value is attached as a note property, which is what the code under test reads.
+  function New-FakeCimException {
+    param([string]$NativeErrorCode)
+    $ex = [Microsoft.Management.Infrastructure.CimException]::new('fake CIM failure')
+    Add-Member -InputObject $ex -NotePropertyName NativeErrorCode -NotePropertyValue $NativeErrorCode -Force
+    return $ex
   }
 
   # What Get-AppxPackage returns, as far as the pipeline into Remove-AppxPackage cares: that cmdlet's
@@ -73,7 +88,9 @@ BeforeAll {
   #   $script:cimGet       the arguments of each Get-CimInstance call
   #   $script:cimCalls     one hashtable per Invoke-CimMethod call (Method, Arguments)
   #   $script:ext          one hashtable per Invoke-External call
-  #   $script:statusSeq    GetConversionStatus answers, one per call; the last one repeats forever
+  #   $script:statusSeq    GetConversionStatus answers, one per call; the last one repeats forever. An entry is
+  #                        a status number, 'throw' (the call throws) or 'badrv' (non-zero ReturnValue)
+  #   $script:childCalls   one hashtable per Invoke-PowerShellChild call (Command, Timeout)
   function Initialize-SystemMocks {
     $script:calls = New-Object System.Collections.ArrayList
     $script:regValues = New-Object System.Collections.ArrayList
@@ -87,7 +104,8 @@ BeforeAll {
 
     # BitLocker
     $script:volume = New-FakeVolume             # what Get-CimInstance returns; $null = no volume
-    $script:cimGetThrows = $false               # an invalid namespace / class
+    $script:cimGetError = $null                 # Get-CimInstance throws a CimException with this NativeErrorCode
+    $script:cimGetPlainThrow = $false          # Get-CimInstance throws something that is not a CimException
     $script:statusSeq = @(0)
     $script:statusCalls = 0
     $script:statusReturnValue = 0
@@ -111,15 +129,17 @@ BeforeAll {
     $script:langSetThrowsFor = @()              # Set-WinUserLanguageList throws when this tag is in the new list
 
     # Bloatware
-    $script:installed = @()                     # Get-AppxPackage names
-    $script:provisioned = @()                   # Get-AppxProvisionedPackage display names
+    $script:installed = @()                     # names the in-process Get-AppxPackage lists
+    $script:provisioned = @()                   # display names the provisioned-list child prints
     $script:appxListThrows = $false
-    $script:provListThrows = $false
-    $script:failUserRemoval = @()               # names whose Remove-AppxPackage throws
-    $script:failProvRemoval = @()               # names whose Remove-AppxProvisionedPackage throws
+    $script:provListMode = 'ok'                 # the provisioned-list child: 'ok' | 'fail' | 'timeout' | 'noise'
+    $script:childThrows = $false                # Invoke-PowerShellChild cannot start powershell.exe
+    $script:failUserRemoval = @()               # names whose user-removal child exits 1
+    $script:failProvRemoval = @()               # names whose provisioned-removal child exits 1
+    $script:timeoutUserRemoval = @()            # names whose user-removal child times out
+    $script:childCalls = New-Object System.Collections.ArrayList
     $script:removedUser = New-Object System.Collections.ArrayList
     $script:removedProv = New-Object System.Collections.ArrayList
-    $script:provOnlineFlags = New-Object System.Collections.ArrayList
 
     # Rename
     $script:pendingName = 'DESKTOP-ABC123'
@@ -148,7 +168,8 @@ BeforeAll {
     Mock Get-CimInstance {
       [void]$script:calls.Add('cim-get')
       [void]$script:cimGet.Add(@{ Namespace = $Namespace; ClassName = $ClassName; Filter = $Filter })
-      if ($script:cimGetThrows) { throw 'Invalid namespace' }
+      if ($script:cimGetError) { throw (New-FakeCimException -NativeErrorCode $script:cimGetError) }
+      if ($script:cimGetPlainThrow) { throw 'WMI repository is busy' }
       return $script:volume
     }
     Mock Invoke-CimMethod {
@@ -158,7 +179,10 @@ BeforeAll {
         'GetConversionStatus' {
           $i = [Math]::Min($script:statusCalls, $script:statusSeq.Count - 1)
           $script:statusCalls++
-          return [pscustomobject]@{ ReturnValue = [uint32]$script:statusReturnValue; ConversionStatus = [uint32]$script:statusSeq[$i] }
+          $answer = $script:statusSeq[$i]
+          if ([string]$answer -eq 'throw') { throw 'GetConversionStatus failed' }
+          if ([string]$answer -eq 'badrv') { return [pscustomobject]@{ ReturnValue = $script:FveLockedVolume; ConversionStatus = [uint32]0 } }
+          return [pscustomobject]@{ ReturnValue = [uint32]$script:statusReturnValue; ConversionStatus = [uint32]$answer }
         }
         'Decrypt' {
           if ($script:decryptThrows) { throw 'Decrypt failed' }
@@ -199,32 +223,52 @@ BeforeAll {
       $script:langTags = $tags
     }
 
-    # Bloatware
+    # Bloatware. Only the current user's package LIST is read in-process. Everything that removes an
+    # app, and the provisioned list, goes through Invoke-PowerShellChild (a child process with a time
+    # limit); the mock below plays the part of that child by reading the command line it is given.
+    # The in-process Remove-Appx* / Get-AppxProvisionedPackage mocks are tripwires: any call to them is
+    # a bug (an unbounded call), and shows up in $script:calls.
     Mock Get-AppxPackage {
       [void]$script:calls.Add("appx-list $Name")
       if ($script:appxListThrows) { throw 'Appx service unavailable' }
       foreach ($n in $script:installed) { if ((-not $Name) -or ($n -like $Name)) { New-FakeAppx -Name $n } }
     }
-    Mock Get-AppxProvisionedPackage {
-      [void]$script:calls.Add('prov-list')
-      if ($script:provListThrows) { throw 'DISM unavailable' }
-      foreach ($n in $script:provisioned) { [pscustomobject]@{ DisplayName = $n; PackageName = "${n}_1.0.0.0_neutral_~_8wekyb3d8bbwe" } }
+    Mock Get-AppxProvisionedPackage { [void]$script:calls.Add('IN-PROCESS prov-list') }
+    Mock Remove-AppxPackage { [void]$script:calls.Add('IN-PROCESS appx-remove') }
+    Mock Remove-AppxProvisionedPackage { [void]$script:calls.Add('IN-PROCESS prov-remove') }
+    Mock Invoke-PowerShellChild {
+      [void]$script:calls.Add("child $Command")
+      [void]$script:childCalls.Add(@{ Command = $Command; Timeout = $TimeoutMinutes })
+      if ($script:childThrows) { throw 'cannot start powershell.exe' }
+      $ok = @{ ExitCode = 0; TimedOut = $false; Output = '' }
+      $bad = @{ ExitCode = 1; TimedOut = $false; Output = 'error' }
+      $hung = @{ ExitCode = $null; TimedOut = $true; Output = '' }
+      if ($Command -eq $script:ProvisionedListCommand) {
+        switch ($script:provListMode) {
+          'fail' { return $bad }
+          'timeout' { return $hung }
+          'noise' { return @{ ExitCode = 0; TimedOut = $false; Output = "#< CLIXML`r`n<Objs Version=`"1.1.0.1`">a|b c</Objs>`r`nnot a package line`r`nKept.Name|Kept.Name_1.0_x64__abc`r`n|nothing`r`nspace name|x`r`n" } }
+        }
+        $lines = foreach ($n in $script:provisioned) { "$n|${n}_1.0.0.0_neutral_~_8wekyb3d8bbwe" }
+        return @{ ExitCode = 0; TimedOut = $false; Output = (@($lines) -join "`r`n") }
+      }
+      if ($Command -match "^Get-AppxPackage -Name '(?<n>(?:[^']|'')*)' -ErrorAction Stop \| Remove-AppxPackage -ErrorAction Stop$") {
+        $n = $Matches['n'] -replace "''", "'"
+        [void]$script:calls.Add("appx-remove $n")
+        [void]$script:removedUser.Add($n)
+        if ($script:timeoutUserRemoval -contains $n) { return $hung }
+        if ($script:failUserRemoval -contains $n) { return $bad }
+        return $ok
+      }
+      if ($Command -match "^Remove-AppxProvisionedPackage -Online -PackageName '(?<p>(?:[^']|'')*)' -ErrorAction Stop \| Out-Null$") {
+        $short = (($Matches['p'] -replace "''", "'") -split '_')[0]
+        [void]$script:calls.Add("prov-remove $short")
+        [void]$script:removedProv.Add($short)
+        if ($script:failProvRemoval -contains $short) { return $bad }
+        return $ok
+      }
+      throw "UNEXPECTED child command: $Command"
     }
-    Mock Remove-AppxPackage {
-      $full = [string]$Package
-      $short = ($full -split '_')[0]
-      [void]$script:calls.Add("appx-remove $short")
-      [void]$script:removedUser.Add($short)
-      if ($script:failUserRemoval -contains $short) { throw "0x80073CFA removing $short" }
-    }
-    Mock Remove-AppxProvisionedPackage {
-      $short = ($PackageName -split '_')[0]
-      [void]$script:calls.Add("prov-remove $short")
-      [void]$script:removedProv.Add($short)
-      [void]$script:provOnlineFlags.Add([bool]$Online)
-      if ($script:failProvRemoval -contains $short) { throw "0x80070002 removing $short" }
-    }
-
     # Rename
     Mock Rename-Computer {
       [void]$script:calls.Add("rename $NewName")
@@ -294,8 +338,8 @@ Describe 'Get-BitLockerConversionStatus' {
     $null -eq $r | Should -BeFalse
     $r | Should -Be 0
   }
-  It 'returns $null when the namespace or class is missing (the query throws)' {
-    $script:cimGetThrows = $true
+  It 'returns $null when the <code> query fails' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }, @{ code = 'AccessDenied' }) {
+    $script:cimGetError = $code
     $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
     @(Get-CimMethodCall -Method 'GetConversionStatus').Count | Should -Be 0
   }
@@ -308,6 +352,48 @@ Describe 'Get-BitLockerConversionStatus' {
     $script:statusSeq = @(1)
     $script:statusReturnValue = $script:FveLockedVolume
     $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'returns $null and logs a WARN when GetConversionStatus throws' {
+    $script:statusSeq = @('throw')
+    { Get-BitLockerConversionStatus } | Should -Not -Throw
+    $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+}
+
+Describe 'Get-BitLockerVolumeInfo' {
+  BeforeEach { Initialize-SystemMocks }
+
+  It 'Present: found volume, handed back for reuse; one query for C: only' {
+    $r = Get-BitLockerVolumeInfo
+    $r.State | Should -Be 'Present'
+    $r.Volume | Should -Be $script:volume
+    $script:cimGet.Count | Should -Be 1
+    $script:cimGet[0].Filter | Should -Be "DriveLetter='C:'"
+    @(Get-LogEntry -Level 'WARN').Count | Should -Be 0
+  }
+  It 'Absent: the <code> CimException means this PC has no BitLocker (logged at INFO, not WARN)' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }) {
+    $script:cimGetError = $code
+    $r = Get-BitLockerVolumeInfo
+    $r.State | Should -Be 'Absent'
+    $null -eq $r.Volume | Should -BeTrue
+    @(Get-LogEntry -Level 'WARN').Count | Should -Be 0
+  }
+  It 'Absent: the query worked and no volume matched' {
+    $script:volume = $null
+    (Get-BitLockerVolumeInfo).State | Should -Be 'Absent'
+  }
+  It 'Unknown, never Absent: the <code> CimException says nothing about whether BitLocker exists (logged at WARN)' -ForEach @(@{ code = 'AccessDenied' }, @{ code = 'Failed' }, @{ code = 'ServerLimitsExceeded' }, @{ code = 'NotFound' }) {
+    $script:cimGetError = $code
+    $r = Get-BitLockerVolumeInfo
+    $r.State | Should -Be 'Unknown'
+    $null -eq $r.Volume | Should -BeTrue
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'Unknown: an error that is not a CimException (WMI busy, timeout...)' {
+    $script:cimGetPlainThrow = $true
+    (Get-BitLockerVolumeInfo).State | Should -Be 'Unknown'
     @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
   }
 }
@@ -338,14 +424,45 @@ Describe 'Invoke-StepBitLocker' {
     $script:regKeys.Count | Should -Be 0
     @(Get-RegWrite -Name 'PreventDeviceEncryption').Count | Should -Be 1
   }
-  It 'no BitLocker on the machine -> Done "BitLocker not present"; the registry value is still written' {
-    $script:cimGetThrows = $true
+  It 'no BitLocker on the machine (<code>) -> Done "BitLocker not present"; the registry value is still written' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }) {
+    $script:cimGetError = $code
     $r = Invoke-StepBitLocker -Context (New-SysContext)
     $r.Status | Should -Be 'Done'
     $r.Message | Should -Be 'BitLocker not present'
     $r.Reboot | Should -Be 'None'
+    @($r.Notes).Count | Should -Be 0
     @(Get-RegWrite -Name 'PreventDeviceEncryption').Count | Should -Be 1
     @(Get-CimMethodCall -Method 'Decrypt').Count | Should -Be 0
+  }
+  It 'no volume for C: -> Done "BitLocker not present"' {
+    $script:volume = $null
+    $r = Invoke-StepBitLocker -Context (New-SysContext)
+    $r.Message | Should -Be 'BitLocker not present'
+    @($r.Notes).Count | Should -Be 0
+  }
+  It 'a volume that could not be queried (<code>) is NOT "not present": Done with the Note "BitLocker status could not be read", nothing decrypted, registry value still written' -ForEach @(@{ code = 'AccessDenied' }, @{ code = 'Failed' }) {
+    $script:cimGetError = $code
+    $r = Invoke-StepBitLocker -Context (New-SysContext)
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Not -Be 'BitLocker not present'
+    @($r.Notes) | Should -Be @('BitLocker status could not be read')
+    @(Get-CimMethodCall -Method 'Decrypt').Count | Should -Be 0
+    @(Get-RegWrite -Name 'PreventDeviceEncryption').Count | Should -Be 1
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'a volume whose status cannot be read (<how>) is NOT "not present" either: same Note, nothing decrypted' -ForEach @(@{ how = 'throw' }, @{ how = 'badrv' }) {
+    $script:statusSeq = @($how)
+    $r = Invoke-StepBitLocker -Context (New-SysContext)
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Not -Be 'BitLocker not present'
+    @($r.Notes) | Should -Be @('BitLocker status could not be read')
+    @(Get-CimMethodCall -Method 'Decrypt').Count | Should -Be 0
+  }
+  It 'reads the volume once and reuses that object for Decrypt' {
+    $script:statusSeq = @(1)
+    $null = Invoke-StepBitLocker -Context (New-SysContext)
+    $script:cimGet.Count | Should -Be 1
+    @(Get-CimMethodCall -Method 'Decrypt')[0].Target | Should -Be $script:volume
   }
   It 'status 0 (decrypted) -> Done "Not encrypted" and Decrypt is never called' {
     $script:statusSeq = @(0)
@@ -412,9 +529,31 @@ Describe 'Wait-BitLockerDecrypted' {
     Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeTrue
     $script:statusCalls | Should -Be 1
   }
-  It 'is true at once when there is no BitLocker at all (status $null)' {
+  It 'is true at once when there is no BitLocker at all (no volume)' {
     $script:volume = $null
     Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeTrue
+  }
+  It 'is true at once when the BitLocker namespace or class is missing (<code>)' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }) {
+    $script:cimGetError = $code
+    Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeTrue
+    $script:statusCalls | Should -Be 0
+  }
+  It 'is FALSE (WARN) when the volume cannot be queried at all (<code>): "could not look" is not "decrypted"' -ForEach @(@{ code = 'AccessDenied' }, @{ code = 'Failed' }) {
+    $script:cimGetError = $code
+    Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeFalse
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'is FALSE (WARN) when the status cannot be read on the first poll (<how>)' -ForEach @(@{ how = 'throw' }, @{ how = 'badrv' }) {
+    $script:statusSeq = @($how)
+    Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeFalse
+    $script:statusCalls | Should -Be 1
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'is FALSE (WARN) when the status was 3 and then becomes unreadable mid-poll (<how>), never a false "decrypted"' -ForEach @(@{ how = 'throw' }, @{ how = 'badrv' }) {
+    $script:statusSeq = @(3, $how)
+    Wait-BitLockerDecrypted -TimeoutMinutes 1 -PollSeconds 0.01 | Should -BeFalse
+    $script:statusCalls | Should -Be 2
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
   }
   It 'polls while the status is 3 and is true as soon as it reaches 0' {
     $script:statusSeq = @(3, 3, 0)
@@ -475,6 +614,37 @@ Describe 'Suspend-BitLockerOnce' {
     $script:volume = $null
     Suspend-BitLockerOnce | Should -BeTrue
     @(Get-CimMethodCall -Method 'DisableKeyProtectors').Count | Should -Be 0
+  }
+  It 'has nothing to suspend when the BitLocker namespace or class is missing (<code>)' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }) {
+    $script:cimGetError = $code
+    Suspend-BitLockerOnce | Should -BeTrue
+    @(Get-CimMethodCall -Method 'DisableKeyProtectors').Count | Should -Be 0
+  }
+  It 'returns $false, and calls nothing, when the volume cannot be queried at all (<code>)' -ForEach @(@{ code = 'AccessDenied' }, @{ code = 'Failed' }) {
+    $script:cimGetError = $code
+    Suspend-BitLockerOnce | Should -BeFalse
+    @(Get-CimMethodCall -Method 'DisableKeyProtectors').Count | Should -Be 0
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'still attempts DisableKeyProtectors when the volume exists but its status is unreadable (<how>)' -ForEach @(@{ how = 'throw' }, @{ how = 'badrv' }) {
+    $script:statusSeq = @($how)
+    Suspend-BitLockerOnce | Should -BeTrue
+    $d = @(Get-CimMethodCall -Method 'DisableKeyProtectors')
+    $d.Count | Should -Be 1
+    $d[0].Target | Should -Be $script:volume
+    $d[0].Arguments['DisableCount'] | Should -BeOfType [uint32]
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
+  }
+  It 'returns $false when the status is unreadable AND DisableKeyProtectors fails' {
+    $script:statusSeq = @('throw')
+    $script:disableReturnValue = $script:FveLockedVolume
+    Suspend-BitLockerOnce | Should -BeFalse
+    @(Get-CimMethodCall -Method 'DisableKeyProtectors').Count | Should -Be 1
+  }
+  It 'reads the volume once and reuses that object' {
+    $script:statusSeq = @(1)
+    $null = Suspend-BitLockerOnce
+    $script:cimGet.Count | Should -Be 1
   }
   It 'has nothing to suspend on a decrypted volume' {
     $script:statusSeq = @(0)
@@ -691,23 +861,74 @@ Describe 'Invoke-StepBloatware' {
     @($r.Notes).Count | Should -Be 0
     @($script:removedUser) | Should -Be @('king.com.CandyCrushSaga', 'MicrosoftTeams')
     @($script:removedProv) | Should -Be @('king.com.CandyCrushSaga', 'MicrosoftTeams')
-    $script:removedUser | Should -Not -Contain 'Microsoft.WindowsCalculator'
-    $script:removedUser | Should -Not -Contain 'MSTeams'
-    $script:removedProv | Should -Not -Contain 'Microsoft.WindowsCalculator'
-    $script:removedProv | Should -Not -Contain 'MSTeams'
-    $script:provOnlineFlags | Should -Not -Contain $false
+  }
+  It 'no protected package name appears in ANY command line that reaches a child process' {
+    $script:installed = @('king.com.CandyCrushSaga', 'Microsoft.WindowsCalculator', 'MicrosoftTeams', 'MSTeams', 'Contoso.Keep')
+    $script:provisioned = @('king.com.CandyCrushSaga', 'Microsoft.WindowsCalculator', 'MicrosoftTeams', 'MSTeams')
+    $ctx = New-SysContext -Remove @('king.com.*', 'MicrosoftTeams', 'Microsoft.WindowsCalculator') -Protect @('Microsoft.WindowsCalculator', 'MSTeams')
+    $null = Invoke-StepBloatware -Context $ctx
+    $script:childCalls.Count | Should -BeGreaterThan 1
+    foreach ($call in $script:childCalls) {
+      $call.Command | Should -Not -Match 'Microsoft\.WindowsCalculator'
+      $call.Command | Should -Not -Match 'MSTeams'
+      $call.Command | Should -Not -Match 'Contoso\.Keep'
+    }
+  }
+  It 'runs the provisioned list and every removal as an exact, quoted command line in a child process' {
+    $script:installed = @('king.com.CandyCrushSaga')
+    $script:provisioned = @('king.com.CandyCrushSaga')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    @($script:childCalls | ForEach-Object { $_.Command }) | Should -Be @(
+      'Get-AppxProvisionedPackage -Online -ErrorAction Stop | ForEach-Object { $_.DisplayName + ''|'' + $_.PackageName }',
+      'Get-AppxPackage -Name ''king.com.CandyCrushSaga'' -ErrorAction Stop | Remove-AppxPackage -ErrorAction Stop',
+      'Remove-AppxProvisionedPackage -Online -PackageName ''king.com.CandyCrushSaga_1.0.0.0_neutral_~_8wekyb3d8bbwe'' -ErrorAction Stop | Out-Null')
+  }
+  It 'bounds every child with Config.timeoutsMinutes.default' {
+    $script:installed = @('king.com.CandyCrushSaga')
+    $script:provisioned = @('king.com.CandyCrushSaga')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    $script:childCalls.Count | Should -Be 3
+    foreach ($call in $script:childCalls) { $call.Timeout | Should -Be 7 }
+  }
+  It 'falls back to 30 minutes when the config has no default timeout' {
+    $script:installed = @('king.com.CandyCrushSaga')
+    $ctx = New-SysContext
+    $ctx.Config.PSObject.Properties.Remove('timeoutsMinutes')
+    $null = Invoke-StepBloatware -Context $ctx
+    $script:childCalls.Count | Should -BeGreaterThan 1
+    foreach ($call in $script:childCalls) { $call.Timeout | Should -Be 30 }
+  }
+  It 'never calls the unbounded in-process Appx/DISM cmdlets' {
+    $script:installed = @('king.com.CandyCrushSaga', 'MicrosoftTeams')
+    $script:provisioned = @('king.com.CandyCrushSaga', 'MicrosoftTeams')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    @($script:calls | Where-Object { $_ -like 'IN-PROCESS*' }).Count | Should -Be 0
+    @($script:removedUser).Count | Should -Be 2
+  }
+  It 'every command line it builds is valid PowerShell, even for a name with an apostrophe' {
+    $script:installed = @("king.com.O'Brien.App", 'king.com.Plain')
+    $script:provisioned = @('king.com.Plain')
+    $r = Invoke-StepBloatware -Context (New-SysContext)
+    $r.Message | Should -Be 'Removed 2 packages'
+    @($script:removedUser) | Should -Be @("king.com.O'Brien.App", 'king.com.Plain')
+    @($script:childCalls | Where-Object { $_.Command -like "*O''Brien*" }).Count | Should -Be 1
+    foreach ($call in $script:childCalls) {
+      $errors = $null
+      [void][Management.Automation.Language.Parser]::ParseInput($call.Command, [ref]$null, [ref]$errors)
+      @($errors).Count | Should -Be 0 -Because $call.Command
+    }
   }
   It 'collects names from both lists, once each, and looks each one up by -Name' {
     $script:installed = @('king.com.CandyCrushSaga')
     $script:provisioned = @('king.com.CandyCrushSaga', 'MicrosoftTeams')
     $r = Invoke-StepBloatware -Context (New-SysContext)
     $r.Message | Should -Be 'Removed 2 packages'
-    ($script:calls -match '^appx-list king\.com\.CandyCrushSaga$').Count | Should -Be 1
-    ($script:calls -match '^appx-list MicrosoftTeams$').Count | Should -Be 1
-    @($script:removedUser) | Should -Be @('king.com.CandyCrushSaga')           # MicrosoftTeams is provisioned only
+    @($script:childCalls | Where-Object { $_.Command -like "Get-AppxPackage -Name 'king.com.CandyCrushSaga' *" }).Count | Should -Be 1
+    @($script:childCalls | Where-Object { $_.Command -like "Get-AppxPackage -Name 'MicrosoftTeams' *" }).Count | Should -Be 1
+    @($script:removedUser) | Should -Be @('king.com.CandyCrushSaga', 'MicrosoftTeams')    # the second is a no-op for this user: it is provisioned only
     @($script:removedProv) | Should -Be @('king.com.CandyCrushSaga', 'MicrosoftTeams')
   }
-  It 'with the shipping config, none of the protected apps is touched' {
+  It 'with the shipping config, none of the protected apps reaches a removal command' {
     $cfg = Get-Content -LiteralPath $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
     $keep = @('Microsoft.WindowsStore', 'Microsoft.DesktopAppInstaller', 'Microsoft.Windows.Photos', 'Microsoft.WindowsCalculator',
       'Microsoft.WindowsNotepad', 'Microsoft.Paint', 'Microsoft.ScreenSketch', 'Microsoft.WindowsCamera', 'Microsoft.ZuneMusic',
@@ -724,9 +945,12 @@ Describe 'Invoke-StepBloatware' {
     @($script:removedUser | Where-Object { $_ -in $keep }).Count | Should -Be 0
     @($script:removedProv | Where-Object { $_ -in $keep }).Count | Should -Be 0
     @($script:removedUser | Sort-Object) | Should -Be @($junk | Sort-Object)
+    foreach ($call in $script:childCalls) {
+      foreach ($k in $keep) { $call.Command | Should -Not -Match ([regex]::Escape("'$k")) }
+    }
     $result.Message | Should -Be "Removed $($junk.Count) packages"
   }
-  It 'counts the packages that failed: Done, "Removed N packages" for the rest, and one Note' {
+  It 'a child that exits non-zero is one failed package: Done, "Removed N packages" for the rest, one Note, a WARN' {
     $script:installed = @('king.com.CandyCrushSaga', 'king.com.Other', 'MicrosoftTeams')
     $script:provisioned = @('king.com.CandyCrushSaga', 'king.com.Other', 'MicrosoftTeams')
     $script:failUserRemoval = @('king.com.Other')
@@ -746,30 +970,109 @@ Describe 'Invoke-StepBloatware' {
     $r.Message | Should -Be 'Removed 1 packages'
     @($r.Notes) | Should -Be @('Bloatware: 2 packages could not be removed')
     $script:removedUser | Should -Contain 'king.com.B'
-    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterOrEqual 2          # one WARN per failure, none swallowed
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterOrEqual 3          # one WARN per failed removal, none swallowed
   }
-  It 'nothing to remove -> Done "Removed 0 packages", no Note, no removal call' {
+  It 'a removal that times out stops the run of removals: the rest are not tried, count as failed, and the Notes say why' {
+    $script:installed = @('king.com.A', 'king.com.B', 'king.com.C')
+    $script:provisioned = @('king.com.A', 'king.com.B', 'king.com.C')
+    $script:timeoutUserRemoval = @('king.com.A')
+    $r = Invoke-StepBloatware -Context (New-SysContext)
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Removed 0 packages'
+    @($r.Notes) | Should -Be @('Bloatware: removal stopped after a timeout', 'Bloatware: 3 packages could not be removed')
+    @($script:removedUser) | Should -Be @('king.com.A')
+    $script:removedProv.Count | Should -Be 0
+    $script:childCalls.Count | Should -Be 2           # the list and the one removal that hung
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterOrEqual 2
+  }
+  It 'a child process that cannot be started counts as a failure of that package, without stopping the others' {
+    $script:installed = @('king.com.A', 'king.com.B')
+    $script:childThrows = $true
+    $r = Invoke-StepBloatware -Context (New-SysContext)
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Removed 0 packages'
+    @($r.Notes) | Should -Be @('Bloatware: provisioned apps could not be listed', 'Bloatware: 2 packages could not be removed')
+    @($script:childCalls | Where-Object { $_.Command -like 'Get-AppxPackage -Name*' }).Count | Should -Be 2
+  }
+  It 'nothing to remove -> Done "Removed 0 packages", no Note, only the provisioned list is run' {
     $script:installed = @('Microsoft.WindowsCalculator', 'Contoso.Keep')
     $script:provisioned = @('Microsoft.WindowsCalculator')
     $r = Invoke-StepBloatware -Context (New-SysContext)
     $r.Status | Should -Be 'Done'
     $r.Message | Should -Be 'Removed 0 packages'
     @($r.Notes).Count | Should -Be 0
+    $script:childCalls.Count | Should -Be 1
     $script:removedUser.Count | Should -Be 0
     $script:removedProv.Count | Should -Be 0
   }
-  It 'an unreadable app list is a Note, not a failure, and removes what the other list shows' {
+  It 'an unreadable user app list is a Note, not a failure, and removes what the provisioned list shows' {
     $script:appxListThrows = $true
     $script:provisioned = @('MicrosoftTeams', 'Contoso.Keep')
     $r = Invoke-StepBloatware -Context (New-SysContext)
     $r.Status | Should -Be 'Done'
-    @($r.Notes).Count | Should -BeGreaterOrEqual 1
+    @($r.Notes) | Should -Be @('Bloatware: installed apps could not be listed')
     @($script:removedProv) | Should -Be @('MicrosoftTeams')
+  }
+  It 'a provisioned list that <mode> -> a WARN and a Note, and the current user''s packages are still removed' -ForEach @(@{ mode = 'fails'; value = 'fail' }, @{ mode = 'times out'; value = 'timeout' }) {
+    $script:provListMode = $value
+    $script:installed = @('king.com.CandyCrushSaga', 'Contoso.Keep')
+    $r = Invoke-StepBloatware -Context (New-SysContext)
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Removed 1 packages'
+    @($r.Notes) | Should -Be @('Bloatware: provisioned apps could not be listed')
+    @($script:removedUser) | Should -Be @('king.com.CandyCrushSaga')
+    $script:removedProv.Count | Should -Be 0
+    @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterOrEqual 1
+  }
+  It 'only well-formed "<DisplayName>|<PackageName>" lines of the provisioned list are used; noise never becomes a target' {
+    $script:provListMode = 'noise'
+    $ctx = New-SysContext -Remove @('*') -Protect @()
+    $r = Invoke-StepBloatware -Context $ctx
+    $r.Message | Should -Be 'Removed 1 packages'
+    @($script:removedProv) | Should -Be @('Kept.Name')
+    @($script:childCalls | Where-Object { $_.Command -like '*CLIXML*' -or $_.Command -like '*not a package*' -or $_.Command -like '*space name*' }).Count | Should -Be 0
   }
   It 'never restarts anything' {
     $script:installed = @('MicrosoftTeams')
     $null = Invoke-StepBloatware -Context (New-SysContext)
     ($script:calls -match '^(restart-computer|stop-computer|stop-process)').Count | Should -Be 0
+  }
+}
+
+Describe 'Invoke-StepBloatware through the real Invoke-PowerShellChild' {
+  # Invoke-PowerShellChild itself is NOT mocked here, only Invoke-External under it, so the command
+  # line that would reach powershell.exe can be decoded and checked.
+  BeforeEach {
+    $script:extCalls = New-Object System.Collections.ArrayList
+    $script:tripwire = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog {}
+    Mock Get-AppxPackage { foreach ($n in 'king.com.CandyCrushSaga', 'Microsoft.WindowsCalculator') { [pscustomobject]@{ Name = $n } } }
+    Mock Get-AppxProvisionedPackage { [void]$script:tripwire.Add('prov-list') }
+    Mock Remove-AppxPackage { [void]$script:tripwire.Add('appx-remove') }
+    Mock Remove-AppxProvisionedPackage { [void]$script:tripwire.Add('prov-remove') }
+    Mock Invoke-External {
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $text = if ($ArgumentList -match 'EncodedCommand (?<b>\S+)$') { [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches['b'])) } else { '' }
+      $out = if ($text -like '*Get-AppxProvisionedPackage*') { "king.com.CandyCrushSaga|king.com.CandyCrushSaga_1.0_x64__abc`r`n" } else { '' }
+      return @{ ExitCode = 0; TimedOut = $false; Output = $out }
+    }
+  }
+
+  It 'each Appx/DISM call is its own -EncodedCommand powershell.exe with the configured timeout, and nothing runs in-process' {
+    $r = Invoke-StepBloatware -Context (New-SysContext)
+    $r.Message | Should -Be 'Removed 1 packages'
+    $script:tripwire.Count | Should -Be 0
+    $script:extCalls.Count | Should -Be 3
+    $decoded = foreach ($c in $script:extCalls) {
+      $c.FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
+      $c.TimeoutMinutes | Should -Be 7
+      $c.Capture | Should -BeTrue
+      $c.ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
+      [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($c.ArgumentList -split ' ')[-1]))
+    }
+    $decoded[1].EndsWith("Get-AppxPackage -Name 'king.com.CandyCrushSaga' -ErrorAction Stop | Remove-AppxPackage -ErrorAction Stop") | Should -BeTrue
+    $decoded[2].EndsWith("Remove-AppxProvisionedPackage -Online -PackageName 'king.com.CandyCrushSaga_1.0_x64__abc' -ErrorAction Stop | Out-Null") | Should -BeTrue
+    ($decoded -join "`n") | Should -Not -Match 'WindowsCalculator'
   }
 }
 

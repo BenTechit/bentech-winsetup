@@ -6,12 +6,24 @@
 # no manage-bde, no BitLocker module, nothing whose output is localized text. Needs StepResult.ps1 and
 # Logging.ps1, and Set-RegistryDword from Prepare.ps1 (the bundle holds every file).
 #
+# "No BitLocker" and "could not read BitLocker" are different answers and must never be mixed up:
+# the first is safe to act on (nothing to wait for, nothing to suspend), the second is not (a BIOS
+# flash on a drive that is in fact encrypted can leave the PC asking for a recovery key). The
+# volume is therefore reported as 'Present', 'Absent' or 'Unknown' (Get-BitLockerVolumeInfo), and
+# only Absent is treated as "no BitLocker".
+#
 # A new Windows 11 PC auto-encrypts the system drive ("device encryption") as soon as the user signs
 # in with a Microsoft account. PreventDeviceEncryption = 1 stops that from happening again after
 # the drive has been decrypted here.
 
 $script:BitLockerNamespace = 'root\cimv2\Security\MicrosoftVolumeEncryption'
 $script:BitLockerPolicyKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker'
+
+# CimException.NativeErrorCode values that mean "this class of object does not exist here" (the
+# namespace is missing on an edition without BitLocker, or the class is). The enum NAME is used, not
+# the message text, which is localized. Anything else (AccessDenied, Failed, a timeout, a service
+# that is down...) says nothing about whether BitLocker exists, so it is 'Unknown'.
+$script:BitLockerAbsentErrorCodes = @('InvalidNamespace', 'InvalidClass')
 
 function Get-BitLockerAction {
   <#
@@ -36,46 +48,85 @@ function Get-BitLockerAction {
   }
 }
 
-function Get-BitLockerCimVolume {
-  # Private. The CIM instance for C:, or $null when the namespace, the class or the volume is missing
-  # (no BitLocker on this edition, or a VM without it). The exception text is localized and is only logged.
+function Get-BitLockerVolumeInfo {
+  <#
+  .SYNOPSIS
+    Private. Looks C: up in CIM and returns @{ State = 'Present'|'Absent'|'Unknown'; Volume = <CimInstance|$null> }.
+  .DESCRIPTION
+    Present: the volume was found (Volume holds it, for the caller to reuse).
+    Absent:  the namespace or class does not exist (CimException.NativeErrorCode InvalidNamespace or
+             InvalidClass), or the query worked and no volume matched. Logged at INFO.
+    Unknown: the query failed for any other reason (access denied, WMI down, a timeout, an error
+             that is not a CimException). Logged at WARN. Never to be read as "no BitLocker".
+  #>
   [CmdletBinding()]
+  [OutputType([hashtable])]
   param()
 
   try {
-    $volume = Get-CimInstance -Namespace $script:BitLockerNamespace -ClassName Win32_EncryptableVolume -Filter "DriveLetter='C:'" -ErrorAction Stop
+    $found = Get-CimInstance -Namespace $script:BitLockerNamespace -ClassName Win32_EncryptableVolume -Filter "DriveLetter='C:'" -ErrorAction Stop
   } catch {
-    Write-SetupLog -Message 'BitLocker volume not available' -Data @{ error = $_.Exception.Message }
-    return $null
+    $code = [string]$_.Exception.NativeErrorCode
+    if ($code -in $script:BitLockerAbsentErrorCodes) {
+      Write-SetupLog -Message 'BitLocker is not available on this PC' -Data @{ nativeErrorCode = $code }
+      return @{ State = 'Absent'; Volume = $null }
+    }
+    Write-SetupLog -Message 'BitLocker volume could not be queried' -Level WARN -Data @{ nativeErrorCode = $code; error = $_.Exception.Message }
+    return @{ State = 'Unknown'; Volume = $null }
   }
-  return @($volume | Select-Object -First 1)[0]
+
+  $volume = @($found | Select-Object -First 1)[0]
+  if ($null -eq $volume) {
+    Write-SetupLog -Message 'BitLocker has no volume for C:'
+    return @{ State = 'Absent'; Volume = $null }
+  }
+  return @{ State = 'Present'; Volume = $volume }
+}
+
+function Get-BitLockerState {
+  <#
+  .SYNOPSIS
+    Private. @{ Presence = 'Present'|'Absent'|'Unknown'; Volume; Status = <int|$null> } in one CIM round.
+  .DESCRIPTION
+    Status is the ConversionStatus and is $null unless Presence is 'Present' AND GetConversionStatus
+    answered (an exception or a non-zero ReturnValue is a WARN and leaves it $null). So Present with a
+    $null Status means "there is a volume but its state could not be read".
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param()
+
+  $info = Get-BitLockerVolumeInfo
+  $state = @{ Presence = $info.State; Volume = $info.Volume; Status = $null }
+  if ($info.State -ne 'Present') { return $state }
+
+  try {
+    $r = Invoke-CimMethod -InputObject $info.Volume -MethodName GetConversionStatus -ErrorAction Stop
+  } catch {
+    Write-SetupLog -Message 'BitLocker status could not be read' -Level WARN -Data @{ error = $_.Exception.Message }
+    return $state
+  }
+  if ($null -eq $r -or [uint32]$r.ReturnValue -ne 0) {
+    $code = if ($null -ne $r) { '0x{0:X8}' -f [uint32]$r.ReturnValue } else { 'no result' }
+    Write-SetupLog -Message 'BitLocker status call failed' -Level WARN -Data @{ returnValue = $code }
+    return $state
+  }
+  $state.Status = [int]$r.ConversionStatus
+  return $state
 }
 
 function Get-BitLockerConversionStatus {
   <#
   .SYNOPSIS
-    Returns C:'s ConversionStatus (0..5) as an int, or $null when BitLocker is not there.
+    Returns C:'s ConversionStatus (0..5) as an int, or $null when it is not available.
   .DESCRIPTION
-    $null means "no volume": a missing namespace, class or volume. A GetConversionStatus call that
-    fails (an exception, or a non-zero ReturnValue) is a WARN in the log and also gives $null.
+    $null covers both "no BitLocker" and "could not be read" (a failure is a WARN in the log). Callers
+    that must tell the two apart (the steps in this file do) use Get-BitLockerState.
   #>
   [CmdletBinding()]
   param()
 
-  $volume = Get-BitLockerCimVolume
-  if ($null -eq $volume) { return $null }
-  try {
-    $r = Invoke-CimMethod -InputObject $volume -MethodName GetConversionStatus -ErrorAction Stop
-  } catch {
-    Write-SetupLog -Message 'BitLocker status could not be read' -Level WARN -Data @{ error = $_.Exception.Message }
-    return $null
-  }
-  if ($null -eq $r -or [uint32]$r.ReturnValue -ne 0) {
-    $code = if ($null -ne $r) { '0x{0:X8}' -f [uint32]$r.ReturnValue } else { 'no result' }
-    Write-SetupLog -Message 'BitLocker status call failed' -Level WARN -Data @{ returnValue = $code }
-    return $null
-  }
-  return [int]$r.ConversionStatus
+  return (Get-BitLockerState).Status
 }
 
 function Invoke-StepBitLocker {
@@ -86,9 +137,13 @@ function Invoke-StepBitLocker {
     1. HKLM\SYSTEM\CurrentControlSet\Control\BitLocker\PreventDeviceEncryption = 1, ALWAYS and first,
        so a failure further down still leaves the machine from re-encrypting. A refused write is a
        Note, not a failure.
-    2. The conversion status decides: no BitLocker -> Done('BitLocker not present'), Not encrypted ->
-       Done('Not encrypted'), already decrypting -> Done('Decryption in progress'), anything else ->
-       the Decrypt method -> Done('Decryption started').
+    2. The volume and its conversion status are read once; that volume is then reused for Decrypt.
+         Absent                       -> Done('BitLocker not present')
+         Unknown, or unreadable status -> Done('BitLocker status unknown') with the Note
+                                          'BitLocker status could not be read' (never "not present")
+         not encrypted                -> Done('Not encrypted')
+         already decrypting           -> Done('Decryption in progress')
+         anything else                -> the Decrypt method -> Done('Decryption started')
     Decryption runs in the background and needs no restart, so the step does not wait for it; the
     vendor step waits (Wait-BitLockerDecrypted) before it flashes a BIOS, and Finalize reports it.
     A Decrypt that fails (non-zero ReturnValue, or an exception) is Failed.
@@ -102,10 +157,16 @@ function Invoke-StepBitLocker {
     $notes.Add('Automatic device encryption could not be turned off')
   }
 
-  $status = Get-BitLockerConversionStatus
-  if ($null -eq $status) {
+  $state = Get-BitLockerState
+  if ($state.Presence -eq 'Absent') {
     return New-StepResult -Status Done -Message 'BitLocker not present' -Notes $notes.ToArray()
   }
+  if ($state.Presence -ne 'Present' -or $null -eq $state.Status) {
+    Write-SetupLog -Message 'BitLocker state is unknown; nothing was changed' -Level WARN -Data @{ presence = $state.Presence }
+    $notes.Add('BitLocker status could not be read')
+    return New-StepResult -Status Done -Message 'BitLocker status unknown' -Notes $notes.ToArray()
+  }
+  $status = [int]$state.Status
 
   switch (Get-BitLockerAction -ConversionStatus $status) {
     'None' { return New-StepResult -Status Done -Message 'Not encrypted' -Notes $notes.ToArray() }
@@ -113,12 +174,8 @@ function Invoke-StepBitLocker {
   }
 
   # Decrypt
-  $volume = Get-BitLockerCimVolume
-  if ($null -eq $volume) {
-    return New-StepResult -Status Done -Message 'BitLocker not present' -Notes $notes.ToArray()
-  }
   try {
-    $r = Invoke-CimMethod -InputObject $volume -MethodName Decrypt -ErrorAction Stop
+    $r = Invoke-CimMethod -InputObject $state.Volume -MethodName Decrypt -ErrorAction Stop
   } catch {
     $reason = $_.Exception.Message
     Write-SetupLog -Message 'BitLocker decrypt threw' -Level ERROR -Data @{ status = $status; error = $reason }
@@ -137,13 +194,15 @@ function Invoke-StepBitLocker {
 function Wait-BitLockerDecrypted {
   <#
   .SYNOPSIS
-    Waits for C: to finish decrypting. $true = decrypted (or no BitLocker); $false = timed out, or
-    the volume is not decrypting.
+    Waits for C: to finish decrypting. $true = decrypted, or there is no BitLocker; $false = timed out,
+    not decrypting, or the state could not be read.
   .DESCRIPTION
-    Status 0 or $null (no BitLocker) -> $true. Status 3 (decrypting) -> poll again every PollSeconds
-    until the TimeoutMinutes are used up, then $false. Status 1, 2, 4 or 5 means no decryption is
-    running, so waiting would be pointless: $false at once. PollSeconds and TimeoutMinutes take
-    fractions so a test can run in milliseconds.
+    Volume absent, or status 0 -> $true. Status 3 (decrypting) -> poll again every PollSeconds until
+    the TimeoutMinutes are used up, then $false. Status 1, 2, 4 or 5 means no decryption is
+    running, so waiting would be pointless: $false at once. A volume that cannot be queried at all
+    (Unknown), or a volume whose status cannot be read, is $false with a WARN: "I could not look" must
+    never be reported as "decrypted", because the caller goes on to flash a BIOS. PollSeconds and
+    TimeoutMinutes take fractions so a test can run in milliseconds.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -156,8 +215,17 @@ function Wait-BitLockerDecrypted {
   $timeoutMs = $TimeoutMinutes * 60000
   $lastStatus = -1
   while ($true) {
-    $status = Get-BitLockerConversionStatus
-    if ($null -eq $status -or $status -eq 0) {
+    $state = Get-BitLockerState
+    if ($state.Presence -eq 'Absent') {
+      Write-SetupLog -Message 'No BitLocker; nothing to wait for'
+      return $true
+    }
+    if ($state.Presence -ne 'Present' -or $null -eq $state.Status) {
+      Write-SetupLog -Message 'BitLocker state could not be read; not treating it as decrypted' -Level WARN -Data @{ presence = $state.Presence; waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
+      return $false
+    }
+    $status = [int]$state.Status
+    if ($status -eq 0) {
       Write-SetupLog -Message 'BitLocker is decrypted' -Data @{ waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
       return $true
     }
@@ -184,22 +252,35 @@ function Suspend-BitLockerOnce {
     Suspends BitLocker protection for one restart (DisableKeyProtectors, DisableCount = 1), e.g. before
     a BIOS flash. Returns $true when C: is suspended or there is nothing to suspend; never throws.
   .DESCRIPTION
-    A machine without BitLocker, or with a decrypted C:, has nothing to protect, so that is $true and
-    nothing is called. Anything that goes wrong (an exception, a non-zero ReturnValue) is a WARN and $false.
+    No BitLocker (the volume is Absent) or a decrypted C: (status 0) has nothing to protect: $true,
+    nothing is called. A volume that cannot be queried at all (Unknown) cannot be suspended: $false.
+    A volume that exists but whose status could not be read is treated as possibly encrypted: the
+    suspension is still attempted, because suspending an unprotected drive is harmless and a wrongly
+    skipped suspension is not. Anything that goes wrong (an exception, a non-zero ReturnValue) is a
+    WARN and $false.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param()
 
   try {
-    $status = Get-BitLockerConversionStatus
-    if ($null -eq $status -or $status -eq 0) {
+    $state = Get-BitLockerState
+    if ($state.Presence -eq 'Absent') {
+      Write-SetupLog -Message 'No BitLocker; nothing to suspend'
+      return $true
+    }
+    if ($state.Presence -ne 'Present') {
+      Write-SetupLog -Message 'BitLocker could not be queried, so it cannot be suspended' -Level WARN
+      return $false
+    }
+    if ($null -ne $state.Status -and $state.Status -eq 0) {
       Write-SetupLog -Message 'BitLocker not active; nothing to suspend'
       return $true
     }
-    $volume = Get-BitLockerCimVolume
-    if ($null -eq $volume) { return $true }
-    $r = Invoke-CimMethod -InputObject $volume -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]1 } -ErrorAction Stop
+    if ($null -eq $state.Status) {
+      Write-SetupLog -Message 'BitLocker status unreadable; suspending anyway' -Level WARN
+    }
+    $r = Invoke-CimMethod -InputObject $state.Volume -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]1 } -ErrorAction Stop
     if ($null -ne $r -and [uint32]$r.ReturnValue -eq 0) {
       Write-SetupLog -Message 'BitLocker suspended for one restart'
       return $true
