@@ -123,8 +123,8 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # What a child round writes, as Invoke-WuRound builds it.
     function New-ChildResult {
-      param([object[]]$Installed = @(), [object[]]$Failed = @(), [string[]]$Hidden = @(), [bool]$OnlyDefinitions = $false, [bool]$RebootRequired = $false, $ErrorText = $null)
-      [ordered]@{ Installed = @($Installed); Failed = @($Failed); Hidden = [string[]]@($Hidden); OnlyDefinitions = $OnlyDefinitions; RebootRequired = $RebootRequired; Error = $ErrorText }
+      param([object[]]$Installed = @(), [object[]]$Failed = @(), [string[]]$Hidden = @(), [bool]$OnlyDefinitions = $false, [bool]$RebootRequired = $false, $ErrorText = $null, $ErrorCode = $null)
+      [ordered]@{ Installed = @($Installed); Failed = @($Failed); Hidden = [string[]]@($Hidden); OnlyDefinitions = $OnlyDefinitions; RebootRequired = $RebootRequired; Error = $ErrorText; ErrorCode = $ErrorCode }
     }
   }
 
@@ -202,6 +202,9 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:installCalls = New-Object System.Collections.ArrayList
       $script:installCodes = @{}
       $script:installReboot = $false
+      $script:installThrow = $null
+      $script:installHResult = 0
+      $script:downloadHResult = 0
       $script:systemReboot = $false
       $script:registerCalls = 0
       $script:registered = $true
@@ -221,13 +224,15 @@ Describe 'Windows Update round and step (mocked COM)' {
       Mock Invoke-WuDownload {
         $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID })
         [void]$script:downloadCalls.Add($ids)
-        foreach ($id in $ids) { if ($script:downloadCodes.Contains($id)) { $script:downloadCodes[$id] } else { 2 } }
+        $codes = @(foreach ($id in $ids) { if ($script:downloadCodes.Contains($id)) { $script:downloadCodes[$id] } else { 2 } })
+        return @{ ResultCodes = $codes; HResult = $script:downloadHResult }
       }
       Mock Invoke-WuInstall {
         $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID })
         [void]$script:installCalls.Add($ids)
+        if ($null -ne $script:installThrow) { throw $script:installThrow }
         $codes = @(foreach ($id in $ids) { if ($script:installCodes.Contains($id)) { $script:installCodes[$id] } else { 2 } })
-        return @{ ResultCodes = $codes; RebootRequired = $script:installReboot }
+        return @{ ResultCodes = $codes; RebootRequired = $script:installReboot; HResult = $script:installHResult }
       }
       Mock Get-WuRebootRequired { return $script:systemReboot }
     }
@@ -385,6 +390,46 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r.Error | Should -Match 'state'
       $script:searches.Count | Should -Be 0
     }
+
+    # Ruling R23: the numeric code next to the text.
+    It 'writes the ErrorCode of a COM exception next to its text' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $script:installThrow = New-Object Runtime.InteropServices.COMException('x', 0x80240016)
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $r.Error | Should -Be 'x'
+      $r.ErrorCode | Should -Be '0x80240016'
+    }
+    It 'finds the COM code inside a PowerShell wrapper exception' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $com = New-Object Runtime.InteropServices.COMException('inner', 0x8024A000)
+      $script:installThrow = New-Object System.Management.Automation.MethodInvocationException('Exception calling "Install" with "0" argument(s): "inner"', $com)
+      (Invoke-TestRound -StatePath (New-WuStateFile)).ErrorCode | Should -Be '0x8024A000'
+    }
+    It 'writes the outer code for a non-COM exception' {
+      $script:searchError = 'plain failure'
+      (Invoke-TestRound -StatePath (New-WuStateFile)).ErrorCode | Should -Match '^0x[0-9A-F]{8}$'
+    }
+    It 'records the installation result''s own HResult without turning it into an Error' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+      $script:installCodes = @{ b = 4 }
+      $script:installHResult = 0x80242014
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $r.ErrorCode | Should -Be '0x80242014'
+      $r.Error | Should -BeNullOrEmpty
+      @($r.Installed.Id) | Should -Be @('a')
+      @($r.Failed.Id) | Should -Be @('b')
+    }
+    It 'records the download result''s own HResult' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $script:downloadHResult = 0x80240016
+      (Invoke-TestRound -StatePath (New-WuStateFile)).ErrorCode | Should -Be '0x80240016'
+    }
+    It 'has no ErrorCode when the round went well' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $r.PSObject.Properties['ErrorCode'] | Should -Not -BeNullOrEmpty
+      $r.ErrorCode | Should -BeNullOrEmpty
+    }
   }
 
   Context 'Invoke-StepWindowsUpdate (parent step, child process mocked)' {
@@ -394,7 +439,10 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:childJson = $null
       $script:childTimedOut = $false
       $script:roundsSeenByChild = $null
-      Mock Write-SetupLog { }
+      $script:logs = New-Object System.Collections.ArrayList
+      $script:sleeps = New-Object System.Collections.ArrayList
+      Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+      Mock Start-Sleep { [void]$script:sleeps.Add($Seconds) }
       Mock Invoke-External {
         [void]$script:ext.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes })
         $saved = Read-RunState -Root $script:ctx.Root
@@ -531,6 +579,74 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r = Invoke-StepWindowsUpdate -Context $script:ctx
       $r.Data.ContainsKey('Interruptions') | Should -BeFalse
       $script:ctx.State.Steps['windows-update'].Data['Interruptions'] | Should -Be 1
+    }
+
+    # Ruling R23: busy agent / restart pending are retried, by numeric code.
+    It 'waits 120 seconds by default and continues without a restart when another install is running (<_>)' -ForEach @('0x80240016', '0x8024A000') {
+      $code = $_
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode $code
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'
+      $r.Reboot | Should -Be 'None'
+      @($script:sleeps) | Should -Be @(120)
+      $warns = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'busy' })
+      $warns.Count | Should -Be 1
+      $warns[0].Data.errorCode | Should -Be $code
+    }
+    It 'uses the injected busy wait' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x80240016'
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+      $r.Status | Should -Be 'Continue'
+      @($script:sleeps) | Should -Be @(0)
+    }
+    It 'matches the busy code whatever its letter case' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x8024a000'
+      (Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0).Status | Should -Be 'Continue'
+    }
+    It 'counts a busy round toward the cap, which still ends the loop' {
+      $script:ctx = New-WuContext -Data @{ Rounds = 5 }
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x80240016'
+      $first = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+      $first.Status | Should -Be 'Continue'
+      $first.Data.Rounds | Should -Be 6
+      $second = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+      $second.Status | Should -Be 'Failed'
+      $second.Message | Should -Be 'Windows Update round cap reached (6)'
+      $script:ext.Count | Should -Be 1
+    }
+    It 'still books hidden and failed updates on a busy round' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -Hidden @('h1') -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }) -ErrorText 'x' -ErrorCode '0x80240016'
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+      @($script:ctx.State.HiddenUpdateIds) | Should -Be @('h1')
+      $script:ctx.State.WuFailureCounts['f1'] | Should -Be 1
+    }
+    It 'restarts when earlier updates still need a restart (0x80242014)' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x80242014'
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'
+      $r.Reboot | Should -Be 'Now'
+      $script:sleeps.Count | Should -Be 0
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'restart' }).Count | Should -Be 1
+    }
+    It 'fails on any other code and carries it in the message' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'access denied' -ErrorCode '0x80070005'
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be 'Windows Update error: access denied (0x80070005)'
+      $script:sleeps.Count | Should -Be 0
+    }
+    It 'lets the per-update results decide when a code comes without an Error' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }) -ErrorCode '0x80070643'
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'
+      $script:ctx.State.WuFailureCounts['f1'] | Should -Be 1
     }
   }
 }

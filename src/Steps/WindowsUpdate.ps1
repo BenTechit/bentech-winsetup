@@ -29,6 +29,14 @@ $script:UpgradesCategoryId = '3689bdc8-b205-4af4-8d4a-a63924c5e9d5'
 
 $script:WuStepId = 'windows-update'
 
+# Ruling R23: WUA error codes the parent step retries instead of failing. Matched on the numeric code,
+# never on the (localized) message text.
+#   0x80240016 WU_E_INSTALL_NOT_ALLOWED (another installation is in progress)
+#   0x8024A000 WU_E_AU_NOSERVICE (the Automatic Updates service is not available)
+#   0x80242014 WU_E_UH_POSTREBOOTSTILLPENDING (earlier updates need a restart to finish)
+$script:WuBusyErrorCodes = @('0x80240016', '0x8024A000')
+$script:WuRebootPendingErrorCode = '0x80242014'
+
 # --- pure helpers -----------------------------------------------------------------------------
 
 function ConvertTo-WuList {
@@ -54,6 +62,43 @@ function Get-WuCollectionItems {
   if ($null -eq $Collection) { return }
   $count = [int]$Collection.Count
   for ($i = 0; $i -lt $count; $i++) { $Collection.Item($i) }
+}
+
+function Format-WuHResult {
+  # Private. An HRESULT as '0x' + 8 upper-case hex digits. Accepts the negative Int32 that .NET reports
+  # (0x80240016 is -2145124330) as well as a positive 64-bit value.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)]$HResult)
+
+  return ('0x{0:X8}' -f ([int64]$HResult -band [int64]4294967295))
+}
+
+function Get-WuExceptionErrorCode {
+  # Private. The HRESULT behind an exception, formatted by Format-WuHResult. A failing COM call can
+  # reach PowerShell as a COMException or wrapped (MethodInvocationException, SetValueInvocationException,
+  # TargetInvocationException), and a wrapper's own HResult is a generic 0x80131501. So the chain is
+  # searched for the first COM (ExternalException) error; without one, the outer exception's HResult
+  # is used.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][Exception]$Exception)
+
+  for ($e = $Exception; $null -ne $e; $e = $e.InnerException) {
+    if ($e -is [System.Runtime.InteropServices.ExternalException]) { return (Format-WuHResult -HResult $e.HResult) }
+  }
+  return (Format-WuHResult -HResult $Exception.HResult)
+}
+
+function Get-WuResultErrorCode {
+  # Private. A round result's ErrorCode as a trimmed string, '' when there is none.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)]$Result)
+
+  $code = [string]$Result.ErrorCode
+  if ([string]::IsNullOrWhiteSpace($code)) { return '' }
+  return $code.Trim()
 }
 
 function Test-WuResultError {
@@ -285,10 +330,12 @@ function Set-WuHidden {
 }
 
 function Invoke-WuDownload {
-  # Private. Downloads the updates in one batch and emits each update's download ResultCode (int), in
-  # the order given. (The UpdateColl is built in place, not returned from a helper: PowerShell would
+  # Private. Downloads the updates in one batch. Returns @{ ResultCodes = <int[]> (each update's
+  # download ResultCode, in the order given); HResult = <int> (the download result's own HResult,
+  # 0 = success) }. (The UpdateColl is built in place, not returned from a helper: PowerShell would
   # enumerate a COM collection that a function returns.)
   [CmdletBinding()]
+  [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)]$Session,
     [Parameter(Mandatory)][object[]]$Updates
@@ -299,12 +346,13 @@ function Invoke-WuDownload {
   $downloader = $Session.CreateUpdateDownloader()
   $downloader.Updates = $collection
   $result = $downloader.Download()
-  for ($i = 0; $i -lt $Updates.Count; $i++) { [int]$result.GetUpdateResult($i).ResultCode }
+  $codes = @(for ($i = 0; $i -lt $Updates.Count; $i++) { [int]$result.GetUpdateResult($i).ResultCode })
+  return @{ ResultCodes = $codes; HResult = [int]$result.HResult }
 }
 
 function Invoke-WuInstall {
   # Private. Installs the updates in one batch. Returns @{ ResultCodes = <int[]> (in the order given);
-  # RebootRequired = <bool> }.
+  # RebootRequired = <bool>; HResult = <int> (the installation result's own HResult, 0 = success) }.
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
@@ -318,7 +366,7 @@ function Invoke-WuInstall {
   $installer.Updates = $collection
   $result = $installer.Install()
   $codes = @(for ($i = 0; $i -lt $Updates.Count; $i++) { [int]$result.GetUpdateResult($i).ResultCode })
-  return @{ ResultCodes = $codes; RebootRequired = [bool]$result.RebootRequired }
+  return @{ ResultCodes = $codes; RebootRequired = [bool]$result.RebootRequired; HResult = [int]$result.HResult }
 }
 
 function Get-WuRebootRequired {
@@ -367,7 +415,7 @@ function Invoke-WuRound {
     One Windows Update round, run in the child process the parent step starts with -WuRound. Always
     writes ResultPath:
       { Installed: [{Id,Title}], Failed: [{Id,Title,ResultCode}], Hidden: [Id],
-        OnlyDefinitions, RebootRequired, Error }
+        OnlyDefinitions, RebootRequired, Error, ErrorCode }
   .DESCRIPTION
     1. Reads state.json (Read-RunState on StatePath's folder; read-only use): WuFailureCounts,
        PreviousHiddenUpdateIds and Steps['windows-update'].Data.Rounds (the parent saved the new
@@ -385,6 +433,10 @@ function Invoke-WuRound {
        (failed), 5 (aborted) and anything else are Failed with their code.
     9. RebootRequired = the install result's RebootRequired or Microsoft.Update.SystemInfo's.
     Any exception ends the round: its message is Error, and whatever was already done stays listed.
+    ErrorCode (ruling R23) is the numeric HRESULT as '0x' + 8 hex digits, so the parent never depends
+    on localized text: an exception's code (Get-WuExceptionErrorCode), otherwise the download or
+    installation result's own non-zero HResult (the install's wins over the download's), otherwise
+    $null. A result HResult alone does not set Error: the per-update results still count.
 
     -SearchOnly (smoke test only, WhatIf-style): changes nothing on the machine. It does not register
     Microsoft Update (it is an Error when it is not registered), does not un-hide, hide, download or
@@ -405,6 +457,7 @@ function Invoke-WuRound {
   $onlyDefinitions = $false
   $rebootRequired = $false
   $errorText = $null
+  $errorCode = $null
 
   try {
     $state = Read-RunState -Root (Split-Path -Parent $StatePath)
@@ -472,7 +525,12 @@ function Invoke-WuRound {
       $downloadCodes = @{}
       $toDownload = @(foreach ($info in $selection.Install) { if (-not [bool]$byId[$info.Id].IsDownloaded) { $info } })
       if ($toDownload.Count -gt 0) {
-        $codes = @(Invoke-WuDownload -Session $session -Updates @(foreach ($info in $toDownload) { $byId[$info.Id] }))
+        $download = Invoke-WuDownload -Session $session -Updates @(foreach ($info in $toDownload) { $byId[$info.Id] })
+        $codes = @(ConvertTo-WuList -Value $download.ResultCodes)
+        if ($null -ne $download.HResult -and [int64]$download.HResult -ne 0) {
+          $errorCode = Format-WuHResult -HResult $download.HResult
+          Write-SetupLog -Message 'Windows Update download reported an error code' -Level WARN -Data @{ errorCode = $errorCode }
+        }
         for ($i = 0; $i -lt $toDownload.Count; $i++) {
           $downloadCodes[$toDownload[$i].Id] = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
         }
@@ -493,6 +551,10 @@ function Invoke-WuRound {
         $install = Invoke-WuInstall -Session $session -Updates @(foreach ($info in $ready) { $byId[$info.Id] })
         $codes = @(ConvertTo-WuList -Value $install.ResultCodes)
         $installReboot = [bool]$install.RebootRequired
+        if ($null -ne $install.HResult -and [int64]$install.HResult -ne 0) {
+          $errorCode = Format-WuHResult -HResult $install.HResult
+          Write-SetupLog -Message 'Windows Update installation reported an error code' -Level WARN -Data @{ errorCode = $errorCode }
+        }
         for ($i = 0; $i -lt $ready.Count; $i++) {
           $info = $ready[$i]
           $code = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
@@ -509,7 +571,8 @@ function Invoke-WuRound {
   } catch {
     $errorText = [string]$_.Exception.Message
     if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = [string]$_ }
-    Write-SetupLog -Message 'Windows Update round failed' -Level ERROR -Data @{ error = $errorText }
+    $errorCode = Get-WuExceptionErrorCode -Exception $_.Exception
+    Write-SetupLog -Message 'Windows Update round failed' -Level ERROR -Data @{ error = $errorText; errorCode = $errorCode }
   }
 
   $result = [ordered]@{
@@ -519,9 +582,10 @@ function Invoke-WuRound {
     OnlyDefinitions = $onlyDefinitions
     RebootRequired  = $rebootRequired
     Error           = $errorText
+    ErrorCode       = $errorCode
   }
   Write-WuRoundResult -Path $ResultPath -Result $result
-  Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; rebootRequired = $rebootRequired; error = $errorText }
+  Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; rebootRequired = $rebootRequired; error = $errorText; errorCode = $errorCode }
 }
 
 # --- the parent step --------------------------------------------------------------------------
@@ -625,14 +689,25 @@ function Invoke-StepWindowsUpdate {
     4. No readable result JSON -> Failed('Windows Update round produced no result').
     5. Books the result into the state (Update-WuRunState), even when it carries an Error, so an update
        the round hid before failing is still reported.
-    6. Error -> Failed('Windows Update error: <Error>').
-    7. Get-WuRoundOutcome: Done -> Done('Installed <total> updates in <rounds> rounds');
+    6. ErrorCode (ruling R23; the numeric code, never the localized text), before the Error check:
+         0x80240016 / 0x8024A000 (another install in progress / no AU service): WARN, wait
+           BusyWaitSeconds (default 120), then Continue with no restart. The round still counts toward
+           the cap, so a machine that stays busy ends at the cap.
+         0x80242014 (earlier updates need a restart to finish): WARN, Continue with Reboot 'Now'.
+    7. Error -> Failed('Windows Update error: <Error> (<ErrorCode>)'), or without the brackets when there
+       is no code. An ErrorCode without an Error (a download or installation result's own HResult)
+       does not fail the step: it is logged and the per-update results decide, so ordinary update
+       failures still go through the failure counter.
+    8. Get-WuRoundOutcome: Done -> Done('Installed <total> updates in <rounds> rounds');
        Continue -> Continue, Reboot 'Now' when RebootRequired.
     Data = @{ Rounds; Installed; FailedTitles } (shallow: the report prints hidden updates by title).
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
-  param([Parameter(Mandatory)][hashtable]$Context)
+  param(
+    [Parameter(Mandatory)][hashtable]$Context,
+    [ValidateRange(0, 3600)][int]$BusyWaitSeconds = 120
+  )
 
   $state = $Context.State
   $data = Get-WuStepData -State $state
@@ -672,10 +747,27 @@ function Invoke-StepWindowsUpdate {
   $installedNow = @(ConvertTo-WuList -Value $result.Installed).Count
   $failedNow = @(ConvertTo-WuList -Value $result.Failed).Count
   $rebootNow = ($result.RebootRequired -eq $true)
-  Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; rebootRequired = $rebootNow; error = [string]$result.Error }
+  $errorCode = Get-WuResultErrorCode -Result $result
+  Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; rebootRequired = $rebootNow; error = [string]$result.Error; errorCode = $errorCode }
+
+  # Ruling R23: codes that mean "not now" are retried; the round still counts toward the cap.
+  if ($script:WuBusyErrorCodes -contains $errorCode) {
+    Write-SetupLog -Message 'Windows Update agent is busy; waiting, then retrying' -Level WARN -Data @{ round = $round; errorCode = $errorCode; waitSeconds = $BusyWaitSeconds; cap = $cap }
+    Start-Sleep -Seconds $BusyWaitSeconds
+    return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), retrying" -Data (Get-WuResultData -Data $data)
+  }
+  if ($errorCode -eq $script:WuRebootPendingErrorCode) {
+    Write-SetupLog -Message 'Windows Update needs a restart to finish earlier updates; restarting' -Level WARN -Data @{ round = $round; errorCode = $errorCode; cap = $cap }
+    return New-StepResult -Status Continue -Message "Windows Update round ${round}: restart needed to finish earlier updates ($errorCode)" -Reboot Now -Data (Get-WuResultData -Data $data)
+  }
 
   if (Test-WuResultError -Result $result) {
-    return New-StepResult -Status Failed -Message "Windows Update error: $($result.Error)" -Data (Get-WuResultData -Data $data)
+    $text = "Windows Update error: $($result.Error)"
+    if ($errorCode) { $text += " ($errorCode)" }
+    return New-StepResult -Status Failed -Message $text -Data (Get-WuResultData -Data $data)
+  }
+  if ($errorCode) {
+    Write-SetupLog -Message 'Windows Update reported an error code without an error; the per-update results decide' -Level WARN -Data @{ round = $round; errorCode = $errorCode }
   }
 
   if ((Get-WuRoundOutcome -Result $result) -eq 'Done') {
