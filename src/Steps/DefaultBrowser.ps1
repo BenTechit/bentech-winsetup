@@ -46,12 +46,14 @@ function Invoke-StepDefaultBrowser {
   <#
   .SYNOPSIS
     Step 11: writes <Root>\DefaultAssociations.xml and points the DefaultAssociationsConfiguration
-    policy at it. Done('Applies at next sign-in') / Skipped('Chrome not installed') / Failed.
+    policy at it. Done('Applies at next sign-in') / Skipped.
   .DESCRIPTION
     The XML is UTF-8 without a BOM. The policy value is a REG_SZ holding the file's path; its key is
-    created first when it is missing (an existing key is never recreated). A file or registry write
-    that fails is Failed('Default browser policy could not be set'): the step did not do its job, and
-    the runner may retry it; the final screen's manual hint still covers the customer.
+    created first when it is missing (an existing key is never recreated). The default browser is
+    best effort (spec 12, ruling R17b): Chrome missing is Skipped('Chrome not installed'), and a file
+    or registry write that fails is Skipped('Default browser policy could not be set: <short reason>'),
+    logged at WARN. The report shows it yellow and the final screen's "press B" hint covers the
+    customer. The short reason is the first line of the error, cut to 120 characters.
     The Done result carries Data.RebootCountAtSet (State.RebootCount) and Data.SetAtUtc (ISO 8601,
     UTC), which Finalize uses to decide whether anybody has signed in since the policy was set
     (ruling R16).
@@ -70,8 +72,11 @@ function Invoke-StepDefaultBrowser {
     }
     New-ItemProperty -LiteralPath $script:DefaultAssociationsPolicyKey -Name $script:DefaultAssociationsPolicyName -Value $xmlPath -PropertyType String -Force | Out-Null
   } catch {
-    Write-SetupLog -Message 'Default browser policy could not be set' -Level ERROR -Data @{ file = $xmlPath; error = $_.Exception.Message }
-    return New-StepResult -Status Failed -Message 'Default browser policy could not be set'
+    Write-SetupLog -Message 'Default browser policy could not be set' -Level WARN -Data @{ file = $xmlPath; error = $_.Exception.Message }
+    $reason = ([string]$_.Exception.Message -split "`r`n|`r|`n")[0].Trim()
+    if ([string]::IsNullOrEmpty($reason)) { $reason = 'unknown error' }
+    if ($reason.Length -gt 120) { $reason = $reason.Substring(0, 117) + '...' }
+    return New-StepResult -Status Skipped -Message "Default browser policy could not be set: $reason"
   }
 
   return New-StepResult -Status Done -Message 'Applies at next sign-in' -Data @{

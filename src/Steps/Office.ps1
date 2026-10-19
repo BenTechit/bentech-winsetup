@@ -141,8 +141,9 @@ function Invoke-StepOffice {
     Done('Office already installed'). Otherwise Get-OdtSetupPath finds the ODT, setup.exe is
     signature-checked against the Microsoft signer, the configuration is written UTF-8 without a BOM to
     <Downloads>\office.xml and `setup.exe /configure "<xml>"` runs with the configured office timeout.
-    Exit code 0 is Done; any other is Failed('Office setup exit <code>'); a timeout is
-    Failed('Office setup timed out').
+    Exit code 0 is Done; 3010 and 1641 (install succeeded, restart pending) are Done too, with the
+    message 'Office installed (restart pending)' and no reboot of their own (ruling R17a); any other
+    code is Failed('Office setup exit <code>'); a timeout is Failed('Office setup timed out').
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -185,6 +186,9 @@ function Invoke-StepOffice {
     return New-StepResult -Status Failed -Message 'Office setup could not be started'
   }
   if ($run.TimedOut) { return New-StepResult -Status Failed -Message 'Office setup timed out' }
-  if ($run.ExitCode -ne 0) { return New-StepResult -Status Failed -Message "Office setup exit $($run.ExitCode)" }
+  # 3010 and 1641 mean the install succeeded and a restart is pending; the Windows Update loop reboots
+  # anyway (ruling R17a), so they are Done and the step asks for no reboot of its own.
+  if ($null -ne $run.ExitCode -and $run.ExitCode -in 3010, 1641) { return New-StepResult -Status Done -Message 'Office installed (restart pending)' }
+  if ($null -eq $run.ExitCode -or $run.ExitCode -ne 0) { return New-StepResult -Status Failed -Message "Office setup exit $($run.ExitCode)" }
   return New-StepResult -Status Done -Message 'Office installed'
 }

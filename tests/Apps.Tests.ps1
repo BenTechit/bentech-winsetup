@@ -76,6 +76,7 @@ BeforeAll {
     $script:regKeys = New-Object System.Collections.ArrayList
     $script:regValues = New-Object System.Collections.ArrayList
     $script:regWriteThrows = $false
+    $script:regWriteMessage = $null
     $script:fileText = @{}
     $script:fileReadThrows = $false
     $script:shellProgId = $null
@@ -118,7 +119,7 @@ BeforeAll {
     }
     Mock New-Item { [void]$script:regKeys.Add([string]$Path); $script:existing += [string]$Path }
     Mock New-ItemProperty {
-      if ($script:regWriteThrows) { throw 'Requested registry access is not allowed' }
+      if ($script:regWriteThrows) { throw $(if ($script:regWriteMessage) { $script:regWriteMessage } else { 'Requested registry access is not allowed' }) }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
     }
     Mock Get-Content {
@@ -736,6 +737,29 @@ Describe 'Invoke-StepOffice' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Office setup exit 1603'
   }
+  It 'treats 3010 and 1641 (restart pending) as Done, ruling R17a' {
+    $script:existing = @($script:odt)
+    foreach ($code in 3010, 1641) {
+      $script:configureCode = $code
+      $r = Invoke-StepOffice -Context $script:ctx
+      $r.Status | Should -Be 'Done'
+      $r.Message | Should -Be 'Office installed (restart pending)'
+      $r.Reboot | Should -Be 'None'
+    }
+  }
+  It 'still fails on exit codes next to the success codes' {
+    $script:existing = @($script:odt)
+    foreach ($code in 1, 3011, 1642, -1) {
+      $script:configureCode = $code
+      $r = Invoke-StepOffice -Context $script:ctx
+      $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be "Office setup exit $code"
+    }
+  }
+  It 'reports a plain exit 0 as Office installed' {
+    $script:existing = @($script:odt)
+    (Invoke-StepOffice -Context $script:ctx).Message | Should -Be 'Office installed'
+  }
   It 'fails when setup.exe times out' {
     $script:existing = @($script:odt)
     $script:configureCode = 'timeout'
@@ -819,13 +843,49 @@ Describe 'Invoke-StepDefaultBrowser' {
     $script:ctx.State.Remove('RebootCount')
     (Invoke-StepDefaultBrowser -Context $script:ctx).Data.RebootCountAtSet | Should -Be 0
   }
-  It 'is Failed, and records no Data, when the policy value cannot be written' {
+  It 'is Skipped (best effort, ruling R17b) with the reason when the policy value cannot be written' {
     Set-ChromeInstalled
     $script:regWriteThrows = $true
     $r = Invoke-StepDefaultBrowser -Context $script:ctx
-    $r.Status | Should -Be 'Failed'
-    $r.Message | Should -Be 'Default browser policy could not be set'
+    $r.Status | Should -Be 'Skipped'
+    $r.Message | Should -Be 'Default browser policy could not be set: Requested registry access is not allowed'
+    $r.Reboot | Should -Be 'None'
     $r.Data.Count | Should -Be 0
+  }
+  It 'is Skipped, with the reason, when the policy key cannot be created' {
+    Set-ChromeInstalled
+    Mock New-Item { throw 'Attempted to perform an unauthorized operation.' }
+    $r = Invoke-StepDefaultBrowser -Context $script:ctx
+    $r.Status | Should -Be 'Skipped'
+    $r.Message | Should -Be 'Default browser policy could not be set: Attempted to perform an unauthorized operation.'
+    Should -Invoke -CommandName New-ItemProperty -Times 0 -Exactly
+  }
+  It 'is Skipped, and sets no policy, when the XML file cannot be written' {
+    Set-ChromeInstalled
+    $blocker = Join-Path $script:ctx.Root 'blocker'
+    [IO.File]::WriteAllText($blocker, 'a file where the folder should be')
+    $script:ctx.Root = $blocker
+    $r = Invoke-StepDefaultBrowser -Context $script:ctx
+    $r.Status | Should -Be 'Skipped'
+    $r.Message | Should -Match '^Default browser policy could not be set: .+'
+    Should -Invoke -CommandName New-ItemProperty -Times 0 -Exactly
+  }
+  It 'keeps the reason short: first line only, at most 120 characters' {
+    Set-ChromeInstalled
+    $script:regWriteThrows = $true
+    $script:regWriteMessage = ('x' * 300) + "`r`nsecond line"
+    $r = Invoke-StepDefaultBrowser -Context $script:ctx
+    $r.Status | Should -Be 'Skipped'
+    $r.Message | Should -Not -Match 'second line'
+    $r.Message.Substring('Default browser policy could not be set: '.Length).Length | Should -BeLessOrEqual 120
+  }
+  It 'logs the failure at WARN, not ERROR' {
+    Set-ChromeInstalled
+    $script:regWriteThrows = $true
+    $null = Invoke-StepDefaultBrowser -Context $script:ctx
+    $failure = @($script:logs | Where-Object { $_.Message -eq 'Default browser policy could not be set' })
+    $failure.Count | Should -Be 1
+    $failure[0].Level | Should -Be 'WARN'
   }
 }
 
