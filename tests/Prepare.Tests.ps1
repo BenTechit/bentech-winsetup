@@ -68,7 +68,10 @@ BeforeAll {
     # creates a real junction or reads the real C:\BenTech.
     $script:existingFolders = @('C:\BenTech', 'C:\BenTech\Setup')
     $script:reparseFolders = @()
-    $script:reparseAfterIcacls = @()   # these turn into a reparse point once all three icacls calls ran
+    # R28b: what Get-Acl answers for a path (real in-memory DirectorySecurity objects), and what it answers
+    # for it once both icacls calls ran (the post-verify after creating the parent).
+    $script:aclByPath = @{ 'C:\BenTech' = (New-TestAcl) }
+    $script:aclAfterIcacls = @{}
     $script:queryValues = @{}
     foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 111; DC = 222 } }
 
@@ -102,16 +105,36 @@ BeforeAll {
       if ($script:existingFolders -notcontains $LiteralPath) { return $null }
       $attributes = [IO.FileAttributes]::Directory
       if ($script:reparseFolders -contains $LiteralPath) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
-      if ($script:reparseAfterIcacls -contains $LiteralPath -and @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count -ge 3) {
-        $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint
-      }
       [pscustomobject]@{ FullName = $LiteralPath; Attributes = $attributes }
     }
+    Mock Get-Acl {
+      [void]$script:calls.Add("acl $LiteralPath")
+      $icaclsRan = @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count
+      if ($icaclsRan -ge 2 -and $script:aclAfterIcacls.ContainsKey([string]$LiteralPath)) { return $script:aclAfterIcacls[[string]$LiteralPath] }
+      if ($script:aclByPath.ContainsKey([string]$LiteralPath)) { return $script:aclByPath[[string]$LiteralPath] }
+      throw "Cannot find path '$LiteralPath'"
+    }
+    Mock New-SetupLockedDirectory { [void]$script:calls.Add("mkdir-locked $Path") }
     Mock New-ItemProperty {
       [void]$script:calls.Add("regvalue $LiteralPath $Name")
       if ($script:throwNewItemProperty) { throw 'Requested registry access is not allowed' }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType; Force = [bool]$Force })
     }
+  }
+
+  # A real in-memory DirectorySecurity (never applied to disk), so the code under test calls the real
+  # GetOwner / AreAccessRulesProtected / GetAccessRules API. Defaults: our locked state.
+  function New-TestAcl {
+    param([string]$Owner = 'S-1-5-32-544', [bool]$Protected = $true, [string[]]$Sids = @('S-1-5-32-544', 'S-1-5-18'))
+    $s = New-Object Security.AccessControl.DirectorySecurity
+    $s.SetOwner((New-Object Security.Principal.SecurityIdentifier $Owner))
+    $s.SetAccessRuleProtection($Protected, $false)
+    foreach ($sid in $Sids) {
+      $s.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList (New-Object Security.Principal.SecurityIdentifier $sid),
+          ([Security.AccessControl.FileSystemRights]::FullControl), ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
+          ([Security.AccessControl.PropagationFlags]::None), ([Security.AccessControl.AccessControlType]::Allow)))
+    }
+    return $s
   }
 
   function Get-CallIndex {
@@ -179,12 +202,10 @@ Describe 'resume task definition' {
   }
 }
 
-Describe 'folder ACL (R28)' {
-  It 'is exactly: take ownership, reset every ACL below, then admin-only on the parent - in that order' {
-    $c = @(Get-SetupFolderAclCommands -Parent 'C:\BenTech')
-    $c | Should -Be @(
-      '"C:\BenTech" /setowner *S-1-5-32-544 /T'
-      '"C:\BenTech" /reset /T'
+Describe 'folder ACL (R28b)' {
+  It 'is exactly two non-recursive commands: Administrators own the parent, then admin-only on it' {
+    @(Get-SetupFolderAclCommands -Parent 'C:\BenTech') | Should -Be @(
+      '"C:\BenTech" /setowner *S-1-5-32-544'
       '"C:\BenTech" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F'
     )
   }
@@ -193,16 +214,52 @@ Describe 'folder ACL (R28)' {
     $all | Should -Match '\*S-1-5-32-544'; $all | Should -Match '\*S-1-5-18'
     $all | Should -Not -Match 'Administrators|SYSTEM|Everyone'
   }
-  It 'never uses /C (it makes icacls exit 0 even when every file failed)' {
-    (Get-SetupFolderAclCommands -Parent 'C:\BenTech') -join ' ' | Should -Not -Match '/C\b'
+  It 'never recurses or repairs (no /T, no /reset) and never uses /C' {
+    $all = (Get-SetupFolderAclCommands -Parent 'C:\BenTech') -join ' '
+    $all | Should -Not -Match '/T\b|/reset|/C\b'
   }
   It 'keeps a path with spaces together and never ends the quote with a backslash' {
     @(Get-SetupFolderAclCommands -Parent 'C:\Ben Tech\') | ForEach-Object { $_ | Should -Match '^"C:\\Ben Tech" /' }
   }
-  It 'refuses a drive root, a relative or an empty path (a recursive owner change there would wreck the system)' {
-    foreach ($bad in 'C:\', 'C:', 'BenTech', '.\BenTech', '\BenTech', ' ') {
+  It 'refuses a drive root, a relative, an empty or a not-normalized path' {
+    foreach ($bad in 'C:\', 'C:', 'BenTech', '.\BenTech', '\BenTech', ' ', 'C:\x\..', 'C:\.\BenTech', 'C:\BenTech\..\Windows') {
       { Get-SetupFolderAclCommands -Parent $bad } | Should -Throw
     }
+  }
+  It 'Prepare.ps1 holds no recursive or repairing icacls switch anywhere (R28b)' {
+    $text = [IO.File]::ReadAllText("$PSScriptRoot\..\src\Steps\Prepare.ps1")
+    $text | Should -Not -Match '/T\b'
+    $text | Should -Not -Match '/reset'
+  }
+}
+
+Describe 'Test-SetupFolderAdminOnly (R28b)' {
+  BeforeEach { Initialize-PrepareMocks }
+  It 'accepts our locked state: owner Administrators (or SYSTEM), protected, only Administrators and SYSTEM' {
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeTrue
+    $script:aclByPath['C:\BenTech'] = New-TestAcl -Owner 'S-1-5-18'
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeTrue
+  }
+  It 'refuses <Case>' -ForEach @(
+    @{ Case = 'an owner that is a user'; Acl = @{ Owner = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) } }
+    @{ Case = 'inherited rules (not protected)'; Acl = @{ Protected = $false } }
+    @{ Case = 'an extra Authenticated Users rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-11') } }
+    @{ Case = 'an extra Everyone rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-1-0') } }
+  ) {
+    $script:aclByPath['C:\BenTech'] = New-TestAcl @Acl
+    $r = Test-SetupFolderAdminOnly -Path 'C:\BenTech'
+    $r | Should -BeOfType [bool]
+    $r | Should -BeFalse
+  }
+  It 'refuses a junction or symlink without reading its ACL' {
+    $script:reparseFolders = @('C:\BenTech')
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeFalse
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+  It 'returns $false, never throws, when the ACL cannot be read' {
+    $script:aclByPath = @{}
+    { Test-SetupFolderAdminOnly -Path 'C:\BenTech' } | Should -Not -Throw
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeFalse
   }
 }
 
@@ -436,10 +493,10 @@ Describe 'Invoke-StepPrepare' {
     @($r.Errors).Count | Should -Be 0
   }
 
-  It 'runs in the documented order: icacls, resume task, power capture, power set, Fast Startup, nags, no-auto-reboot' {
+  It 'runs in the documented order: folder check, resume task, power capture, power set, Fast Startup, nags, no-auto-reboot' {
     Invoke-StepPrepare -Context (New-PrepareContext) | Out-Null
     $order = @(
-      (Get-CallIndex '^icacls$'),
+      (Get-CallIndex '^acl C:\\BenTech$'),
       (Get-CallIndex '^task$'),
       (Get-CallIndex '^powercfg /query '),
       (Get-CallIndex '^powercfg /setacvalueindex '),
@@ -456,24 +513,42 @@ Describe 'Invoke-StepPrepare' {
     $lastQuery | Should -BeLessThan (Get-CallIndex '^powercfg /setacvalueindex ')
   }
 
-  It 'locks down the PARENT folder with the three icacls commands in order, through Invoke-External (R28)' {
-    Invoke-StepPrepare -Context (New-PrepareContext) | Out-Null
+  It 'only verifies an existing, locked C:\BenTech: no icacls, nothing created (R28b)' {
+    $r = Invoke-StepPrepare -Context (New-PrepareContext)
+    $r.Status | Should -Be 'Done'
+    @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+    @($script:calls | Where-Object { $_ -like 'mkdir*' }) | Should -BeNullOrEmpty
+  }
+
+  It 'creates a missing working folder inside a locked C:\BenTech, with no icacls (it inherits)' {
+    $script:existingFolders = @('C:\BenTech')
+    $r = Invoke-StepPrepare -Context (New-PrepareContext)
+    $r.Status | Should -Be 'Done'
+    @($script:calls | Where-Object { $_ -like 'mkdir*' }) | Should -Be @('mkdir C:\BenTech\Setup')
+    @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+  }
+
+  It 'creates a missing C:\BenTech already locked, runs the two icacls commands, verifies, then creates the working folder (R28b)' {
+    $script:existingFolders = @()
+    $script:aclByPath = @{}                                   # nothing to read before it exists
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    $r = Invoke-StepPrepare -Context (New-PrepareContext)
+    $r.Status | Should -Be 'Done'
     $icacls = @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' })
-    $icacls.Count | Should -Be 3
+    @($icacls | ForEach-Object { $_.Args }) | Should -Be @(
+      '"C:\BenTech" /setowner *S-1-5-32-544'
+      '"C:\BenTech" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F'
+    )
     foreach ($call in $icacls) {
       $call.File | Should -Be (Join-Path $env:windir 'System32\icacls.exe')
       $call.Timeout | Should -Be 7           # config timeoutsMinutes.default
     }
-    @($icacls | ForEach-Object { $_.Args }) | Should -Be @(Get-SetupFolderAclCommands -Parent 'C:\BenTech')
-    @($script:calls | Where-Object { $_ -like 'mkdir *' }) | Should -BeNullOrEmpty     # both folders already exist
-  }
-
-  It 'creates a missing parent folder before icacls, and the working folder after it (R28)' {
-    $script:existingFolders = @()
-    Invoke-StepPrepare -Context (New-PrepareContext) | Out-Null
-    (Get-CallIndex '^mkdir C:\\BenTech$') | Should -BeLessThan (Get-CallIndex '^icacls$')
+    $firstIcacls = Get-CallIndex '^icacls$'
     $lastIcacls = ($script:calls | ForEach-Object -Begin { $k = 0; $last = -1 } -Process { if ($_ -eq 'icacls') { $last = $k }; $k++ } -End { $last })
-    (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -BeGreaterThan $lastIcacls
+    (Get-CallIndex '^mkdir-locked C:\\BenTech$') | Should -BeLessThan $firstIcacls
+    (Get-CallIndex '^acl C:\\BenTech$') | Should -BeGreaterThan $lastIcacls          # the post-verify
+    (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -BeGreaterThan (Get-CallIndex '^acl C:\\BenTech$')
+    @($script:calls | Where-Object { $_ -eq 'mkdir C:\BenTech' }) | Should -BeNullOrEmpty  # never a plain (inheriting) create
   }
 
   It 'registers the resume task for the context script path' {
@@ -547,59 +622,88 @@ Describe 'Invoke-StepPrepare' {
   }
 
   Context 'when something fails' {
-    # R28: the working folder is fail-closed. Any failure is Failed('Working folder could not be secured')
-    # with an Error; the rest of the step still runs, like a failed resume task.
-    It 'a non-zero icacls exit fails the step, stops the icacls sequence, and the rest still runs' {
-      $script:failExternal = @('/setowner')
+    # R28/R28b: the working folder is fail-closed. Any failure is Failed('Working folder could not be secured')
+    # with an Error; the rest of the step still runs, like a failed resume task. An existing C:\BenTech is
+    # only verified, never repaired (no icacls on it).
+    It 'refuses an existing C:\BenTech <Case>, without icacls, and the rest still runs' -ForEach @(
+      @{ Case = 'owned by a user'; Acl = @{ Owner = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) } }
+      @{ Case = 'that inherits (not protected)'; Acl = @{ Protected = $false } }
+      @{ Case = 'with an extra Authenticated Users rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-11') } }
+    ) {
+      $script:aclByPath['C:\BenTech'] = New-TestAcl @Acl
       $r = Invoke-StepPrepare -Context (New-PrepareContext)
       $r.Status | Should -Be 'Failed'
       $r.Message | Should -Be 'Working folder could not be secured'
-      @($r.Errors | Where-Object { $_ -match 'C:\\BenTech' -and $_ -match 'admin' }).Count | Should -Be 1
-      @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count | Should -Be 1     # /reset and the grant never ran
+      @($r.Errors | Where-Object { $_ -match 'C:\\BenTech already exists and is not admin-only' }).Count | Should -Be 1
+      @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+      @($script:calls | Where-Object { $_ -like 'mkdir*' }) | Should -BeNullOrEmpty
       Should -Invoke Register-ScheduledTask -Times 1 -Exactly
       (Get-CallIndex '^powercfg /setactive') | Should -BeGreaterThan -1
       @($script:regValues | Where-Object { $_.Name -eq 'NoAutoRebootWithLoggedOnUsers' }).Count | Should -Be 1
     }
-    It 'a failure on the last icacls command (the grant) also fails the step' {
-      $script:failExternal = @('/inheritance:r')
-      $r = Invoke-StepPrepare -Context (New-PrepareContext)
-      $r.Status | Should -Be 'Failed'
-      $r.Message | Should -Be 'Working folder could not be secured'
+    Context 'with no C:\BenTech yet' {
+      BeforeEach {
+        $script:existingFolders = @()
+        $script:aclByPath = @{}
+        $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+      }
+      It 'a failing /setowner fails the step and stops before the grant' {
+        $script:failExternal = @('/setowner')
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        $r.Message | Should -Be 'Working folder could not be secured'
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count | Should -Be 1
+        (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
+      }
+      It 'a failing grant fails the step' {
+        $script:failExternal = @('/inheritance:r')
+        (Invoke-StepPrepare -Context (New-PrepareContext)).Message | Should -Be 'Working folder could not be secured'
+      }
+      It 'an icacls that cannot be started fails the step' {
+        $script:throwExternal = @('icacls')
+        (Invoke-StepPrepare -Context (New-PrepareContext)).Message | Should -Be 'Working folder could not be secured'
+      }
+      It 'a timed-out icacls fails the step' {
+        Mock Invoke-External { return @{ ExitCode = $null; TimedOut = $true; Output = '' } } -ParameterFilter { $FilePath -match 'icacls' }
+        (Invoke-StepPrepare -Context (New-PrepareContext)).Message | Should -Be 'Working folder could not be secured'
+      }
+      It 'a failing post-verify (still not admin-only after icacls) fails the step' {
+        $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl -Sids @('S-1-5-32-544', 'S-1-5-11')) }
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        $r.Message | Should -Be 'Working folder could not be secured'
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count | Should -Be 2
+        (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
+      }
+      It 'a locked create that throws fails the step without icacls' {
+        Mock New-SetupLockedDirectory { throw 'Access is denied' }
+        (Invoke-StepPrepare -Context (New-PrepareContext)).Message | Should -Be 'Working folder could not be secured'
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+      }
     }
-    It 'an icacls that cannot be started fails the step' {
-      $script:throwExternal = @('icacls')
-      $r = Invoke-StepPrepare -Context (New-PrepareContext)
-      $r.Status | Should -Be 'Failed'
-      $r.Message | Should -Be 'Working folder could not be secured'
-    }
-    It 'a timed-out icacls fails the step' {
-      Mock Invoke-External { return @{ ExitCode = $null; TimedOut = $true; Output = '' } } -ParameterFilter { $FilePath -match 'icacls' }
-      $r = Invoke-StepPrepare -Context (New-PrepareContext)
-      $r.Status | Should -Be 'Failed'
-      $r.Message | Should -Be 'Working folder could not be secured'
-    }
-    It 'refuses a parent folder that is a junction or symlink, without running icacls' {
+    It 'refuses a C:\BenTech that is a junction or symlink, without icacls' {
       $script:reparseFolders = @('C:\BenTech')
       $r = Invoke-StepPrepare -Context (New-PrepareContext)
       $r.Status | Should -Be 'Failed'
       $r.Message | Should -Be 'Working folder could not be secured'
       @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
     }
-    It 'refuses a working folder that is a junction or symlink, without running icacls' {
+    It 'refuses a working folder that is a junction or symlink' {
       $script:reparseFolders = @('C:\BenTech\Setup')
       $r = Invoke-StepPrepare -Context (New-PrepareContext)
       $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be 'Working folder could not be secured'
       @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
     }
-    It 'checks for a junction again after icacls (one swapped in before the lockdown is still refused)' {
-      $script:reparseAfterIcacls = @('C:\BenTech\Setup')
-      $r = Invoke-StepPrepare -Context (New-PrepareContext)
+    It 'normalizes the root first: C:\x\..\Setup has C:\ as its parent and is refused, touching nothing' {
+      $ctx = New-PrepareContext; $ctx.Root = 'C:\x\..\Setup'
+      $r = Invoke-StepPrepare -Context $ctx
       $r.Status | Should -Be 'Failed'
       $r.Message | Should -Be 'Working folder could not be secured'
-      @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count | Should -Be 3
+      @($script:calls | Where-Object { $_ -like 'mkdir*' -or $_ -like 'acl *' -or $_ -eq 'icacls' }) | Should -BeNullOrEmpty
     }
     It 'reports the folder first when the resume task fails too, and keeps both errors' {
-      $script:failExternal = @('/reset')
+      $script:aclByPath['C:\BenTech'] = New-TestAcl -Protected $false
       $script:registerFailuresLeft = 99
       $r = Invoke-StepPrepare -Context (New-PrepareContext) -ResumeTaskRetrySeconds 0
       $r.Status | Should -Be 'Failed'

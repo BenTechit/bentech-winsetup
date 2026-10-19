@@ -84,16 +84,18 @@ function Test-ReleaseSignature($Data, $Signature, $KeyXml) {
 }
 
 function Get-LauncherAclCommands([string]$Parent) {
-  # Mirror of src/Steps/Prepare.ps1 / Get-SetupFolderAclCommands - keep in step. In order: Administrators
-  # take ownership of the parent and everything below; every ACL below is reset to inherited-only (drops
-  # planted ACEs); the parent stops inheriting from C:\ and grants only Administrators and SYSTEM. SIDs,
-  # never localized group names. No /C, which makes icacls exit 0 even when it failed. No trailing
-  # backslash, since \" escapes the quote. Throws unless Parent is below a drive root ("C:\x").
+  # Mirror of src/Steps/Prepare.ps1 / Get-SetupFolderAclCommands - keep in step. The two commands that
+  # lock down a C:\BenTech this run has just created: Administrators own it, then it stops inheriting
+  # from C:\ and grants only Administrators and SYSTEM. Both act on that one folder only: nothing here
+  # may recurse or reset, because a recursive change follows junctions below the folder. SIDs, never
+  # localized group names. No /C, which makes icacls exit 0 even when it failed. No trailing backslash,
+  # since \" escapes the quote. Throws unless Parent is absolute, normalized and below a drive root.
   $path = $Parent.Trim().TrimEnd('\')
-  if ($path -notmatch '^[A-Za-z]:\\[^\\]') { throw "Refusing to lock down '$Parent': expected an absolute folder below a drive root." }
+  if ($path -notmatch '^[A-Za-z]:\\[^\\]' -or [IO.Path]::GetFullPath($path) -ne $path) {
+    throw "Refusing to lock down '$Parent': expected an absolute, normalized folder below a drive root."
+  }
   @(
-    "`"$path`" /setowner *S-1-5-32-544 /T"
-    "`"$path`" /reset /T"
+    "`"$path`" /setowner *S-1-5-32-544"
     "`"$path`" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F"
   )
 }
@@ -104,27 +106,70 @@ function Test-LauncherReparsePoint([string]$Path) {
   return ($null -ne $item -and (([IO.FileAttributes]$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))
 }
 
-function Protect-LauncherFolder([string]$TargetDir) {
-  # Same sequence as src/Steps/Prepare.ps1 / Protect-SetupFolder - keep in step. $true only when the parent
-  # (C:\BenTech) and everything below are owned by Administrators and only Administrators and SYSTEM have
-  # access, and neither folder is a junction or symlink. Never throws: any problem is $false.
+function Test-LauncherFolderAdminOnly([string]$Path) {
+  # Mirror of src/Steps/Prepare.ps1 / Test-SetupFolderAdminOnly - keep in step. $true only when Path is
+  # not a reparse point, is owned by Administrators or SYSTEM, does not inherit, and every access rule is
+  # for Administrators or SYSTEM. Get-Acl and SIDs only (language-independent). Never throws.
   try {
-    $parent = Split-Path -Parent $TargetDir
-    $commands = Get-LauncherAclCommands -Parent $parent
-    foreach ($path in $parent, $TargetDir) { if (Test-LauncherReparsePoint -Path $path) { return $false } }
-    if ($null -eq (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    foreach ($arguments in $commands) {
-      $icacls = Start-Process -FilePath "$env:windir\System32\icacls.exe" -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
-      if ($null -eq $icacls -or $icacls.ExitCode -ne 0) { return $false }
+    if (Test-LauncherReparsePoint -Path $Path) { return $false }
+    $allowed = @('S-1-5-32-544', 'S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($null -eq $acl) { return $false }
+    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { return $false }
+    if ($acl.AreAccessRulesProtected -ne $true) { return $false }
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+      if ([string]$rule.IdentityReference.Value -notin $allowed) { return $false }
     }
-    # Created only now, so it inherits the lockdown.
-    if ($null -eq (Get-Item -LiteralPath $TargetDir -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null }
-    # Again: a junction swapped in before the lockdown is refused too. From here on only administrators
-    # can change anything under the parent.
-    foreach ($path in $parent, $TargetDir) { if (Test-LauncherReparsePoint -Path $path) { return $false } }
     return $true
   } catch {
     return $false
+  }
+}
+
+function New-LauncherLockedDirectory([string]$Path) {
+  # Mirror of src/Steps/Prepare.ps1 / New-SetupLockedDirectory - keep in step. Creates Path with its final
+  # protected DACL in the same call (full control for Administrators and SYSTEM, inherited below, nothing
+  # from above), so it never inherits Authenticated Users: Modify from C:\, not even until icacls runs.
+  $security = New-Object Security.AccessControl.DirectorySecurity
+  $security.SetAccessRuleProtection($true, $false)
+  foreach ($sid in 'S-1-5-32-544', 'S-1-5-18') {
+    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList (New-Object Security.Principal.SecurityIdentifier $sid),
+        ([Security.AccessControl.FileSystemRights]::FullControl), ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
+        ([Security.AccessControl.PropagationFlags]::None), ([Security.AccessControl.AccessControlType]::Allow)))
+  }
+  $null = [IO.Directory]::CreateDirectory($Path, $security)
+}
+
+function Protect-LauncherFolder([string]$TargetDir) {
+  # Same sequence as src/Steps/Prepare.ps1 / Protect-SetupFolder - keep in step. Verify or create; never
+  # repair, never recurse. Returns @{ Ok; Message }, Message being the red refusal text. Never throws.
+  #   1. Normalize TargetDir, then take its parent (C:\BenTech); the root guard refuses a drive root.
+  #   2. Parent exists: it must pass Test-LauncherFolderAdminOnly, else refuse. No icacls on it, ever.
+  #   3. Parent missing: create it locked, the two icacls commands, then verify it again.
+  #   4. Working folder: refuse a reparse point; create it when missing (it inherits). No icacls on it.
+  $parent = $TargetDir   # replaced by the real parent below; only used in a message if that fails
+  try {
+    $target = [IO.Path]::GetFullPath($TargetDir).TrimEnd('\')
+    $parent = Split-Path -Parent $target
+    $commands = Get-LauncherAclCommands -Parent $parent
+    $couldNot = @{ Ok = $false; Message = "Cannot secure $parent - nothing was run." }
+    if ($null -ne (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+      if (-not (Test-LauncherFolderAdminOnly -Path $parent)) {
+        return @{ Ok = $false; Message = "$parent already exists and is not admin-only. Delete it (as administrator) and run again. Nothing was run." }
+      }
+    } else {
+      New-LauncherLockedDirectory -Path $parent
+      foreach ($arguments in $commands) {
+        $icacls = Start-Process -FilePath "$env:windir\System32\icacls.exe" -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+        if ($null -eq $icacls -or $icacls.ExitCode -ne 0) { return $couldNot }
+      }
+      if (-not (Test-LauncherFolderAdminOnly -Path $parent)) { return $couldNot }
+    }
+    if (Test-LauncherReparsePoint -Path $target) { return $couldNot }
+    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target | Out-Null }
+    return @{ Ok = $true; Message = '' }
+  } catch {
+    return @{ Ok = $false; Message = "Cannot secure $parent - nothing was run." }
   }
 }
 
@@ -196,9 +241,14 @@ try {
   #    -SkipAcl is for the tests only: they run without elevation and cannot lock a folder down.
   if ($SkipAcl) {
     if (-not (Test-Path -LiteralPath $TargetDir -PathType Container)) { New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null }
-  } elseif (-not (Protect-LauncherFolder -TargetDir $TargetDir)) {
-    Write-Failure "Cannot secure $(Split-Path -Parent $TargetDir) - nothing was run."
-    Exit-Launcher 5
+  } else {
+    $secured = Protect-LauncherFolder -TargetDir $TargetDir
+    if (-not (($secured -is [hashtable]) -and ($secured.Ok -eq $true))) {
+      $refusal = "Cannot secure $(Split-Path -Parent $TargetDir) - nothing was run."
+      if (($secured -is [hashtable]) -and $secured.Message) { $refusal = [string]$secured.Message }
+      Write-Failure $refusal
+      Exit-Launcher 5
+    }
   }
   foreach ($name in $ReleaseFiles) {
     [IO.File]::WriteAllBytes((Join-Path $TargetDir $name), [byte[]]$downloaded[$name])

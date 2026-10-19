@@ -296,34 +296,34 @@ function Unregister-ResumeTask {
 function Get-SetupFolderAclCommands {
   <#
   .SYNOPSIS
-    The three icacls argument strings, in order, that make <Parent> (C:\BenTech) and everything under it
-    admin-only (R28). The launcher holds a mirror of this function; keep the two in step.
+    The two icacls argument strings, in order, that lock down a C:\BenTech this run has just created
+    (R28b). The launcher holds a mirror of this function; keep the two in step.
   .DESCRIPTION
-      1. /setowner *S-1-5-32-544 /T   Administrators own the parent and everything below. An owner keeps
-                                      the right to change the ACL, so a folder pre-created by a standard
-                                      user would otherwise stay theirs.
-      2. /reset /T                    Every ACL below goes back to inherited-only, which drops ACEs planted
-                                      there (for example Everyone:M, which /grant:r leaves in place).
-      3. /inheritance:r /grant:r ...  The parent stops inheriting from C:\ (which gives Authenticated Users
-                                      Modify) and grants only Administrators and SYSTEM, to it and to
-                                      everything below.
+      1. /setowner *S-1-5-32-544            Administrators own the folder (an owner can always change the
+                                             ACL, so it must not stay the creating user's).
+      2. /inheritance:r /grant:r ...        It does not inherit from C:\ (which gives Authenticated Users
+                                             Modify) and grants only Administrators and SYSTEM, to itself and
+                                             to everything created below it later.
+    Both act on that one folder only. Nothing here may recurse or reset: a recursive owner or ACL change
+    follows junctions below the folder and would change files wherever they point. An existing folder is
+    therefore never repaired, only verified (Test-SetupFolderAdminOnly).
     `*S-1-5-32-544` and `*S-1-5-18` are the well-known SIDs of Administrators and SYSTEM. Group NAMES are
     localized (Hebrew Windows has other names), so a name must never be used here.
-    No /C: with /C icacls exits 0 even when it failed on every file, so a failure would go unnoticed.
-    Without it, icacls stops at the first error with a non-zero exit code.
+    No /C: with /C icacls exits 0 even when it failed, so a failure would go unnoticed.
     The path is quoted, and a trailing backslash is dropped because \" would escape the closing quote.
-    Throws unless <Parent> is an absolute path below a drive root ("C:\x"): a recursive owner change
-    on "C:\" or on a relative path (resolved against the working directory) would wreck the system.
+    Throws unless <Parent> is an absolute, already normalized folder below a drive root ("C:\x"): no
+    drive root, no relative path (resolved against the working directory) and no "." or ".." parts.
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
   param([Parameter(Mandatory)][string]$Parent)
 
   $path = $Parent.Trim().TrimEnd('\')
-  if ($path -notmatch '^[A-Za-z]:\\[^\\]') { throw "Refusing to lock down '$Parent': expected an absolute folder below a drive root, such as C:\BenTech." }
+  if ($path -notmatch '^[A-Za-z]:\\[^\\]' -or [IO.Path]::GetFullPath($path) -ne $path) {
+    throw "Refusing to lock down '$Parent': expected an absolute, normalized folder below a drive root, such as C:\BenTech."
+  }
   @(
-    "`"$path`" /setowner *S-1-5-32-544 /T"
-    "`"$path`" /reset /T"
+    "`"$path`" /setowner *S-1-5-32-544"
     "`"$path`" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F"
   )
 }
@@ -338,57 +338,123 @@ function Test-SetupReparsePoint {
   return ($null -ne $item -and (([IO.FileAttributes]$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))
 }
 
-function Protect-SetupFolder {
+function Test-SetupFolderAdminOnly {
   <#
   .SYNOPSIS
-    Private. Makes the working folder's parent (C:\BenTech) admin-only, fail closed (R28). $true only when
-    every stage worked. Never throws.
+    Private. $true only when Path is admin-only in our locked state (R28b). Never throws: any doubt is $false.
   .DESCRIPTION
-    The same sequence as the launcher's Protect-LauncherFolder, which normally did this already; this
-    re-asserts it.
-      1. Refuse when the parent or the working folder is a reparse point (a junction would redirect the
-         lockdown and the setup files somewhere else).
-      2. Create the parent if it is missing.
-      3. The three Get-SetupFolderAclCommands calls to icacls, stopping at the first failure.
-      4. Create the working folder if it is missing (it inherits the lockdown).
-      5. The reparse check again: one swapped in before the lockdown is refused too. After it, only
-         administrators can change anything under the parent.
+    All of: not a reparse point; owned by Administrators (S-1-5-32-544) or SYSTEM (S-1-5-18); does not
+    inherit (AreAccessRulesProtected); and every access rule, allow or deny, explicit or inherited, is for
+    Administrators or SYSTEM. Read through Get-Acl and SIDs only, so it is the same on Hebrew Windows.
+    The launcher holds a mirror (Test-LauncherFolderAdminOnly); keep the two in step.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    if (Test-SetupReparsePoint -Path $Path) { return $false }
+    $allowed = @('S-1-5-32-544', 'S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($null -eq $acl) { return $false }
+    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { return $false }
+    if ($acl.AreAccessRulesProtected -ne $true) { return $false }
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+      if ([string]$rule.IdentityReference.Value -notin $allowed) { return $false }
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function New-SetupLockedDirectory {
+  <#
+  .SYNOPSIS
+    Private. Creates Path with its final protected DACL in the same call: full control for Administrators
+    and SYSTEM, inherited by everything below, nothing inherited from above.
+  .DESCRIPTION
+    A folder made with New-Item under C:\ inherits Authenticated Users: Modify from C:\ until icacls runs.
+    In that window a waiting non-admin process could create C:\BenTech\Setup (or keep a handle open) with
+    its own permissions, which a later run's verify-only path would accept. Created this way, the folder
+    is never accessible to non-admins, not even for a moment. The owner is left to the default (icacls sets
+    it next), because naming an owner here needs privileges the token may not have enabled.
+    The launcher holds a mirror (New-LauncherLockedDirectory); keep the two in step.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  $security = New-Object Security.AccessControl.DirectorySecurity
+  $security.SetAccessRuleProtection($true, $false)
+  foreach ($sid in 'S-1-5-32-544', 'S-1-5-18') {
+    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList (New-Object Security.Principal.SecurityIdentifier $sid),
+        ([Security.AccessControl.FileSystemRights]::FullControl), ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
+        ([Security.AccessControl.PropagationFlags]::None), ([Security.AccessControl.AccessControlType]::Allow)))
+  }
+  $null = [IO.Directory]::CreateDirectory($Path, $security)
+}
+
+function Protect-SetupFolder {
+  <#
+  .SYNOPSIS
+    Private. Makes sure the working folder's parent (C:\BenTech) is admin-only, fail closed (R28b). Returns
+    @{ Ok = <bool>; Message = <string> }; Message is the Error text when Ok is $false. Never throws.
+  .DESCRIPTION
+    Verify or create; never repair, never recurse. The same sequence as the launcher's
+    Protect-LauncherFolder, which normally did this already; this re-asserts it.
+      1. Normalize Root, then take its parent. Get-SetupFolderAclCommands refuses a parent that is a drive
+         root or not normalized (so "C:\x\..\Setup" is refused, not turned into a lockdown of C:\).
+      2. Parent exists: Test-SetupFolderAdminOnly must pass, else refuse. No icacls on it, ever: it is
+         either our own locked folder from an earlier run, or someone else's and refused.
+      3. Parent missing: New-SetupLockedDirectory, then the two Get-SetupFolderAclCommands calls to icacls
+         (stopping at the first failure), then Test-SetupFolderAdminOnly again as a post-condition.
+      4. Working folder: refuse a reparse point; create it when missing (it inherits). No icacls on it.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][string]$Root,
     [Parameter(Mandatory)][double]$TimeoutMinutes
   )
 
+  $parent = $Root   # replaced by the real parent below; only used in a message if that fails
+  $failed = { param([string]$Text) @{ Ok = $false; Message = $Text } }
   try {
-    $parent = Split-Path -Parent $Root
+    $target = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $parent = Split-Path -Parent $target
     $commands = Get-SetupFolderAclCommands -Parent $parent
-    foreach ($path in $parent, $Root) {
-      if (Test-SetupReparsePoint -Path $path) {
-        Write-SetupLog -Level ERROR -Message 'Working folder is a junction or symlink; refusing to use it' -Data @{ path = $path }
-        return $false
+    $notAdminOnly = "$parent already exists and is not admin-only, so non-admin users may be able to change the setup files. Delete it (as administrator) and run setup again."
+    $couldNot = "Could not make $parent admin-only, so non-admin users may be able to change the setup files"
+
+    if ($null -ne (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+      if (-not (Test-SetupFolderAdminOnly -Path $parent)) {
+        Write-SetupLog -Level ERROR -Message 'Working folder parent exists and is not admin-only; refusing it (never repaired)' -Data @{ path = $parent }
+        return (& $failed $notAdminOnly)
+      }
+    } else {
+      New-SetupLockedDirectory -Path $parent
+      foreach ($arguments in $commands) {
+        $run = Invoke-PrepareTool -FilePath (Join-Path $env:windir 'System32\icacls.exe') -ArgumentList $arguments -TimeoutMinutes $TimeoutMinutes
+        if (-not $run.Ok) {
+          Write-SetupLog -Level ERROR -Message 'Working folder parent could not be locked down (icacls failed)' -Data @{ args = $arguments }
+          return (& $failed $couldNot)
+        }
+      }
+      if (-not (Test-SetupFolderAdminOnly -Path $parent)) {
+        Write-SetupLog -Level ERROR -Message 'Working folder parent is still not admin-only after the lockdown' -Data @{ path = $parent }
+        return (& $failed $couldNot)
       }
     }
-    if ($null -eq (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    foreach ($arguments in $commands) {
-      $run = Invoke-PrepareTool -FilePath (Join-Path $env:windir 'System32\icacls.exe') -ArgumentList $arguments -TimeoutMinutes $TimeoutMinutes
-      if (-not $run.Ok) {
-        Write-SetupLog -Level ERROR -Message 'Working folder could not be locked down (icacls failed)' -Data @{ args = $arguments }
-        return $false
-      }
+
+    if (Test-SetupReparsePoint -Path $target) {
+      Write-SetupLog -Level ERROR -Message 'Working folder is a junction or symlink; refusing to use it' -Data @{ path = $target }
+      return (& $failed $couldNot)
     }
-    if ($null -eq (Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
-    foreach ($path in $parent, $Root) {
-      if (Test-SetupReparsePoint -Path $path) {
-        Write-SetupLog -Level ERROR -Message 'Working folder became a junction or symlink during the lockdown; refusing to use it' -Data @{ path = $path }
-        return $false
-      }
-    }
-    return $true
+    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target | Out-Null }
+    return @{ Ok = $true; Message = '' }
   } catch {
-    Write-SetupLog -Level ERROR -Message 'Working folder could not be locked down' -Data @{ root = $Root; error = $_.Exception.Message }
-    return $false
+    Write-SetupLog -Level ERROR -Message 'Working folder could not be secured' -Data @{ root = $Root; error = $_.Exception.Message }
+    return (& $failed "Could not make $parent admin-only, so non-admin users may be able to change the setup files")
   }
 }
 
@@ -420,10 +486,11 @@ function Invoke-StepPrepare {
     Step 0: prepares the machine for an unattended run. Returns Done('Machine prepared').
   .DESCRIPTION
     In order:
-      1. Protect-SetupFolder (R28): the working folder's parent (C:\BenTech) is owned by Administrators
-         and only Administrators and SYSTEM can open it or anything below. Fail closed: a junction or
-         symlink in the way, or any failing icacls, is Failed('Working folder could not be secured')
-         with an Error. That message wins over the resume task's, and every other stage still runs.
+      1. Protect-SetupFolder (R28b): the working folder's parent (C:\BenTech) must be owned by
+         Administrators and open only to Administrators and SYSTEM. An existing one is only verified;
+         a missing one is created locked. Fail closed: a junction or symlink, a folder that is not
+         admin-only, or any failing icacls is Failed('Working folder could not be secured') with an
+         Error. That message wins over the resume task's, and every other stage still runs.
       2. The logon task that resumes the run after a reboot.
       3. Power: remember the original settings (first run only), then never sleep, hibernate or turn
          the display off, and ignore the lid, on AC and on battery.
@@ -452,9 +519,10 @@ function Invoke-StepPrepare {
   }
 
   # 1. Working folder (R28): its parent admin-only, fail closed
-  $folderSecured = Protect-SetupFolder -Root $Context.Root -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.default)
+  $folder = Protect-SetupFolder -Root $Context.Root -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.default)
+  $folderSecured = ($folder -is [hashtable]) -and ($folder.Ok -eq $true)
   if (-not $folderSecured) {
-    $errors.Add("Could not make $(Split-Path -Parent $Context.Root) admin-only (icacls failed, or a junction or symlink is in the way), so non-admin users may be able to change the setup files")
+    $errors.Add($(if (($folder -is [hashtable]) -and $folder.Message) { [string]$folder.Message } else { 'Could not make the working folder admin-only' }))
   }
 
   # 2. Resume task

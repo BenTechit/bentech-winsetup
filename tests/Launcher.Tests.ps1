@@ -5,9 +5,10 @@
 # SAFETY:
 # - Every signature here uses a throwaway RSA key made in this file, never Ben's real signing key.
 # - Launchers are built into $TestDrive, read their "release" from a file:/// folder in $TestDrive and
-#   install into $TestDrive, with -SkipAcl. Nothing touches C:\BenTech. The one exception to -SkipAcl is
-#   the exit-5 test: not elevated, the real "icacls <TestDrive folder> /setowner" is refused and changes
-#   nothing (the test is skipped when elevated). The folder lockdown itself is tested with mocks.
+#   install into $TestDrive, with -SkipAcl. Nothing touches C:\BenTech. The exceptions all stay inside
+#   $TestDrive: the two exit-5 tests (a plain folder refused before any icacls; a new folder whose real,
+#   non-recursive "icacls /setowner" is refused when not elevated - skipped when elevated) and the real
+#   locked-create test. Each gives access back in a finally. The lockdown logic itself is tested with mocks.
 # - Publish.ps1 only runs as a -DryRun in a stubbed copy under $TestDrive, with a fake gh first on PATH,
 #   an invalid GH_TOKEN and a repo that does not exist.
 BeforeAll {
@@ -224,17 +225,46 @@ Describe 'launcher mirrors stay in step with src' {
       if ($fn.Name -in 'Test-ReleaseSignature', 'Test-SetupLockHeld', 'Get-LauncherAclCommands') { . ([ScriptBlock]::Create($fn.Extent.Text)) }
     }
   }
-  It 'builds the same icacls commands as Get-SetupFolderAclCommands (src/Steps/Prepare.ps1), and refuses the same bad paths' {
+  It 'builds the same two icacls commands as Get-SetupFolderAclCommands (src/Steps/Prepare.ps1), and refuses the same bad paths' {
     . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
     foreach ($p in 'C:\BenTech', 'C:\BenTech\', 'D:\Some Dir\x') {
       $mine = @(Get-LauncherAclCommands -Parent $p)
-      $mine.Count | Should -Be 3
+      $mine.Count | Should -Be 2
       $mine | Should -Be @(Get-SetupFolderAclCommands -Parent $p)
     }
-    foreach ($bad in 'C:\', 'C:', 'BenTech', '\BenTech', ' ') {
+    foreach ($bad in 'C:\', 'C:', 'BenTech', '.\BenTech', '\BenTech', ' ', 'C:\x\..', 'C:\.\BenTech') {
       { Get-LauncherAclCommands -Parent $bad } | Should -Throw
       { Get-SetupFolderAclCommands -Parent $bad } | Should -Throw
     }
+  }
+  It 'creates a folder admin-only from the start, exactly like New-SetupLockedDirectory (real folders in TestDrive)' {
+    . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
+    $tok = $null; $err = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)
+    $fn = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'New-LauncherLockedDirectory' }, $false))
+    $fn.Count | Should -Be 1
+    . ([ScriptBlock]::Create($fn[0].Extent.Text))
+    $a = Join-Path $TestDrive 'locked-launcher'; $b = Join-Path $TestDrive 'locked-prepare'
+    try {
+      New-LauncherLockedDirectory -Path $a
+      New-SetupLockedDirectory -Path $b
+      foreach ($p in $a, $b) {
+        $acl = Get-Acl -LiteralPath $p
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) |
+          Should -Be @('S-1-5-18', 'S-1-5-32-544')
+        @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IsInherited }) | Should -BeNullOrEmpty
+      }
+      (Get-Acl -LiteralPath $a).GetSecurityDescriptorSddlForm('Access') | Should -Be (Get-Acl -LiteralPath $b).GetSecurityDescriptorSddlForm('Access')
+    } finally {
+      # Not elevated, this user owns them but cannot open them: give access back so Pester can delete them.
+      foreach ($p in $a, $b) { if (Test-Path -LiteralPath $p) { & "$env:windir\System32\icacls.exe" $p /reset 2>&1 | Out-Null } }
+    }
+  }
+  It 'holds no recursive or repairing icacls switch anywhere in the launcher (R28b)' {
+    $text = [IO.File]::ReadAllText("$PSScriptRoot\..\launcher\BenTechSetup.template.cmd")
+    $text | Should -Not -Match '/T\b'
+    $text | Should -Not -Match '/reset'
   }
   It 'accepts a valid signature and returns a real $false for anything else (like Test-DetachedSignature)' {
     $data = [Text.Encoding]::UTF8.GetBytes('payload'); $pub = $rsa.ToXmlString($false)
@@ -267,24 +297,42 @@ Describe 'launcher mirrors stay in step with src' {
   }
 }
 
-Describe 'launcher folder lockdown (R28)' {
-  # Protect-LauncherFolder runs here in this process with Start-Process, Get-Item and New-Item mocked:
-  # no real icacls, no real junction, nothing under C:\BenTech is read or changed.
+Describe 'launcher folder lockdown (R28b)' {
+  # Protect-LauncherFolder runs here in this process with Start-Process, Get-Item, Get-Acl, New-Item and
+  # New-LauncherLockedDirectory mocked: no real icacls, no real junction, nothing under C:\BenTech is read
+  # or changed. Get-Acl answers real in-memory DirectorySecurity objects (never applied to disk).
   BeforeAll {
     $tok = $null; $err = $null
     $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)
     foreach ($fn in $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-      if ($fn.Name -in 'Get-LauncherAclCommands', 'Test-LauncherReparsePoint', 'Protect-LauncherFolder') { . ([ScriptBlock]::Create($fn.Extent.Text)) }
+      if ($fn.Name -in 'Get-LauncherAclCommands', 'Test-LauncherReparsePoint', 'Test-LauncherFolderAdminOnly', 'New-LauncherLockedDirectory', 'Protect-LauncherFolder') {
+        . ([ScriptBlock]::Create($fn.Extent.Text))
+      }
     }
     $script:icaclsExe = "$env:windir\System32\icacls.exe"
+    function New-TestAcl {
+      param([string]$Owner = 'S-1-5-32-544', [bool]$Protected = $true, [string[]]$Sids = @('S-1-5-32-544', 'S-1-5-18'))
+      $s = New-Object Security.AccessControl.DirectorySecurity
+      $s.SetOwner((New-Object Security.Principal.SecurityIdentifier $Owner))
+      $s.SetAccessRuleProtection($Protected, $false)
+      foreach ($sid in $Sids) {
+        $s.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList (New-Object Security.Principal.SecurityIdentifier $sid),
+            ([Security.AccessControl.FileSystemRights]::FullControl), ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
+            ([Security.AccessControl.PropagationFlags]::None), ([Security.AccessControl.AccessControlType]::Allow)))
+      }
+      return $s
+    }
+    $script:userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $script:notAdminOnly = 'C:\BenTech already exists and is not admin-only. Delete it (as administrator) and run again. Nothing was run.'
   }
   BeforeEach {
     $script:icacls = New-Object System.Collections.ArrayList   # one hashtable per Start-Process call
-    $script:steps = New-Object System.Collections.ArrayList    # ordered: 'icacls' / 'mkdir <path>'
+    $script:steps = New-Object System.Collections.ArrayList    # ordered: 'icacls', 'acl <path>', 'mkdir <path>', 'mkdir-locked <path>'
     $script:failIcaclsAt = 0                                   # 1-based icacls call that exits 1307; 0 = none
     $script:folders = @('C:\BenTech', 'C:\BenTech\Setup')
     $script:reparse = @()
-    $script:reparseAfterIcacls = @()
+    $script:aclByPath = @{ 'C:\BenTech' = (New-TestAcl) }
+    $script:aclAfterIcacls = @{}
     Mock Start-Process {
       [void]$script:icacls.Add(@{ File = $FilePath; Args = (@($ArgumentList) -join ' '); Wait = [bool]$Wait; PassThru = [bool]$PassThru; Window = [string]$WindowStyle })
       [void]$script:steps.Add('icacls')
@@ -294,77 +342,135 @@ Describe 'launcher folder lockdown (R28)' {
       if ($script:folders -notcontains $LiteralPath) { return $null }
       $attributes = [IO.FileAttributes]::Directory
       if ($script:reparse -contains $LiteralPath) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
-      if ($script:reparseAfterIcacls -contains $LiteralPath -and $script:icacls.Count -ge 3) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
       [pscustomobject]@{ FullName = $LiteralPath; Attributes = $attributes }
     }
+    Mock Get-Acl {
+      [void]$script:steps.Add("acl $LiteralPath")
+      if ($script:icacls.Count -ge 2 -and $script:aclAfterIcacls.ContainsKey([string]$LiteralPath)) { return $script:aclAfterIcacls[[string]$LiteralPath] }
+      if ($script:aclByPath.ContainsKey([string]$LiteralPath)) { return $script:aclByPath[[string]$LiteralPath] }
+      throw "Cannot find path '$LiteralPath'"
+    }
     Mock New-Item { [void]$script:steps.Add("mkdir $Path") }
+    Mock New-LauncherLockedDirectory { [void]$script:steps.Add("mkdir-locked $Path") }
   }
 
-  It 'runs the three icacls commands in order on C:\BenTech, by full path, hidden and waited for' {
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeTrue
+  It 'accepts an existing, locked C:\BenTech without running icacls or creating anything' {
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeTrue
+    @($script:steps) | Should -Be @('acl C:\BenTech')
+  }
+  It 'creates a missing working folder inside a locked C:\BenTech (it inherits), still without icacls' {
+    $script:folders = @('C:\BenTech')
+    (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeTrue
+    @($script:steps) | Should -Be @('acl C:\BenTech', 'mkdir C:\BenTech\Setup')
+  }
+  It 'refuses an existing C:\BenTech <Case>, with the delete-it message and no icacls' -ForEach @(
+    @{ Case = 'owned by a user'; Acl = @{ Owner = 'USER' } }
+    @{ Case = 'that inherits (not protected)'; Acl = @{ Protected = $false } }
+    @{ Case = 'with an extra Authenticated Users (S-1-5-11) rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-11') } }
+  ) {
+    if ($Acl.Owner -eq 'USER') { $Acl = @{ Owner = $userSid } }
+    $script:aclByPath['C:\BenTech'] = New-TestAcl @Acl
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be $notAdminOnly
+    $script:icacls.Count | Should -Be 0
+    @($script:steps | Where-Object { $_ -like 'mkdir*' }) | Should -BeNullOrEmpty
+  }
+  It 'creates a missing C:\BenTech already locked, runs the two icacls commands, verifies it, then creates Setup' {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeTrue
+    @($script:steps) | Should -Be @('mkdir-locked C:\BenTech', 'icacls', 'icacls', 'acl C:\BenTech', 'mkdir C:\BenTech\Setup')
     @($script:icacls | ForEach-Object { $_.Args }) | Should -Be @(
-      '"C:\BenTech" /setowner *S-1-5-32-544 /T'
-      '"C:\BenTech" /reset /T'
+      '"C:\BenTech" /setowner *S-1-5-32-544'
       '"C:\BenTech" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F'
     )
     foreach ($c in $script:icacls) { $c.File | Should -Be $icaclsExe; $c.Wait | Should -BeTrue; $c.PassThru | Should -BeTrue; $c.Window | Should -Be 'Hidden' }
   }
-  It 'creates a missing C:\BenTech before icacls, and the working folder only after it (so it inherits the lockdown)' {
+  It 'refuses when the new C:\BenTech is still not admin-only after icacls (post-verify)' {
     $script:folders = @()
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeTrue
-    @($script:steps) | Should -Be @('mkdir C:\BenTech', 'icacls', 'icacls', 'icacls', 'mkdir C:\BenTech\Setup')
+    $script:aclByPath = @{}
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl -Sids @('S-1-5-32-544', 'S-1-5-11')) }
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be 'Cannot secure C:\BenTech - nothing was run.'
+    @($script:steps | Where-Object { $_ -eq 'mkdir C:\BenTech\Setup' }) | Should -BeNullOrEmpty
   }
-  It 'refuses when <Which> is a junction or symlink, before running anything' -ForEach @(
-    @{ Which = 'C:\BenTech' }, @{ Which = 'C:\BenTech\Setup' }
-  ) {
-    $script:reparse = @($Which)
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
-    @($script:steps) | Should -BeNullOrEmpty
-  }
-  It 'refuses a junction swapped in before the lockdown (checked again after icacls)' {
-    $script:reparseAfterIcacls = @('C:\BenTech\Setup')
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
-    $script:icacls.Count | Should -Be 3
-  }
-  It 'stops at the first icacls command that fails (call <At>)' -ForEach @(@{ At = 1 }, @{ At = 2 }, @{ At = 3 }) {
+  It 'stops at the icacls command that fails (call <At>) and refuses' -ForEach @(@{ At = 1 }, @{ At = 2 }) {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
     $script:failIcaclsAt = $At
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be 'Cannot secure C:\BenTech - nothing was run.'
     $script:icacls.Count | Should -Be $At
+    @($script:steps | Where-Object { $_ -like 'acl *' -or $_ -eq 'mkdir C:\BenTech\Setup' }) | Should -BeNullOrEmpty
   }
   It 'treats an icacls without an exit code as a failure' {
+    $script:folders = @()
     Mock Start-Process { [void]$script:icacls.Add(@{}); [pscustomobject]@{ ExitCode = $null } }
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeFalse
   }
-  It 'refuses a target directly under a drive root without touching anything' {
-    Protect-LauncherFolder -TargetDir 'C:\Setup' | Should -BeFalse
+  It 'refuses a C:\BenTech that is a junction or symlink before reading or running anything' {
+    $script:reparse = @('C:\BenTech')
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be $notAdminOnly
+    @($script:steps) | Should -BeNullOrEmpty
+  }
+  It 'refuses a working folder that is a junction or symlink' {
+    $script:reparse = @('C:\BenTech\Setup')
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $script:icacls.Count | Should -Be 0
+  }
+  It 'normalizes first: <Target> is refused by the root guard without touching anything' -ForEach @(
+    @{ Target = 'C:\Setup' }, @{ Target = 'C:\x\..\Setup' }, @{ Target = 'C:\BenTech\..\Setup' }, @{ Target = 'C:\' }
+  ) {
+    $r = Protect-LauncherFolder -TargetDir $Target
+    $r.Ok | Should -BeFalse
     @($script:steps) | Should -BeNullOrEmpty
   }
   It 'never throws (an icacls that cannot be started is a refusal)' {
+    $script:folders = @()
     Mock Start-Process { throw 'cannot start icacls' }
     { Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' } | Should -Not -Throw
-    Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' | Should -BeFalse
+    (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeFalse
   }
 }
 
-Describe 'launcher exit 5 (R28)' {
-  It 'exits 5, says so, and writes nothing when the folder cannot be secured (real icacls, refused when not elevated)' {
+Describe 'launcher exit 5 (R28b)' {
+  It 'exits 5 with the delete-it message and writes nothing when the parent exists and is not admin-only (real)' {
+    # A plain folder made here inherits from TestDrive: not protected, so it is refused before any icacls.
+    SignAll; $parent = Join-Path $TestDrive 's6'; New-Item -ItemType Directory $parent | Out-Null; $d = Join-Path $parent 'Setup'
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TestDrive\launcher.ps1" -TargetDir $d -NoPause 2>&1 | Out-String
+    $LASTEXITCODE | Should -Be 5
+    $out | Should -Match ([regex]::Escape("$parent already exists and is not admin-only. Delete it (as administrator) and run again. Nothing was run."))
+    $d | Should -Not -Exist
+  }
+  It 'exits 5 and writes nothing when a new parent cannot be locked down (real icacls, refused when not elevated)' {
     $principal = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
     if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
       Set-ItResult -Skipped -Because 'elevated: icacls /setowner would succeed here, so it cannot be the failure under test'
       return
     }
-    # Not elevated, "icacls <folder> /setowner *S-1-5-32-544" is refused (exit 1307) and changes nothing.
+    # Not elevated, "icacls <new folder> /setowner *S-1-5-32-544" is refused (exit 1307).
     SignAll; $parent = Join-Path $TestDrive 's5'; $d = Join-Path $parent 'Setup'
     try {
       $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TestDrive\launcher.ps1" -TargetDir $d -NoPause 2>&1 | Out-String
       $LASTEXITCODE | Should -Be 5
       $out | Should -Match ([regex]::Escape("Cannot secure $parent - nothing was run."))
-      $d | Should -Not -Exist
+      Test-Path -LiteralPath $parent | Should -BeTrue             # created locked, then refused
+      (Get-Acl -LiteralPath $parent).AreAccessRulesProtected | Should -BeTrue
     } finally {
-      # If a regression ever did lock the folder down, this user still owns it: give access back so
-      # Pester can delete $TestDrive.
-      if (Test-Path -LiteralPath $parent) { & "$env:windir\System32\icacls.exe" $parent /reset /T /C 2>&1 | Out-Null }
+      # The new folder is admin-only and this (non-admin) user only owns it: give access back so Pester
+      # can delete $TestDrive. Not recursive: the folder is empty.
+      if (Test-Path -LiteralPath $parent) { & "$env:windir\System32\icacls.exe" $parent /reset 2>&1 | Out-Null }
     }
+    Test-Path -LiteralPath $d | Should -BeFalse
   }
 }
 
