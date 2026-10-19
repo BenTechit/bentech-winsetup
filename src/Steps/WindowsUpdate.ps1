@@ -641,14 +641,17 @@ function Read-WuRoundResult {
 }
 
 function Update-WuRunState {
-  # Private. Books one round result into the state: WuFailureCounts[Id]++ and FailedTitles[Id] = Title
-  # for every failed update, Hidden appended to HiddenUpdateIds (no duplicates, ignoring case), and
-  # the Installed count added to Data.Installed.
+  # Private. Books one round result into the state: FailedTitles[Id] = Title and (unless
+  # -SkipFailureCounts) WuFailureCounts[Id]++ for every failed update, Hidden appended to
+  # HiddenUpdateIds (no duplicates, ignoring case), and the Installed count added to Data.Installed.
+  # -SkipFailureCounts (ruling R23b) is for a busy / restart-pending round: that says nothing about
+  # whether an update is bad, so it must not push healthy updates toward being hidden.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$State,
     [Parameter(Mandatory)][System.Collections.IDictionary]$Data,
-    [Parameter(Mandatory)]$Result
+    [Parameter(Mandatory)]$Result,
+    [switch]$SkipFailureCounts
   )
 
   if ($State['WuFailureCounts'] -isnot [System.Collections.IDictionary]) { $State['WuFailureCounts'] = @{} }
@@ -657,7 +660,7 @@ function Update-WuRunState {
   foreach ($item in @(ConvertTo-WuList -Value $Result.Failed)) {
     $id = [string]$item.Id
     if (-not $id) { continue }
-    $counts[$id] = [int]$counts[$id] + 1
+    if (-not $SkipFailureCounts) { $counts[$id] = [int]$counts[$id] + 1 }
     $titles[$id] = [string]$item.Title
   }
 
@@ -688,7 +691,9 @@ function Invoke-StepWindowsUpdate {
        out'); a child that cannot start -> Failed('Windows Update round could not be started: ...').
     4. No readable result JSON -> Failed('Windows Update round produced no result').
     5. Books the result into the state (Update-WuRunState), even when it carries an Error, so an update
-       the round hid before failing is still reported.
+       the round hid before failing is still reported. On a round with one of the three mapped codes
+       below, failed updates get their FailedTitles entry but NOT a WuFailureCounts increment (ruling
+       R23b: a busy agent says nothing about whether an update is bad).
     6. ErrorCode (ruling R23; the numeric code, never the localized text), before the Error check:
          0x80240016 / 0x8024A000 (another install in progress / no AU service): WARN, wait
            BusyWaitSeconds (default 120), then Continue with no restart. The round still counts toward
@@ -743,20 +748,22 @@ function Invoke-StepWindowsUpdate {
     return New-StepResult -Status Failed -Message 'Windows Update round produced no result' -Data (Get-WuResultData -Data $data)
   }
 
-  Update-WuRunState -State $state -Data $data -Result $result
+  $errorCode = Get-WuResultErrorCode -Result $result
+  $isBusy = $script:WuBusyErrorCodes -contains $errorCode
+  $isRebootPending = $errorCode -eq $script:WuRebootPendingErrorCode
+  Update-WuRunState -State $state -Data $data -Result $result -SkipFailureCounts:($isBusy -or $isRebootPending)
   $installedNow = @(ConvertTo-WuList -Value $result.Installed).Count
   $failedNow = @(ConvertTo-WuList -Value $result.Failed).Count
   $rebootNow = ($result.RebootRequired -eq $true)
-  $errorCode = Get-WuResultErrorCode -Result $result
   Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; rebootRequired = $rebootNow; error = [string]$result.Error; errorCode = $errorCode }
 
   # Ruling R23: codes that mean "not now" are retried; the round still counts toward the cap.
-  if ($script:WuBusyErrorCodes -contains $errorCode) {
+  if ($isBusy) {
     Write-SetupLog -Message 'Windows Update agent is busy; waiting, then retrying' -Level WARN -Data @{ round = $round; errorCode = $errorCode; waitSeconds = $BusyWaitSeconds; cap = $cap }
     Start-Sleep -Seconds $BusyWaitSeconds
     return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), retrying" -Data (Get-WuResultData -Data $data)
   }
-  if ($errorCode -eq $script:WuRebootPendingErrorCode) {
+  if ($isRebootPending) {
     Write-SetupLog -Message 'Windows Update needs a restart to finish earlier updates; restarting' -Level WARN -Data @{ round = $round; errorCode = $errorCode; cap = $cap }
     return New-StepResult -Status Continue -Message "Windows Update round ${round}: restart needed to finish earlier updates ($errorCode)" -Reboot Now -Data (Get-WuResultData -Data $data)
   }

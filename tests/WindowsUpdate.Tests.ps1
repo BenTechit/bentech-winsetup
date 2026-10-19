@@ -617,11 +617,29 @@ Describe 'Windows Update round and step (mocked COM)' {
       $second.Message | Should -Be 'Windows Update round cap reached (6)'
       $script:ext.Count | Should -Be 1
     }
-    It 'still books hidden and failed updates on a busy round' {
-      $script:ctx = New-WuContext
-      $script:childResult = New-ChildResult -Hidden @('h1') -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }) -ErrorText 'x' -ErrorCode '0x80240016'
-      $null = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+    # Ruling R23b: a busy / restart-pending round says nothing about whether an update is bad.
+    It 'does not count failures on a <_> round, but still records titles and hidden ids' -ForEach @('0x80240016', '0x8024A000', '0x80242014') {
+      $script:ctx = New-WuContext -FailureCounts @{ f1 = 1 }
+      $script:childResult = New-ChildResult -Hidden @('h1') -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }, [ordered]@{ Id = 'f2'; Title = 'F2'; ResultCode = 4 }) -ErrorText 'x' -ErrorCode $_
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx -BusyWaitSeconds 0
+      $script:ctx.State.WuFailureCounts['f1'] | Should -Be 1
+      $script:ctx.State.WuFailureCounts.ContainsKey('f2') | Should -BeFalse
+      $r.Data.FailedTitles['f1'] | Should -Be 'F1'
+      $r.Data.FailedTitles['f2'] | Should -Be 'F2'
       @($script:ctx.State.HiddenUpdateIds) | Should -Be @('h1')
+    }
+    It 'still counts failures on a normal failure round' {
+      $script:ctx = New-WuContext -FailureCounts @{ f1 = 1 }
+      $script:childResult = New-ChildResult -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }, [ordered]@{ Id = 'f2'; Title = 'F2'; ResultCode = 5 })
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'
+      $script:ctx.State.WuFailureCounts['f1'] | Should -Be 2
+      $script:ctx.State.WuFailureCounts['f2'] | Should -Be 1
+    }
+    It 'still counts failures when the round fails with an unmapped code' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }) -ErrorText 'access denied' -ErrorCode '0x80070005'
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
       $script:ctx.State.WuFailureCounts['f1'] | Should -Be 1
     }
     It 'restarts when earlier updates still need a restart (0x80242014)' {
