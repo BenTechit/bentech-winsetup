@@ -88,10 +88,12 @@ function Invoke-StepDefaultBrowser {
   try {
     $xmlPath = Get-DefaultAssociationsPath
     Write-TextFileUtf8NoBom -Path $xmlPath -Text (New-DefaultAssociationsXml -ProgId 'ChromeHTML' -ApplicationName 'Google Chrome')
+    # -ErrorAction Stop: a refused registry write is a non-terminating error, which would skip the catch
+    # and report Done for a policy that was never set (final review I1).
     if (-not (Test-Path -LiteralPath $script:DefaultAssociationsPolicyKey)) {
-      New-Item -Path $script:DefaultAssociationsPolicyKey -Force | Out-Null
+      New-Item -Path $script:DefaultAssociationsPolicyKey -Force -ErrorAction Stop | Out-Null
     }
-    New-ItemProperty -LiteralPath $script:DefaultAssociationsPolicyKey -Name $script:DefaultAssociationsPolicyName -Value $xmlPath -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:DefaultAssociationsPolicyKey -Name $script:DefaultAssociationsPolicyName -Value $xmlPath -PropertyType String -Force -ErrorAction Stop | Out-Null
   } catch {
     Write-SetupLog -Message 'Default browser policy could not be set' -Level WARN -Data @{ file = $xmlPath; error = $_.Exception.Message }
     $reason = ([string]$_.Exception.Message -split "`r`n|`r|`n")[0].Trim()

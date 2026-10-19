@@ -119,7 +119,8 @@ BeforeAll {
     }
     Mock New-Item { [void]$script:regKeys.Add([string]$Path); $script:existing += [string]$Path }
     Mock New-ItemProperty {
-      if ($script:regWriteThrows) { throw $(if ($script:regWriteMessage) { $script:regWriteMessage } else { 'Requested registry access is not allowed' }) }
+      # Write-Error, not throw: the registry provider reports a refusal as a non-terminating error (I1).
+      if ($script:regWriteThrows) { Write-Error -Message $(if ($script:regWriteMessage) { $script:regWriteMessage } else { 'Requested registry access is not allowed' }) -Category PermissionDenied; return }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
     }
     Mock Get-Content {
@@ -894,7 +895,7 @@ Describe 'Invoke-StepDefaultBrowser' {
   }
   It 'is Skipped, with the reason, when the policy key cannot be created' {
     Set-ChromeInstalled
-    Mock New-Item { throw 'Attempted to perform an unauthorized operation.' }
+    Mock New-Item { Write-Error -Message 'Attempted to perform an unauthorized operation.' -Category PermissionDenied }
     $r = Invoke-StepDefaultBrowser -Context $script:ctx
     $r.Status | Should -Be 'Skipped'
     $r.Message | Should -Be 'Default browser policy could not be set: Attempted to perform an unauthorized operation.'

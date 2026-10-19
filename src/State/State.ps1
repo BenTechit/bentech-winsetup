@@ -197,7 +197,7 @@ function Read-RunState {
   $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
   $destination = Get-FreeArchivePath -Path (Join-Path $LogDir "state.corrupt-$stamp.json")
   try {
-    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null }
     [IO.File]::Move($path, $destination)
     Write-SetupLog -Level WARN -Message "state.json is unreadable; moved it to $destination and starting clean" -Data @{ reason = $problem }
   } catch {

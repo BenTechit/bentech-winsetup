@@ -236,9 +236,11 @@ function Get-ResumeTaskDefinition {
   .SYNOPSIS
     The parts of the resume task as @{ Execute; Argument; UserId; Settings}. Registers nothing.
   .DESCRIPTION
-    The script path is wrapped in double quotes so a path with spaces stays one argument; the user id
-    is passed through untouched (it may hold Hebrew letters). Settings: runs on battery and keeps
-    running when the charger is pulled, no execution time limit, one instance at a time, priority 5.
+    Execute is powershell.exe by its full System32 path, never a bare name looked up through PATH (the
+    same rule as the launcher's R30). The script path is wrapped in double quotes so a path with spaces
+    stays one argument; the user id is passed through untouched (it may hold Hebrew letters). Settings:
+    runs on battery and keeps running when the charger is pulled, no execution time limit, one instance
+    at a time, priority 5.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -248,7 +250,7 @@ function Get-ResumeTaskDefinition {
   )
 
   @{
-    Execute  = 'powershell.exe'
+    Execute  = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
     Argument = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -Resume"
     UserId   = $UserId
     Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 5
@@ -263,6 +265,10 @@ function Register-ResumeTask {
     Interactive logon type with the highest run level: the run needs the user's desktop (it shows a
     window) and administrator rights. -Force replaces an older registration, so re-running the step
     is safe. Throws if Task Scheduler refuses; Invoke-StepPrepare handles that.
+    Register-ScheduledTask is a CDXML cmdlet: it reports a refusal as a NON-terminating error, so it
+    runs with -ErrorAction Stop (otherwise a refused registration would look like success and R15 would
+    never fire). The registration is then read back with Get-ScheduledTask (-ErrorAction Stop): a task
+    that is not there afterwards is a failure too.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$ScriptPath)
@@ -272,24 +278,37 @@ function Register-ResumeTask {
   $action = New-ScheduledTaskAction -Execute $def.Execute -Argument $def.Argument
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $def.UserId
   $principal = New-ScheduledTaskPrincipal -UserId $def.UserId -LogonType Interactive -RunLevel Highest
-  Register-ScheduledTask -TaskName $script:ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $def.Settings -Force | Out-Null
+  Register-ScheduledTask -TaskName $script:ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $def.Settings -Force -ErrorAction Stop | Out-Null
+  $null = Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction Stop
   Write-SetupLog -Message 'Resume task registered' -Data @{ task = $script:ResumeTaskName; user = $userId }
 }
 
 function Unregister-ResumeTask {
   <#
   .SYNOPSIS
-    Removes the BenTechSetup-Resume task. Never throws: a task that is already gone is the normal case.
+    Removes the BenTechSetup-Resume task. Returns $true when the task is gone afterwards (removed now, or
+    already absent: the normal case, Finalize may run twice), $false when it could not be removed. Never
+    throws.
+  .DESCRIPTION
+    "Already absent" is recognized by the error's category (ObjectNotFound), never by its text, which is
+    localized. Any other failure (access denied, Task Scheduler unavailable) is a WARN and $false, so the
+    caller can report the leftover task (triage 250).
   #>
   [CmdletBinding()]
+  [OutputType([bool])]
   param()
 
   try {
     Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false -ErrorAction Stop
     Write-SetupLog -Message 'Resume task removed' -Data @{ task = $script:ResumeTaskName }
+    return $true
   } catch {
-    # Absent is expected (Finalize may run twice); the text is localized, so it is only logged.
-    Write-SetupLog -Message 'Resume task was not removed (it may not exist)' -Data @{ task = $script:ResumeTaskName; error = $_.Exception.Message }
+    if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound) {
+      Write-SetupLog -Message 'Resume task was not registered; nothing to remove' -Data @{ task = $script:ResumeTaskName }
+      return $true
+    }
+    Write-SetupLog -Message 'Resume task could not be removed' -Level WARN -Data @{ task = $script:ResumeTaskName; error = $_.Exception.Message }
+    return $false
   }
 }
 
@@ -487,6 +506,8 @@ function Set-RegistryDword {
   # Private. Creates the key if it is missing, then writes the DWord. Never throws: returns $false
   # (and logs a WARN) when the write is refused.
   # New-Item -Force on an EXISTING key can clear what the key holds, so it runs only when the key is missing.
+  # Both writes use -ErrorAction Stop: the registry provider reports a refusal as a non-terminating error,
+  # which the catch below would otherwise never see (final review I1).
   [CmdletBinding()]
   [OutputType([bool])]
   param(
@@ -496,8 +517,8 @@ function Set-RegistryDword {
   )
 
   try {
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
-    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([int]$Value) -PropertyType DWord -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([int]$Value) -PropertyType DWord -Force -ErrorAction Stop | Out-Null
     return $true
   } catch {
     Write-SetupLog -Message 'Registry value could not be written' -Level WARN -Data @{ path = $Path; name = $Name; error = $_.Exception.Message }

@@ -1,9 +1,12 @@
 ﻿# tests/Prepare.Tests.ps1
 # SAFETY: nothing here may touch the real machine. Every test that reaches Invoke-External,
-# Register-ScheduledTask, Unregister-ScheduledTask, New-Item, New-ItemProperty or Test-Path runs with
-# those mocked (Initialize-PrepareMocks, called from each BeforeEach). The only commands that run for
+# Register-ScheduledTask, Get-ScheduledTask, Unregister-ScheduledTask, New-Item, New-ItemProperty or Test-Path
+# runs with those mocked (Initialize-PrepareMocks, called from each BeforeEach). The only commands that run for
 # real are the in-memory New-ScheduledTask* constructors and New-ScheduledTaskSettingsSet, which build
 # objects and register nothing. The powercfg fixtures were captured with a read-only `powercfg /query`.
+# A failing cmdlet is mocked with Write-Error, never throw: the real Register-ScheduledTask (CDXML) and the
+# registry provider cmdlets report failures as NON-terminating errors, which a try/catch only sees when the
+# call carries -ErrorAction Stop (final review I1).
 BeforeAll {
   . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
 
@@ -61,7 +64,9 @@ BeforeAll {
     $script:regValues = New-Object System.Collections.ArrayList
     $script:failExternal = @()
     $script:throwExternal = @()
-    $script:registerFailuresLeft = 0     # Register-ScheduledTask throws this many times, then succeeds
+    $script:registerFailuresLeft = 0     # Register-ScheduledTask fails (non-terminating) this many times, then succeeds
+    $script:taskVisible = $false         # what Get-ScheduledTask finds; a successful registration makes it $true
+    $script:registerButInvisible = $false   # Register-ScheduledTask reports nothing, yet the task is not there afterwards
     $script:throwNewItemProperty = $false
     $script:existingKeys = @()
     # Folders Get-Item finds (R28), and those it reports as a junction/symlink (ReparsePoint). No test
@@ -96,8 +101,14 @@ BeforeAll {
     }
     Mock Register-ScheduledTask {
       [void]$script:calls.Add('task')
-      if ($script:registerFailuresLeft -gt 0) { $script:registerFailuresLeft--; throw 'Task Scheduler is not available' }
+      if ($script:registerFailuresLeft -gt 0) { $script:registerFailuresLeft--; Write-Error -Message 'Task Scheduler is not available' -Category NotSpecified; return }
       $script:regTask = @{ TaskName = $TaskName; Action = $Action; Trigger = $Trigger; Principal = $Principal; Settings = $Settings; Force = [bool]$Force }
+      if (-not $script:registerButInvisible) { $script:taskVisible = $true }
+    }
+    Mock Get-ScheduledTask {
+      [void]$script:calls.Add("get-task $TaskName")
+      if ($script:taskVisible) { return [pscustomobject]@{ TaskName = [string]$TaskName } }
+      Write-Error -Message "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'." -Category ObjectNotFound
     }
     Mock Unregister-ScheduledTask { [void]$script:calls.Add("unregister $TaskName") }
     Mock Start-Sleep { [void]$script:calls.Add("sleep $Seconds") }      # no test ever really waits
@@ -129,7 +140,7 @@ BeforeAll {
     Mock New-SetupLockedDirectory { [void]$script:calls.Add("mkdir-locked $Path") }
     Mock New-ItemProperty {
       [void]$script:calls.Add("regvalue $LiteralPath $Name")
-      if ($script:throwNewItemProperty) { throw 'Requested registry access is not allowed' }
+      if ($script:throwNewItemProperty) { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied; return }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType; Force = [bool]$Force })
     }
   }
@@ -209,8 +220,8 @@ Describe 'resume task definition' {
     $s.DisallowStartIfOnBatteries | Should -BeFalse; $s.StopIfGoingOnBatteries | Should -BeFalse
     $s.ExecutionTimeLimit | Should -Be 'PT0S'; $s.Priority | Should -Be 5; $s.MultipleInstances | Should -Be 'IgnoreNew'
   }
-  It 'starts powershell.exe' {
-    (Get-ResumeTaskDefinition -ScriptPath 'C:\x.ps1' -UserId 'a\b').Execute | Should -Be 'powershell.exe'
+  It 'starts powershell.exe by its full System32 path (R30: never a bare name)' {
+    (Get-ResumeTaskDefinition -ScriptPath 'C:\x.ps1' -UserId 'a\b').Execute | Should -Be "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
   }
 }
 
@@ -293,7 +304,7 @@ Describe 'Register-ResumeTask' {
     Should -Invoke Register-ScheduledTask -Times 1 -Exactly
     $script:regTask.TaskName | Should -Be 'BenTechSetup-Resume'
     $script:regTask.Force | Should -BeTrue
-    $script:regTask.Action.Execute | Should -Be 'powershell.exe'
+    $script:regTask.Action.Execute | Should -Be "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
     $script:regTask.Action.Arguments | Should -Be '-NoProfile -ExecutionPolicy Bypass -File "C:\Ben Tech\Setup\setup.ps1" -Resume'
     $script:regTask.Trigger.CimClass.CimClassName | Should -Be 'MSFT_TaskLogonTrigger'
     $script:regTask.Trigger.UserId | Should -Be $uid
@@ -302,18 +313,51 @@ Describe 'Register-ResumeTask' {
     [string]$script:regTask.Principal.RunLevel | Should -Be 'Highest'
     $script:regTask.Settings.ExecutionTimeLimit | Should -Be 'PT0S'
   }
+  It 'verifies the registration with Get-ScheduledTask after registering' {
+    Register-ResumeTask -ScriptPath 'C:\BenTech\Setup\setup.ps1'
+    Should -Invoke Get-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'BenTechSetup-Resume' }
+    (Get-CallIndex '^get-task BenTechSetup-Resume$') | Should -BeGreaterThan (Get-CallIndex '^task$')
+  }
+  It 'throws when Register-ScheduledTask fails with a non-terminating error (I1), and logs no success' {
+    $script:registerFailuresLeft = 1
+    $script:logged = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logged.Add($Message) }
+    { Register-ResumeTask -ScriptPath 'C:\BenTech\Setup\setup.ps1' } | Should -Throw '*Task Scheduler is not available*'
+    $script:logged | Should -Not -Contain 'Resume task registered'
+  }
+  It 'throws when the task is not there after an apparently successful registration' {
+    $script:registerButInvisible = $true
+    { Register-ResumeTask -ScriptPath 'C:\BenTech\Setup\setup.ps1' } | Should -Throw
+  }
 }
 
 Describe 'Unregister-ResumeTask' {
   BeforeEach { Initialize-PrepareMocks }
 
-  It 'removes the task by name without a confirmation prompt' {
-    Unregister-ResumeTask
+  It 'removes the task by name without a confirmation prompt, and returns $true' {
+    $r = Unregister-ResumeTask
+    $r | Should -BeOfType [bool]
+    $r | Should -BeTrue
     Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'BenTechSetup-Resume' -and $Confirm -eq $false }
   }
-  It 'never throws when the task is absent or cannot be removed' {
-    Mock Unregister-ScheduledTask { throw 'No MSFT_ScheduledTask objects found with property TaskName equal to BenTechSetup-Resume.' }
-    { Unregister-ResumeTask } | Should -Not -Throw
+  It 'returns $true, without throwing, when the task is already gone (ObjectNotFound, the normal case)' {
+    Mock Unregister-ScheduledTask { Write-Error -Message 'No MSFT_ScheduledTask objects found with property TaskName equal to BenTechSetup-Resume.' -Category ObjectNotFound }
+    $r = Unregister-ResumeTask
+    @($r).Count | Should -Be 1
+    $r | Should -BeOfType [bool]
+    $r | Should -BeTrue
+  }
+  It 'returns $false, without throwing, when the removal is refused (no longer hidden, triage 250)' {
+    Mock Unregister-ScheduledTask { Write-Error -Message 'Access is denied.' -Category PermissionDenied }
+    { $script:unreg = Unregister-ResumeTask } | Should -Not -Throw
+    @($script:unreg).Count | Should -Be 1
+    $script:unreg | Should -BeOfType [bool]
+    $script:unreg | Should -BeFalse
+  }
+  It 'returns $false, without throwing, when the removal throws' {
+    Mock Unregister-ScheduledTask { throw 'The RPC server is unavailable.' }
+    { $script:unreg = Unregister-ResumeTask } | Should -Not -Throw
+    $script:unreg | Should -BeFalse
   }
 }
 
@@ -708,7 +752,7 @@ Describe 'Invoke-StepPrepare' {
         (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
       }
       It 'refuses when the working folder cannot be created fresh (it appeared in the last moment)' {
-        Mock New-Item { if ($ItemType -eq 'Directory') { throw 'An item with the specified name already exists.' } } -ParameterFilter { $ItemType -eq 'Directory' }
+        Mock New-Item { if ($ItemType -eq 'Directory') { Write-Error -Message 'An item with the specified name already exists.' -Category ResourceExists } } -ParameterFilter { $ItemType -eq 'Directory' }
         $r = Invoke-StepPrepare -Context (New-PrepareContext)
         $r.Status | Should -Be 'Failed'
         $r.Message | Should -Be 'Working folder could not be secured'
@@ -846,6 +890,15 @@ Describe 'Invoke-StepPrepare' {
       Should -Invoke Start-Sleep -Times 0 -Exactly
       $ctx.State.ResumeTaskMissing | Should -BeTrue
       (Get-CallIndex '^powercfg /setactive') | Should -BeGreaterThan -1       # the rest of the step still ran
+    }
+    It 'a registration that reports no error but cannot be found afterwards counts as failed (verified with Get-ScheduledTask)' {
+      $script:registerButInvisible = $true
+      $ctx = New-PrepareContext
+      $r = Invoke-StepPrepare -Context $ctx -ResumeTaskRetrySeconds 0
+      $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be 'Could not register the resume task'
+      Should -Invoke Register-ScheduledTask -Times 2 -Exactly
+      $ctx.State.ResumeTaskMissing | Should -BeTrue
     }
     It 'waits 10 seconds between the two attempts by default' {
       $script:registerFailuresLeft = 1

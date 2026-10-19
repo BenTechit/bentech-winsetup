@@ -526,7 +526,8 @@ function Set-LenovoAdminCommandLine {
   # each key when it is missing. $true only when both writes succeeded; any refused write is an ERROR
   # in the log and makes it $false, because a view left with an older value could still allow a BIOS
   # flash. Both views are always tried. New-Item runs only for a missing key: -Force on an existing
-  # key could clear what it holds.
+  # key could clear what it holds. Both writes use -ErrorAction Stop: a refused registry write is a
+  # non-terminating error, and without it the R19 guard (no tvsu run) would never fire (final review I1).
   [CmdletBinding()]
   [OutputType([bool])]
   param([Parameter(Mandatory)][string]$Value)
@@ -534,8 +535,8 @@ function Set-LenovoAdminCommandLine {
   $allOk = $true
   foreach ($key in $script:LenovoPolicyKeys) {
     try {
-      if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
-      New-ItemProperty -LiteralPath $key -Name $script:LenovoPolicyValueName -Value $Value -PropertyType String -Force | Out-Null
+      if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+      New-ItemProperty -LiteralPath $key -Name $script:LenovoPolicyValueName -Value $Value -PropertyType String -Force -ErrorAction Stop | Out-Null
       Write-SetupLog -Message 'Lenovo System Update policy written' -Data @{ key = $key; value = $Value }
     } catch {
       Write-SetupLog -Message 'Lenovo System Update policy could not be written' -Level ERROR -Data @{ key = $key; error = $_.Exception.Message }
@@ -606,7 +607,7 @@ function Copy-LenovoLog {
       Write-SetupLog -Message 'Lenovo System Update wrote no logs to copy' -Data @{ source = $source }
       return
     }
-    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force -ErrorAction Stop | Out-Null }
     Copy-Item -Path (Join-Path $source '*') -Destination $target -Recurse -Force -ErrorAction Stop
   } catch {
     Write-SetupLog -Message 'Lenovo System Update logs could not be copied' -Level WARN -Data @{ source = $source; target = $target; error = $_.Exception.Message }

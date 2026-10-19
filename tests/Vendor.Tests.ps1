@@ -187,7 +187,8 @@ BeforeAll {
     }
     Mock New-Item { [void]$script:regKeys.Add([string]$Path); $script:existing += [string]$Path }
     Mock New-ItemProperty {
-      if ($script:regWriteThrows -or ($script:regWriteThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
+      # Write-Error, not throw: the registry provider reports a refusal as a non-terminating error (I1).
+      if ($script:regWriteThrows -or ($script:regWriteThrowsFor -contains [string]$LiteralPath)) { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied; return }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
       # What was written is there to read back (and to remove) afterwards.
       if ($null -eq $script:regPresent[[string]$LiteralPath]) { $script:regPresent[[string]$LiteralPath] = @{} }
@@ -199,7 +200,7 @@ BeforeAll {
       return [pscustomobject]$values
     }
     Mock Remove-ItemProperty {
-      if ($script:regRemoveThrows -or ($script:regRemoveThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
+      if ($script:regRemoveThrows -or ($script:regRemoveThrowsFor -contains [string]$LiteralPath)) { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied; return }
       [void]$script:order.Add('Remove-ItemProperty')
       [void]$script:regRemoved.Add(@{ Path = [string]$LiteralPath; Name = @($Name) })
       $values = $script:regPresent[[string]$LiteralPath]
@@ -210,7 +211,7 @@ BeforeAll {
     }
     Mock Remove-Item { [void]$script:removed.Add([string]$LiteralPath) }
     Mock Copy-Item {
-      if ($script:copyThrows) { throw 'The process cannot access the file' }
+      if ($script:copyThrows) { Write-Error -Message 'The process cannot access the file' -Category WriteError; return }
       [void]$script:copies.Add(@{ Path = @($Path); Destination = [string]$Destination })
     }
     Mock Get-Process {

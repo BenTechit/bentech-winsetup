@@ -155,7 +155,8 @@ BeforeAll {
     Mock New-Item { [void]$script:calls.Add("regkey $Path"); [void]$script:regKeys.Add([string]$Path); $script:existingKeys += [string]$Path }   # the key exists from now on, as in the registry
     Mock New-ItemProperty {
       [void]$script:calls.Add("regvalue $Name")
-      if ($script:throwRegName -contains $Name) { throw 'Requested registry access is not allowed' }
+      # Write-Error, not throw: the registry provider reports a refusal as a non-terminating error (I1).
+      if ($script:throwRegName -contains $Name) { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied; return }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
     }
     Mock Get-ItemProperty {

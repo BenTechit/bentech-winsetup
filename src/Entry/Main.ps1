@@ -126,6 +126,7 @@ function Complete-SetupRun {
     }
   } finally {
     # Defensive: Finalize normally removes it already. A task left behind would re-open setup at every logon.
+    # Its bool is ignored here: Finalize has already reported a removal that failed (a Note).
     $null = Unregister-ResumeTask
   }
 

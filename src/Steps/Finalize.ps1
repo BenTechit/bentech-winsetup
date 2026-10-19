@@ -331,7 +331,7 @@ function Complete-SetupFinalization {
       4. Activation not 'Activated' -> Note 'Windows not activated'.
       5. BitLocker (ConvertTo-BitLockerFinding): a Note or an Error, and the report's BitLocker text.
       6. Windows 10 -> Note 'Windows 10: no security updates'.
-      7. The resume task removed.
+      7. The resume task removed; a removal that fails -> Note 'Resume task could not be removed'.
       8. Downloads\, <Root>\setup.ps1 and <Root>\config.json deleted (best effort); state.json and
          Logs\ stay.
       9. State.EndedAt = now.
@@ -380,7 +380,8 @@ function Complete-SetupFinalization {
 
   if ($machine['IsWindows10'] -eq $true) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Windows 10: no security updates' }
 
-  Unregister-ResumeTask
+  # Left behind, the task would start setup again at every logon (spec 4: no junk), so a failure is a Note.
+  if ((Unregister-ResumeTask) -ne $true) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Resume task could not be removed' }
 
   Remove-SetupItem -Path $Context.DownloadDir
   Remove-SetupItem -Path (Join-Path $Context.Root 'setup.ps1')

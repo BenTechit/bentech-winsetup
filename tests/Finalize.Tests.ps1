@@ -94,6 +94,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
   #   $script:chromeInstalled / $script:progId   Test-ChromeInstalled / Get-DefaultBrowserProgId
   #   $script:assocPath       Get-DefaultAssociationsPath (a fresh folder in $TestDrive)
   #   $script:lenovoCalls / $script:unregisterCalls   Remove-LenovoAdminCommandLine / Unregister-ResumeTask calls
+  #   $script:unregisterResult  what Unregister-ResumeTask answers ($true: the task is gone)
   #   $script:activation      what Get-ActivationStatus answers
   #   $script:bitlocker       what Get-BitLockerState answers ($script:bitlockerThrows: it throws)
   #   $script:apps            what Get-InstalledAppVersions answers
@@ -112,6 +113,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     $script:assocPath = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '\BenTech\DefaultAssociations.xml')
     $script:lenovoCalls = 0
     $script:unregisterCalls = 0
+    $script:unregisterResult = $true
     $script:activation = 'Activated'
     $script:bitlocker = @{ Presence = 'Present'; Volume = $null; Status = 0 }
     $script:bitlockerThrows = $false
@@ -138,7 +140,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
       if ($script:bitlockerThrows) { throw 'WMI is down' }
       return $script:bitlocker
     }
-    Mock Unregister-ResumeTask { $script:unregisterCalls++ }
+    Mock Unregister-ResumeTask { $script:unregisterCalls++; return $script:unregisterResult }
     Mock Get-InstalledAppVersions { return $script:apps }
     Mock Get-ItemProperty {
       $values = $script:regPresent[[string]$LiteralPath]
@@ -147,7 +149,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
       return [pscustomobject]$values
     }
     Mock Remove-ItemProperty {
-      if ($script:regRemoveThrows) { throw 'Requested registry access is not allowed' }
+      if ($script:regRemoveThrows) { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied; return }
       [void]$script:regRemoved.Add(@{ Path = [string]$LiteralPath; Name = [string]@($Name)[0] })
       $values = $script:regPresent[[string]$LiteralPath]
       if ($null -ne $values) { $values.Remove([string]@($Name)[0]) }
@@ -636,6 +638,24 @@ Describe 'Invoke-StepFinalize phase B' {
     $ctx = New-FinalizeContext -PhaseB
     (Invoke-StepFinalize -Context $ctx).Status | Should -Be 'Done'
     @($script:logs | Where-Object { $_.Level -in 'WARN', 'ERROR' }).Count | Should -Be 0
+  }
+  It 'adds the Note "Resume task could not be removed" only when the removal failed (triage 250): removed=<Removed>' -ForEach @(
+    @{ Removed = $true }
+    @{ Removed = $false }
+  ) {
+    $script:unregisterResult = $Removed
+    $ctx = New-FinalizeContext -PhaseB
+    (Invoke-StepFinalize -Context $ctx).Status | Should -Be 'Done'
+    $script:unregisterCalls | Should -Be 1
+    (@($ctx.State.Notes) -contains 'Resume task could not be removed') | Should -Be (-not $Removed)
+    if (-not $Removed) { Get-ReportLines -Context $ctx | Should -Contain '  Resume task could not be removed' }
+  }
+  It 'Complete-SetupFinalization on its own (R26) also notes a resume task it could not remove' {
+    $script:unregisterResult = $false
+    $ctx = New-FinalizeContext
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $null = Complete-SetupFinalization -Context $ctx
+    @($ctx.State.Notes) | Should -Contain 'Resume task could not be removed'
   }
   It 'cleans the Lenovo System Update policy only on a <Brand>' -ForEach @(
     @{ Brand = 'LENOVO'; Calls = 1 }
