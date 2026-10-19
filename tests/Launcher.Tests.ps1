@@ -333,22 +333,33 @@ Describe 'launcher folder lockdown (R28b)' {
     $script:reparse = @()
     $script:aclByPath = @{ 'C:\BenTech' = (New-TestAcl) }
     $script:aclAfterIcacls = @{}
+    # R28c: Get-Acl right after New-LauncherLockedDirectory (before icacls), and folders that appear when
+    # it runs or once both icacls calls ran (someone else racing us).
+    $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl) }
+    $script:appearOnCreate = @()
+    $script:appearAfterIcacls = @()
     Mock Start-Process {
       [void]$script:icacls.Add(@{ File = $FilePath; Args = (@($ArgumentList) -join ' '); Wait = [bool]$Wait; PassThru = [bool]$PassThru; Window = [string]$WindowStyle })
       [void]$script:steps.Add('icacls')
       [pscustomobject]@{ ExitCode = $(if ($script:icacls.Count -eq $script:failIcaclsAt) { 1307 } else { 0 }) }
     }
     Mock Get-Item {
-      if ($script:folders -notcontains $LiteralPath) { return $null }
+      $path = [string]$LiteralPath
+      $created = $script:steps -contains 'mkdir-locked C:\BenTech'
+      $exists = ($script:folders -contains $path) -or ($created -and $script:appearOnCreate -contains $path) -or
+        ($script:icacls.Count -ge 2 -and $script:appearAfterIcacls -contains $path)
+      if (-not $exists) { return $null }
       $attributes = [IO.FileAttributes]::Directory
-      if ($script:reparse -contains $LiteralPath) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
-      [pscustomobject]@{ FullName = $LiteralPath; Attributes = $attributes }
+      if ($script:reparse -contains $path) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      [pscustomobject]@{ FullName = $path; Attributes = $attributes }
     }
     Mock Get-Acl {
-      [void]$script:steps.Add("acl $LiteralPath")
-      if ($script:icacls.Count -ge 2 -and $script:aclAfterIcacls.ContainsKey([string]$LiteralPath)) { return $script:aclAfterIcacls[[string]$LiteralPath] }
-      if ($script:aclByPath.ContainsKey([string]$LiteralPath)) { return $script:aclByPath[[string]$LiteralPath] }
-      throw "Cannot find path '$LiteralPath'"
+      $path = [string]$LiteralPath
+      [void]$script:steps.Add("acl $path")
+      if ($script:icacls.Count -ge 2 -and $script:aclAfterIcacls.ContainsKey($path)) { return $script:aclAfterIcacls[$path] }
+      if (($script:steps -contains "mkdir-locked $path") -and $script:aclAfterCreate.ContainsKey($path)) { return $script:aclAfterCreate[$path] }
+      if ($script:aclByPath.ContainsKey($path)) { return $script:aclByPath[$path] }
+      throw "Cannot find path '$path'"
     }
     Mock New-Item { [void]$script:steps.Add("mkdir $Path") }
     Mock New-LauncherLockedDirectory { [void]$script:steps.Add("mkdir-locked $Path") }
@@ -377,12 +388,12 @@ Describe 'launcher folder lockdown (R28b)' {
     $script:icacls.Count | Should -Be 0
     @($script:steps | Where-Object { $_ -like 'mkdir*' }) | Should -BeNullOrEmpty
   }
-  It 'creates a missing C:\BenTech already locked, runs the two icacls commands, verifies it, then creates Setup' {
+  It 'creates a missing C:\BenTech already locked, checks it is ours, runs the two icacls commands, verifies it, then creates Setup' {
     $script:folders = @()
     $script:aclByPath = @{}
     $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
     (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeTrue
-    @($script:steps) | Should -Be @('mkdir-locked C:\BenTech', 'icacls', 'icacls', 'acl C:\BenTech', 'mkdir C:\BenTech\Setup')
+    @($script:steps) | Should -Be @('mkdir-locked C:\BenTech', 'acl C:\BenTech', 'icacls', 'icacls', 'acl C:\BenTech', 'mkdir C:\BenTech\Setup')
     @($script:icacls | ForEach-Object { $_.Args }) | Should -Be @(
       '"C:\BenTech" /setowner *S-1-5-32-544'
       '"C:\BenTech" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F'
@@ -407,7 +418,57 @@ Describe 'launcher folder lockdown (R28b)' {
     $r.Ok | Should -BeFalse
     $r.Message | Should -Be 'Cannot secure C:\BenTech - nothing was run.'
     $script:icacls.Count | Should -Be $At
-    @($script:steps | Where-Object { $_ -like 'acl *' -or $_ -eq 'mkdir C:\BenTech\Setup' }) | Should -BeNullOrEmpty
+    @($script:steps) | Should -Be (@('mkdir-locked C:\BenTech', 'acl C:\BenTech') + @(1..$At | ForEach-Object { 'icacls' }))
+  }
+  It 'accepts a fresh C:\BenTech still owned by this process''s user before /setowner (R28c)' {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl -Owner $userSid) }
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeTrue
+  }
+  # R28c: a non-admin can create C:\BenTech between "absent" and our create. CreateDirectory then neither
+  # throws nor applies our security, so the folder must be proven ours before any icacls.
+  It 'refuses, without icacls, when the folder after the create is not ours (<Case>)' -ForEach @(
+    @{ Case = 'user-owned and inheriting: someone else made it first'; Acl = @{ Owner = 'S-1-5-21-1-2-3-1001'; Protected = $false } }
+    @{ Case = 'owned by another user'; Acl = @{ Owner = 'S-1-5-21-1-2-3-1001' } }
+    @{ Case = 'inheriting (our security was not applied)'; Acl = @{ Protected = $false } }
+    @{ Case = 'with an extra Authenticated Users rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-11') } }
+  ) {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl @Acl) }
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be $notAdminOnly
+    @($script:steps) | Should -Be @('mkdir-locked C:\BenTech', 'acl C:\BenTech')
+  }
+  It 'refuses, without icacls, a just-created C:\BenTech that already holds the working folder' {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:appearOnCreate = @('C:\BenTech\Setup')
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be $notAdminOnly
+    $script:icacls.Count | Should -Be 0
+  }
+  It 'refuses a working folder that shows up in the just-created C:\BenTech after icacls' {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    $script:appearAfterIcacls = @('C:\BenTech\Setup')
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
+    $r.Message | Should -Be $notAdminOnly
+    @($script:steps | Where-Object { $_ -like 'mkdir C:*' }) | Should -BeNullOrEmpty
+  }
+  It 'refuses when the working folder cannot be created fresh (it appeared in the last moment)' {
+    $script:folders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    Mock New-Item { throw 'An item with the specified name already exists.' }
+    $r = Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup'
+    $r.Ok | Should -BeFalse
   }
   It 'treats an icacls without an exit code as a failure' {
     $script:folders = @()
@@ -439,6 +500,100 @@ Describe 'launcher folder lockdown (R28b)' {
     Mock Start-Process { throw 'cannot start icacls' }
     { Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup' } | Should -Not -Throw
     (Protect-LauncherFolder -TargetDir 'C:\BenTech\Setup').Ok | Should -BeFalse
+  }
+}
+
+Describe 'launcher and Prepare lockdown agree (R28b/R28c mirror)' {
+  # The same scenarios through Protect-LauncherFolder and Protect-SetupFolder (src/Steps/Prepare.ps1), with
+  # the same mocks: both must reach the same verdict through the same steps. Nothing real is touched.
+  BeforeAll {
+    . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
+    $tok = $null; $err = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)
+    foreach ($fn in $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+      if ($fn.Name -in 'Get-LauncherAclCommands', 'Test-LauncherReparsePoint', 'Test-LauncherFolderAdminOnly', 'New-LauncherLockedDirectory', 'Protect-LauncherFolder') {
+        . ([ScriptBlock]::Create($fn.Extent.Text))
+      }
+    }
+    function New-SpecAcl([hashtable]$Spec) {
+      # @{} is our locked state; Owner 'CURRENT' is this process's user.
+      $owner = if ($Spec.Owner -eq 'CURRENT') { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } elseif ($Spec.Owner) { $Spec.Owner } else { 'S-1-5-32-544' }
+      $s = New-Object Security.AccessControl.DirectorySecurity
+      $s.SetOwner((New-Object Security.Principal.SecurityIdentifier $owner))
+      $s.SetAccessRuleProtection($(if ($Spec.ContainsKey('Protected')) { [bool]$Spec.Protected } else { $true }), $false)
+      foreach ($sid in $(if ($Spec.Sids) { $Spec.Sids } else { @('S-1-5-32-544', 'S-1-5-18') })) {
+        $s.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList (New-Object Security.Principal.SecurityIdentifier $sid),
+            ([Security.AccessControl.FileSystemRights]::FullControl), ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
+            ([Security.AccessControl.PropagationFlags]::None), ([Security.AccessControl.AccessControlType]::Allow)))
+      }
+      return $s
+    }
+    function ConvertTo-AclMap([hashtable]$Specs) { $m = @{}; if ($Specs) { foreach ($k in $Specs.Keys) { $m[$k] = New-SpecAcl $Specs[$k] } }; $m }
+    function Invoke-Scenario([hashtable]$S, [string]$Side) {
+      $script:icacls = New-Object System.Collections.ArrayList
+      $script:steps = New-Object System.Collections.ArrayList
+      $script:failIcaclsAt = [int]$S.FailAt
+      $script:folders = @($S.Folders); $script:reparse = @($S.Reparse)
+      $script:aclByPath = ConvertTo-AclMap $S.AclByPath
+      $script:aclAfterCreate = ConvertTo-AclMap $S.AclAfterCreate
+      $script:aclAfterIcacls = ConvertTo-AclMap $S.AclAfterIcacls
+      $script:appearOnCreate = @($S.AppearOnCreate); $script:appearAfterIcacls = @($S.AppearAfterIcacls)
+      $target = if ($S.Target) { $S.Target } else { 'C:\BenTech\Setup' }
+      $r = if ($Side -eq 'launcher') { Protect-LauncherFolder -TargetDir $target } else { Protect-SetupFolder -Root $target -TimeoutMinutes 1 }
+      @{ Ok = (($r -is [hashtable]) -and ($r.Ok -eq $true)); Steps = @($script:steps) }
+    }
+  }
+  BeforeEach {
+    Mock Start-Process { [void]$script:icacls.Add($ArgumentList); [void]$script:steps.Add('icacls'); [pscustomobject]@{ ExitCode = $(if ($script:icacls.Count -eq $script:failIcaclsAt) { 1307 } else { 0 }) } }
+    Mock Invoke-External { [void]$script:icacls.Add($ArgumentList); [void]$script:steps.Add('icacls'); @{ ExitCode = $(if ($script:icacls.Count -eq $script:failIcaclsAt) { 1307 } else { 0 }); TimedOut = $false; Output = '' } }
+    Mock Write-SetupLog { }
+    Mock Get-Item {
+      $path = [string]$LiteralPath
+      $created = $script:steps -contains 'mkdir-locked C:\BenTech'
+      $exists = ($script:folders -contains $path) -or ($created -and $script:appearOnCreate -contains $path) -or
+        ($script:icacls.Count -ge 2 -and $script:appearAfterIcacls -contains $path)
+      if (-not $exists) { return $null }
+      $attributes = [IO.FileAttributes]::Directory
+      if ($script:reparse -contains $path) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      [pscustomobject]@{ FullName = $path; Attributes = $attributes }
+    }
+    Mock Get-Acl {
+      $path = [string]$LiteralPath
+      [void]$script:steps.Add("acl $path")
+      if ($script:icacls.Count -ge 2 -and $script:aclAfterIcacls.ContainsKey($path)) { return $script:aclAfterIcacls[$path] }
+      if (($script:steps -contains "mkdir-locked $path") -and $script:aclAfterCreate.ContainsKey($path)) { return $script:aclAfterCreate[$path] }
+      if ($script:aclByPath.ContainsKey($path)) { return $script:aclByPath[$path] }
+      throw "Cannot find path '$path'"
+    }
+    Mock New-Item { [void]$script:steps.Add("mkdir $Path") }
+    Mock New-LauncherLockedDirectory { [void]$script:steps.Add("mkdir-locked $Path") }
+    Mock New-SetupLockedDirectory { [void]$script:steps.Add("mkdir-locked $Path") }
+  }
+  It '<Name>: both give Ok=<Ok> through the same steps' -ForEach @(
+    @{ Name = 'existing locked parent and target'; Ok = $true; Folders = @('C:\BenTech', 'C:\BenTech\Setup'); AclByPath = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'existing locked parent, no target'; Ok = $true; Folders = @('C:\BenTech'); AclByPath = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'existing parent that inherits'; Ok = $false; Folders = @('C:\BenTech'); AclByPath = @{ 'C:\BenTech' = @{ Protected = $false } } }
+    @{ Name = 'existing parent owned by this user'; Ok = $false; Folders = @('C:\BenTech'); AclByPath = @{ 'C:\BenTech' = @{ Owner = 'CURRENT' } } }
+    @{ Name = 'existing parent with Authenticated Users'; Ok = $false; Folders = @('C:\BenTech'); AclByPath = @{ 'C:\BenTech' = @{ Sids = @('S-1-5-32-544', 'S-1-5-11') } } }
+    @{ Name = 'parent is a junction'; Ok = $false; Folders = @('C:\BenTech'); Reparse = @('C:\BenTech'); AclByPath = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'target is a junction'; Ok = $false; Folders = @('C:\BenTech', 'C:\BenTech\Setup'); Reparse = @('C:\BenTech\Setup'); AclByPath = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'fresh parent'; Ok = $true; AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'fresh parent owned by this user before /setowner'; Ok = $true; AclAfterCreate = @{ 'C:\BenTech' = @{ Owner = 'CURRENT' } }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'race: someone else created the parent first'; Ok = $false; AclAfterCreate = @{ 'C:\BenTech' = @{ Owner = 'S-1-5-21-1-2-3-1001'; Protected = $false } }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'race: our security was not applied'; Ok = $false; AclAfterCreate = @{ 'C:\BenTech' = @{ Owner = 'CURRENT'; Protected = $false } }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'race: target planted when the parent was made'; Ok = $false; AppearOnCreate = @('C:\BenTech\Setup'); AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'race: target planted during icacls'; Ok = $false; AppearAfterIcacls = @('C:\BenTech\Setup'); AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'fresh parent, /setowner fails'; Ok = $false; FailAt = 1; AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'fresh parent, the grant fails'; Ok = $false; FailAt = 2; AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{} } }
+    @{ Name = 'fresh parent, post-verify fails'; Ok = $false; AclAfterCreate = @{ 'C:\BenTech' = @{} }; AclAfterIcacls = @{ 'C:\BenTech' = @{ Sids = @('S-1-5-32-544', 'S-1-5-11') } } }
+    @{ Name = 'not normalized: C:\x\..\Setup'; Ok = $false; Target = 'C:\x\..\Setup' }
+  ) {
+    $launcher = Invoke-Scenario $_ 'launcher'
+    $prepare = Invoke-Scenario $_ 'prepare'
+    $launcher.Ok | Should -Be $Ok
+    $prepare.Ok | Should -Be $Ok
+    ($prepare.Steps -join ' | ') | Should -Be ($launcher.Steps -join ' | ')
   }
 }
 

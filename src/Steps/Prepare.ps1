@@ -346,18 +346,25 @@ function Test-SetupFolderAdminOnly {
     All of: not a reparse point; owned by Administrators (S-1-5-32-544) or SYSTEM (S-1-5-18); does not
     inherit (AreAccessRulesProtected); and every access rule, allow or deny, explicit or inherited, is for
     Administrators or SYSTEM. Read through Get-Acl and SIDs only, so it is the same on Hebrew Windows.
+    -OwnerMayBeCurrentUser (R28c) also accepts this process's own user as owner: the check right after
+    New-SetupLockedDirectory, before /setowner, where the default owner can still be the creating admin.
     The launcher holds a mirror (Test-LauncherFolderAdminOnly); keep the two in step.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
-  param([Parameter(Mandatory)][string]$Path)
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [switch]$OwnerMayBeCurrentUser
+  )
 
   try {
     if (Test-SetupReparsePoint -Path $Path) { return $false }
     $allowed = @('S-1-5-32-544', 'S-1-5-18')
+    $owners = @($allowed)
+    if ($OwnerMayBeCurrentUser) { $owners += [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     if ($null -eq $acl) { return $false }
-    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { return $false }
+    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $owners) { return $false }
     if ($acl.AreAccessRulesProtected -ne $true) { return $false }
     foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
       if ([string]$rule.IdentityReference.Value -notin $allowed) { return $false }
@@ -406,8 +413,10 @@ function Protect-SetupFolder {
          root or not normalized (so "C:\x\..\Setup" is refused, not turned into a lockdown of C:\).
       2. Parent exists: Test-SetupFolderAdminOnly must pass, else refuse. No icacls on it, ever: it is
          either our own locked folder from an earlier run, or someone else's and refused.
-      3. Parent missing: New-SetupLockedDirectory, then the two Get-SetupFolderAclCommands calls to icacls
-         (stopping at the first failure), then Test-SetupFolderAdminOnly again as a post-condition.
+      3. Parent missing: New-SetupLockedDirectory; then (R28c) it must be ours - Test-SetupFolderAdminOnly
+         -OwnerMayBeCurrentUser, and the working folder must not exist in it yet - else refuse with no
+         icacls; then the two Get-SetupFolderAclCommands calls to icacls (stopping at the first failure);
+         then Test-SetupFolderAdminOnly as a post-condition, and the working folder still must not exist.
       4. Working folder: refuse a reparse point; create it when missing (it inherits). No icacls on it.
   #>
   [CmdletBinding()]
@@ -433,6 +442,17 @@ function Protect-SetupFolder {
       }
     } else {
       New-SetupLockedDirectory -Path $parent
+      # R28c: someone may have created it between "missing" and our create; CreateDirectory then neither
+      # fails nor applies our security. Prove it is ours (our security descriptor, empty of the working
+      # folder) before any icacls, which would otherwise tidy up their folder for them.
+      if (-not (Test-SetupFolderAdminOnly -Path $parent -OwnerMayBeCurrentUser)) {
+        Write-SetupLog -Level ERROR -Message 'Working folder parent was not created by this run (someone else made it first); refusing it' -Data @{ path = $parent }
+        return (& $failed $notAdminOnly)
+      }
+      if ($null -ne (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) {
+        Write-SetupLog -Level ERROR -Message 'A parent created by this run already holds the working folder; refusing it' -Data @{ path = $target }
+        return (& $failed $notAdminOnly)
+      }
       foreach ($arguments in $commands) {
         $run = Invoke-PrepareTool -FilePath (Join-Path $env:windir 'System32\icacls.exe') -ArgumentList $arguments -TimeoutMinutes $TimeoutMinutes
         if (-not $run.Ok) {
@@ -444,13 +464,18 @@ function Protect-SetupFolder {
         Write-SetupLog -Level ERROR -Message 'Working folder parent is still not admin-only after the lockdown' -Data @{ path = $parent }
         return (& $failed $couldNot)
       }
+      if ($null -ne (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) {
+        Write-SetupLog -Level ERROR -Message 'A parent created by this run already holds the working folder; refusing it' -Data @{ path = $target }
+        return (& $failed $notAdminOnly)
+      }
     }
 
     if (Test-SetupReparsePoint -Path $target) {
       Write-SetupLog -Level ERROR -Message 'Working folder is a junction or symlink; refusing to use it' -Data @{ path = $target }
       return (& $failed $couldNot)
     }
-    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target | Out-Null }
+    # -ErrorAction Stop without -Force: a folder that appears after the check is an error, never reused.
+    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target -ErrorAction Stop | Out-Null }
     return @{ Ok = $true; Message = '' }
   } catch {
     Write-SetupLog -Level ERROR -Message 'Working folder could not be secured' -Data @{ root = $Root; error = $_.Exception.Message }

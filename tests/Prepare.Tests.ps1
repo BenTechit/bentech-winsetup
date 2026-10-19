@@ -72,6 +72,11 @@ BeforeAll {
     # for it once both icacls calls ran (the post-verify after creating the parent).
     $script:aclByPath = @{ 'C:\BenTech' = (New-TestAcl) }
     $script:aclAfterIcacls = @{}
+    # R28c: what Get-Acl answers right after New-SetupLockedDirectory ran (before any icacls), and folders
+    # that appear when it runs or once both icacls calls ran (someone else racing us).
+    $script:aclAfterCreate = @{}
+    $script:appearOnCreate = @()
+    $script:appearAfterIcacls = @()
     $script:queryValues = @{}
     foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 111; DC = 222 } }
 
@@ -102,17 +107,24 @@ BeforeAll {
       [void]$script:calls.Add("regkey $Path"); [void]$script:regKeys.Add([string]$Path)
     }
     Mock Get-Item {
-      if ($script:existingFolders -notcontains $LiteralPath) { return $null }
+      $path = [string]$LiteralPath
+      $created = $script:calls -contains 'mkdir-locked C:\BenTech'
+      $icaclsRan = @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count
+      $exists = ($script:existingFolders -contains $path) -or ($created -and $script:appearOnCreate -contains $path) -or
+        ($icaclsRan -ge 2 -and $script:appearAfterIcacls -contains $path)
+      if (-not $exists) { return $null }
       $attributes = [IO.FileAttributes]::Directory
-      if ($script:reparseFolders -contains $LiteralPath) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
-      [pscustomobject]@{ FullName = $LiteralPath; Attributes = $attributes }
+      if ($script:reparseFolders -contains $path) { $attributes = $attributes -bor [IO.FileAttributes]::ReparsePoint }
+      [pscustomobject]@{ FullName = $path; Attributes = $attributes }
     }
     Mock Get-Acl {
-      [void]$script:calls.Add("acl $LiteralPath")
+      $path = [string]$LiteralPath
+      [void]$script:calls.Add("acl $path")
       $icaclsRan = @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count
-      if ($icaclsRan -ge 2 -and $script:aclAfterIcacls.ContainsKey([string]$LiteralPath)) { return $script:aclAfterIcacls[[string]$LiteralPath] }
-      if ($script:aclByPath.ContainsKey([string]$LiteralPath)) { return $script:aclByPath[[string]$LiteralPath] }
-      throw "Cannot find path '$LiteralPath'"
+      if ($icaclsRan -ge 2 -and $script:aclAfterIcacls.ContainsKey($path)) { return $script:aclAfterIcacls[$path] }
+      if (($script:calls -contains "mkdir-locked $path") -and $script:aclAfterCreate.ContainsKey($path)) { return $script:aclAfterCreate[$path] }
+      if ($script:aclByPath.ContainsKey($path)) { return $script:aclByPath[$path] }
+      throw "Cannot find path '$path'"
     }
     Mock New-SetupLockedDirectory { [void]$script:calls.Add("mkdir-locked $Path") }
     Mock New-ItemProperty {
@@ -255,6 +267,15 @@ Describe 'Test-SetupFolderAdminOnly (R28b)' {
     $script:reparseFolders = @('C:\BenTech')
     Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeFalse
     Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+  It 'accepts this process''s user as owner only with -OwnerMayBeCurrentUser, and never another user (R28c)' {
+    $script:aclByPath['C:\BenTech'] = New-TestAcl -Owner ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' | Should -BeFalse
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' -OwnerMayBeCurrentUser | Should -BeTrue
+    $script:aclByPath['C:\BenTech'] = New-TestAcl -Owner 'S-1-5-21-1-2-3-1001'
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' -OwnerMayBeCurrentUser | Should -BeFalse
+    $script:aclByPath['C:\BenTech'] = New-TestAcl -Owner ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -Protected $false
+    Test-SetupFolderAdminOnly -Path 'C:\BenTech' -OwnerMayBeCurrentUser | Should -BeFalse
   }
   It 'returns $false, never throws, when the ACL cannot be read' {
     $script:aclByPath = @{}
@@ -528,9 +549,10 @@ Describe 'Invoke-StepPrepare' {
     @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
   }
 
-  It 'creates a missing C:\BenTech already locked, runs the two icacls commands, verifies, then creates the working folder (R28b)' {
+  It 'creates a missing C:\BenTech already locked, checks it is ours, runs the two icacls commands, verifies, then creates the working folder (R28b/R28c)' {
     $script:existingFolders = @()
     $script:aclByPath = @{}                                   # nothing to read before it exists
+    $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl) }
     $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
     $r = Invoke-StepPrepare -Context (New-PrepareContext)
     $r.Status | Should -Be 'Done'
@@ -543,12 +565,17 @@ Describe 'Invoke-StepPrepare' {
       $call.File | Should -Be (Join-Path $env:windir 'System32\icacls.exe')
       $call.Timeout | Should -Be 7           # config timeoutsMinutes.default
     }
-    $firstIcacls = Get-CallIndex '^icacls$'
-    $lastIcacls = ($script:calls | ForEach-Object -Begin { $k = 0; $last = -1 } -Process { if ($_ -eq 'icacls') { $last = $k }; $k++ } -End { $last })
-    (Get-CallIndex '^mkdir-locked C:\\BenTech$') | Should -BeLessThan $firstIcacls
-    (Get-CallIndex '^acl C:\\BenTech$') | Should -BeGreaterThan $lastIcacls          # the post-verify
-    (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -BeGreaterThan (Get-CallIndex '^acl C:\\BenTech$')
-    @($script:calls | Where-Object { $_ -eq 'mkdir C:\BenTech' }) | Should -BeNullOrEmpty  # never a plain (inheriting) create
+    # create locked -> ours? (before any icacls) -> icacls x2 -> post-verify -> working folder
+    @($script:calls | Where-Object { $_ -match '^(mkdir|acl |icacls$)' }) |
+      Should -Be @('mkdir-locked C:\BenTech', 'acl C:\BenTech', 'icacls', 'icacls', 'acl C:\BenTech', 'mkdir C:\BenTech\Setup')
+  }
+
+  It 'accepts a fresh C:\BenTech still owned by this process''s user before /setowner (R28c)' {
+    $script:existingFolders = @()
+    $script:aclByPath = @{}
+    $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl -Owner ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)) }
+    $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+    (Invoke-StepPrepare -Context (New-PrepareContext)).Status | Should -Be 'Done'
   }
 
   It 'registers the resume task for the context script path' {
@@ -645,7 +672,46 @@ Describe 'Invoke-StepPrepare' {
       BeforeEach {
         $script:existingFolders = @()
         $script:aclByPath = @{}
+        $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl) }
         $script:aclAfterIcacls = @{ 'C:\BenTech' = (New-TestAcl) }
+      }
+      # R28c: a non-admin can create C:\BenTech between "absent" and our create. CreateDirectory then
+      # neither throws nor applies our security, so the folder must be proven ours before any icacls.
+      It 'refuses, without icacls, when the folder after the create is not ours (<Case>)' -ForEach @(
+        @{ Case = 'user-owned and inheriting: someone else made it first'; Acl = @{ Owner = 'S-1-5-21-1-2-3-1001'; Protected = $false } }
+        @{ Case = 'owned by another user'; Acl = @{ Owner = 'S-1-5-21-1-2-3-1001' } }
+        @{ Case = 'inheriting (our security was not applied)'; Acl = @{ Protected = $false } }
+        @{ Case = 'with an extra Authenticated Users rule'; Acl = @{ Sids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-11') } }
+      ) {
+        $script:aclAfterCreate = @{ 'C:\BenTech' = (New-TestAcl @Acl) }
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        $r.Message | Should -Be 'Working folder could not be secured'
+        @($r.Errors | Where-Object { $_ -match 'C:\\BenTech already exists and is not admin-only' }).Count | Should -Be 1
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+        (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
+      }
+      It 'refuses, without icacls, a just-created C:\BenTech that already holds the working folder' {
+        $script:appearOnCreate = @('C:\BenTech\Setup')
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        @($r.Errors | Where-Object { $_ -match 'C:\\BenTech already exists and is not admin-only' }).Count | Should -Be 1
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }) | Should -BeNullOrEmpty
+        (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
+      }
+      It 'refuses a working folder that shows up in the just-created C:\BenTech after icacls' {
+        $script:appearAfterIcacls = @('C:\BenTech\Setup')
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        @($r.Errors | Where-Object { $_ -match 'C:\\BenTech already exists and is not admin-only' }).Count | Should -Be 1
+        @($script:ext | Where-Object { $_.File -match 'icacls\.exe$' }).Count | Should -Be 2
+        (Get-CallIndex '^mkdir C:\\BenTech\\Setup$') | Should -Be -1
+      }
+      It 'refuses when the working folder cannot be created fresh (it appeared in the last moment)' {
+        Mock New-Item { if ($ItemType -eq 'Directory') { throw 'An item with the specified name already exists.' } } -ParameterFilter { $ItemType -eq 'Directory' }
+        $r = Invoke-StepPrepare -Context (New-PrepareContext)
+        $r.Status | Should -Be 'Failed'
+        $r.Message | Should -Be 'Working folder could not be secured'
       }
       It 'a failing /setowner fails the step and stops before the grant' {
         $script:failExternal = @('/setowner')

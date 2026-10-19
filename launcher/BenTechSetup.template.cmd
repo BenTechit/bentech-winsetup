@@ -106,16 +106,19 @@ function Test-LauncherReparsePoint([string]$Path) {
   return ($null -ne $item -and (([IO.FileAttributes]$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))
 }
 
-function Test-LauncherFolderAdminOnly([string]$Path) {
+function Test-LauncherFolderAdminOnly([string]$Path, [switch]$OwnerMayBeCurrentUser) {
   # Mirror of src/Steps/Prepare.ps1 / Test-SetupFolderAdminOnly - keep in step. $true only when Path is
   # not a reparse point, is owned by Administrators or SYSTEM, does not inherit, and every access rule is
-  # for Administrators or SYSTEM. Get-Acl and SIDs only (language-independent). Never throws.
+  # for Administrators or SYSTEM. -OwnerMayBeCurrentUser also accepts this process's own user as owner
+  # (right after the locked create, before /setowner). Get-Acl and SIDs only. Never throws.
   try {
     if (Test-LauncherReparsePoint -Path $Path) { return $false }
     $allowed = @('S-1-5-32-544', 'S-1-5-18')
+    $owners = @($allowed)
+    if ($OwnerMayBeCurrentUser) { $owners += [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     if ($null -eq $acl) { return $false }
-    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { return $false }
+    if ([string]$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $owners) { return $false }
     if ($acl.AreAccessRulesProtected -ne $true) { return $false }
     foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
       if ([string]$rule.IdentityReference.Value -notin $allowed) { return $false }
@@ -145,7 +148,8 @@ function Protect-LauncherFolder([string]$TargetDir) {
   # repair, never recurse. Returns @{ Ok; Message }, Message being the red refusal text. Never throws.
   #   1. Normalize TargetDir, then take its parent (C:\BenTech); the root guard refuses a drive root.
   #   2. Parent exists: it must pass Test-LauncherFolderAdminOnly, else refuse. No icacls on it, ever.
-  #   3. Parent missing: create it locked, the two icacls commands, then verify it again.
+  #   3. Parent missing: create it locked; it must then be ours (our security, no working folder in it
+  #      yet) or we refuse with no icacls; the two icacls commands; verify it again; still no working folder.
   #   4. Working folder: refuse a reparse point; create it when missing (it inherits). No icacls on it.
   $parent = $TargetDir   # replaced by the real parent below; only used in a message if that fails
   try {
@@ -153,20 +157,25 @@ function Protect-LauncherFolder([string]$TargetDir) {
     $parent = Split-Path -Parent $target
     $commands = Get-LauncherAclCommands -Parent $parent
     $couldNot = @{ Ok = $false; Message = "Cannot secure $parent - nothing was run." }
+    $notAdminOnly = @{ Ok = $false; Message = "$parent already exists and is not admin-only. Delete it (as administrator) and run again. Nothing was run." }
     if ($null -ne (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
-      if (-not (Test-LauncherFolderAdminOnly -Path $parent)) {
-        return @{ Ok = $false; Message = "$parent already exists and is not admin-only. Delete it (as administrator) and run again. Nothing was run." }
-      }
+      if (-not (Test-LauncherFolderAdminOnly -Path $parent)) { return $notAdminOnly }
     } else {
       New-LauncherLockedDirectory -Path $parent
+      # Someone may have created it between "missing" and our create; CreateDirectory then neither fails
+      # nor applies our security. Prove it is ours, and empty of the working folder, before any icacls.
+      if (-not (Test-LauncherFolderAdminOnly -Path $parent -OwnerMayBeCurrentUser)) { return $notAdminOnly }
+      if ($null -ne (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { return $notAdminOnly }
       foreach ($arguments in $commands) {
         $icacls = Start-Process -FilePath "$env:windir\System32\icacls.exe" -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
         if ($null -eq $icacls -or $icacls.ExitCode -ne 0) { return $couldNot }
       }
       if (-not (Test-LauncherFolderAdminOnly -Path $parent)) { return $couldNot }
+      if ($null -ne (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { return $notAdminOnly }
     }
     if (Test-LauncherReparsePoint -Path $target) { return $couldNot }
-    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target | Out-Null }
+    # -ErrorAction Stop without -Force: a folder that appears after the check is an error, never reused.
+    if ($null -eq (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $target -ErrorAction Stop | Out-Null }
     return @{ Ok = $true; Message = '' }
   } catch {
     return @{ Ok = $false; Message = "Cannot secure $parent - nothing was run." }
