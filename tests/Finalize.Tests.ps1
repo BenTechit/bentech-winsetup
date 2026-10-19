@@ -7,7 +7,7 @@
 # Describe calls it from BeforeEach), which replaces every system command the step can reach with a
 # recorder: Restore-FinalPowerSettings, Get-PendingRebootSignals, Get-LastBootUtc, Test-ChromeInstalled,
 # Get-DefaultBrowserProgId, Get-DefaultAssociationsPath (pointed into $TestDrive),
-# Remove-LenovoAdminCommandLine, Get-ActivationStatus, Get-BitLockerState, Unregister-ResumeTask,
+# Remove-LenovoAdminCommandLine, Get-ActivationStatus, Get-SmartAppControlState, Get-BitLockerState, Unregister-ResumeTask,
 # Get-InstalledAppVersions, Get-ItemProperty, Remove-ItemProperty and Write-SetupLog. As a safety net,
 # New-Item, New-ItemProperty, Set-ItemProperty, Invoke-External, Register-ScheduledTask,
 # Unregister-ScheduledTask, Restart-Computer, Get-CimInstance and Invoke-CimMethod throw (and are
@@ -96,6 +96,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
   #   $script:lenovoCalls / $script:unregisterCalls   Remove-LenovoAdminCommandLine / Unregister-ResumeTask calls
   #   $script:unregisterResult  what Unregister-ResumeTask answers ($true: the task is gone)
   #   $script:activation      what Get-ActivationStatus answers
+  #   $script:smartAppControl what Get-SmartAppControlState answers
   #   $script:bitlocker       what Get-BitLockerState answers ($script:bitlockerThrows: it throws)
   #   $script:apps            what Get-InstalledAppVersions answers
   #   $script:regPresent      registry path -> hashtable of values, for Get-ItemProperty
@@ -115,6 +116,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     $script:unregisterCalls = 0
     $script:unregisterResult = $true
     $script:activation = 'Activated'
+    $script:smartAppControl = 'Off'
     $script:bitlocker = @{ Presence = 'Present'; Volume = $null; Status = 0 }
     $script:bitlockerThrows = $false
     $script:apps = @{ 'Google Chrome' = '155.0.8059.85'; 'AnyDesk' = '9.5.3' }
@@ -136,6 +138,7 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     Mock Get-DefaultAssociationsPath { return $script:assocPath }
     Mock Remove-LenovoAdminCommandLine { $script:lenovoCalls++ }
     Mock Get-ActivationStatus { return $script:activation }
+    Mock Get-SmartAppControlState { return $script:smartAppControl }
     Mock Get-BitLockerState {
       if ($script:bitlockerThrows) { throw 'WMI is down' }
       return $script:bitlocker
@@ -203,8 +206,13 @@ Describe 'Format-SetupReport content' {
   }
   It 'starts with the title and lists the header lines in order' {
     $expected = 'BenTech Windows Setup - Report', 'Tool version : ', 'Result       : ', 'Started      : ', 'Finished     : ', 'Duration     : ',
-      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'AnyDesk ID   : '
+      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : '
     for ($i = 0; $i -lt $expected.Count; $i++) { $green[$i] | Should -BeLike ($expected[$i] + '*') }
+  }
+  It 'shows Smart App Control as given, and Unknown when it was not passed (M8)' {
+    $green | Should -Contain 'Smart App Control : Unknown'
+    $l = @(Format-SetupReport -State $st -Verdict (Get-RunVerdict -State $st) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{} -SmartAppControl 'Evaluation')
+    $l | Should -Contain 'Smart App Control : Evaluation'
   }
   It 'shows the machine, mode and Windows lines' {
     $green | Should -Contain 'Machine      : Dell Inc. Latitude 5440   SN: 7HX2K93'
@@ -406,6 +414,41 @@ Describe 'Get-ActivationStatus' {
   It 'is Unknown when CIM fails' {
     Mock Get-CimInstance { throw 'Access denied' }
     Get-ActivationStatus | Should -Be 'Unknown'
+  }
+}
+
+Describe 'Get-SmartAppControlState (M8)' {
+  BeforeEach {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level }) }
+  }
+  It 'reads VerifiedAndReputablePolicyState under CI\Policy: <Value> -> <Expected>' -ForEach @(
+    @{ Value = 0; Expected = 'Off' }
+    @{ Value = 1; Expected = 'On' }
+    @{ Value = 2; Expected = 'Evaluation' }
+    @{ Value = 3; Expected = 'Unknown' }
+    @{ Value = 'abc'; Expected = 'Unknown' }
+  ) {
+    $script:sacValue = $Value
+    Mock Get-ItemProperty { [pscustomobject]@{ VerifiedAndReputablePolicyState = $script:sacValue } } -ParameterFilter {
+      $LiteralPath -eq 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -and @($Name) -contains 'VerifiedAndReputablePolicyState'
+    }
+    Mock Get-ItemProperty { throw 'wrong registry read' }
+    Get-SmartAppControlState | Should -Be $Expected
+  }
+  It 'is Unknown, without throwing, when the value is missing' {
+    Mock Get-ItemProperty { Write-Error -Message 'Property VerifiedAndReputablePolicyState does not exist' -Category InvalidArgument }
+    { $script:sac = Get-SmartAppControlState } | Should -Not -Throw
+    $script:sac | Should -Be 'Unknown'
+  }
+  It 'is Unknown, without throwing, when the key cannot be read' {
+    Mock Get-ItemProperty { throw 'Requested registry access is not allowed' }
+    { $script:sac = Get-SmartAppControlState } | Should -Not -Throw
+    $script:sac | Should -Be 'Unknown'
+  }
+  It 'is Unknown when the read returns nothing' {
+    Mock Get-ItemProperty { }
+    Get-SmartAppControlState | Should -Be 'Unknown'
   }
 }
 
@@ -667,16 +710,26 @@ Describe 'Invoke-StepFinalize phase B' {
     Invoke-StepFinalize -Context $ctx | Out-Null
     $script:lenovoCalls | Should -Be $Calls
   }
-  It 'activation <Activation>: note=<Noted>' -ForEach @(
-    @{ Activation = 'Activated';     Noted = $false }
-    @{ Activation = 'Not activated'; Noted = $true }
-    @{ Activation = 'Unknown';       Noted = $true }
+  It 'activation <Activation>: note <Note> (M5: an unreadable status is not "not activated")' -ForEach @(
+    @{ Activation = 'Activated';     Note = $null }
+    @{ Activation = 'Not activated'; Note = 'Windows not activated' }
+    @{ Activation = 'Unknown';       Note = 'Windows activation status unknown' }
   ) {
     $script:activation = $Activation
     $ctx = New-FinalizeContext -PhaseB
     Invoke-StepFinalize -Context $ctx | Out-Null
-    (@($ctx.State.Notes) -contains 'Windows not activated') | Should -Be $Noted
+    $activationNotes = @(@($ctx.State.Notes) | Where-Object { $_ -match 'activat' })
+    if ($null -eq $Note) { $activationNotes.Count | Should -Be 0 } else { $activationNotes | Should -Be @($Note) }
     Get-ReportLines -Context $ctx | Should -Contain "Activation   : $Activation"
+  }
+  It 'records Smart App Control in the report (M8): <State>' -ForEach @(
+    @{ State = 'Off' }, @{ State = 'On' }, @{ State = 'Evaluation' }, @{ State = 'Unknown' }
+  ) {
+    $script:smartAppControl = $State
+    $ctx = New-FinalizeContext -PhaseB
+    Invoke-StepFinalize -Context $ctx | Out-Null
+    Should -Invoke Get-SmartAppControlState -Times 1 -Exactly
+    Get-ReportLines -Context $ctx | Should -Contain "Smart App Control : $State"
   }
   It 'BitLocker <Presence>/<Status>: report <Text>' -ForEach @(
     @{ Presence = 'Absent';  Status = $null; Text = 'Not present'; Note = $null; Err = $null }

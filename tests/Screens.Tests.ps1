@@ -562,16 +562,23 @@ Describe 'Format-FinalScreen' {
     $l = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $true)
     $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [any other key] close'
   }
-  It 'caps long lists so the banner and the ID stay on screen, and cuts long lines' {
+  It 'caps long lists (4 failures, 3 notes) so the banner and the ID stay on screen, and cuts long lines' {
     $many = 1..9 | ForEach-Object { "Failure number $_" }
     $long = 'Windows Update: ' + ('y' * 200)
     $l = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures (@($long) + $many) -Notes @(1..6 | ForEach-Object { "Note $_" })) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
-    @($l | Where-Object { $_ -like '  X  *' -and $_ -notlike '*more*' }).Count | Should -Be 5
-    @($l | Where-Object { $_ -like '  !  *' -and $_ -notlike '*more*' }).Count | Should -Be 4
-    $l | Should -Contain '  X  ... and 5 more: see the report'
-    $l | Should -Contain '  !  ... and 2 more: see the report'
-    $l.Count | Should -BeLessThan 36
+    @($l | Where-Object { $_ -like '  X  *' -and $_ -notlike '*more*' }).Count | Should -Be 4
+    @($l | Where-Object { $_ -like '  !  *' -and $_ -notlike '*more*' }).Count | Should -Be 3
+    $l | Should -Contain '  X  ... and 6 more: see the report'
+    $l | Should -Contain '  !  ... and 3 more: see the report'
     @($l | Where-Object { $_ -like '  X  *' -and $_.Length -gt 79 }).Count | Should -Be 0
+  }
+  It 'fits a 30-row console in the worst case: every list over its cap, the Chrome hint and a 10-digit ID (triage 240)' {
+    $st = New-FinalState; $st.AnyDeskId = '1234567890'
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | ForEach-Object { "Failure $_" }) -Notes @(1..20 | ForEach-Object { "Note $_" })) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false)
+    $l.Count | Should -BeLessOrEqual 30
+    $l[0] | Should -Be ('=' * 80)                                       # the frame and the banner are the first lines
+    $l | Should -Contain "  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'"
+    $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [any other key] close'
   }
   It 'cuts one very long failure to fit 79 columns' {
     $long = 'Windows Update: ' + ('y' * 200)
@@ -643,6 +650,18 @@ Describe 'Show-FinalScreen' {
     $cleared | Should -Be 1
     @($hostCalls | Where-Object { $_.Text -match 'SETUP COMPLETE' }).Count | Should -Be 1
     @($hostCalls | Where-Object { $_.Color -ne 'White' }).Count | Should -Be 0
+  }
+  It 'writes the last line without a newline, so a screen of exactly 30 lines does not scroll its top line away' {
+    $script:hostCalls = New-Object System.Collections.ArrayList
+    Mock Clear-Host { }
+    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; NoNewline = [bool]$NoNewline }) }
+    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
+      -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { 'Q' } -SetColor { param($c) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+    $hostCalls.Count | Should -BeGreaterThan 10
+    $hostCalls[$hostCalls.Count - 1].Text | Should -Match '^  Report: '
+    $hostCalls[$hostCalls.Count - 1].NoNewline | Should -BeTrue
+    @($hostCalls | Select-Object -First ($hostCalls.Count - 1) | Where-Object { $_.NoNewline }).Count | Should -Be 0
   }
   It 'treats an unknown default browser as not Chrome' {
     Mock Get-DefaultBrowserProgId { $null }

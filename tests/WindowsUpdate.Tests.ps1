@@ -823,3 +823,53 @@ Describe 'Windows Update round and step (mocked COM)' {
     }
   }
 }
+
+# Triage 233: the installer must never sit on a hidden prompt for the whole round. Invoke-WuInstall gets a
+# fake session (plain objects, no COM); New-Object -ComObject is mocked, so no WUA object is ever created.
+Describe 'Invoke-WuInstall (COM wrapper, fake session)' {
+  BeforeAll {
+    . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    function New-FakeInstallerSession {
+      param([switch]$RefuseQuiet)
+      $script:installer = [pscustomobject]@{ Updates = $null; AllowSourcePrompts = $true; SeenAtInstall = $null }
+      if ($RefuseQuiet) {
+        $script:installer | Add-Member -MemberType ScriptProperty -Name ForceQuiet -Value { $false } -SecondValue { throw 'Access is denied.' }
+      } else {
+        $script:installer | Add-Member -MemberType NoteProperty -Name ForceQuiet -Value $false
+      }
+      $script:installer | Add-Member -MemberType ScriptMethod -Name Install -Value {
+        $this.SeenAtInstall = @{ ForceQuiet = $this.ForceQuiet; AllowSourcePrompts = $this.AllowSourcePrompts; Updates = @($this.Updates.Items) }
+        $result = [pscustomobject]@{ RebootRequired = $true; HResult = 0 }
+        $result | Add-Member -MemberType ScriptMethod -Name GetUpdateResult -Value { param($i) [pscustomobject]@{ ResultCode = 2 + $i } } -PassThru
+      }
+      $session = [pscustomobject]@{}
+      $session | Add-Member -MemberType ScriptMethod -Name CreateUpdateInstaller -Value { $script:installer } -PassThru
+    }
+  }
+  BeforeEach {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level }) }
+    # The most recently defined matching mock wins: the catch-all block first, the UpdateColl fake after it.
+    Mock New-Object { throw "blocked by the test: New-Object $ComObject $TypeName" } -ParameterFilter { $ComObject }
+    Mock New-Object {
+      $coll = [pscustomobject]@{ Items = [System.Collections.ArrayList]::new() }
+      $coll | Add-Member -MemberType ScriptMethod -Name Add -Value { param($u) $this.Items.Add($u) } -PassThru
+    } -ParameterFilter { $ComObject -eq 'Microsoft.Update.UpdateColl' }
+  }
+  It 'sets ForceQuiet and turns AllowSourcePrompts off before Install()' {
+    $r = Invoke-WuInstall -Session (New-FakeInstallerSession) -Updates @('u1', 'u2')
+    $script:installer.SeenAtInstall.ForceQuiet | Should -BeTrue
+    $script:installer.SeenAtInstall.AllowSourcePrompts | Should -BeFalse
+    $script:installer.SeenAtInstall.Updates | Should -Be @('u1', 'u2')
+    $r.ResultCodes | Should -Be @(2, 3)
+    $r.RebootRequired | Should -BeTrue
+    $r.HResult | Should -Be 0
+  }
+  It 'still installs (WARN) when the installer refuses one of the settings' {
+    $r = Invoke-WuInstall -Session (New-FakeInstallerSession -RefuseQuiet) -Updates @('u1')
+    $script:installer.SeenAtInstall | Should -Not -BeNullOrEmpty
+    $script:installer.SeenAtInstall.AllowSourcePrompts | Should -BeFalse
+    $r.ResultCodes | Should -Be @(2)
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'ForceQuiet' }).Count | Should -Be 1
+  }
+}

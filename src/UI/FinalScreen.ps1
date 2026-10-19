@@ -9,8 +9,11 @@
 # DefaultBrowser.ps1 and Apps.ps1.
 
 $script:FinalScreenWidth = 80
-$script:FinalMaxFailures = 5
-$script:FinalMaxNotes = 4
+# Triage 240: with both lists over their caps, the Chrome hint and a 10-digit AnyDesk ID, the screen is 30
+# lines, the height of a default console window. Show-FinalScreen writes the last one without a newline, so
+# nothing scrolls the banner away.
+$script:FinalMaxFailures = 4
+$script:FinalMaxNotes = 3
 
 # A 5x5 font for the AnyDesk ID. Every glyph is exactly 5 columns wide and 5 rows tall.
 $script:BigDigitFont = @{
@@ -104,9 +107,10 @@ function Format-FinalScreen {
     In order: the banner centred in an 80-column frame of '=', the machine and new name, the AnyDesk
     ID in big digits grouped 3-3-3 (or "not available"), the total time and reboot count, each
     failure ("  X  ..."), each note ("  !  ..."), the Chrome hint when Chrome is not the default
-    browser, and the report line. The total time runs from State.StartedAt to State.EndedAt, or to
-    -Now while the run has no end time. At most 5 failures and 4 notes are listed (then "... and N
-    more"), and each is cut to 79 columns.
+    browser (right above the report line), and the report line. The total time runs from
+    State.StartedAt to State.EndedAt, or to -Now while the run has no end time. At most 4 failures and
+    3 notes are listed (then "... and N more"), and each is cut to 79 columns, so the worst case is
+    30 lines (one default console window).
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -157,11 +161,10 @@ function Format-FinalScreen {
     $lines.AddRange($problems)
   }
 
+  $lines.Add('')
   if (-not $DefaultBrowserIsChrome) {
-    $lines.Add('')
     $lines.Add("  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'")
   }
-  $lines.Add('')
   $lines.Add(('  Report: {0}   [R] open report   [any other key] close' -f $ReportPath))
 
   return $lines.ToArray()
@@ -182,7 +185,7 @@ function Show-FinalScreen {
       -ReadKey    waits for a key and returns its [ConsoleKey] name (nothing = treated as "any key")
       -SetColor   sets the console background to a colour name
       -ResetColor puts the console colours back (runs when the screen closes, also after an error)
-      -Write      clears and draws the lines
+      -Write      clears and draws the lines (the last one without a newline)
       -Launch     starts a program or opens a URI: param($target, $arguments)
       -FlushInput throws away waiting key presses
   #>
@@ -194,7 +197,13 @@ function Show-FinalScreen {
     [scriptblock]$ReadKey = { [Console]::ReadKey($true).Key.ToString() },
     [scriptblock]$SetColor = { param($c) $Host.UI.RawUI.BackgroundColor = $c },
     [scriptblock]$ResetColor = { [Console]::ResetColor() },
-    [scriptblock]$Write = { param($lines) Clear-Host; $lines | ForEach-Object { Write-Host $_ -ForegroundColor White } },
+    [scriptblock]$Write = {
+      param($lines)
+      Clear-Host
+      $all = @($lines)
+      # The last line has no newline: a full 30-line screen in a 30-row window must not scroll.
+      for ($i = 0; $i -lt $all.Count; $i++) { Write-Host $all[$i] -ForegroundColor White -NoNewline:($i -eq $all.Count - 1) }
+    },
     [scriptblock]$Launch = {
       param($target, $arguments)
       if ([string]::IsNullOrEmpty($arguments)) { Start-Process -FilePath $target }

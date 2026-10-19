@@ -41,9 +41,9 @@ function Limit-ScreenLine {
 }
 
 function ConvertFrom-StateTime {
-  # A state timestamp as a [datetime], or $null. State holds ISO strings (yyyy-MM-ddTHH:mm:ss), but
-  # Windows PowerShell 5.1's ConvertFrom-Json turns such strings into [datetime] when state.json is
-  # read back, so both forms must work. Never throws.
+  # A state timestamp as a [datetime], or $null. State holds ISO strings (yyyy-MM-ddTHH:mm:ss), and
+  # Windows PowerShell 5.1's ConvertFrom-Json leaves them as strings when state.json is read back. A
+  # [datetime] is accepted too (a caller or a test may pass one). Never throws.
   [CmdletBinding()]
   [OutputType([datetime])]
   param([AllowNull()]$Value)

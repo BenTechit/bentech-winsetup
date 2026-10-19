@@ -1,7 +1,8 @@
 ﻿# src/Report/Report.ps1
 # The setup report (spec 8.7): C:\BenTech\Setup\Logs\Setup-Report.txt. Finalize (Finalize.ps1) writes it,
-# and R on the final screen opens it. Format-SetupReport is pure. Get-ActivationStatus and
-# Get-InstalledAppVersions are the two read-only collectors it needs; Finalize calls them.
+# and R on the final screen opens it. Format-SetupReport is pure. Get-ActivationStatus,
+# Get-SmartAppControlState and Get-InstalledAppVersions are the read-only collectors it needs; Finalize
+# calls them.
 # Needs Catalog.ps1 + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
 # ConvertFrom-StateTime, Format-HoursMinutes), DefaultBrowser.ps1 (Read-RegistryStringValue),
 # Office.ps1 ($script:OfficeReleaseKey) and Logging.ps1; the bundle holds every file.
@@ -50,6 +51,38 @@ function Get-ActivationStatus {
     return 'Not activated'
   } catch {
     Write-SetupLog -Message 'Windows activation status could not be read' -Level WARN -Data @{ error = $_.Exception.Message }
+    return 'Unknown'
+  }
+}
+
+function Get-SmartAppControlState {
+  <#
+  .SYNOPSIS
+    Smart App Control: 'Off', 'On', 'Evaluation' or 'Unknown'. Read-only; never throws.
+  .DESCRIPTION
+    Spec 16 (M8): the report records it. HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy,
+    VerifiedAndReputablePolicyState: 0 Off, 1 On, 2 Evaluation. Anything else, a missing value (Windows 10,
+    older builds) or a read that fails is 'Unknown'.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  try {
+    $item = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name 'VerifiedAndReputablePolicyState' -ErrorAction Stop
+    if ($null -eq $item) { return 'Unknown' }
+    $property = $item.PSObject.Properties['VerifiedAndReputablePolicyState']
+    if ($null -eq $property) { return 'Unknown' }
+    $value = 0
+    if (-not [int]::TryParse([string]$property.Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) { return 'Unknown' }
+    switch ($value) {
+      0 { return 'Off' }
+      1 { return 'On' }
+      2 { return 'Evaluation' }
+    }
+    return 'Unknown'
+  } catch {
+    Write-SetupLog -Message 'Smart App Control state could not be read' -Data @{ error = $_.Exception.Message }
     return 'Unknown'
   }
 }
@@ -131,7 +164,8 @@ function Format-SetupReport {
       BenTech Windows Setup - Report
       Tool version / Result (the verdict banner) / Started / Finished / Duration (h:mm) / Machine /
       PC name (old -> new) / Mode (chosen, and detected LAPTOP|DESKTOP|VM) / Windows / Activation /
-      BitLocker / AnyDesk ID ('not available' when there is none)
+      BitLocker / Smart App Control (Off|On|Evaluation|Unknown; -SmartAppControl, 'Unknown' when not
+      given) / AnyDesk ID ('not available' when there is none)
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, hidden: <titles, or ids, or 'none'>
@@ -142,7 +176,7 @@ function Format-SetupReport {
              rounds, Finalize across its restart) shows the time of its last call.
       Failures: / Notes: from the verdict, each section only when it has entries.
     Dates are dd/MM/yyyy HH:mm; a missing or unreadable time is 'unknown' (and so is the duration).
-    Times may be ISO strings or [datetime] (state.json read back by ConvertFrom-Json).
+    Times may be ISO strings (as state.json holds them) or [datetime] (ConvertFrom-StateTime takes both).
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -151,7 +185,8 @@ function Format-SetupReport {
     [Parameter(Mandatory)][hashtable]$Verdict,
     [Parameter(Mandatory)][AllowEmptyString()][string]$Activation,
     [Parameter(Mandatory)][AllowEmptyString()][string]$BitLockerText,
-    [Parameter(Mandatory)][AllowNull()][hashtable]$AppVersions
+    [Parameter(Mandatory)][AllowNull()][hashtable]$AppVersions,
+    [AllowNull()][AllowEmptyString()][string]$SmartAppControl = 'Unknown'
   )
 
   $machine = if ($State['Machine'] -is [System.Collections.IDictionary]) { $State['Machine'] } else { @{} }
@@ -178,6 +213,9 @@ function Format-SetupReport {
   $lines.Add(('Windows      : {0} {1} ({2}) {3}' -f (ConvertTo-ScreenText $machine['OsCaption']), (ConvertTo-ScreenText $machine['OsDisplayVersion']), (ConvertTo-ScreenText $machine['OsBuild']), (ConvertTo-ScreenText $machine['Arch'])))
   $lines.Add('Activation   : ' + (ConvertTo-ScreenText $Activation))
   $lines.Add('BitLocker    : ' + (ConvertTo-ScreenText $BitLockerText))
+  $smartAppControlText = ConvertTo-ScreenText $SmartAppControl
+  if ($smartAppControlText -eq '') { $smartAppControlText = 'Unknown' }
+  $lines.Add('Smart App Control : ' + $smartAppControlText)
   $lines.Add('AnyDesk ID   : ' + $anyDesk)
 
   $lines.Add('')

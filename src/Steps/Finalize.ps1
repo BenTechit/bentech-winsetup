@@ -328,7 +328,8 @@ function Complete-SetupFinalization {
          and its folder too when it is empty.
       3. LENOVO: the AdminCommandLine policy values removed (a forced BIOS restart can skip the
          per-pass cleanup).
-      4. Activation not 'Activated' -> Note 'Windows not activated'.
+      4. Activation 'Not activated' -> Note 'Windows not activated'; 'Unknown' (it could not be read)
+         -> Note 'Windows activation status unknown'.
       5. BitLocker (ConvertTo-BitLockerFinding): a Note or an Error, and the report's BitLocker text.
       6. Windows 10 -> Note 'Windows 10: no security updates'.
       7. The resume task removed; a removal that fails -> Note 'Resume task could not be removed'.
@@ -336,7 +337,8 @@ function Complete-SetupFinalization {
          Logs\ stay.
       9. State.EndedAt = now.
      10. Steps['finalize'] marked Done('Finalized') first, so the verdict cannot call this step "did
-         not finish"; then the verdict, and the report in <LogDir>\Setup-Report.txt. A report that
+         not finish"; then the verdict, and the report in <LogDir>\Setup-Report.txt (with the Smart
+         App Control state, Get-SmartAppControlState). A report that
          cannot be written marks finalize Failed('Setup report could not be written') instead.
   #>
   [CmdletBinding()]
@@ -366,7 +368,9 @@ function Complete-SetupFinalization {
   if ([string]$machine['Brand'] -eq 'LENOVO') { Remove-LenovoAdminCommandLine }
 
   $activation = Get-ActivationStatus
-  if ($activation -ne 'Activated') { Add-FinalizeMessage -State $runState -Field Notes -Text 'Windows not activated' }
+  # M5: a status that could not be read is not "not activated".
+  if ($activation -eq 'Unknown') { Add-FinalizeMessage -State $runState -Field Notes -Text 'Windows activation status unknown' }
+  elseif ($activation -ne 'Activated') { Add-FinalizeMessage -State $runState -Field Notes -Text 'Windows not activated' }
 
   try {
     $bitLocker = Get-BitLockerState
@@ -393,7 +397,7 @@ function Complete-SetupFinalization {
   $verdict = Get-RunVerdict -State $runState
   $reportPath = Join-Path $Context.LogDir $script:SetupReportFileName
   try {
-    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions)
+    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions) -SmartAppControl (Get-SmartAppControlState)
     Write-SetupReport -Path $reportPath -Lines $lines
     Write-SetupLog -Message 'Setup report written' -Data @{ path = $reportPath; result = $verdict.Color }
     $result = New-StepResult -Status Done -Message 'Finalized'

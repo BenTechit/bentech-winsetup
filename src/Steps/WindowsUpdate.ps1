@@ -362,6 +362,9 @@ function Invoke-WuDownload {
 function Invoke-WuInstall {
   # Private. Installs the updates in one batch. Returns @{ ResultCodes = <int[]> (in the order given);
   # RebootRequired = <bool>; HResult = <int> (the installation result's own HResult, 0 = success) }.
+  # Triage 233: IUpdateInstaller.ForceQuiet = $true and AllowSourcePrompts = $false, so WUA never waits on a
+  # dialog or a "insert the source media" prompt nobody can see for the whole round. Each is best effort: a
+  # refused setting is a WARN and the install still runs (the round timeout still bounds it).
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
@@ -372,6 +375,10 @@ function Invoke-WuInstall {
   $collection = New-Object -ComObject 'Microsoft.Update.UpdateColl'
   foreach ($update in $Updates) { [void]$collection.Add($update) }
   $installer = $Session.CreateUpdateInstaller()
+  try { $installer.ForceQuiet = $true }
+  catch { Write-SetupLog -Message 'Windows Update installer refused ForceQuiet' -Level WARN -Data @{ error = $_.Exception.Message } }
+  try { $installer.AllowSourcePrompts = $false }
+  catch { Write-SetupLog -Message 'Windows Update installer refused AllowSourcePrompts' -Level WARN -Data @{ error = $_.Exception.Message } }
   $installer.Updates = $collection
   $result = $installer.Install()
   $codes = @(for ($i = 0; $i -lt $Updates.Count; $i++) { [int]$result.GetUpdateResult($i).ResultCode })

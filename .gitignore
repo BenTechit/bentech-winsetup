@@ -1,3 +1,8 @@
 dist/
 *.dpapi
 TestResults/
+# Private signing-key material must never be committed (the repo is public and a pushed key cannot be
+# recalled): a -BackupPath export, any other copy named after the key, and PEM files.
+*BACKUP*
+signing-key*
+*.pem

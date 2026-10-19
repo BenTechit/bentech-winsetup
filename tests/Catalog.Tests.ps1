@@ -130,4 +130,28 @@ Describe 'Get-RunVerdict' {
     $v.Failures -is [string[]] | Should -BeTrue; $v.Notes -is [string[]] | Should -BeTrue
     @($v.Failures).Count | Should -Be 0; @($v.Notes).Count | Should -Be 0
   }
+  It 'names a hidden update by the title the Windows Update step recorded, else by its id (M7)' {
+    $s.Plan = @('chrome', 'windows-update'); $s.Steps['windows-update'] = @{ Status = 'Done'; Message = ''; Data = @{ FailedTitles = @{ 'abc' = 'Cumulative Update KB5050001'; 'xyz' = 'not hidden' } } }
+    $s.HiddenUpdateIds = @('abc', 'def')
+    $f = (Get-RunVerdict -State $s).Failures
+    $f | Should -Contain 'Windows update hidden after repeated failures: Cumulative Update KB5050001'
+    $f | Should -Contain 'Windows update hidden after repeated failures: def'
+    ($f -join "`n") | Should -Not -Match 'xyz|not hidden'
+  }
+  It 'falls back to the id when the title is empty or the step Data is missing' {
+    $s.Plan = @('chrome', 'windows-update'); $s.Steps['windows-update'] = @{ Status = 'Done'; Message = ''; Data = @{ FailedTitles = @{ 'abc' = '  ' } } }
+    $s.HiddenUpdateIds = @('abc')
+    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update hidden after repeated failures: abc'
+    $s.Steps['windows-update'] = @{ Status = 'Done'; Message = '' }
+    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update hidden after repeated failures: abc'
+  }
+  It 'lists an exact duplicate failure or note once, keeping the first (M1)' {
+    $s.Steps.chrome.Status = 'Failed'; $s.Steps.chrome.Message = 'x'
+    $s.Errors = @('Restart skipped: no resume task', 'Google Chrome: x', 'Restart skipped: no resume task', 'restart skipped: no resume task')
+    $s.Notes = @('On battery: BIOS skipped', 'n2', 'On battery: BIOS skipped')
+    $v = Get-RunVerdict -State $s
+    @($v.Failures) | Should -Be @('Google Chrome: x', 'Restart skipped: no resume task', 'restart skipped: no resume task')   # exact match only
+    @($v.Notes) | Should -Be @('On battery: BIOS skipped', 'n2')
+    $v.Failures -is [string[]] | Should -BeTrue
+  }
 }

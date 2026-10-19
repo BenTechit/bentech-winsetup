@@ -1,7 +1,8 @@
 @echo off
 setlocal
-"%SystemRoot%\System32\fltmc.exe" >nul 2>&1 || ( "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b )
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText('%~f0'); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf('#__PS__')))) %*"
+set "BT_SELF=%~f0"
+"%SystemRoot%\System32\fltmc.exe" >nul 2>&1 || ( "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:BT_SELF -Verb RunAs" & exit /b )
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText($env:BT_SELF); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf('#__PS__')))) %*"
 exit /b %errorlevel%
 #__PS__
 # BenTech Windows Setup launcher - the PowerShell part of BenTechSetup.cmd.
@@ -11,9 +12,12 @@ exit /b %errorlevel%
 # against the public key embedded below, and only then writes them to $TargetDir and runs setup.ps1.
 # Nothing unsigned ever runs. This section is self-contained on purpose (it cannot dot-source anything),
 # so the small helpers below are commented copies ("mirrors") of src code and must be kept in step.
-# Keep this file ASCII-only and never write the marker string from line 6 anywhere below it.
+# Keep this file ASCII-only and never write the marker string from line 7 anywhere below it.
 # The cmd part starts every program by its full path: cmd looks for a bare name in the .cmd's own folder
 # first, so a powershell.bat or fltmc.bat planted next to the launcher (Downloads) would run instead.
+# The .cmd's own path reaches PowerShell only through the BT_SELF environment variable, never inside a
+# quoted PowerShell string: an apostrophe in the path (a Hebrew name such as Jenny written with a geresh)
+# would otherwise end the string and stop the launcher.
 #
 # Exit codes: setup.ps1's own exit code once it ran; 1 unexpected launcher error; 2 a setup run already
 # holds the lock; 3 a signature check failed (nothing written, nothing run); 4 the release could not be

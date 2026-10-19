@@ -28,4 +28,35 @@ Describe 'New-PcName' {
   It 'strips invalid chars' { New-PcName -Brand LENOVO -Serial 'pf-3a b7c' -BiosUuid 'x' | Should -Be 'LEN-PF3AB7C' }
   It 'junk serial uses the uuid tail' { New-PcName -Brand OTHER -Serial 'To be filled by O.E.M.' -BiosUuid '4C4C4544-0037-4810-8058-B7C04F4B3933' | Should -Be 'PC-4B3933' }
   It 'VM uses the uuid tail' { New-PcName -Brand VM -Serial '1234-5678' -BiosUuid 'abcdef12-0000-0000-0000-00000a1b2c3d' | Should -Be 'PC-1B2C3D' }
+  # Triage 119: placeholder serials that white-box boards ship with must not become a shared PC name.
+  It 'treats the placeholder serial <Serial> as junk' -ForEach @(
+    @{ Serial = 'Not Applicable' }, @{ Serial = 'Not Specified' }, @{ Serial = 'Unknown' }, @{ Serial = 'Serial Number' }
+    @{ Serial = 'Chassis Serial Number' }, @{ Serial = '0123456789' }, @{ Serial = '123456789' }, @{ Serial = 'not-applicable' }
+    @{ Serial = ' UNKNOWN ' }, @{ Serial = 'System Serial Number' }, @{ Serial = 'Default string' }, @{ Serial = 'N/A' }
+    @{ Serial = '0123-4567-89' }, @{ Serial = 'serial number' }
+  ) {
+    New-PcName -Brand ASUS -Serial $Serial -BiosUuid '4C4C4544-0037-4810-8058-B7C04F4B3933' | Should -Be 'PC-4B3933'
+  }
+  It 'treats an all-same-character serial as junk: <Serial>' -ForEach @(
+    @{ Serial = '1111111111' }, @{ Serial = 'XXXXXXXX' }, @{ Serial = 'FFFF-FFFF' }, @{ Serial = '9' }
+  ) {
+    New-PcName -Brand DELL -Serial $Serial -BiosUuid '4C4C4544-0037-4810-8058-B7C04F4B3933' | Should -Be 'PC-4B3933'
+  }
+  It 'keeps a real serial that merely contains a placeholder-like part' {
+    New-PcName -Brand LENOVO -Serial 'PF123456789' -BiosUuid 'x' | Should -Be 'LEN-PF123456789'
+    New-PcName -Brand HP -Serial '5CD0123456789A' -BiosUuid 'x' | Should -Be 'HP-D0123456789A'
+    New-PcName -Brand DELL -Serial '11111112' -BiosUuid 'x' | Should -Be 'DELL-11111112'
+  }
+  It 'uses random hex, not the shared tail, for the AMI default UUID and all-same-character UUIDs: <Uuid>' -ForEach @(
+    @{ Uuid = '03000200-0400-0500-0006-000700080009' }
+    @{ Uuid = '03000200-0400-0500-0006-000700080009'.ToLowerInvariant() }
+    @{ Uuid = '11111111-1111-1111-1111-111111111111' }
+    @{ Uuid = 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA' }
+    @{ Uuid = 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF' }
+    @{ Uuid = '00000000-0000-0000-0000-000000000000' }
+  ) {
+    $names = @(1..5 | ForEach-Object { New-PcName -Brand OTHER -Serial 'To be filled by O.E.M.' -BiosUuid $Uuid })
+    foreach ($n in $names) { $n | Should -Match '^PC-[0-9A-F]{6}$'; $n | Should -Not -Be 'PC-080009' }
+    @($names | Sort-Object -Unique).Count | Should -BeGreaterThan 1     # random each time, so two such PCs differ
+  }
 }

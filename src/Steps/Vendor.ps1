@@ -198,18 +198,24 @@ function Test-ShouldRemoveBusinessTool {
 function Convert-LenovoUpdateRecords {
   <#
   .SYNOPSIS
-    Turns the Lenovo_Updates records System Update exported to WMI into 'Done', 'DoneReboot', 'Failed'
-    or 'FailedReboot'.
+    Turns the Lenovo_Updates records System Update exported to WMI into 'Done', 'DoneReboot', 'Failed',
+    'FailedReboot' or 'Unverified'.
   .DESCRIPTION
     Provisional until SPIKE#4 shows the real property names and values (the spike dumps every
     property). Every record is looked at: a Status text containing "fail" marks a failure, one
-    containing "reboot" or "restart" marks a needed restart (one record can mark both).
+    containing "reboot" or "restart" marks a needed restart (one record can mark both), and a Status
+    that is, as a whole, a success word (installed, success, successful, succeeded, complete,
+    completed) marks a success.
       failure and restart -> FailedReboot (the updates that did install still get their restart)
       failure only        -> Failed
       restart only        -> DoneReboot
-      neither, or no records -> Done
-    Matching is case-insensitive. $null records and records without a Status are ignored. Accepts
-    CimInstances, plain objects and hashtables.
+      a success only, or no records -> Done
+      records, but not one Status the above recognizes -> Unverified (final review I4: on Hebrew
+        Windows or with other property names everything would otherwise fall through to a silent
+        Done; the caller turns this into a yellow Note)
+    The success word must be the whole Status, so "Not installed" is not a success. Matching is
+    case-insensitive. $null records are ignored; a record without a Status recognizes nothing.
+    Accepts CimInstances, plain objects and hashtables.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -217,8 +223,11 @@ function Convert-LenovoUpdateRecords {
 
   $failed = $false
   $reboot = $false
+  $success = $false
+  $seen = 0
   foreach ($record in @($Records)) {
     if ($null -eq $record) { continue }
+    $seen++
     $status = $null
     if ($record -is [System.Collections.IDictionary]) {
       $status = $record['Status']
@@ -226,13 +235,15 @@ function Convert-LenovoUpdateRecords {
       $property = $record.PSObject.Properties['Status']
       if ($null -ne $property) { $status = $property.Value }
     }
-    $text = [string]$status
+    $text = ([string]$status).Trim()
     if ($text -match 'fail') { $failed = $true }
     if ($text -match 'reboot|restart') { $reboot = $true }
+    if ($text -match '^(installed|success|successful|succeeded|completed?)$') { $success = $true }
   }
   if ($failed -and $reboot) { return 'FailedReboot' }
   if ($failed) { return 'Failed' }
   if ($reboot) { return 'DoneReboot' }
+  if ($seen -gt 0 -and -not $success) { return 'Unverified' }
   return 'Done'
 }
 
@@ -654,8 +665,10 @@ function Invoke-LenovoUpdate {
        Done with the Note 'Lenovo System Update result could not be read'. No record ->
        Done('No Lenovo updates reported'). Otherwise Convert-LenovoUpdateRecords decides Done,
        DoneReboot, or Failed('Lenovo System Update reported failed updates'), the latter with a
-       restart (FailedReboot) when another record needs one. tvsu's own exit code (undocumented) is
-       kept in the outcome for the step Data and decides nothing.
+       restart (FailedReboot) when another record needs one. Records it cannot interpret
+       (Unverified, final review I4) -> Done with the Note 'Lenovo System Update result could not be
+       verified; see Logs\lenovo-pass<Pass>'. tvsu's own exit code (undocumented) is kept in the
+       outcome for the step Data and decides nothing.
     A BIOS (type 5) update forces its own restart in the middle of this (the finally does not run
     then); the runner re-runs the step after it, which writes and removes the value again. If SPIKE#4
     shows that consumer models are not covered, LSUClient replaces steps 1-7 here and this function
@@ -723,6 +736,12 @@ function Invoke-LenovoUpdate {
   $verdict = Convert-LenovoUpdateRecords -Records $records
   if ($verdict -eq 'Failed' -or $verdict -eq 'FailedReboot') {
     return New-VendorOutcome -Outcome $verdict -ExitCode $exitCode -Message "$name reported failed updates" -Notes $notes.ToArray()
+  }
+  if ($verdict -eq 'Unverified') {
+    # I4 interim (until SPIKE#4): records that say nothing the parser knows are yellow, never a silent Done.
+    Write-SetupLog -Message 'Lenovo update results could not be interpreted' -Level WARN -Data @{ records = $records.Count; pass = $Pass }
+    $notes.Add("Lenovo System Update result could not be verified; see Logs\lenovo-pass$Pass")
+    return New-VendorOutcome -Outcome Done -ExitCode $exitCode -Notes $notes.ToArray()
   }
   return New-VendorOutcome -Outcome $verdict -ExitCode $exitCode -Notes $notes.ToArray()
 }

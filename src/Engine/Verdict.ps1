@@ -23,6 +23,10 @@ function Get-RunVerdict {
     "<Title>: <Message>". A step that is still pending or running (or has no state entry at all)
     when the verdict is taken never finished, so it is a failure ("<Title>: did not finish"): the
     final screen must never be green when steps never ran. Done steps are fine.
+    Then 'Reboot limit reached', each hidden update ("Windows update hidden after repeated failures:
+    <title>", the title the Windows Update step recorded in Data.FailedTitles, else the id; M7), and
+    State.Errors are failures; State.Notes are notes. A string already in its list is not added again
+    (exact match; M1), so one root cause reported by two steps takes one line on the final screen.
     RED if any failure, otherwise YELLOW if any note, otherwise GREEN.
   #>
   [CmdletBinding()]
@@ -31,6 +35,11 @@ function Get-RunVerdict {
 
   $failures = New-Object System.Collections.Generic.List[string]
   $notes = New-Object System.Collections.Generic.List[string]
+  # Exact (ordinal) duplicates are dropped as they arrive; the first occurrence keeps its place.
+  $failureSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $noteSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $addFailure = { param([string]$Text) if ($failureSeen.Add($Text)) { $failures.Add($Text) } }
+  $addNote = { param([string]$Text) if ($noteSeen.Add($Text)) { $notes.Add($Text) } }
 
   foreach ($id in @($State['Plan'])) {
     if ([string]::IsNullOrEmpty($id)) { continue }
@@ -42,20 +51,30 @@ function Get-RunVerdict {
 
     switch ($status) {
       'Done'    { }
-      'Skipped' { $notes.Add(('{0}: {1}' -f $title, $message)) }
-      'Failed'  { $failures.Add(('{0}: {1}' -f $title, $message)) }
-      default   { $failures.Add(('{0}: did not finish' -f $title)) }   # pending, running, missing, unknown
+      'Skipped' { & $addNote ('{0}: {1}' -f $title, $message) }
+      'Failed'  { & $addFailure ('{0}: {1}' -f $title, $message) }
+      default   { & $addFailure ('{0}: did not finish' -f $title) }   # pending, running, missing, unknown
     }
   }
 
-  if ($State['RebootCapHit'] -eq $true) { $failures.Add('Reboot limit reached') }
-  foreach ($updateId in @($State['HiddenUpdateIds'])) {
-    if (-not [string]::IsNullOrEmpty($updateId)) {
-      $failures.Add(('Windows update hidden after repeated failures: {0}' -f $updateId))
-    }
+  if ($State['RebootCapHit'] -eq $true) { & $addFailure 'Reboot limit reached' }
+
+  # Hidden updates by title (as the report lists them), else by id.
+  $titles = @{}
+  $wuStep = if ($State['Steps'] -is [System.Collections.IDictionary]) { $State['Steps']['windows-update'] } else { $null }
+  if ($wuStep -is [System.Collections.IDictionary] -and $wuStep['Data'] -is [System.Collections.IDictionary] -and
+      $wuStep['Data']['FailedTitles'] -is [System.Collections.IDictionary]) {
+    $titles = $wuStep['Data']['FailedTitles']
   }
-  foreach ($e in @($State['Errors'])) { if (-not [string]::IsNullOrEmpty($e)) { $failures.Add([string]$e) } }
-  foreach ($n in @($State['Notes']))  { if (-not [string]::IsNullOrEmpty($n)) { $notes.Add([string]$n) } }
+  foreach ($updateId in @($State['HiddenUpdateIds'])) {
+    $key = [string]$updateId
+    if ([string]::IsNullOrEmpty($key)) { continue }
+    $title = if ($titles.Contains($key)) { [string]$titles[$key] } else { '' }
+    $name = if ([string]::IsNullOrWhiteSpace($title)) { $key } else { $title }
+    & $addFailure ('Windows update hidden after repeated failures: {0}' -f $name)
+  }
+  foreach ($e in @($State['Errors'])) { if (-not [string]::IsNullOrEmpty($e)) { & $addFailure ([string]$e) } }
+  foreach ($n in @($State['Notes']))  { if (-not [string]::IsNullOrEmpty($n)) { & $addNote ([string]$n) } }
 
   if ($failures.Count -gt 0) { $color = 'RED';    $banner = 'COMPLETED WITH ERRORS' }
   elseif ($notes.Count -gt 0) { $color = 'YELLOW'; $banner = 'COMPLETE - CHECK NOTES' }

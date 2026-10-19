@@ -398,8 +398,29 @@ Describe 'Convert-LenovoUpdateRecords' {
   It 'matches the status text case-insensitively' {
     Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'REBOOT')) | Should -Be 'DoneReboot'
   }
-  It 'ignores $null records and records without a Status' {
-    Convert-LenovoUpdateRecords -Records @($null, [pscustomobject]@{ Name = 'x' }) | Should -Be 'Done'
+  It 'ignores $null records' {
+    Convert-LenovoUpdateRecords -Records @($null, $null) | Should -Be 'Done'
+    Convert-LenovoUpdateRecords -Records @($null, (New-FakeLenovoUpdate 'Installed')) | Should -Be 'Done'
+  }
+  # Final review I4 (interim until SPIKE#4): records that say nothing the parser knows must never be a
+  # silent success. Known: "fail", "reboot"/"restart", or a whole-status success word.
+  It 'records whose Status matches no known token are Unverified: <Case>' -ForEach @(
+    @{ Case = 'unknown English text'; Records = { @((New-FakeLenovoUpdate 'Pending'), (New-FakeLenovoUpdate 'Downloaded')) } }
+    @{ Case = 'no Status at all'; Records = { @([pscustomobject]@{ Name = 'x' }, @{ Title = 'y' }) } }
+    @{ Case = 'an empty Status'; Records = { @((New-FakeLenovoUpdate ''), (New-FakeLenovoUpdate '  ')) } }
+    @{ Case = 'Hebrew text'; Records = { @((New-FakeLenovoUpdate ([string]::new([char[]]@(0x05D4, 0x05D5, 0x05EA, 0x05E7, 0x05DF))))) } }
+    @{ Case = '"Not installed" (a success word inside other text)'; Records = { @((New-FakeLenovoUpdate 'Not installed')) } }
+  ) {
+    Convert-LenovoUpdateRecords -Records (& $Records) | Should -Be 'Unverified'
+  }
+  It 'one recognized record is enough: <Status> next to an unknown one' -ForEach @(
+    @{ Status = 'Installed'; Expected = 'Done' }
+    @{ Status = 'Success'; Expected = 'Done' }
+    @{ Status = 'Completed'; Expected = 'Done' }
+    @{ Status = 'Reboot required'; Expected = 'DoneReboot' }
+    @{ Status = 'Install failed'; Expected = 'Failed' }
+  ) {
+    Convert-LenovoUpdateRecords -Records @((New-FakeLenovoUpdate 'Something new'), (New-FakeLenovoUpdate $Status)) | Should -Be $Expected
   }
   It 'reads plain objects and hashtables too' {
     Convert-LenovoUpdateRecords -Records @([pscustomobject]@{ Status = 'Failed' }) | Should -Be 'Failed'
@@ -1029,6 +1050,16 @@ Describe 'Lenovo System Update' {
     $r.Status | Should -Be 'Done'
     $r.Message | Should -Be 'Lenovo System Update finished'
     $r.Reboot | Should -Be 'None'
+  }
+  It 'records it cannot interpret: Done WITH the Note naming that pass''s logs, never a silent success (I4 interim)' -ForEach @(
+    @{ Pass = 1 }
+    @{ Pass = 2 }
+  ) {
+    $script:lenovoRecords = @((New-FakeLenovoUpdate 'Pending'), [pscustomobject]@{ Title = 'no status' })
+    $r = Invoke-VendorPass -Context $script:ctx -Pass $Pass
+    $r.Status | Should -Be 'Done'
+    $r.Reboot | Should -Be 'None'
+    $r.Notes | Should -Contain "Lenovo System Update result could not be verified; see Logs\lenovo-pass$Pass"
   }
   It 'an unreadable WMI result is Done WITH the Note, never a silent success' {
     $script:cimThrows = $true

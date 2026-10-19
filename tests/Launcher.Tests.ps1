@@ -155,6 +155,18 @@ Describe 'launcher polyglot through cmd' {
     $LASTEXITCODE | Should -Be 0
     "$d\ran.txt" | Should -Exist
   }
+  It 'runs end to end from a folder whose path holds an apostrophe (triage 269)' {
+    # A user named ג'ני (or O'Brien) has Downloads at C:\Users\<name>\Downloads.
+    SignAll
+    $folder = Join-Path $TestDrive "o'brien"
+    [void][IO.Directory]::CreateDirectory($folder)
+    $quoted = Join-Path $folder 'BenTechSetup.cmd'
+    Copy-Item -LiteralPath $cmdPath -Destination $quoted
+    $d = Join-Path $TestDrive 'c3'
+    & cmd.exe /c $quoted -TargetDir $d -SkipAcl -NoPause | Out-Null
+    $LASTEXITCODE | Should -Be 0
+    "$d\ran.txt" | Should -Exist
+  }
 }
 
 Describe 'launcher file layout' {
@@ -176,15 +188,22 @@ Describe 'launcher file layout' {
     $built | Should -Not -Match "`r(?!`n)"
   }
   It 'starts with the fixed polyglot header (R30: full paths, so nothing planted next to the .cmd can run)' {
+    # The .cmd's own path reaches PowerShell through BT_SELF, never inside a quoted PowerShell string, so a
+    # path with an apostrophe (a Hebrew name such as ג'ני uses it as a geresh) cannot break it (triage 269).
     $expected = @(
       '@echo off'
       'setlocal'
-      '"%SystemRoot%\System32\fltmc.exe" >nul 2>&1 || ( "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath ''%~f0'' -Verb RunAs" & exit /b )'
-      '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText(''%~f0''); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf(''#__PS__'')))) %*"'
+      'set "BT_SELF=%~f0"'
+      '"%SystemRoot%\System32\fltmc.exe" >nul 2>&1 || ( "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:BT_SELF -Verb RunAs" & exit /b )'
+      '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText($env:BT_SELF); & ([ScriptBlock]::Create($t.Substring($t.LastIndexOf(''#__PS__'')))) %*"'
       'exit /b %errorlevel%'
       '#__PS__'
     )
-    @($built -split "`r`n")[0..5] | Should -Be $expected
+    @($built -split "`r`n")[0..6] | Should -Be $expected
+  }
+  It 'never puts the .cmd''s own path (%~f0) inside a PowerShell command' {
+    $cmdPart = $built.Substring(0, $built.IndexOf("`r`n#__PS__`r`n"))
+    @($cmdPart -split "`r`n" | Where-Object { $_ -match '%~f0' }) | Should -Be @('set "BT_SELF=%~f0"')
   }
   It 'never starts a bare program name in the cmd part (cmd looks in the .cmd''s own folder first)' {
     $cmdPart = $built.Substring(0, $built.IndexOf("`r`n#__PS__`r`n"))

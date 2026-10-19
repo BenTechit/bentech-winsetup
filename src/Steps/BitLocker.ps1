@@ -1,6 +1,6 @@
 ﻿# src/Steps/BitLocker.ps1
 # Step 1, "Turn off BitLocker" (spec 8.3, Q13), plus the helpers the vendor step (Wait-BitLockerDecrypted,
-# Suspend-BitLockerOnce) and Finalize (Get-BitLockerAction, Get-BitLockerConversionStatus) use.
+# Suspend-BitLockerOnce) and Finalize (Get-BitLockerAction, Get-BitLockerState) use.
 #
 # Everything goes through CIM (root\cimv2\Security\MicrosoftVolumeEncryption, Win32_EncryptableVolume):
 # no manage-bde, no BitLocker module, nothing whose output is localized text. Needs StepResult.ps1 and
@@ -113,20 +113,6 @@ function Get-BitLockerState {
   }
   $state.Status = [int]$r.ConversionStatus
   return $state
-}
-
-function Get-BitLockerConversionStatus {
-  <#
-  .SYNOPSIS
-    Returns C:'s ConversionStatus (0..5) as an int, or $null when it is not available.
-  .DESCRIPTION
-    $null covers both "no BitLocker" and "could not be read" (a failure is a WARN in the log). Callers
-    that must tell the two apart (the steps in this file do) use Get-BitLockerState.
-  #>
-  [CmdletBinding()]
-  param()
-
-  return (Get-BitLockerState).Status
 }
 
 function Invoke-StepBitLocker {

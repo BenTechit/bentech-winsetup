@@ -313,12 +313,14 @@ Describe 'Get-BitLockerAction' {
   }
 }
 
-Describe 'Get-BitLockerConversionStatus' {
+Describe 'Get-BitLockerState (Status)' {
+  # These tests used to go through Get-BitLockerConversionStatus, a one-line wrapper removed as dead code
+  # (final review M11); they now pin Get-BitLockerState's Status directly.
   BeforeEach { Initialize-SystemMocks }
 
   It 'queries the BitLocker namespace, Win32_EncryptableVolume and C:' {
     $script:statusSeq = @(1)
-    Get-BitLockerConversionStatus | Should -Be 1
+    (Get-BitLockerState).Status | Should -Be 1
     $script:cimGet.Count | Should -Be 1
     $script:cimGet[0].Namespace | Should -Be 'root\cimv2\Security\MicrosoftVolumeEncryption'
     $script:cimGet[0].ClassName | Should -Be 'Win32_EncryptableVolume'
@@ -326,7 +328,7 @@ Describe 'Get-BitLockerConversionStatus' {
   }
   It 'asks GetConversionStatus of that volume and returns the status as an int' {
     $script:statusSeq = @(3)
-    $r = Get-BitLockerConversionStatus
+    $r = (Get-BitLockerState).Status
     $r | Should -BeOfType [int]
     $r | Should -Be 3
     $calls = @(Get-CimMethodCall -Method 'GetConversionStatus')
@@ -335,30 +337,30 @@ Describe 'Get-BitLockerConversionStatus' {
   }
   It 'returns 0 for a decrypted volume (0 is a status, not "missing")' {
     $script:statusSeq = @(0)
-    $r = Get-BitLockerConversionStatus
+    $r = (Get-BitLockerState).Status
     $null -eq $r | Should -BeFalse
     $r | Should -Be 0
   }
   It 'returns $null when the <code> query fails' -ForEach @(@{ code = 'InvalidNamespace' }, @{ code = 'InvalidClass' }, @{ code = 'AccessDenied' }) {
     $script:cimGetError = $code
-    $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    $null -eq ((Get-BitLockerState).Status) | Should -BeTrue
     @(Get-CimMethodCall -Method 'GetConversionStatus').Count | Should -Be 0
   }
   It 'returns $null when there is no matching volume' {
     $script:volume = $null
-    $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    $null -eq ((Get-BitLockerState).Status) | Should -BeTrue
     $script:cimCalls.Count | Should -Be 0
   }
   It 'returns $null and logs a WARN when GetConversionStatus reports a non-zero ReturnValue' {
     $script:statusSeq = @(1)
     $script:statusReturnValue = $script:FveLockedVolume
-    $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    $null -eq ((Get-BitLockerState).Status) | Should -BeTrue
     @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
   }
   It 'returns $null and logs a WARN when GetConversionStatus throws' {
     $script:statusSeq = @('throw')
-    { Get-BitLockerConversionStatus } | Should -Not -Throw
-    $null -eq (Get-BitLockerConversionStatus) | Should -BeTrue
+    { (Get-BitLockerState).Status } | Should -Not -Throw
+    $null -eq ((Get-BitLockerState).Status) | Should -BeTrue
     @(Get-LogEntry -Level 'WARN').Count | Should -BeGreaterThan 0
   }
 }
