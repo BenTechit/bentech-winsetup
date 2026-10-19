@@ -12,8 +12,9 @@
 #   - Power, first: on battery, firmware is NOT allowed and the BitLocker gate is skipped (ruling R20).
 #   - BitLocker (on AC only): decrypted (or absent) is fine. Still encrypted: it is suspended for one
 #     restart; if that fails, firmware is NOT allowed.
-#   - Power again, right before the tool: the BitLocker wait can be long and the charger may have been
-#     pulled meanwhile.
+#   - Power again, inside each tool function right before it applies anything (after its install,
+#     download, extract or /configure): the BitLocker wait and that setup can be long, and the charger
+#     may have been pulled meanwhile.
 # When it is not allowed, the argument builders leave BIOS/firmware out (Review Focus #3).
 #
 # No vendor output text is ever parsed (Windows may be Hebrew). DCU and HPIA report through exit codes;
@@ -24,9 +25,12 @@ $script:VendorToolNames = @{ dcu = 'Dell Command Update'; lsu = 'Lenovo System U
 # The brands whose business tool runs (steps 12/14) and is removed on laptops (step 16).
 $script:VendorToolBrands = @('DELL', 'LENOVO', 'HP')
 
+$script:BatteryNote = 'On battery: BIOS/firmware updates skipped'
+
 $script:DcuConfigureArgs = '/configure -silent -autoSuspendBitLocker=enable'
 $script:DcuConfigureTimeoutMinutes = 5
 $script:DcuServiceName = 'DellClientManagementService'
+$script:DcuServiceStartSeconds = 60
 
 # tvsu.exe is a 32-bit program and this script runs as 64-bit PowerShell, so the policy is written to
 # both registry views, the native one and the WOW6432Node one (ruling R19).
@@ -156,16 +160,18 @@ function Get-LenovoAdminCommandLine {
     results exported to WMI.
   .DESCRIPTION
     -includerebootpackages picks the reboot types System Update may install: 1 (restart needed),
-    3 (no restart needed) and 5 (BIOS/firmware; Lenovo forces its own restart after a countdown). OnAC
-    $false leaves 5 out. Type 4 (forces a SHUTDOWN) is never included: a powered-off machine would
-    stall the run.
+    3 (no restart needed) and 5 (BIOS/firmware; Lenovo forces its own restart after a countdown). Type 4
+    (forces a SHUTDOWN) is never included: a powered-off machine would stall the run.
+    OnAC $false (ruling R21) leaves type 5 out AND adds -packagetypes 1,2 (1 = application, 2 =
+    driver): the reboot type alone does not keep out firmware, or an older BIOS package, that carries
+    reboot type 1 or 3. The AC variant has no package-type filter (Q18: everything recommended).
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param([Parameter(Mandatory)][bool]$OnAC)
 
-  $packages = if ($OnAC) { '1,3,5' } else { '1,3' }
-  return "/CM -search A -action INSTALL -includerebootpackages $packages -noreboot -noicon -nolicense -exporttowmi"
+  if ($OnAC) { return '/CM -search A -action INSTALL -includerebootpackages 1,3,5 -noreboot -noicon -nolicense -exporttowmi' }
+  return '/CM -search A -action INSTALL -includerebootpackages 1,3 -packagetypes 1,2 -noreboot -noicon -nolicense -exporttowmi'
 }
 
 # --- rules ------------------------------------------------------------------------------------
@@ -255,27 +261,54 @@ function New-VendorOutcome {
   <#
   .SYNOPSIS
     Private. What one vendor tool run came to, before Invoke-VendorPass turns it into a StepResult:
-    @{ Outcome; ExitCode = <int|$null>; Message = <string|$null> }.
+    @{ Outcome; ExitCode = <int|$null>; Message = <string|$null>; Notes = <string[]> }.
   .DESCRIPTION
     Outcome is Done, DoneReboot, DoneWarning, Skipped, Failed, FailedReboot or TimedOut. A Message
-    replaces the default text for that outcome (see ConvertTo-VendorStepResult).
+    replaces the default text for that outcome (see ConvertTo-VendorStepResult). Notes are the tool
+    run's own yellow notes (power lost right before the apply, an unreadable Lenovo result).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][ValidateSet('Done', 'DoneReboot', 'DoneWarning', 'Skipped', 'Failed', 'FailedReboot', 'TimedOut')][string]$Outcome,
     $ExitCode = $null,
-    [string]$Message
+    [string]$Message,
+    [AllowEmptyCollection()][string[]]$Notes = @()
   )
 
-  return @{ Outcome = $Outcome; ExitCode = (ConvertTo-VendorExitCode -ExitCode $ExitCode); Message = $Message }
+  return @{ Outcome = $Outcome; ExitCode = (ConvertTo-VendorExitCode -ExitCode $ExitCode); Message = $Message; Notes = [string[]]@($Notes) }
+}
+
+function Resolve-VendorFirmwareAllowed {
+  <#
+  .SYNOPSIS
+    Private. Reads AC power once more right before a tool applies updates (spec 9.2: the step
+    re-checks power right before it runs) and returns whether BIOS/firmware is still allowed.
+  .DESCRIPTION
+    OnAC $false stays $false without a read (battery at the first read, or BitLocker not suspended).
+    OnAC $true and still on AC: $true. AC lost since the first read (after an install, download,
+    extract, /configure or a retry wait): $false, a WARN, and the battery Note is added to Notes once.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][bool]$OnAC,
+    [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Notes
+  )
+
+  if (-not $OnAC) { return $false }
+  if ([bool](Test-OnACPower)) { return $true }
+  Write-SetupLog -Message 'AC power lost right before the vendor tool; BIOS/firmware left out' -Level WARN
+  if (-not $Notes.Contains($script:BatteryNote)) { $Notes.Add($script:BatteryNote) }
+  return $false
 }
 
 function ConvertTo-VendorStepResult {
   <#
   .SYNOPSIS
     Private. Turns a vendor outcome into the pass's StepResult. Notes are the gate's notes (BitLocker,
-    battery); Data is @{ Pass; ExitCode } (ExitCode only when the tool returned one).
+    battery), followed by the outcome's own Notes (no text twice); Data is @{ Pass; ExitCode }
+    (ExitCode only when the tool returned one).
   .DESCRIPTION
     Done        -> Done('<tool> finished')
     DoneReboot  -> Done('<tool> finished, restart needed') with Reboot 'Now'
@@ -296,7 +329,9 @@ function ConvertTo-VendorStepResult {
   )
 
   $allNotes = New-Object 'System.Collections.Generic.List[string]'
-  foreach ($n in @($Notes)) { if ($n) { $allNotes.Add($n) } }
+  foreach ($n in (@($Notes) + @($Outcome.Notes))) {
+    if ($n -and -not $allNotes.Contains([string]$n)) { $allNotes.Add([string]$n) }
+  }
   $data = @{ Pass = $Pass }
   if ($null -ne $Outcome.ExitCode) { $data['ExitCode'] = [int]$Outcome.ExitCode }
   $text = [string]$Outcome.Message
@@ -399,11 +434,13 @@ function Invoke-DellUpdate {
     1. dcu-cli.exe through Get-VendorToolExe (exeCandidates, else winget Tool.wingetId; Dell signer).
     2. `/configure -silent -autoSuspendBitLocker=enable`, limited to 5 minutes. A failure (non-zero
        exit, timeout, cannot start) is only a WARN: the apply still runs.
-    3. `/applyUpdates` (Get-DcuApplyArgs; OnAC $false = no BIOS/firmware) with the log
+    3. Right before each apply, AC power is read again (Resolve-VendorFirmwareAllowed): lost AC means
+       no BIOS/firmware and the battery Note.
+    4. `/applyUpdates` (Get-DcuApplyArgs; OnAC $false = no BIOS/firmware) with the log
        <Logs>\dcu-pass<Pass>.log and timeoutsMinutes.vendor.
-    4. Exit codes 3000-3005 (the Dell service is not running, busy or updating itself): Start-Service
-       DellClientManagementService, wait RetrySeconds (30) so a service that is starting or updating
-       can settle, and apply once more; a second such code is Failed.
+    5. Exit codes 3000-3005 (the Dell service is not running, busy or updating itself):
+       Start-DellClientService (bounded to 60 s), wait RetrySeconds (30) so a service that is starting
+       or updating can settle, and apply once more; a second such code is Failed.
     A timeout is TimedOut; a dcu-cli that cannot be started is Failed('Dell Command Update could not
     be started').
   #>
@@ -431,31 +468,54 @@ function Invoke-DellUpdate {
     Write-SetupLog -Message 'DCU /configure could not be started; applying updates anyway' -Level WARN -Data @{ error = $_.Exception.Message }
   }
 
-  $arguments = Get-DcuApplyArgs -LogPath (Join-Path $Context.LogDir "dcu-pass$Pass.log") -OnAC $OnAC
+  $logPath = Join-Path $Context.LogDir "dcu-pass$Pass.log"
   $timeout = [double]$Context.Config.timeoutsMinutes.vendor
+  $notes = New-Object 'System.Collections.Generic.List[string]'
   $maxTries = 2
   for ($try = 1; $try -le $maxTries; $try++) {
+    $OnAC = Resolve-VendorFirmwareAllowed -OnAC $OnAC -Notes $notes
+    $arguments = Get-DcuApplyArgs -LogPath $logPath -OnAC $OnAC
     try {
       $run = Invoke-External -FilePath $exe -ArgumentList $arguments -TimeoutMinutes $timeout
     } catch {
       Write-SetupLog -Message 'dcu-cli could not be started' -Level ERROR -Data @{ file = $exe; error = $_.Exception.Message }
-      return New-VendorOutcome -Outcome Failed -Message "$name could not be started"
+      return New-VendorOutcome -Outcome Failed -Message "$name could not be started" -Notes $notes.ToArray()
     }
-    if ($run.TimedOut) { return New-VendorOutcome -Outcome TimedOut }
+    if ($run.TimedOut) { return New-VendorOutcome -Outcome TimedOut -Notes $notes.ToArray() }
 
     $mapped = Convert-DcuExitCode -ExitCode $run.ExitCode
     if ($mapped -eq 'RetryService' -and $try -lt $maxTries) {
       Write-SetupLog -Message 'The Dell service is not ready; starting it, waiting and applying once more' -Level WARN -Data @{ exitCode = $run.ExitCode; service = $script:DcuServiceName; waitSeconds = $RetrySeconds }
-      try {
-        Start-Service -Name $script:DcuServiceName -ErrorAction Stop
-      } catch {
-        Write-SetupLog -Message 'The Dell service could not be started; retrying anyway' -Level WARN -Data @{ service = $script:DcuServiceName; error = $_.Exception.Message }
-      }
+      Start-DellClientService
       Start-Sleep -Seconds $RetrySeconds
       continue
     }
     if ($mapped -eq 'RetryService') { $mapped = 'Failed' }
-    return New-VendorOutcome -Outcome $mapped -ExitCode $run.ExitCode
+    return New-VendorOutcome -Outcome $mapped -ExitCode $run.ExitCode -Notes $notes.ToArray()
+  }
+}
+
+function Start-DellClientService {
+  <#
+  .SYNOPSIS
+    Private. Starts DellClientManagementService when it is not running and waits at most 60 s for it
+    to reach Running. Never throws: a missing service, a refused start or the 60 s running out is a
+    WARN, and the caller retries anyway.
+  .DESCRIPTION
+    Not Start-Service: in Windows PowerShell it keeps waiting, with no limit, while a service stays
+    StartPending. A service that is already StartPending is only waited for (Start() would throw).
+  #>
+  [CmdletBinding()]
+  param()
+
+  try {
+    $service = Get-Service -Name $script:DcuServiceName -ErrorAction Stop
+    if ([string]$service.Status -ne 'Running') {
+      if ([string]$service.Status -ne 'StartPending') { $service.Start() }
+      $service.WaitForStatus('Running', [TimeSpan]::FromSeconds($script:DcuServiceStartSeconds))
+    }
+  } catch {
+    Write-SetupLog -Message 'The Dell service could not be started; retrying anyway' -Level WARN -Data @{ service = $script:DcuServiceName; waitSeconds = $script:DcuServiceStartSeconds; error = $_.Exception.Message }
   }
 }
 
@@ -554,17 +614,20 @@ function Copy-LenovoLog {
 }
 
 function Read-LenovoUpdateRecords {
-  # Private. The root\Lenovo Lenovo_Updates instances as an array; empty when there are none or the
-  # namespace cannot be read (a WARN: the class only exists once System Update has exported to WMI).
+  # Private. @{ Readable = <bool>; Records = <object[]> } from root\Lenovo Lenovo_Updates, the query
+  # limited to 30 s. A query that worked and found nothing is Readable with no Records. A query that
+  # failed (namespace or class missing, WMI error, timeout) is NOT Readable, with a WARN: the caller
+  # must not report that as a clean result.
   [CmdletBinding()]
-  [OutputType([object[]])]
+  [OutputType([hashtable])]
   param()
 
   try {
-    return @(Get-CimInstance -Namespace 'root\Lenovo' -ClassName 'Lenovo_Updates' -ErrorAction Stop)
+    $records = @(Get-CimInstance -Namespace 'root\Lenovo' -ClassName 'Lenovo_Updates' -OperationTimeoutSec 30 -ErrorAction Stop)
+    return @{ Readable = $true; Records = $records }
   } catch {
     Write-SetupLog -Message 'Lenovo update results could not be read from WMI' -Level WARN -Data @{ error = $_.Exception.Message }
-    return @()
+    return @{ Readable = $false; Records = @() }
   }
 }
 
@@ -574,20 +637,28 @@ function Invoke-LenovoUpdate {
     Runs Lenovo System Update for one pass. Returns a vendor outcome (see New-VendorOutcome).
   .DESCRIPTION
     1. tvsu.exe through Get-VendorToolExe (exeCandidates, else winget Tool.wingetId; Lenovo signer).
-    2. The AdminCommandLine policy = Get-LenovoAdminCommandLine (OnAC $false = no type 5), in both
-       registry views. If either write fails, tvsu does NOT run (an older value could still allow a
-       BIOS flash): Failed.
-    3. `tvsu.exe /CM` with timeoutsMinutes.vendor, then Wait-LenovoProcessExit for whatever is left of
+    2. AC power is read again (Resolve-VendorFirmwareAllowed), because the policy written next decides
+       whether BIOS packages are installed. Lost AC means the restricted policy and the battery Note.
+    3. The AdminCommandLine policy = Get-LenovoAdminCommandLine (OnAC $false = no type 5, applications
+       and drivers only), in both registry views. If either write fails, tvsu does NOT run (an older
+       value could still allow a BIOS flash): Failed.
+    4. `tvsu.exe /CM` with timeoutsMinutes.vendor, then Wait-LenovoProcessExit for whatever is left of
        that same budget, polling every PollSeconds (10). Either running out is TimedOut, after every
        tvsu/Tvsukernel process left has been killed.
-    4. Logs\lenovo-pass<Pass>\ gets a copy of System Update's logs (best effort, also after a timeout).
-    5. The result comes from root\Lenovo Lenovo_Updates (SPIKE#4 will refine this): no record ->
-       Done('No Lenovo updates reported'); otherwise Convert-LenovoUpdateRecords decides Done,
+    5. Whatever happened in 3-4, the AdminCommandLine value is then removed from both views (ruling
+       R22, in a finally): left in place, System Update's own scheduled runs could later install a
+       BIOS unattended, outside this step's power and BitLocker checks. Each pass writes it again.
+    6. Logs\lenovo-pass<Pass>\ gets a copy of System Update's logs (best effort, also after a timeout).
+    7. The result comes from root\Lenovo Lenovo_Updates (SPIKE#4 will refine this). Unreadable ->
+       Done with the Note 'Lenovo System Update result could not be read'. No record ->
+       Done('No Lenovo updates reported'). Otherwise Convert-LenovoUpdateRecords decides Done,
        DoneReboot, or Failed('Lenovo System Update reported failed updates'), the latter with a
-       restart (FailedReboot) when another record needs one.
-    A BIOS (type 5) update forces its own restart in the middle of this; the runner re-runs the step
-    after it. If SPIKE#4 shows that consumer models are not covered, LSUClient replaces steps 1-5 here
-    and this function keeps its signature (spec 9.2).
+       restart (FailedReboot) when another record needs one. tvsu's own exit code (undocumented) is
+       kept in the outcome for the step Data and decides nothing.
+    A BIOS (type 5) update forces its own restart in the middle of this (the finally does not run
+    then); the runner re-runs the step after it, which writes and removes the value again. If SPIKE#4
+    shows that consumer models are not covered, LSUClient replaces steps 1-7 here and this function
+    keeps its signature (spec 9.2).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -603,41 +674,56 @@ function Invoke-LenovoUpdate {
   $ready = Get-VendorToolExe -Tool $Tool -Name $name -Context $Context
   if ($null -ne $ready.Outcome) { return $ready.Outcome }
   $exe = $ready.Exe
+  $notes = New-Object 'System.Collections.Generic.List[string]'
 
-  if (-not (Set-LenovoAdminCommandLine -Value (Get-LenovoAdminCommandLine -OnAC $OnAC))) {
-    return New-VendorOutcome -Outcome Failed -Message "$name settings could not be written"
-  }
-
+  $OnAC = Resolve-VendorFirmwareAllowed -OnAC $OnAC -Notes $notes
   $timeoutMinutes = [double]$Context.Config.timeoutsMinutes.vendor
-  $clock = [Diagnostics.Stopwatch]::StartNew()
+  $run = $null
+  $finished = $false
   try {
-    $run = Invoke-External -FilePath $exe -ArgumentList '/CM' -TimeoutMinutes $timeoutMinutes
-  } catch {
-    Write-SetupLog -Message 'tvsu.exe could not be started' -Level ERROR -Data @{ file = $exe; error = $_.Exception.Message }
-    return New-VendorOutcome -Outcome Failed -Message "$name could not be started"
-  }
+    if (-not (Set-LenovoAdminCommandLine -Value (Get-LenovoAdminCommandLine -OnAC $OnAC))) {
+      return New-VendorOutcome -Outcome Failed -Message "$name settings could not be written" -Notes $notes.ToArray()
+    }
 
-  $finished = -not $run.TimedOut
-  if ($finished) {
-    $finished = Wait-LenovoProcessExit -TimeoutSeconds ($timeoutMinutes * 60 - $clock.Elapsed.TotalSeconds) -PollSeconds $PollSeconds
-  }
-  if (-not $finished) {
-    Write-SetupLog -Message 'Lenovo System Update timed out; killing what is left of it' -Level WARN -Data @{ timeoutMinutes = $timeoutMinutes }
-    Stop-LenovoProcess
-    Copy-LenovoLog -Context $Context -Pass $Pass
-    return New-VendorOutcome -Outcome TimedOut
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $run = Invoke-External -FilePath $exe -ArgumentList '/CM' -TimeoutMinutes $timeoutMinutes
+    } catch {
+      Write-SetupLog -Message 'tvsu.exe could not be started' -Level ERROR -Data @{ file = $exe; error = $_.Exception.Message }
+      return New-VendorOutcome -Outcome Failed -Message "$name could not be started" -Notes $notes.ToArray()
+    }
+
+    $finished = -not $run.TimedOut
+    if ($finished) {
+      $finished = Wait-LenovoProcessExit -TimeoutSeconds ($timeoutMinutes * 60 - $clock.Elapsed.TotalSeconds) -PollSeconds $PollSeconds
+    }
+    if (-not $finished) {
+      Write-SetupLog -Message 'Lenovo System Update timed out; killing what is left of it' -Level WARN -Data @{ timeoutMinutes = $timeoutMinutes }
+      Stop-LenovoProcess
+    }
+  } finally {
+    # Ruling R22: never leave the policy behind, whatever happened above.
+    Remove-LenovoAdminCommandLine
   }
 
   Copy-LenovoLog -Context $Context -Pass $Pass
-  $records = @(Read-LenovoUpdateRecords)
-  Write-SetupLog -Message 'Lenovo update results read' -Data @{ records = $records.Count }
-  if ($records.Count -eq 0) { return New-VendorOutcome -Outcome Done -Message 'No Lenovo updates reported' }
+  $exitCode = $run.ExitCode
+  if (-not $finished) { return New-VendorOutcome -Outcome TimedOut -ExitCode $exitCode -Notes $notes.ToArray() }
+
+  $read = Read-LenovoUpdateRecords
+  $records = @($read.Records)
+  Write-SetupLog -Message 'Lenovo update results read' -Data @{ readable = [bool]$read.Readable; records = $records.Count; tvsuExitCode = $exitCode }
+  if (-not $read.Readable) {
+    $notes.Add('Lenovo System Update result could not be read')
+    return New-VendorOutcome -Outcome Done -ExitCode $exitCode -Notes $notes.ToArray()
+  }
+  if ($records.Count -eq 0) { return New-VendorOutcome -Outcome Done -ExitCode $exitCode -Message 'No Lenovo updates reported' -Notes $notes.ToArray() }
 
   $verdict = Convert-LenovoUpdateRecords -Records $records
   if ($verdict -eq 'Failed' -or $verdict -eq 'FailedReboot') {
-    return New-VendorOutcome -Outcome $verdict -Message "$name reported failed updates"
+    return New-VendorOutcome -Outcome $verdict -ExitCode $exitCode -Message "$name reported failed updates" -Notes $notes.ToArray()
   }
-  return New-VendorOutcome -Outcome $verdict
+  return New-VendorOutcome -Outcome $verdict -ExitCode $exitCode -Notes $notes.ToArray()
 }
 
 # --- HP Image Assistant -----------------------------------------------------------------------
@@ -709,9 +795,11 @@ function Invoke-HpUpdate {
   .DESCRIPTION
     1. <Downloads>\HPIA\HPImageAssistant.exe when it is already there (pass 2), else Get-HpiaExe.
     2. That exe must carry the HP signature, every time, before it runs.
-    3. Get-HpiaArgs (OnAC $false = no BIOS/firmware) with ReportFolder <Logs>\HPIA-pass<Pass> and
+    3. Right before each run, AC power is read again (Resolve-VendorFirmwareAllowed): lost AC means no
+       BIOS/firmware and the battery Note.
+    4. Get-HpiaArgs (OnAC $false = no BIOS/firmware) with ReportFolder <Logs>\HPIA-pass<Pass> and
        SoftpaqDownloadFolder <Downloads>\HPIA-softpaqs, timeoutsMinutes.vendor.
-    4. Exit 4098 (no internet): wait RetrySeconds (30) and run once more; a second 4098 is Failed.
+    5. Exit 4098 (no internet): wait RetrySeconds (30) and run once more; a second 4098 is Failed.
     A timeout is TimedOut; an exe that cannot be started is Failed('HP Image Assistant could not be
     started').
   #>
@@ -739,17 +827,21 @@ function Invoke-HpUpdate {
     return New-VendorOutcome -Outcome Failed -Message "$name signature check failed"
   }
 
-  $arguments = Get-HpiaArgs -ReportFolder (Join-Path $Context.LogDir "HPIA-pass$Pass") -DownloadFolder (Join-Path $Context.DownloadDir 'HPIA-softpaqs') -OnAC $OnAC
+  $reportFolder = Join-Path $Context.LogDir "HPIA-pass$Pass"
+  $softpaqFolder = Join-Path $Context.DownloadDir 'HPIA-softpaqs'
   $timeout = [double]$Context.Config.timeoutsMinutes.vendor
+  $notes = New-Object 'System.Collections.Generic.List[string]'
   $maxTries = 2
   for ($try = 1; $try -le $maxTries; $try++) {
+    $OnAC = Resolve-VendorFirmwareAllowed -OnAC $OnAC -Notes $notes
+    $arguments = Get-HpiaArgs -ReportFolder $reportFolder -DownloadFolder $softpaqFolder -OnAC $OnAC
     try {
       $run = Invoke-External -FilePath $exe -ArgumentList $arguments -TimeoutMinutes $timeout
     } catch {
       Write-SetupLog -Message 'HPImageAssistant.exe could not be started' -Level ERROR -Data @{ file = $exe; error = $_.Exception.Message }
-      return New-VendorOutcome -Outcome Failed -Message "$name could not be started"
+      return New-VendorOutcome -Outcome Failed -Message "$name could not be started" -Notes $notes.ToArray()
     }
-    if ($run.TimedOut) { return New-VendorOutcome -Outcome TimedOut }
+    if ($run.TimedOut) { return New-VendorOutcome -Outcome TimedOut -Notes $notes.ToArray() }
 
     $mapped = Convert-HpiaExitCode -ExitCode $run.ExitCode
     if ($mapped -eq 'Retry' -and $try -lt $maxTries) {
@@ -758,7 +850,7 @@ function Invoke-HpUpdate {
       continue
     }
     if ($mapped -eq 'Retry') { $mapped = 'Failed' }
-    return New-VendorOutcome -Outcome $mapped -ExitCode $run.ExitCode
+    return New-VendorOutcome -Outcome $mapped -ExitCode $run.ExitCode -Notes $notes.ToArray()
   }
 }
 
@@ -777,13 +869,14 @@ function Invoke-VendorPass {
     3. On AC, the BitLocker gate: Wait-BitLockerDecrypted (timeoutsMinutes.bitlockerDecrypt). Not
        decrypted -> Suspend-BitLockerOnce: success is the Note 'BitLocker still decrypting: suspended
        for BIOS update'; failure is the Note 'BitLocker could not be suspended: BIOS/firmware updates
-       skipped' and firmware is not allowed. Then Test-OnACPower once more, right before the tool:
-       the wait can take up to two hours and the charger may have been pulled meanwhile (that is the
-       same battery Note and no BIOS/firmware).
-    4. The tool runs with -OnAC (on AC at both reads, and BitLocker ok): Invoke-DellUpdate (dcu),
-       Invoke-LenovoUpdate (lsu) or Invoke-HpUpdate (hpia).
+       skipped' and firmware is not allowed.
+    4. The tool runs with -OnAC (on AC and BitLocker ok): Invoke-DellUpdate (dcu), Invoke-LenovoUpdate
+       (lsu) or Invoke-HpUpdate (hpia). Each reads AC power once more right before it applies
+       anything (after its install, download, extract or /configure; spec 9.2), because the wait and
+       the setup can take long and the charger may have been pulled meanwhile.
     5. ConvertTo-VendorStepResult maps the outcome (DoneReboot -> Done + Reboot 'Now'; Skipped ->
-       '<tool> does not support this model'; DoneWarning -> Done + Note). Data = @{ Pass; ExitCode }.
+       '<tool> does not support this model'; DoneWarning -> Done + Note) and adds the tool's own Notes.
+       Data = @{ Pass; ExitCode }.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -802,28 +895,23 @@ function Invoke-VendorPass {
   }
 
   $notes = New-Object 'System.Collections.Generic.List[string]'
-  $batteryNote = 'On battery: BIOS/firmware updates skipped'
   $allowFirmware = $false
   $gate = 'skipped (on battery)'
   if (-not [bool](Test-OnACPower)) {
-    $notes.Add($batteryNote)
+    $notes.Add($script:BatteryNote)
   } else {
-    $bitlockerOk = [bool](Wait-BitLockerDecrypted -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.bitlockerDecrypt))
+    $allowFirmware = [bool](Wait-BitLockerDecrypted -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.bitlockerDecrypt))
     $gate = 'decrypted'
-    if (-not $bitlockerOk) {
+    if (-not $allowFirmware) {
       if (Suspend-BitLockerOnce) {
         $notes.Add('BitLocker still decrypting: suspended for BIOS update')
-        $bitlockerOk = $true
+        $allowFirmware = $true
         $gate = 'suspended'
       } else {
         $notes.Add('BitLocker could not be suspended: BIOS/firmware updates skipped')
         $gate = 'not suspended'
       }
     }
-    # Read again right before the tool: the wait above can be long.
-    $stillOnAC = [bool](Test-OnACPower)
-    if (-not $stillOnAC) { $notes.Add($batteryNote) }
-    $allowFirmware = $stillOnAC -and $bitlockerOk
   }
   Write-SetupLog -Message 'Vendor pass starting' -Data @{ tool = $name; pass = $Pass; bitlocker = $gate; firmware = $allowFirmware }
 

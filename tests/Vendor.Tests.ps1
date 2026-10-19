@@ -10,7 +10,7 @@
 #   Invoke-External, Invoke-WingetInstall, Invoke-WingetUninstall, Get-RemoteFile, Get-RemoteText,
 #   Test-FileSignature, Wait-BitLockerDecrypted, Suspend-BitLockerOnce, Test-OnACPower, Test-Path,
 #   New-Item, New-ItemProperty, Get-ItemProperty, Remove-ItemProperty, Remove-Item, Copy-Item,
-#   Get-Process, Stop-Process, Start-Service, Get-CimInstance, Start-Sleep and Write-SetupLog.
+#   Get-Process, Stop-Process, Start-Service, Get-Service, Get-CimInstance, Start-Sleep and Write-SetupLog.
 # The only real file I/O is the placeholder "download" the Get-RemoteFile mock writes inside $TestDrive.
 # The pure functions (exit-code mappers, argument builders, the cleanup rule, the Lenovo record
 # conversion) need no mocks; the CimInstance used there is built in memory, without any WMI call.
@@ -82,7 +82,8 @@ BeforeAll {
   #   $script:stopped        the ids Stop-Process was called for
   #   $script:copies         one hashtable per Copy-Item call
   #   $script:cimCalls       one hashtable per Get-CimInstance call; $script:lenovoRecords is its answer
-  #   $script:serviceStarts  one name per Start-Service call
+  #   $script:serviceStarts  one name per Start-Service call (must stay empty)
+  #   $script:svc*           the fake Dell service behind Get-Service (see the mock)
   #   $script:removed        one path per Remove-Item call
   function Initialize-VendorMocks {
     $script:order = New-Object System.Collections.ArrayList
@@ -128,7 +129,13 @@ BeforeAll {
     $script:cimThrows = $false
     $script:lenovoRecords = @()
     $script:serviceStarts = New-Object System.Collections.ArrayList
-    $script:serviceThrows = $false
+    $script:svcNames = New-Object System.Collections.ArrayList
+    $script:svcStatus = 'Stopped'
+    $script:svcStarts = 0
+    $script:svcStartThrows = $false
+    $script:svcWaits = New-Object System.Collections.ArrayList
+    $script:svcWaitThrows = $false
+    $script:svcGetThrows = $false
     $script:removed = New-Object System.Collections.ArrayList
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
@@ -182,6 +189,9 @@ BeforeAll {
     Mock New-ItemProperty {
       if ($script:regWriteThrows -or ($script:regWriteThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
       [void]$script:regValues.Add(@{ Path = [string]$LiteralPath; Name = $Name; Value = $Value; Type = [string]$PropertyType })
+      # What was written is there to read back (and to remove) afterwards.
+      if ($null -eq $script:regPresent[[string]$LiteralPath]) { $script:regPresent[[string]$LiteralPath] = @{} }
+      $script:regPresent[[string]$LiteralPath][$Name] = $Value
     }
     Mock Get-ItemProperty {
       $values = $script:regPresent[[string]$LiteralPath]
@@ -190,7 +200,13 @@ BeforeAll {
     }
     Mock Remove-ItemProperty {
       if ($script:regRemoveThrows -or ($script:regRemoveThrowsFor -contains [string]$LiteralPath)) { throw 'Requested registry access is not allowed' }
+      [void]$script:order.Add('Remove-ItemProperty')
       [void]$script:regRemoved.Add(@{ Path = [string]$LiteralPath; Name = @($Name) })
+      $values = $script:regPresent[[string]$LiteralPath]
+      if ($null -ne $values) {
+        foreach ($n in @($Name)) { $values.Remove($n) }
+        if ($values.Count -eq 0) { $script:regPresent.Remove([string]$LiteralPath) }
+      }
     }
     Mock Remove-Item { [void]$script:removed.Add([string]$LiteralPath) }
     Mock Copy-Item {
@@ -198,19 +214,36 @@ BeforeAll {
       [void]$script:copies.Add(@{ Path = @($Path); Destination = [string]$Destination })
     }
     Mock Get-Process {
+      [void]$script:order.Add('Get-Process')
       [void]$script:procNames.Add(@($Name))
       $script:procPolls++
       if ($script:procPolls -le $script:procRunningPolls) { return $script:procList }
     }
     Mock Stop-Process { foreach ($i in @($Id)) { [void]$script:stopped.Add($i) } }
     Mock Get-CimInstance {
-      [void]$script:cimCalls.Add(@{ Namespace = $Namespace; ClassName = $ClassName })
+      [void]$script:cimCalls.Add(@{ Namespace = $Namespace; ClassName = $ClassName; OperationTimeoutSec = $OperationTimeoutSec })
       if ($script:cimThrows) { throw 'Invalid namespace' }
       return $script:lenovoRecords
     }
-    Mock Start-Service {
-      [void]$script:serviceStarts.Add([string]$Name)
-      if ($script:serviceThrows) { throw 'Service cannot be started' }
+    # Start-Service must never be used (it can wait forever on a StartPending service); this mock only
+    # records, so a test can assert it was not called.
+    Mock Start-Service { [void]$script:serviceStarts.Add([string]$Name) }
+    # A fake ServiceController: Status from $script:svcStatus; Start() and WaitForStatus() are recorded,
+    # and WaitForStatus throws (as the real one does when its time runs out) when $script:svcWaitThrows.
+    Mock Get-Service {
+      [void]$script:svcNames.Add([string]$Name)
+      if ($script:svcGetThrows) { throw "Cannot find any service with service name '$Name'." }
+      $service = [pscustomobject]@{ Name = [string]$Name; Status = $script:svcStatus }
+      $service | Add-Member -MemberType ScriptMethod -Name Start -Value {
+        $script:svcStarts++
+        if ($script:svcStartThrows) { throw 'Cannot start service.' }
+      }
+      $service | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($Desired, $Timeout)
+        [void]$script:svcWaits.Add(@{ Status = [string]$Desired; Timeout = $Timeout })
+        if ($script:svcWaitThrows) { throw 'Time out has expired and the operation has not been completed.' }
+      }
+      return $service
     }
   }
 
@@ -303,8 +336,11 @@ Describe 'argument builders (exact text)' {
   It 'Lenovo on AC' {
     Get-LenovoAdminCommandLine -OnAC $true | Should -Be '/CM -search A -action INSTALL -includerebootpackages 1,3,5 -noreboot -noicon -nolicense -exporttowmi'
   }
-  It 'Lenovo on battery' {
-    Get-LenovoAdminCommandLine -OnAC $false | Should -Be '/CM -search A -action INSTALL -includerebootpackages 1,3 -noreboot -noicon -nolicense -exporttowmi'
+  It 'Lenovo on battery: reboot types 1,3 and package types 1,2 (applications, drivers) only (R21)' {
+    Get-LenovoAdminCommandLine -OnAC $false | Should -Be '/CM -search A -action INSTALL -includerebootpackages 1,3 -packagetypes 1,2 -noreboot -noicon -nolicense -exporttowmi'
+  }
+  It 'Lenovo on AC has no package-type filter' {
+    Get-LenovoAdminCommandLine -OnAC $true | Should -Not -Match 'packagetypes'
   }
   It 'Lenovo never includes reboot type 4 (forces a shutdown)' {
     foreach ($ac in $true, $false) {
@@ -433,22 +469,36 @@ Describe 'Invoke-VendorPass: BitLocker and power gate' {
     @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:noBiosArgs
     $script:acCalls | Should -Be 1
   }
-  It 'on AC: reads the power state first, runs the gate, then reads it again right before the tool' {
+  It 'HP: an AC loss before the 4098 retry leaves BIOS out of the retry' {
+    $script:ctx = New-VendorContext -Brand HP
+    $script:existing = @(Join-Path $script:ctx.DownloadDir 'HPIA\HPImageAssistant.exe')
+    Set-ToolCodes -Codes @(4098, 0) -OtherPattern '^/s /e /f '
+    $script:onACSeq = @($true, $true, $false)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    $script:ext[0].ArgumentList | Should -Match '/Category:All '
+    $script:ext[1].ArgumentList | Should -Match '/Category:Drivers,Software '
+    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+  }
+  It 'on AC: power first, then the gate, then /configure, then power again right before the apply' {
     $script:bitlockerDecrypted = $false
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
     $firstPower = $script:order.IndexOf('Test-OnACPower')
     $wait = $script:order.IndexOf('Wait-BitLockerDecrypted')
     $suspend = $script:order.IndexOf('Suspend-BitLockerOnce')
+    $configure = $script:order.IndexOf('Invoke-External')
     $lastPower = $script:order.LastIndexOf('Test-OnACPower')
-    $tool = $script:order.IndexOf('Invoke-External')
+    $apply = $script:order.LastIndexOf('Invoke-External')
     $firstPower | Should -Be 0
     $wait | Should -BeGreaterThan $firstPower
     $suspend | Should -BeGreaterThan $wait
-    $lastPower | Should -BeGreaterThan $suspend
-    $tool | Should -BeGreaterThan $lastPower
+    $configure | Should -BeGreaterThan $suspend
+    $lastPower | Should -BeGreaterThan $configure
+    $apply | Should -BeGreaterThan $lastPower
+    $script:ext[0].ArgumentList | Should -Match '^/configure'
     $script:acCalls | Should -Be 2
   }
-  It 'charger pulled during the BitLocker wait: no BIOS, with the battery Note' {
+  It 'Dell: AC lost after the gate and /configure: no BIOS, with the battery Note' {
     $script:onACSeq = @($true, $false)
     $script:bitlockerDecrypted = $false
     $script:suspendOk = $true
@@ -456,7 +506,23 @@ Describe 'Invoke-VendorPass: BitLocker and power gate' {
     $r.Status | Should -Be 'Done'
     Should -Invoke -CommandName Wait-BitLockerDecrypted -Times 1 -Exactly
     $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+    @($r.Notes | Where-Object { $_ -eq 'On battery: BIOS/firmware updates skipped' }).Count | Should -Be 1
     @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:noBiosArgs
+  }
+  It 'Dell: AC lost during the service-retry wait: the retry leaves BIOS out' {
+    $script:onACSeq = @($true, $true, $false)
+    Set-ToolCodes -Codes @(3001, 0) -OtherPattern '^/configure'
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    @(Get-ToolRuns)[0].ArgumentList | Should -Be $script:acArgs
+    @(Get-ToolRuns)[1].ArgumentList | Should -Be $script:noBiosArgs
+    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+  }
+  It 'does not read power again when BIOS is already ruled out (BitLocker not suspended)' {
+    $script:bitlockerDecrypted = $false
+    $script:suspendOk = $false
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:acCalls | Should -Be 1
   }
   It 'Lenovo: a failed suspend leaves type 5 out of AdminCommandLine, in both registry views' {
     $script:ctx = New-VendorContext -Brand LENOVO
@@ -466,6 +532,37 @@ Describe 'Invoke-VendorPass: BitLocker and power gate' {
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
     $script:regValues.Count | Should -Be 2
     foreach ($v in $script:regValues) { $v.Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false) }
+  }
+  It 'Lenovo: AC lost after the install: the restricted policy is written, with the battery Note' {
+    $script:ctx = New-VendorContext -Brand LENOVO
+    $tvsu = [string]$script:ctx.Config.vendors.LENOVO.tool.exeCandidates[0]
+    $script:wingetInstalls = @($tvsu)
+    $script:onACSeq = @($true, $false)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:order.IndexOf('Invoke-WingetInstall') | Should -BeLessThan $script:order.LastIndexOf('Test-OnACPower')
+    $script:regValues.Count | Should -Be 2
+    foreach ($v in $script:regValues) { $v.Value | Should -Be (Get-LenovoAdminCommandLine -OnAC $false) }
+    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
+  }
+  It 'HP: AC lost after the download and extract: no BIOS, with the battery Note' {
+    $script:ctx = New-VendorContext -Brand HP
+    $hpiaDir = Join-Path $script:ctx.DownloadDir 'HPIA'
+    $hpia = Join-Path $hpiaDir 'HPImageAssistant.exe'
+    $installer = Join-Path $script:ctx.DownloadDir 'hp-hpia.exe'
+    $script:pageHtml = $script:HpiaHtml
+    $script:extHandler = {
+      param($c)
+      if ($c.FilePath -like '*hp-hpia.exe') { $script:existing += (Join-Path (Split-Path -Parent $c.FilePath) 'HPIA\HPImageAssistant.exe') }
+      @{ ExitCode = 0; TimedOut = $false; Output = '' }
+    }
+    $script:onACSeq = @($true, $false)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    $script:ext[0].FilePath | Should -Be $installer
+    $script:order.IndexOf('Invoke-External') | Should -BeLessThan $script:order.LastIndexOf('Test-OnACPower')
+    $script:ext[1].FilePath | Should -Be $hpia
+    $script:ext[1].ArgumentList | Should -Match '/Category:Drivers,Software '
+    $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
   }
   It 'HP: on battery HPIA gets /Category:Drivers,Software' {
     $script:ctx = New-VendorContext -Brand HP
@@ -631,11 +728,45 @@ Describe 'Dell Command Update' {
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
     @(Get-ToolRuns).Count | Should -Be 2
-    $script:serviceStarts.Count | Should -Be 1
-    $script:serviceStarts[0] | Should -Be 'DellClientManagementService'
+    @($script:svcNames) | Should -Be @('DellClientManagementService')
+    $script:svcStarts | Should -Be 1
     $script:sleeps.Count | Should -Be 1
     $script:sleeps[0].Seconds | Should -Be 30
     $r.Data.ExitCode | Should -Be 0
+  }
+  It 'bounds the service start: waits at most 60 s for Running, and never uses Start-Service' {
+    Set-ToolCodes -Codes @(3000, 0) -OtherPattern '^/configure'
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:svcWaits.Count | Should -Be 1
+    $script:svcWaits[0].Status | Should -Be 'Running'
+    $script:svcWaits[0].Timeout | Should -Be ([TimeSpan]::FromSeconds(60))
+    Should -Invoke -CommandName Start-Service -Times 0 -Exactly
+  }
+  It 'a service still not Running after 60 s is a WARN, and the retry still happens' {
+    $script:svcWaitThrows = $true
+    Set-ToolCodes -Codes @(3003, 0) -OtherPattern '^/configure'
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    @(Get-ToolRuns).Count | Should -Be 2
+    $script:sleeps.Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'The Dell service could not be started; retrying anyway' }).Count | Should -Be 1
+  }
+  It 'only waits for a service that is already StartPending (Start() would throw)' {
+    $script:svcStatus = 'StartPending'
+    Set-ToolCodes -Codes @(3005, 0) -OtherPattern '^/configure'
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    $script:svcStarts | Should -Be 0
+    $script:svcWaits.Count | Should -Be 1
+  }
+  It 'leaves a service that is already Running alone, and still retries' {
+    $script:svcStatus = 'Running'
+    Set-ToolCodes -Codes @(3004, 0) -OtherPattern '^/configure'
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Done'
+    $script:svcStarts | Should -Be 0
+    $script:svcWaits.Count | Should -Be 0
+    @(Get-ToolRuns).Count | Should -Be 2
   }
   It 'does not wait when no retry is needed' {
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
@@ -654,15 +785,17 @@ Describe 'Dell Command Update' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Dell Command Update failed (exit 3005)'
     @(Get-ToolRuns).Count | Should -Be 2
-    $script:serviceStarts.Count | Should -Be 1
+    $script:svcStarts | Should -Be 1
   }
-  It 'still waits and retries when the service cannot be started' {
-    $script:serviceThrows = $true
+  It 'still waits and retries when the service <Why>' -ForEach @(@{ Why = 'cannot be found'; Get = $true; Start = $false }, @{ Why = 'refuses to start'; Get = $false; Start = $true }) {
+    $script:svcGetThrows = $Get
+    $script:svcStartThrows = $Start
     Set-ToolCodes -Codes @(3000, 500) -OtherPattern '^/configure'
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
     @(Get-ToolRuns).Count | Should -Be 2
     $script:sleeps.Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'The Dell service could not be started; retrying anyway' }).Count | Should -Be 1
   }
 }
 
@@ -840,17 +973,34 @@ Describe 'Lenovo System Update' {
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
     $script:copies.Count | Should -Be 0
   }
-  It 'reads the result from root\Lenovo Lenovo_Updates' {
+  It 'reads the result from root\Lenovo Lenovo_Updates, with a 30 s limit' {
     $null = Invoke-VendorPass -Context $script:ctx -Pass 1
     $script:cimCalls.Count | Should -Be 1
     $script:cimCalls[0].Namespace | Should -Be 'root\Lenovo'
     $script:cimCalls[0].ClassName | Should -Be 'Lenovo_Updates'
+    $script:cimCalls[0].OperationTimeoutSec | Should -Be 30
   }
-  It 'no records: Done(No Lenovo updates reported)' {
+  It 'no records from a query that worked: a plain Done(No Lenovo updates reported)' {
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
     $r.Message | Should -Be 'No Lenovo updates reported'
     $r.Reboot | Should -Be 'None'
+    $r.Notes.Count | Should -Be 0
+  }
+  It 'keeps the tvsu exit code in the step Data' {
+    Set-ToolCodes -Codes @(7)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 2
+    $r.Status | Should -Be 'Done'
+    $r.Data.Pass | Should -Be 2
+    $r.Data.ExitCode | Should -Be 7
+  }
+  It 'keeps the tvsu exit code when the processes outlive the timeout' {
+    $script:ctx.Config.timeoutsMinutes.vendor = 0.001
+    $script:procRunningPolls = [int]::MaxValue
+    Set-ToolCodes -Codes @(0)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Message | Should -Be 'Lenovo System Update timed out'
+    $r.Data.ExitCode | Should -Be 0
   }
   It 'a failed record: Failed, without a reboot' {
     $script:lenovoRecords = @((New-FakeLenovoUpdate 'Installed'), (New-FakeLenovoUpdate 'Install failed'))
@@ -879,12 +1029,63 @@ Describe 'Lenovo System Update' {
     $r.Message | Should -Be 'Lenovo System Update finished'
     $r.Reboot | Should -Be 'None'
   }
-  It 'an unreadable WMI result counts as no records, with a WARN' {
+  It 'an unreadable WMI result is Done WITH the Note, never a silent success' {
     $script:cimThrows = $true
     $r = Invoke-VendorPass -Context $script:ctx -Pass 1
     $r.Status | Should -Be 'Done'
-    $r.Message | Should -Be 'No Lenovo updates reported'
+    $r.Message | Should -Not -Be 'No Lenovo updates reported'
+    $r.Notes | Should -Contain 'Lenovo System Update result could not be read'
+    $r.Data.ExitCode | Should -Be 0
     @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -BeGreaterThan 0
+  }
+  It 'an unreadable result keeps the gate Notes too' {
+    $script:cimThrows = $true
+    $script:bitlockerDecrypted = $false
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Notes | Should -Contain 'BitLocker still decrypting: suspended for BIOS update'
+    $r.Notes | Should -Contain 'Lenovo System Update result could not be read'
+  }
+
+  # Ruling R22: the policy never outlives the tvsu run.
+  It 'removes AdminCommandLine from both views after <Case>' -ForEach @(
+    @{ Case = 'a success'; Expected = 'No Lenovo updates reported'; Setup = { } }
+    @{ Case = 'reported failures'; Expected = 'Lenovo System Update reported failed updates'; Setup = { $script:lenovoRecords = @((New-FakeLenovoUpdate 'Install failed')) } }
+    @{ Case = 'a tvsu timeout'; Expected = 'Lenovo System Update timed out'; Setup = { Set-ToolCodes -Codes @('timeout') } }
+    @{ Case = 'a process-wait timeout'; Expected = 'Lenovo System Update timed out'; Setup = { $script:ctx.Config.timeoutsMinutes.vendor = 0.001; $script:procRunningPolls = [int]::MaxValue } }
+    @{ Case = 'tvsu could not be started'; Expected = 'Lenovo System Update could not be started'; Setup = { Set-ToolCodes -Codes @('throw') } }
+  ) {
+    . $Setup
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Message | Should -Be $Expected
+    $script:regValues.Count | Should -Be 2
+    $script:regRemoved.Count | Should -Be 2
+    @($script:regRemoved | ForEach-Object { $_.Path }) | Should -Be @($script:LenovoPolicyKey, $script:LenovoWowPolicyKey)
+    foreach ($removal in $script:regRemoved) { @($removal.Name) | Should -Be @('AdminCommandLine') }
+    $script:regPresent.Count | Should -Be 0
+    Should -Invoke -CommandName Remove-Item -Times 0 -Exactly
+  }
+  It 'removes the value only after tvsu and its processes are done' {
+    $script:procRunningPolls = 2
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    Should -Invoke -CommandName Remove-ItemProperty -Times 2 -Exactly
+    $script:procPolls | Should -Be 3
+    $script:order.IndexOf('Remove-ItemProperty') | Should -BeGreaterThan $script:order.LastIndexOf('Get-Process')
+    $script:order.IndexOf('Remove-ItemProperty') | Should -BeGreaterThan $script:order.IndexOf('Invoke-External')
+  }
+  It 'kills leftover processes before it removes the value' {
+    $script:ctx.Config.timeoutsMinutes.vendor = 0.001
+    $script:procRunningPolls = [int]::MaxValue
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:stopped.Count | Should -Be 2
+    $script:order.IndexOf('Remove-ItemProperty') | Should -BeGreaterThan $script:order.LastIndexOf('Get-Process')
+  }
+  It 'removes a half-written policy when the other view could not be written' {
+    $script:regWriteThrowsFor = @($script:LenovoWowPolicyKey)
+    $r = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $r.Status | Should -Be 'Failed'
+    $script:regRemoved.Count | Should -Be 1
+    $script:regRemoved[0].Path | Should -Be $script:LenovoPolicyKey
+    $script:regPresent.Count | Should -Be 0
   }
 }
 
