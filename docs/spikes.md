@@ -68,7 +68,7 @@ powershell -ExecutionPolicy Bypass -File C:\spikes\Spike-WuaSearch.ps1
 **What the result changes:**
 - Task 14 (Windows Update search), the `BrowseOnly` and Upgrades handling.
 - If the enablement package appears with `BrowseOnly=0`, the search stays as written.
-- If it appears only with `BrowseOnly=1`, a third search for the Upgrades category is added.
+- If it appears only with `BrowseOnly=1`, a third search for the Upgrades category is added. In plan terms: **if the 25H2/26H2 enablement package only appears with `BrowseOnly=1`, Task 14 needs a third search (Upgrades category, `BrowseOnly=1`).** The script already counts the updates in the Upgrades category for each of its four searches.
 - If it doesn't appear at all, the spec is updated to say that feature updates are left to Windows itself.
 
 ---
@@ -100,6 +100,13 @@ If the installs fail, an extra run helps: sign in to the VM's Microsoft Store wi
 
 **Question:** does Lenovo System Update cover consumer lines (IdeaPad, Yoga) as well as business ThinkPads, and what does it report back?
 
+**Three more questions** (added after the Lenovo step was built; the code makes an assumption for each until they are answered):
+- **Does `tvsu /CM` accept `-packagetypes 1,2`?** The on-battery variant relies on it to keep firmware and BIOS packages out (ruling R21). If tvsu rejects the parameter, the Lenovo battery run fails visibly (red) instead of flashing, and the argument needs another form.
+- **Which reboot types do BIOS/firmware packages use on this model?** The AC variant installs reboot types 1, 3 and 5 and never type 4 (forced shutdown); the battery variant leaves out type 5. A BIOS or firmware package that carries type 1 or 3 would slip past the reboot-type filter, which is why `-packagetypes` exists.
+- **Which registry view does tvsu read `AdminCommandLine` from?** tvsu is a 32-bit program. The tool currently writes the value to both the 64-bit and the `WOW6432Node` policy keys (ruling R19) and removes both afterwards. Once the answer is known, the unused view can be dropped.
+
+The spike script as it stands lists the available packages (search only) and dumps every property of every `Lenovo_Updates` record, which may show each package's type and reboot type. It does not test `-packagetypes` or watch the registry yet; those two need a small extension of `Spike-LenovoSystemUpdate.ps1` (a second search-only run with `-packagetypes 1,2` added, and a registry-access trace of `tvsu.exe`).
+
 **Which machine:** a **real Lenovo laptop** (not a VM). Run it on two of them if you can:
 - an IdeaPad or Yoga (consumer),
 - a ThinkPad (business).
@@ -118,6 +125,7 @@ It installs Lenovo System Update if it isn't there, then runs it in **search-onl
 - Task 13 (Lenovo update step): the way the result is read and the "this model isn't supported" signal.
 - If System Update reports updates on the consumer laptop, the result parsing is built from the real property names in the JSON.
 - If it reports nothing on consumer models, the Lenovo path switches to the LSUClient fallback, with the same function signature.
+- The three extra questions: if `-packagetypes` is rejected, the battery variant in Task 13 gets another way to keep firmware out; the reboot types decide the `-includerebootpackages` lists; the registry view decides which `AdminCommandLine` key is kept.
 
 ---
 
