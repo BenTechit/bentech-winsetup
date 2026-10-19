@@ -135,6 +135,8 @@ The next launcher run downloads that release. Machines already running keep thei
 
 Run from the repo root. Nothing below needs the key to be printed on screen.
 
+**Precondition: turn the cloud clipboard off first.** The key passes through the clipboard (Notepad copy, `Set-Clipboard`, the password manager). With Windows cloud clipboard on, that copy is sent to Microsoft's cloud, and `Set-Clipboard -Value $null` does not remove clipboard-history entries. Before you touch the key, open **Settings > System > Clipboard** and switch **Clipboard history** OFF and **Sync across your devices** OFF. You can switch them back on at the end if you want them. The same applies to restoring the key below.
+
 1. **Get the XML into the password manager** (a secure note, named for example `bentech-winsetup signing key`):
    - If `%USERPROFILE%\Desktop\bentech-signing-key-BACKUP.xml` exists (`New-SigningKey` wrote it when the key was created), open it in Notepad, select all, copy, paste it into the password manager entry, and close Notepad.
    - If it does not exist, export the key from the DPAPI file straight to the clipboard. This uses `Read-PrivateKeyXml -Path` from `tools\Signing.ps1` and writes nothing to disk:
@@ -151,24 +153,26 @@ Run from the repo root. Nothing below needs the key to be printed on screen.
    . tools\Signing.ps1
    (Read-PrivateKeyXml -Path "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi").Trim() -ceq (Get-Clipboard -Raw).Trim()
    ```
-3. **Delete the plain-text file permanently:** select `bentech-signing-key-BACKUP.xml` and press **Shift+Delete** (not the Recycle Bin; if it already went there, empty the Recycle Bin). Clear the clipboard with `Set-Clipboard -Value $null`, and clear Windows clipboard history (Win+V) if it is turned on.
+3. **Delete the plain-text file permanently:** select `bentech-signing-key-BACKUP.xml` and press **Shift+Delete** (not the Recycle Bin; if it already went there, empty the Recycle Bin). Clear the clipboard with `Set-Clipboard -Value $null`. Then open **Win+V**, click **Clear all**, and confirm the history is empty. (If clipboard history is off, Win+V only offers to turn it on: use **Settings > System > Clipboard > Clear clipboard data > Clear** instead.) Only now switch **Clipboard history** and **Sync across your devices** back on, if you want them.
 4. **For any future `-BackupPath`**, use a folder that is not synced and not the Desktop, for example `$env:LOCALAPPDATA\bentech-key-backup\signing-key-BACKUP.xml` (never the Desktop, Documents or anything OneDrive covers). Move the XML into the password manager, verify it as in step 2, then delete the file permanently as in step 3.
 
-If the plain-text file was ever in a synced folder (OneDrive, a cloud-backed Desktop), shared, committed or pasted into a chat, treat the key as exposed and rotate it ("If the key is lost" below). Before the first release that costs only a new `keys\public-key.xml`.
+If the plain-text file was ever in a synced folder (OneDrive, a cloud-backed Desktop), backed up (for example by File History), shared, committed or pasted into a chat, or if the key was on the clipboard while **Sync across your devices** or **Clipboard history** was on, treat the key as exposed and rotate it ("If the key is lost" below). Before the first release that costs only a new `keys\public-key.xml`.
 
 ### Restore and other key tasks
 
-- **Restore on a new PC or profile** (same key, so no launcher change). **Only when no `signing-key.dpapi` exists there: `Save-PrivateKeyXml` overwrites whatever is at the path.** Copy the entry's text out of the password manager to the clipboard, then:
+- **Restore on a new PC or profile** (same key, so no launcher change). **Only when no `signing-key.dpapi` exists there: `Save-PrivateKeyXml` overwrites whatever is at the path.** Turn **Clipboard history** and **Sync across your devices** OFF first (the precondition above), copy the entry's text out of the password manager to the clipboard, then:
 
   ```
   . tools\Signing.ps1
   $keyPath = "$env:USERPROFILE\.bentech-winsetup\signing-key.dpapi"
   if (Test-Path -LiteralPath $keyPath) { throw "A signing key already exists at $keyPath; not overwriting it." }
-  Save-PrivateKeyXml -Path $keyPath -PrivateKeyXml (Get-Clipboard -Raw)
+  $xml = Get-Clipboard -Raw
+  if ($xml -notmatch '<RSAKeyValue>') { throw 'The clipboard does not hold a key (no <RSAKeyValue>); nothing was saved.' }
+  Save-PrivateKeyXml -Path $keyPath -PrivateKeyXml $xml
   Set-Clipboard -Value $null
   ```
 
-  A `Publish.ps1 -DryRun` then proves the restored key matches `keys\public-key.xml` (it verifies both signatures).
+  Then clear the clipboard history as in step 3 of the backup procedure. A `Publish.ps1 -DryRun` then proves the restored key matches `keys\public-key.xml` (it verifies both signatures).
 - **If the key is lost or exposed:** a lost key cannot sign new releases for the existing launchers, and an exposed one must stop being trusted. Run `tools\New-SigningKey.ps1 -BackupPath <non-synced folder, see step 4 above>` again (it refuses to overwrite, so move any old `signing-key.dpapi` away and delete `keys\public-key.xml` yourself first), commit the new public key, publish a release, and copy the **new launcher to every USB stick**. Old launchers will refuse every new release with exit 3; that is the design. After an exposure, also delete the old launcher from every stick: it still trusts the old key.
 
 ## Changing apps and lists
