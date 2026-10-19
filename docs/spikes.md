@@ -1,15 +1,15 @@
 # Spikes: what to run, where, and what to send back
 
-These are four small throwaway scripts. Each one answers one open question from the design spec (section 17). Run them on test machines, then relay the JSON file each one writes (paste it into the Claude Code session or attach it). The plan is then adjusted where an answer needs it, so there is nothing to read or judge yourself.
+These are five small throwaway scripts. Spikes 1 to 4 each answer one open question from the v1 design spec (section 17); Spike 5 belongs to the v2 design (progress visibility). Run them on the machines named under each spike, then relay what each one writes (spikes 1 to 4: one JSON file, which you paste into the Claude Code session or attach; spike 5: a whole folder). The plan is then adjusted where an answer needs it, so there is nothing to read or judge yourself.
 
-## Before you start (applies to all four)
+## Before you start (spikes 1 to 4; Spike 5 has its own rules below)
 
 - **Copy the folder `tools\spikes` to the test machine** (a USB stick is fine), for example to `C:\spikes`.
 - **Open PowerShell as administrator.** Right-click PowerShell, choose "Run as administrator". If you don't, the script says so and stops.
 - **Every command below is run from that elevated window.** Nothing asks you a question, so you can walk away while it runs.
 - **Every script writes its result to `C:\BenTechSpike\`** (the folder is created for you). Send back the file named under "Send back".
 - **Use a VM checkpoint** for spikes 1 to 3. The scripts install Chrome or Store apps and change settings. Roll the checkpoint back when you're done.
-- **Nothing here goes on a customer machine.** These scripts are for testing only and are never part of the final tool.
+- **Spikes 1 to 4 never go on a customer machine.** They are for testing only and are never part of the final tool. **Spike 5 is the exception:** it is list-only and made for customer Dell and HP laptops that came in for setup (it installs nothing except, with `-InstallTool`, Dell Command Update itself). It writes into its own `capture-...` folder, not into `C:\BenTechSpike\`.
 
 ---
 
@@ -129,6 +129,42 @@ It installs Lenovo System Update if it isn't there, then runs it in **search-onl
 
 ---
 
+## Spike 5: What do the Dell and HP tools list, and what do their logs look like?
+
+**Question:** on a real Dell and a real HP laptop, what does the vendor's update tool list (Dell Command Update's scan, HP Image Assistant's list), and what do the report files and logs look like? The answer decides how the setup tool will read the Dell and HP driver lists and show per-update status (v2 design, [sections 4.5, 7 and 9.3](specs/2026-10-20-progress-visibility-design.md)).
+
+**Which machine:** **one Dell and one HP laptop** that come through the shop, **before** the setup tool runs on them. Keep each on AC power and online. This one is meant for customer laptops, so it only **lists**.
+
+**How to run it** from the USB stick, in an administrator window:
+```
+powershell -ExecutionPolicy Bypass -File E:\spikes\Spike-DriverListCapture.ps1
+```
+- On a **Dell without Dell Command Update**, add `-InstallTool`. The script then installs `Dell.CommandUpdate.Universal` with winget (the package the setup tool installs anyway). Without the switch it stops and prints how to run it again.
+- On an **HP**, nothing needs installing: HP Image Assistant is portable. The script downloads it, checks the HP signature, extracts it under `%TEMP%\BenTechCapture` and runs it from there.
+- It works out the brand itself and stops with a message on any other laptop.
+- It takes about **5 minutes** (Dell Command Update's scan and HP Image Assistant's analysis each take a few minutes). Every run is cut off after `-TimeoutMinutes` (20 by default). Nothing asks a question, so you can walk away.
+
+**What it never does:** apply, download or install a driver or update, change a setting, write the registry, touch BIOS or firmware, or restart the PC. On battery it still runs (the list is the same; it only notes that the PC was on battery).
+
+**What it writes:** a folder `capture-<DELL or HP>-<serial>-<date and time>` next to the script (so on the stick, if you run it from there; `-OutRoot <folder>` picks another place). Inside: `report\` (the tool's own report files), `logs\` (the tool's output and the vendor logs it copied) and `capture.json` (machine, tool, the command line and exit code, the copied files, any errors, and the inventory below). `capture.json` is written even when something failed.
+
+**Send back:** the **whole `capture-...` folder** (zip it if that is easier), one per laptop, saying which model it was.
+
+**After the setup run on the same laptop** (two more things to send back):
+1. Run the script **once more with `-InventoryOnly`**:
+   ```
+   powershell -ExecutionPolicy Bypass -File E:\spikes\Spike-DriverListCapture.ps1 -InventoryOnly
+   ```
+   It skips the Dell/HP tool (Dell Command Update may already be removed by then) and only records the brand's **services, Start-menu shortcuts and Store packages**. Those are the `verify` values for the vendor-app check (v2 design, section 9.3). The inventory is part of every run, so the first capture also shows what was on the laptop before setup; the second one shows what the setup run left behind.
+2. Take **`dcu-pass1.log`** (Dell) or the **`HPIA-pass1` folder** (HP) from the stick's `BenTech-Logs\<PC name>` folder (Task 15 of the v2 plan). Until that task ships, they are in `C:\BenTech\Setup\Logs` on the laptop. They hold what the apply run logged (v2 design, section 7).
+
+**What the result changes:**
+- The Dell and HP list readers: which report fields and log lines exist and how to read them.
+- The NOW line's per-update status during a vendor pass, and the report's "Driver updates" section (build order A, a later plan).
+- The `verify` entries for the Dell and HP consumer apps in `config/config.json` (service names and Start-menu entries from the inventory).
+
+---
+
 ## Quick reference
 
 | Spike | Machine | Command (as administrator) | Send back |
@@ -137,5 +173,6 @@ It installs Lenovo System Update if it isn't there, then runs it in **search-onl
 | 2 Windows Update search | Fresh VM, before any updates | `...\Spike-WuaSearch.ps1` | `wua-result.json` |
 | 3 Store apps | Fresh Win 11 VM, local account only | `...\Spike-StoreInstall.ps1` | `store-result.json` |
 | 4 Lenovo System Update | Real Lenovo laptops (IdeaPad/Yoga and ThinkPad) | `...\Spike-LenovoSystemUpdate.ps1` | `lenovo-result.json` |
+| 5 Dell and HP driver lists | One real Dell and one real HP laptop, **before** setup (list only) | `...\Spike-DriverListCapture.ps1` (Dell without Dell Command Update: add `-InstallTool`); after the setup run, again with `-InventoryOnly` | the whole `capture-...` folder (+ `dcu-pass1.log` / `HPIA-pass1` after setup) |
 
-All commands start with `powershell -ExecutionPolicy Bypass -File C:\spikes\` and all result files are in `C:\BenTechSpike\`.
+Spikes 1 to 4: all commands start with `powershell -ExecutionPolicy Bypass -File C:\spikes\` and all result files are in `C:\BenTechSpike\`. Spike 5 runs from the USB stick (`E:\spikes\`) and writes a `capture-...` folder next to the script.

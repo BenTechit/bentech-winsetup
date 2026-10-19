@@ -886,3 +886,13 @@ Describe 'Publish.ps1' {
     }
   }
 }
+Describe 'the launcher does not change in v2' {
+  It 'a launcher built from this repo matches keys\launcher.sha256' {
+    $repo = (Get-Content "$PSScriptRoot\..\tools\publish.settings.json" -Raw | ConvertFrom-Json).repo
+    $out = Join-Path $TestDrive 'BenTechSetup.cmd'
+    & "$PSScriptRoot\..\tools\Build-Launcher.ps1" -BaseUrl "https://github.com/$repo/releases/latest/download" -OutPath $out | Out-Null
+    $recorded = @(([IO.File]::ReadAllText("$PSScriptRoot\..\keys\launcher.sha256").Trim()) -split '\s+')[0]
+    $recorded | Should -Be '702c323aff5e813d7264375d15387d3bcdc12baded3d192f4bc47890663b69ff'
+    (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant() | Should -Be $recorded
+  }
+}

@@ -207,6 +207,8 @@ Four small research scripts in `tools\spikes\` answer open questions that need r
 | 3 | Can `winget install --source msstore` install SupportAssist, Vantage and MyASUS with no Microsoft account? |
 | 4 | Does Lenovo System Update cover IdeaPad/Yoga, what does it report back, and how does `tvsu` take its parameters? |
 
+Spike 5 is different: `tools\spikes\Spike-DriverListCapture.ps1` is **list-only and made for customer Dell and HP laptops** that come in for setup. Run it from the USB stick on one Dell and one HP laptop before the setup tool, and again with `-InventoryOnly` after it, and send back the whole `capture-...` folder. It decides how the Dell and HP driver lists will be read (v2). It never applies an update, writes the registry or restarts the PC. Details: [Spike 5 in docs/spikes.md](docs/spikes.md).
+
 ## Development
 
 **Tests** (Pester 5.5+ is needed on the dev PC only):
