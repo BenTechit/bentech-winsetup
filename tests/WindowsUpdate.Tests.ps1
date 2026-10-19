@@ -123,8 +123,8 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # What a child round writes, as Invoke-WuRound builds it.
     function New-ChildResult {
-      param([object[]]$Installed = @(), [object[]]$Failed = @(), [string[]]$Hidden = @(), [bool]$OnlyDefinitions = $false, [bool]$RebootRequired = $false, $ErrorText = $null, $ErrorCode = $null)
-      [ordered]@{ Installed = @($Installed); Failed = @($Failed); Hidden = [string[]]@($Hidden); OnlyDefinitions = $OnlyDefinitions; RebootRequired = $RebootRequired; Error = $ErrorText; ErrorCode = $ErrorCode }
+      param([object[]]$Installed = @(), [object[]]$Failed = @(), [string[]]$Hidden = @(), [string[]]$HideFailed = @(), [bool]$OnlyDefinitions = $false, [bool]$RebootRequired = $false, $ErrorText = $null, $ErrorCode = $null)
+      [ordered]@{ Installed = @($Installed); Failed = @($Failed); Hidden = [string[]]@($Hidden); HideFailed = [string[]]@($HideFailed); OnlyDefinitions = $OnlyDefinitions; RebootRequired = $RebootRequired; Error = $ErrorText; ErrorCode = $ErrorCode }
     }
   }
 
@@ -162,6 +162,11 @@ Describe 'Windows Update round and step (mocked COM)' {
     }
     It 'builds the software criteria' {
       Get-WuSearchCriteria -Type Software | Should -Be $script:SoftwareCriteria
+    }
+    It 'Approve-WuEula calls AcceptEula on the update' {
+      $u = New-FakeUpdate -Id 'e' -Eula $false
+      Approve-WuEula -Update $u
+      $u.EulaCalls | Should -Be 1
     }
   }
 
@@ -206,11 +211,16 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:installHResult = 0
       $script:downloadHResult = 0
       $script:systemReboot = $false
+      $script:systemRebootThrow = $null
+      $script:hideThrowFor = @{}
+      $script:eulaApproved = New-Object System.Collections.ArrayList
       $script:registerCalls = 0
       $script:registered = $true
       $script:registeredChecks = 0
+      $script:logs = New-Object System.Collections.ArrayList
 
-      Mock Write-SetupLog { }
+      Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+      Mock Approve-WuEula { [void]$script:eulaApproved.Add([string]$Update.Identity.UpdateID) }
       Mock New-WuSession { [pscustomobject]@{ Name = 'fake session' } }
       Mock Register-MicrosoftUpdateService { $script:registerCalls++ }
       Mock New-WuServiceManager { [pscustomobject]@{ Name = 'fake manager' } }
@@ -220,7 +230,11 @@ Describe 'Windows Update round and step (mocked COM)' {
         if ($script:searchError) { throw $script:searchError }
         if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] }
       }
-      Mock Set-WuHidden { [void]$script:hideCalls.Add(@{ Id = [string]$Update.Identity.UpdateID; Hidden = $Hidden }) }
+      Mock Set-WuHidden {
+        $id = [string]$Update.Identity.UpdateID
+        [void]$script:hideCalls.Add(@{ Id = $id; Hidden = $Hidden })
+        if ($script:hideThrowFor.Contains($id)) { throw $script:hideThrowFor[$id] }
+      }
       Mock Invoke-WuDownload {
         $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID })
         [void]$script:downloadCalls.Add($ids)
@@ -234,7 +248,10 @@ Describe 'Windows Update round and step (mocked COM)' {
         $codes = @(foreach ($id in $ids) { if ($script:installCodes.Contains($id)) { $script:installCodes[$id] } else { 2 } })
         return @{ ResultCodes = $codes; RebootRequired = $script:installReboot; HResult = $script:installHResult }
       }
-      Mock Get-WuRebootRequired { return $script:systemReboot }
+      Mock Get-WuRebootRequired {
+        if ($null -ne $script:systemRebootThrow) { throw $script:systemRebootThrow }
+        return $script:systemReboot
+      }
     }
 
     It 'registers Microsoft Update, then searches software and drivers' {
@@ -281,13 +298,10 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:installCalls[0] | Should -Be @('ok')
       @($r.Installed.Id) | Should -Be @('ok')
     }
-    It 'accepts the EULA of updates that need it, before downloading' {
-      $needs = New-FakeUpdate -Id 'e1' -Eula $false
-      $has = New-FakeUpdate -Id 'e2' -Eula $true
-      $script:searchResults[$script:SoftwareCriteria] = @($needs, $has)
+    It 'accepts the EULA (Approve-WuEula) only of updates that need it' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'e1' -Eula $false), (New-FakeUpdate -Id 'e2' -Eula $true))
       $null = Invoke-TestRound -StatePath (New-WuStateFile)
-      $needs.EulaCalls | Should -Be 1
-      $has.EulaCalls | Should -Be 0
+      @($script:eulaApproved) | Should -Be @('e1')
     }
     It 'maps install result codes: 2 and 3 installed, 4 and 5 failed' {
       $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'), (New-FakeUpdate -Id 'c'), (New-FakeUpdate -Id 'd'))
@@ -419,10 +433,69 @@ Describe 'Windows Update round and step (mocked COM)' {
       @($r.Installed.Id) | Should -Be @('a')
       @($r.Failed.Id) | Should -Be @('b')
     }
-    It 'records the download result''s own HResult' {
+    It 'records the download result''s own HResult when no install ran' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $script:downloadCodes = @{ a = 4 }
+      $script:downloadHResult = 0x80240016
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $script:installCalls.Count | Should -Be 0
+      $r.ErrorCode | Should -Be '0x80240016'
+    }
+    It 'ignores a leftover download code once the installs ran cleanly' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+      $script:downloadCodes = @{ b = 4 }
+      $script:downloadHResult = 0x80240016
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $script:installCalls[0] | Should -Be @('a')
+      $r.ErrorCode | Should -BeNullOrEmpty
+      @($r.Installed.Id) | Should -Be @('a')
+    }
+    It 'prefers the installation''s code over the download''s' {
       $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
       $script:downloadHResult = 0x80240016
-      (Invoke-TestRound -StatePath (New-WuStateFile)).ErrorCode | Should -Be '0x80240016'
+      $script:installHResult = 0x80242014
+      (Invoke-TestRound -StatePath (New-WuStateFile)).ErrorCode | Should -Be '0x80242014'
+    }
+
+    # Ruling R24a: SystemInfo is read on every path.
+    It 'reads the restart flag even when the round threw' {
+      $script:searchError = 'busy (0x80240016)'
+      $script:systemReboot = $true
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $r.Error | Should -Be 'busy (0x80240016)'
+      $r.RebootRequired | Should -BeTrue
+    }
+    It 'does not turn an unreadable restart flag into an error' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $script:installReboot = $true
+      $script:systemRebootThrow = New-Object Runtime.InteropServices.COMException('no sysinfo', 0x80004005)
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      $r.Error | Should -BeNullOrEmpty
+      $r.RebootRequired | Should -BeTrue
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Data.errorCode -eq '0x80004005' }).Count | Should -Be 1
+    }
+
+    # Ruling R24b: an update that cannot be hidden does not abort the round.
+    It 'goes on when an update cannot be hidden, and lists it in HideFailed' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'h'), (New-FakeUpdate -Id 'i'))
+      $script:hideThrowFor['h'] = New-Object Runtime.InteropServices.COMException('not hideable', 0x80248016)
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -FailureCounts @{ h = 2 })
+      $r.Error | Should -BeNullOrEmpty
+      @($r.HideFailed) | Should -Be @('h')
+      ($r.HideFailed -is [array]) | Should -BeTrue
+      @($r.Hidden).Count | Should -Be 0
+      $script:downloadCalls[0] | Should -Be @('i')
+      $script:installCalls[0] | Should -Be @('i')
+      @($r.Installed.Id) | Should -Be @('i')
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Data.errorCode -eq '0x80248016' -and $_.Data.id -eq 'h' }).Count | Should -Be 1
+    }
+
+    # Ruling R24c support: definition updates are flagged so they are never counted as re-offers.
+    It 'flags definition updates in the Installed list' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'def' -Cats @($script:defs)), (New-FakeUpdate -Id 'cu'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile)
+      @($r.Installed | Where-Object { $_.Id -eq 'def' })[0].IsDefinition | Should -BeTrue
+      @($r.Installed | Where-Object { $_.Id -eq 'cu' })[0].IsDefinition | Should -BeFalse
     }
     It 'has no ErrorCode when the round went well' {
       $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
@@ -636,6 +709,88 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:ctx.State.WuFailureCounts['f1'] | Should -Be 2
       $script:ctx.State.WuFailureCounts['f2'] | Should -Be 1
     }
+    # Ruling R24a: busy because a mandatory restart is pending -> restart now, no wait.
+    It 'restarts at once instead of waiting when busy and a restart is pending (<_>)' -ForEach @('0x80240016', '0x8024A000') {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode $_ -RebootRequired $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'
+      $r.Reboot | Should -Be 'Now'
+      $script:sleeps.Count | Should -Be 0
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'restart' }).Count | Should -Be 1
+    }
+
+    # Ruling R24b: an update that cannot be hidden is red, once.
+    It 'reports an update that could not be hidden in State.Errors, once across rounds' {
+      $script:ctx = New-WuContext -Data @{ FailedTitles = @{ h = 'Stubborn update' } }
+      $script:ctx.State.Errors = @('earlier error')
+      $script:childResult = New-ChildResult -HideFailed @('h') -Installed @([ordered]@{ Id = 'a'; Title = 'A'; IsDefinition = $false })
+      $first = Invoke-StepWindowsUpdate -Context $script:ctx
+      $first.Status | Should -Be 'Continue'
+      $script:childResult = New-ChildResult -HideFailed @('h')
+      $second = Invoke-StepWindowsUpdate -Context $script:ctx
+      $second.Status | Should -Be 'Done'
+      @($script:ctx.State.Errors) | Should -Be @('earlier error', 'Windows update could not be hidden: Stubborn update')
+      @($script:ctx.State.HiddenUpdateIds).Count | Should -Be 0
+    }
+    It 'names an update that could not be hidden by its id when there is no title' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -HideFailed @('id-9')
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($script:ctx.State.Errors) | Should -Be @('Windows update could not be hidden: id-9')
+    }
+
+    # Ruling R24c: an update offered again after a "successful" install is counted as a failure.
+    It 'counts re-offers of an installed update and lets it be hidden' {
+      $script:ctx = New-WuContext
+      $again = New-ChildResult -Installed @([ordered]@{ Id = 'drv'; Title = 'Driver X'; IsDefinition = $false })
+      $script:childResult = $again
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.WuFailureCounts.ContainsKey('drv') | Should -BeFalse
+      $script:ctx.State.Steps['windows-update'].Data.Installed | Should -Be 1
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.WuFailureCounts['drv'] | Should -Be 1
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.WuFailureCounts['drv'] | Should -Be 2
+      $r.Data.Installed | Should -Be 1
+      @($r.Data.InstalledIds) | Should -Be @('drv')
+      $r.Data.FailedTitles['drv'] | Should -Be 'Driver X'
+      # The next round's child hides it: two counts reach FailuresBeforeHide.
+      (Select-WuUpdates -Updates @((U drv)) -FailureCounts $script:ctx.State.WuFailureCounts -FailuresBeforeHide 2 -IsWindows10 $false).Hide.Id | Should -Be @('drv')
+    }
+    It 'never counts a definition update installed again as a re-offer' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'def'; Title = 'Defender'; IsDefinition = $true }, [ordered]@{ Id = 'cu'; Title = 'CU'; IsDefinition = $false })
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'def'; Title = 'Defender'; IsDefinition = $true }) -OnlyDefinitions $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'
+      $script:ctx.State.WuFailureCounts.ContainsKey('def') | Should -BeFalse
+      $r.Data.Installed | Should -Be 3
+    }
+
+    # Ruling R24d: Done with failed updates carries a yellow Note.
+    It 'is Done with a Note when a definitions-only round had a failed update' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -OnlyDefinitions $true -Installed @([ordered]@{ Id = 'd1'; Title = 'Defender A'; IsDefinition = $true }) -Failed @([ordered]@{ Id = 'd2'; Title = 'Defender B'; ResultCode = 4 })
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'
+      @($r.Notes) | Should -Be @('Some Windows updates failed: Defender B')
+    }
+    It 'lists at most three failed titles in that Note, then an ellipsis' {
+      $script:ctx = New-WuContext
+      $failedList = @(foreach ($n in 'A', 'B', 'C', 'D') { [ordered]@{ Id = "id$n"; Title = "T$n"; ResultCode = 4 } })
+      $script:childResult = New-ChildResult -OnlyDefinitions $true -Installed @([ordered]@{ Id = 'd1'; Title = 'Defender'; IsDefinition = $true }) -Failed $failedList
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($r.Notes) | Should -Be @('Some Windows updates failed: TA, TB, TC, ' + [char]0x2026)
+    }
+    It 'has no Note when a Done round had no failures' {
+      $script:ctx = New-WuContext
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'
+      @($r.Notes).Count | Should -Be 0
+    }
+
     It 'still counts failures when the round fails with an unmapped code' {
       $script:ctx = New-WuContext
       $script:childResult = New-ChildResult -Failed @([ordered]@{ Id = 'f1'; Title = 'F1'; ResultCode = 4 }) -ErrorText 'access denied' -ErrorCode '0x80070005'
