@@ -22,9 +22,11 @@ BeforeAll {
   # Runs Show-StartScreen against the fake clock. -KeyAt is a scriptblock that gets the elapsed
   # seconds and returns a key name (or nothing). Records every drawn screen in $script:screens.
   function Invoke-StartScreen {
-    param([hashtable]$Machine = $script:m, [bool]$IsFresh = $true, [scriptblock]$KeyAt = { param($s) }, [scriptblock]$OnAC = { $true }, $Previous = $null)
+    param([hashtable]$Machine = $script:m, [bool]$IsFresh = $true, [scriptblock]$KeyAt = { param($s) }, [scriptblock]$OnAC = { $true }, $Previous = $null, [scriptblock]$FlushInput = { })
     Reset-FakeClock
     $script:screens = New-Object System.Collections.ArrayList
+    $script:startEvents = New-Object System.Collections.ArrayList
+    $script:flushBody = $FlushInput
     $script:keyAt = $KeyAt
     $script:readCalls = 0
     Show-StartScreen -Machine $Machine -Config $script:cfg -Version '2026.10.18.1' -Previous $Previous -IsFresh $IsFresh `
@@ -32,7 +34,8 @@ BeforeAll {
       -Now { $script:clock } `
       -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } `
       -OnAC $OnAC `
-      -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
+      -FlushInput { $null = $script:startEvents.Add('flush'); & $script:flushBody } `
+      -Write { param($lines) $null = $script:startEvents.Add('write'); $null = $script:screens.Add(($lines -join "`n")) }
   }
 
   # Runs Show-FinalScreen with a scripted key sequence. Records colours, drawn screens, launches
@@ -248,7 +251,7 @@ Describe 'Show-StartScreen' {
     $script:screens = New-Object System.Collections.ArrayList
     $r = Show-StartScreen -Machine $m -Config $cfg -Version 'v1' -Previous $null -IsFresh $true `
       -ReadKey { $script:readCalls++; if ($script:readCalls -gt 5000) { throw 'runaway loop' } } `
-      -Now { $script:t0 } -Sleep { param($ms) } -OnAC { $true } -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
+      -Now { $script:t0 } -Sleep { param($ms) } -OnAC { $true } -FlushInput { } -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
     $r | Should -Not -BeNullOrEmpty
     $screens.Count | Should -Be 10
   }
@@ -258,7 +261,7 @@ Describe 'Show-StartScreen' {
     $script:screens = New-Object System.Collections.ArrayList
     $r = Show-StartScreen -Machine $m -Config $cfg -Version 'v1' -Previous $null -IsFresh $true `
       -ReadKey { $script:readCalls++; if ($script:readCalls -gt 5000) { throw 'runaway loop' } } `
-      -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds(-$ms) } -OnAC { $true } `
+      -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds(-$ms) } -OnAC { $true } -FlushInput { } `
       -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
     $r | Should -Not -BeNullOrEmpty
     $screens.Count | Should -Be 10
@@ -283,10 +286,38 @@ Describe 'Show-StartScreen' {
     Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor }) }
     Reset-FakeClock
     $r = Show-StartScreen -Machine $m -Config $cfg -Version '2026.10.18.1' -Previous $null -IsFresh $true `
-      -ReadKey { 'Enter' } -Now { $script:clock } -Sleep { param($ms) } -OnAC { $true }
+      -ReadKey { 'Enter' } -Now { $script:clock } -Sleep { param($ms) } -OnAC { $true } -FlushInput { }
     $r | Should -Not -BeNullOrEmpty
     $cleared | Should -Be 1
     ($hostCalls | ForEach-Object { $_.Text }) | Should -Contain '   Starting in 10s ...  [Enter] start now   [Esc] cancel'
+  }
+  It 'empties the key buffer once, before the first draw' {
+    Invoke-StartScreen -KeyAt { param($s) if ($s -ge 2) { 'Escape' } } | Out-Null
+    @($startEvents | Where-Object { $_ -eq 'flush' }).Count | Should -Be 1
+    $startEvents[0] | Should -Be 'flush'
+    $startEvents.IndexOf('flush') | Should -BeLessThan $startEvents.IndexOf('write')
+  }
+  It 'a key waiting before the screen appears cannot start a machine that does not look fresh' {
+    $script:stale = New-Object System.Collections.Queue
+    $script:stale.Enqueue('Enter')
+    $r = Invoke-StartScreen -IsFresh $false -FlushInput { $script:stale.Clear() } `
+      -KeyAt { param($s) if ($script:stale.Count -gt 0) { $script:stale.Dequeue() } elseif ($s -ge 12) { 'Enter' } }
+    $r | Should -Not -BeNullOrEmpty
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 12   # only the Enter pressed after the screen appeared
+    $startEvents[0] | Should -Be 'flush'
+  }
+  It 'the same waiting Enter starts the run at once when nothing empties the buffer' {
+    $script:stale = New-Object System.Collections.Queue
+    $script:stale.Enqueue('Enter')
+    $r = Invoke-StartScreen -IsFresh $false `
+      -KeyAt { param($s) if ($script:stale.Count -gt 0) { $script:stale.Dequeue() } elseif ($s -ge 12) { 'Enter' } }
+    $r | Should -Not -BeNullOrEmpty
+    Get-ElapsedSeconds | Should -BeLessThan 1
+  }
+  It 'still shows the screen when emptying the key buffer fails' {
+    $r = Invoke-StartScreen -FlushInput { throw 'no console input here' }
+    $r | Should -Not -BeNullOrEmpty
+    $screens.Count | Should -Be 10
   }
   It 'keeps going when the power reader throws' {
     $r = Invoke-StartScreen -OnAC { throw 'WMI is unhappy' }

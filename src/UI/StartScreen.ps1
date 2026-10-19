@@ -218,12 +218,17 @@ function Show-StartScreen {
     resets the count to 10. When not fresh it never starts by itself: only Enter does. Escape returns
     $null. -Previous is the @{ StartedAt; Color } summary of an earlier run, or $null.
 
+    Keys already waiting in the console buffer are thrown away once, before the first draw: a stray
+    Enter pressed while the launcher was downloading must not start the run (on a machine that does
+    not look fresh, Enter is the only safeguard).
+
     The seams (production defaults shown):
-      -ReadKey  returns the next key's [ConsoleKey] name, or nothing when no key is waiting
-      -Now      the clock
-      -Sleep    waits the given milliseconds
-      -OnAC     $true when on mains power
-      -Write    draws the lines
+      -ReadKey    returns the next key's [ConsoleKey] name, or nothing when no key is waiting
+      -Now        the clock
+      -Sleep      waits the given milliseconds
+      -OnAC       $true when on mains power
+      -Write      draws the lines
+      -FlushInput throws away waiting key presses
   #>
   [CmdletBinding()]
   param(
@@ -236,7 +241,8 @@ function Show-StartScreen {
     [scriptblock]$Now = { Get-Date },
     [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms },
     [scriptblock]$OnAC = { Test-OnACPower },
-    [scriptblock]$Write = { param($lines) Write-StartScreenLines -Lines $lines }
+    [scriptblock]$Write = { param($lines) Write-StartScreenLines -Lines $lines },
+    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) } }
   )
 
   $choices = New-DefaultChoices -Machine $Machine -Config $Config
@@ -253,6 +259,10 @@ function Show-StartScreen {
     $lines = @(Format-StartScreen -Machine $Machine -Choices $choices -SecondsLeft $secondsLeft -Version $Version -OnAC $powerOnAC -IsFresh $IsFresh -Previous $Previous)
     $null = & $Write $lines
   }
+
+  # Best effort: if the buffer cannot be emptied the screen still works, it just loses this guard.
+  try { $null = & $FlushInput }
+  catch { Write-SetupLog -Message 'Could not empty the console key buffer before the start screen' -Level WARN -Data @{ error = $_.Exception.Message } }
 
   . $readPower
   & $draw
