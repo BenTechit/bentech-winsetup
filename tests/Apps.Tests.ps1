@@ -787,18 +787,57 @@ Describe 'Invoke-StepDefaultBrowser' {
   BeforeEach {
     Initialize-AppMocks
     $script:ctx = New-AppContext -Dir (New-TestDir)
-    $script:xmlFile = Join-Path $script:ctx.Root 'DefaultAssociations.xml'
+    # The XML lives under %ProgramData%\BenTech (ruling R18), so ProgramData is pointed at a test folder
+    # for the length of each test and put back in AfterEach.
+    $script:origProgramData = $env:ProgramData
+    $script:programData = New-TestDir
+    $env:ProgramData = $script:programData
+    $script:xmlFolder = Join-Path $script:programData 'BenTech'
+    $script:xmlFile = Join-Path $script:xmlFolder 'DefaultAssociations.xml'
+    $script:rootXml = Join-Path $script:ctx.Root 'DefaultAssociations.xml'
     $script:policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+  }
+  AfterEach { $env:ProgramData = $script:origProgramData }
+  It 'puts the associations file under ProgramData\BenTech, where the signed-in user can read it (ruling R18)' {
+    Get-DefaultAssociationsPath | Should -Be $script:xmlFile
+    Get-DefaultAssociationsPath | Should -Be (Join-Path $env:ProgramData 'BenTech\DefaultAssociations.xml')
   }
   It 'is Skipped when Chrome is not installed, and changes nothing' {
     $r = Invoke-StepDefaultBrowser -Context $script:ctx
     $r.Status | Should -Be 'Skipped'
     $r.Message | Should -Be 'Chrome not installed'
     [IO.File]::Exists($script:xmlFile) | Should -BeFalse
+    [IO.Directory]::Exists($script:xmlFolder) | Should -BeFalse
     Should -Invoke -CommandName New-ItemProperty -Times 0 -Exactly
     Should -Invoke -CommandName New-Item -Times 0 -Exactly
   }
-  It 'writes DefaultAssociations.xml under Root as UTF-8 without a BOM' {
+  It 'creates the BenTech folder when it is missing, without touching any ACL' {
+    Set-ChromeInstalled
+    Mock Set-Acl {}
+    [IO.Directory]::Exists($script:xmlFolder) | Should -BeFalse
+    $r = Invoke-StepDefaultBrowser -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    [IO.Directory]::Exists($script:xmlFolder) | Should -BeTrue
+    Should -Invoke -CommandName Set-Acl -Times 0 -Exactly
+    Should -Invoke -CommandName Invoke-External -Times 0 -Exactly
+  }
+  It 'leaves an existing BenTech folder and what is in it alone' {
+    Set-ChromeInstalled
+    [void][IO.Directory]::CreateDirectory($script:xmlFolder)
+    $other = Join-Path $script:xmlFolder 'other.txt'
+    [IO.File]::WriteAllText($other, 'keep me')
+    $r = Invoke-StepDefaultBrowser -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    [IO.File]::ReadAllText($other) | Should -Be 'keep me'
+    [IO.File]::Exists($script:xmlFile) | Should -BeTrue
+  }
+  It 'does not write anything under Root any more' {
+    Set-ChromeInstalled
+    $null = Invoke-StepDefaultBrowser -Context $script:ctx
+    [IO.File]::Exists($script:rootXml) | Should -BeFalse
+    @(Get-ChildItem -LiteralPath $script:ctx.Root -Force).Count | Should -Be 0
+  }
+  It 'writes DefaultAssociations.xml as UTF-8 without a BOM' {
     Set-ChromeInstalled
     $r = Invoke-StepDefaultBrowser -Context $script:ctx
     $r.Status | Should -Be 'Done'
@@ -818,6 +857,7 @@ Describe 'Invoke-StepDefaultBrowser' {
     $script:regValues[0].Path | Should -Be $script:policyKey
     $script:regValues[0].Name | Should -Be 'DefaultAssociationsConfiguration'
     $script:regValues[0].Value | Should -Be $script:xmlFile
+    $script:regValues[0].Value | Should -Be (Get-DefaultAssociationsPath)
     $script:regValues[0].Type | Should -Be 'String'
   }
   It 'does not recreate a policy key that exists' {
@@ -862,9 +902,8 @@ Describe 'Invoke-StepDefaultBrowser' {
   }
   It 'is Skipped, and sets no policy, when the XML file cannot be written' {
     Set-ChromeInstalled
-    $blocker = Join-Path $script:ctx.Root 'blocker'
-    [IO.File]::WriteAllText($blocker, 'a file where the folder should be')
-    $script:ctx.Root = $blocker
+    # A file named BenTech where the folder should be.
+    [IO.File]::WriteAllText($script:xmlFolder, 'a file where the folder should be')
     $r = Invoke-StepDefaultBrowser -Context $script:ctx
     $r.Status | Should -Be 'Skipped'
     $r.Message | Should -Match '^Default browser policy could not be set: .+'

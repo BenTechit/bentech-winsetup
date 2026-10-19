@@ -42,14 +42,34 @@ function New-DefaultAssociationsXml {
   return ($lines.ToArray() -join "`r`n")
 }
 
+function Get-DefaultAssociationsPath {
+  <#
+  .SYNOPSIS
+    Where the default-associations XML lives: %ProgramData%\BenTech\DefaultAssociations.xml.
+  .DESCRIPTION
+    Windows reads the DefaultAssociationsConfiguration file at sign-in, in the signed-in user's own
+    session. The working folder (C:\BenTech\Setup) is locked to Administrators and SYSTEM, and a
+    UAC-filtered administrator token (Administrators is deny-only) or a standard user cannot read
+    it, so the policy would silently do nothing. A subfolder of ProgramData inherits read access for
+    Users (ruling R18). Finalize uses this function to delete the file again.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  return (Join-Path $env:ProgramData 'BenTech\DefaultAssociations.xml')
+}
+
 function Invoke-StepDefaultBrowser {
   <#
   .SYNOPSIS
-    Step 11: writes <Root>\DefaultAssociations.xml and points the DefaultAssociationsConfiguration
-    policy at it. Done('Applies at next sign-in') / Skipped.
+    Step 11: writes the associations XML (Get-DefaultAssociationsPath) and points the
+    DefaultAssociationsConfiguration policy at it. Done('Applies at next sign-in') / Skipped.
   .DESCRIPTION
-    The XML is UTF-8 without a BOM. The policy value is a REG_SZ holding the file's path; its key is
-    created first when it is missing (an existing key is never recreated). The default browser is
+    The XML goes under %ProgramData%\BenTech, NOT into the admin-only working folder, so the signed-in
+    user can read it (ruling R18). The BenTech folder is created when it is missing and its ACL is left
+    as inherited. The XML is UTF-8 without a BOM. The policy value is a REG_SZ holding the file's path;
+    its key is created first when it is missing (an existing key is never recreated). The default browser is
     best effort (spec 12, ruling R17b): Chrome missing is Skipped('Chrome not installed'), and a file
     or registry write that fails is Skipped('Default browser policy could not be set: <short reason>'),
     logged at WARN. The report shows it yellow and the final screen's "press B" hint covers the
@@ -64,8 +84,9 @@ function Invoke-StepDefaultBrowser {
 
   if (-not (Test-ChromeInstalled)) { return New-StepResult -Status Skipped -Message 'Chrome not installed' }
 
-  $xmlPath = Join-Path $Context.Root 'DefaultAssociations.xml'
+  $xmlPath = $null
   try {
+    $xmlPath = Get-DefaultAssociationsPath
     Write-TextFileUtf8NoBom -Path $xmlPath -Text (New-DefaultAssociationsXml -ProgId 'ChromeHTML' -ApplicationName 'Google Chrome')
     if (-not (Test-Path -LiteralPath $script:DefaultAssociationsPolicyKey)) {
       New-Item -Path $script:DefaultAssociationsPolicyKey -Force | Out-Null
