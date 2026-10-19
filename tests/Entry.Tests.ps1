@@ -125,15 +125,17 @@ Describe 'Start-BenTechSetup' {
   }
 
   Context 'first run' {
-    It 'Escape on the start screen returns 0, saves nothing and releases the lock' {
+    It 'Escape on the start screen returns 0, removes a leftover resume task (R27), saves nothing and releases the lock' {
       Mock Show-StartScreen { $null }
-      Mock Read-RunState { New-FakeState -RunId 'old-run' -EndedAt '2026-10-17T10:00:00' }
+      Mock Read-RunState { New-FakeState -RunId 'old-run' }   # an unfinished earlier run: its task may still be registered
       Invoke-Entry | Should -Be 0
+      Should -Invoke Unregister-ResumeTask -Times 1 -Exactly
+      # INFO is Write-SetupLog's default level, which a mock does not bind: "not WARN or ERROR".
+      Should -Invoke Write-SetupLog -ParameterFilter { $Message -match 'Cancelled on the start screen' -and $Level -notin 'WARN', 'ERROR' }
       Should -Invoke Backup-RunState -Times 0 -Exactly
       Should -Invoke New-RunState -Times 0 -Exactly
       Should -Invoke Save-RunState -Times 0 -Exactly
       Should -Invoke Invoke-SetupRun -Times 0 -Exactly
-      Should -Invoke Unregister-ResumeTask -Times 0 -Exactly
       Should -Invoke Exit-RunLock -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
     }
     It 'builds the state from the plan, saves it, and runs it' {
@@ -270,13 +272,35 @@ Describe 'Start-BenTechSetup' {
       ($script:order -join ',') | Should -Be 'finalize,save,unregister,final'
       Should -Invoke Exit-RunLock -Times 1 -Exactly
     }
-    It 'Completed: a state that cannot be saved after the finalization still shows the final screen' {
+    It 'Completed: a state that cannot be saved after the finalization is a red error, not a crash' {
       Mock Read-RunState { New-FakeState -FinalizeStatus 'Failed' }
       Mock Save-RunState { throw 'disk full' }
       Invoke-Entry -Resume $true | Should -Be 0
-      Should -Invoke Show-FinalScreen -Times 1 -Exactly
+      Should -Invoke Unregister-ResumeTask -Times 1 -Exactly
+      Should -Invoke Show-FinalScreen -Times 1 -Exactly -ParameterFilter { @($State.Errors) -contains 'Finalization failed: disk full' }
       Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'ERROR' -and $Data.error -eq 'disk full' }
       $crashes.Count | Should -Be 0
+    }
+    It 'Completed: a finalization that throws still removes the resume task and shows a red final screen' {
+      Mock Read-RunState { New-FakeState -FinalizeStatus 'Failed' }
+      Mock Complete-SetupFinalization { throw 'report folder gone' }
+      Mock Get-RunVerdict { @{ Color = 'RED' } } -ParameterFilter { $State.RunId -eq 'resumed-run' }
+      Invoke-Entry -Resume $true | Should -Be 0
+      Should -Invoke Unregister-ResumeTask -Times 1 -Exactly
+      Should -Invoke Get-RunVerdict -Times 1 -Exactly -ParameterFilter { @($State.Errors) -contains 'Finalization failed: report folder gone' }
+      Should -Invoke Show-FinalScreen -Times 1 -Exactly -ParameterFilter {
+        $Verdict.Color -eq 'RED' -and @($State.Errors) -contains 'Finalization failed: report folder gone' }
+      Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'ERROR' -and $Data.error -eq 'report folder gone' }
+      Should -Invoke Save-RunState -Times 0 -Exactly
+      Should -Invoke Exit-RunLock -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
+      $crashes.Count | Should -Be 0
+    }
+    It 'Completed: the finalization error is listed once, after the errors already there' {
+      $existing = @('Restart failed: access denied', 'Finalization failed: report folder gone')
+      Mock Read-RunState { $s = New-FakeState -FinalizeStatus 'Failed'; $s.Errors = $existing; $s }
+      Mock Complete-SetupFinalization { throw 'report folder gone' }
+      Invoke-Entry -Resume $true | Should -Be 0
+      Should -Invoke Show-FinalScreen -Times 1 -Exactly -ParameterFilter { ($State.Errors -join '|') -eq ($existing -join '|') }
     }
     It 'draws the progress screen with the run state from the progress callback' {
       Mock Invoke-SetupRun { & $OnProgress $Context; 'Completed' }
@@ -293,7 +317,7 @@ Describe 'Start-BenTechSetup' {
       $crashes[0] | Should -Be ('Setup crashed: boom - see {0}' -f (Join-Path $TestDrive 'Logs'))
       Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'ERROR' -and $Data.error -eq 'boom' }
       Should -Invoke Exit-RunLock -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
-      Should -Invoke Unregister-ResumeTask -Times 0 -Exactly    # the next logon retries; the attempt caps bound it
+      Should -Invoke Unregister-ResumeTask -Times 0 -Exactly    # the next logon retries (caps bound only crashes inside a step)
       Should -Invoke Show-FinalScreen -Times 0 -Exactly
       Should -Invoke Stop-Transcript -Times 1 -Exactly
     }

@@ -97,28 +97,37 @@ function Complete-SetupRun {
   # (ruling R26: a failed final restart, or a finalize that failed or never finished, would otherwise
   # leave the resume task, the setup policies and no report), removes the resume task in any case, and
   # shows the final screen.
+  # A finalization (or the save after it) that throws is not a crash: it is logged, recorded as the Error
+  # 'Finalization failed: <message>' (so the final screen is red), and the final screen still shows the
+  # AnyDesk ID. The resume task is removed in a finally block: left behind, the same error would come
+  # back at every logon, and nothing (not the runner's caps) would ever stop it.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Context,
     [Parameter(Mandatory)][string]$Root
   )
 
-  $finalize = $null
-  if ($Context.State.Steps -is [System.Collections.IDictionary]) { $finalize = $Context.State.Steps['finalize'] }
-  $finalizeStatus = if ($null -ne $finalize) { [string]$finalize['Status'] } else { '' }
-  if ($finalizeStatus -ne 'Done') {
-    Write-SetupLog -Level WARN -Message 'Run completed without a finished finalize step; completing the finalization' -Data @{ finalizeStatus = $finalizeStatus }
-    $null = Complete-SetupFinalization -Context $Context
-    try {
-      $null = Save-RunState -State $Context.State -Root $Root
-    } catch {
-      # The report is already written; the final screen (AnyDesk ID, result) matters more than a crash here.
-      Write-SetupLog -Level ERROR -Message 'The run state could not be saved after completing the finalization' -Data @{ error = $_.Exception.Message }
+  try {
+    $finalize = $null
+    if ($Context.State.Steps -is [System.Collections.IDictionary]) { $finalize = $Context.State.Steps['finalize'] }
+    $finalizeStatus = if ($null -ne $finalize) { [string]$finalize['Status'] } else { '' }
+    if ($finalizeStatus -ne 'Done') {
+      Write-SetupLog -Level WARN -Message 'Run completed without a finished finalize step; completing the finalization' -Data @{ finalizeStatus = $finalizeStatus }
+      try {
+        $null = Complete-SetupFinalization -Context $Context
+        $null = Save-RunState -State $Context.State -Root $Root
+      } catch {
+        $message = $_.Exception.Message
+        Write-SetupLog -Level ERROR -Message 'Completing the finalization failed' -Data @{ error = $message; stack = $_.ScriptStackTrace }
+        $errorText = "Finalization failed: $message"
+        $errors = @(@($Context.State['Errors']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($errors -notcontains $errorText) { $Context.State['Errors'] = @($errors + $errorText) }
+      }
     }
+  } finally {
+    # Defensive: Finalize normally removes it already. A task left behind would re-open setup at every logon.
+    $null = Unregister-ResumeTask
   }
-
-  # Defensive: Finalize normally removes it already. A task left behind would re-open setup at every logon.
-  $null = Unregister-ResumeTask
 
   $verdict = Get-RunVerdict -State $Context.State
   Write-SetupLog -Message 'Setup finished' -Data @{ result = $verdict['Color'] }
@@ -127,8 +136,9 @@ function Complete-SetupRun {
 
 function Invoke-SetupMainFlow {
   # Private. Everything that runs while this process holds the run lock. Returns 'Cancelled' (Escape on
-  # the start screen; nothing was changed), 'NoState' (resumed without a state), 'Rebooting' or
-  # 'Completed'. Exceptions propagate to Start-BenTechSetup's crash handler.
+  # the start screen: a leftover resume task is removed, nothing else changes), 'NoState' (resumed
+  # without a state), 'Rebooting' or 'Completed'. Exceptions propagate to Start-BenTechSetup's crash
+  # handler.
   [CmdletBinding()]
   [OutputType([string])]
   param(
@@ -160,7 +170,10 @@ function Invoke-SetupMainFlow {
     $fresh = Test-SetupMachineFresh -Machine $machine -Config $config
     $choices = Show-StartScreen -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh
     if ($null -eq $choices) {
-      Write-SetupLog -Message 'Cancelled on the start screen; nothing was changed'
+      # Ruling R27 (spec 8.1, 8.5): cancel leaves no changes and no resume task, so a task left by an
+      # earlier, unfinished run is removed too. No state is saved.
+      Write-SetupLog -Message 'Cancelled on the start screen; removing any leftover resume task, nothing else is changed'
+      $null = Unregister-ResumeTask
       return 'Cancelled'
     }
     if ($null -ne $previous) { $null = Backup-RunState -Root $Root -LogDir $logDir }
@@ -195,20 +208,23 @@ function Start-BenTechSetup {
          (best effort), and the start line with the version ('dev' when unbundled).
       2. Lock: Enter-RunLock. Held by another live run: 'Setup is already running on this machine', 2.
       3. Not resuming: the previous run's summary, the machine facts, the fresh-install check, the start
-         screen (Escape: 0, nothing changed). Then the previous state is archived, the plan built, and
-         the new state saved.
+         screen (Escape: a leftover resume task is removed (R27), nothing else changes, 0). Then the
+         previous state is archived, the plan built, and the new state saved.
          Resuming: the saved state. None: the resume task is removed, 0.
       4. Invoke-SetupRun, drawing the progress screen on every transition.
          'Rebooting': 0, and the lock is kept: the restart ends the process, and the next start finds the
          lock stale.
-         'Completed': the finalization is completed when the finalize step is not Done (R26), the resume
-         task is removed, and the final screen is shown. 0.
+         'Completed': the finalization is completed when the finalize step is not Done (R26); if that
+         throws, the error is logged and added to State.Errors (red), not a crash. The resume task is
+         removed in any case, and the final screen is shown. 0.
     The lock is released in a finally block (also on Ctrl+C on the start screen), except after
     'Rebooting'. The transcript is stopped in the same finally block.
 
-    Any unexpected exception is a crash: logged as ERROR, the red crash text "Setup crashed: <message> -
-    see <Root>\Logs" (-CrashScreen), then a key press (skipped with -NoWait), and 1. The resume task
-    stays registered, so the next logon retries; the runner's attempt caps bound the retries.
+    Any other unexpected exception is a crash: logged as ERROR, the red crash text "Setup crashed:
+    <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with -NoWait), and 1. The
+    resume task stays registered, so the next logon retries. The runner's attempt caps bound only a
+    crash inside a step (that step is failed after maxStepAttempts interruptions); a crash before or
+    after the run (config, state, machine detection, screens) repeats at every logon until it is fixed.
 
     -Root, -ScriptPath, -CrashScreen and -NoWait exist for tests; production uses the defaults
     (C:\BenTech\Setup, <Root>\setup.ps1, the red console text, waiting for a key).
