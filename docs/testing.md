@@ -22,7 +22,8 @@ How to use it: tick the boxes on a printed or copied file. Make one filled copy 
 - [ ] Click **No** on the UAC prompt: nothing runs, and `C:\BenTech` does not exist.
 - [ ] The elevated window prints `downloading the latest version...` then `Signature OK. Starting setup...`.
 - [ ] No SmartScreen warning and no Defender detection for the `.cmd` copied from the stick.
-- [ ] The launcher works from a folder with a space in its path (for example `D:\My Tools\`). Known limit: an apostrophe in the path breaks the elevation line.
+- [ ] The launcher works from a folder with a space in its path (for example `D:\My Tools\`).
+- [ ] **Apostrophe in the path (triage 269).** Run it once from a folder with an apostrophe, for example `D:\O'Brien\`, and once from the Downloads folder of an account named with a geresh (`ג'ני`): one UAC prompt, then a normal run. (The launcher passes its own path through `BT_SELF`; the unit test covers only the non-elevated part.)
 - [ ] **Full paths (R30).** Put a `powershell.bat` and a `fltmc.bat` that each write a marker file next to the launcher, then run it: neither marker appears.
 - [ ] Unplug the network before the double-click: the launcher says `Cannot reach GitHub - retrying in 30s` and carries on by itself when the network returns. (Optional: leave it unplugged for about 10 minutes and confirm it gives up with exit code 4.)
 
@@ -51,13 +52,15 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 ### 1.4 Resume, reboots and power
 
 - [ ] **(b)** The run resumes by itself after **each** reboot (automatic sign-in because there is no password), with no click.
-- [ ] **The reboot after the PC rename resumes too.** The resume task is registered for `<old name>\<user>`; check it survives the rename. Before the rename: `Get-ScheduledTask BenTechSetup-Resume | Select -Expand Principal`. After the restart: the setup window appears at logon, and `Get-ScheduledTaskInfo BenTechSetup-Resume` shows a fresh `LastRunTime`. If this fails, the machine sits at an empty desktop after the rename. Unit tests cannot show this, so it is the first thing to check.
+- [ ] **The reboot after the PC rename resumes too.** The resume task is registered for `<old name>\<user>`; check it survives the rename. Before the rename: `Get-ScheduledTask BenTechSetup-Resume | Select -Expand Principal`, and `... | Select -Expand Actions` shows `Execute` as the full `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` path (triage 180). After the restart: the setup window appears at logon, and `Get-ScheduledTaskInfo BenTechSetup-Resume` shows a fresh `LastRunTime`. If this fails, the machine sits at an empty desktop after the rename. Unit tests cannot show this, so it is the first thing to check.
 - [ ] **(c)** After every logon the progress screen is in front: `[OK]` done steps, `[>>]` with a running timer, `[..]` pending, and the reboot count.
 - [ ] Before every restart a `Restarting in N s ...` countdown (15 s) is on screen, and the reboot count never goes above 12.
 - [ ] Nothing ever waits for input: no "Let's finish setting up your device", no Store sign-in, no second UAC, no BitLocker recovery screen.
 - [ ] Double-click the launcher while a run (or its resume) is active: `Setup is already running on this machine`, exit code 2, and `setup.ps1` and `state.json` are untouched.
 - [ ] **Power off the VM abruptly** (not shut down) during a step: at the next logon the run resumes, the step runs again, and `state.json` is valid. If a `Logs\state.corrupt-*.json` appears, note it.
 - [ ] During the run: Fast Startup is off (`HiberbootEnabled` is 0 under `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power`), the machine never sleeps or turns the screen off, and `NoAutoRebootWithLoggedOnUsers` is 1 under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`.
+- [ ] **A failed resume-task registration is red, with no reboots (final review I1).** Unit tests prove the logic with mocks only; this proves the real `Register-ScheduledTask` failure is caught. On a fresh checkpoint, before the run, block the task name with a Task Scheduler *folder* of the same name (elevated PowerShell): `$s = New-Object -ComObject Schedule.Service; $s.Connect(); $null = $s.GetFolder('\').CreateFolder('BenTechSetup-Resume')`. (Not verified to make the registration fail; if the run still registers the task, note it and try another way, for example a deny ACE on `C:\Windows\System32\Tasks`.) Expected: Prepare is red `Could not register the resume task` (`setup.log` shows the retry after 10 s), the run continues **without any restart** (`Restart skipped: no resume task` instead of a countdown), and the final screen is RED with those lines. Afterwards remove the folder: `$s.GetFolder('\').DeleteFolder('BenTechSetup-Resume', 0)`, and roll the checkpoint back.
+- [ ] **Clicking into the window never pauses the run (final review I3).** On the Windows 10 VM (classic console host), and once on Windows 11 with the default terminal set to *Windows Console Host*: click once into the progress screen mid-run and wait a minute. The title bar must not say `Select`, the timer keeps counting and `setup.log` keeps advancing. (QuickEdit is turned off at start; Windows Terminal never blocks anyway.)
 - Other steps (check the report, then the machine):
   - [ ] Time zone is Israel Standard Time; Hebrew keyboard added next to English.
   - [ ] This PC and the user folder are on the desktop.
@@ -91,14 +94,15 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 - [ ] **(d)** The whole console turns the verdict colour: dark green, dark yellow or dark red. The banner matches (`SETUP COMPLETE`, `COMPLETE - CHECK NOTES`, `COMPLETED WITH ERRORS`).
 - [ ] Check all three colours at least once across the VMs. For RED, make a step fail on purpose (for example a hosts-file entry blocking `dl.google.com` before the run): the Chrome step fails and the screen is red.
 - [ ] The AnyDesk ID is in big digits, readable from 3 to 5 metres. Machine, new name, total time and reboot count are shown.
-- [ ] Failures (`X`) and notes (`!`) are listed with one-line reasons. A worst case of 5 failures, 4 notes and the Chrome hint still shows the banner and the AnyDesk ID without scrolling in a default-size console (the layout is about 33 to 35 lines).
+- [ ] Failures (`X`) and notes (`!`) are listed with one-line reasons, at most 4 failures and 3 notes, each list then `... and N more: see the report`.
+- [ ] **Worst-case final screen in a 30-row window (triage 240).** Set the console to 30 rows (Properties > Layout > Window size, height 30; in Windows Terminal, a profile with `"rows": 30`), and provoke more than 4 failures and 3 notes with Chrome not the default (for example block `dl.google.com` and `download.anydesk.com` in `hosts` and turn 7-Zip and Office on with winget broken). The layout is exactly 30 lines: the top `=====` frame, the banner and the AnyDesk ID must all be visible without scrolling, and the report line is the last row.
 - [ ] **B** opens Settings, Default apps for Google Chrome; **R** opens `Setup-Report.txt` in Notepad. Both keep the final screen up. Any other key closes it.
 - [ ] A key pressed during the last step doesn't close the screen early.
 - [ ] Colours are back to normal when the final screen closes (in a console that stays open). Try the Windows 11 default terminal (Windows Terminal) and, once, the classic console host.
 
 ### 1.8 Report and cleanup
 
-- [ ] **(e)** `C:\BenTech\Setup\Logs\Setup-Report.txt` exists and is complete: tool version, result, started/finished (`dd/MM/yyyy HH:mm`), duration, machine and serial, PC name old to new, mode and detected type, Windows build and architecture, activation, BitLocker, AnyDesk ID, apps with versions, the Windows Update line, one line per step with its time, and the Failures and Notes sections. Its result matches the final screen. The file is plain ASCII.
+- [ ] **(e)** `C:\BenTech\Setup\Logs\Setup-Report.txt` exists and is complete: tool version, result, started/finished (`dd/MM/yyyy HH:mm`), duration, machine and serial, PC name old to new, mode and detected type, Windows build and architecture, activation, BitLocker, Smart App Control (`Off`, `On`, `Evaluation` or `Unknown`; compare with Windows Security > App & browser control), AnyDesk ID, apps with versions, the Windows Update line, one line per step with its time, and the Failures and Notes sections. Its result matches the final screen. The file is plain ASCII.
 - [ ] **(f)** After the run, none of these exist:
   - [ ] the resume task (`Get-ScheduledTask BenTechSetup-Resume` finds nothing)
   - [ ] `NoAutoRebootWithLoggedOnUsers` under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`
@@ -108,6 +112,7 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
   - [ ] `C:\BenTech\Setup\setup.ps1`, `config.json` and `run.lock`
   - [ ] installers left in `%TEMP%`
 - [ ] `Logs\` and `state.json` are still there. Vendor tool logs are in `Logs\`.
+- [ ] **Read the logs the safe way (M9).** Open them with **R** on the final screen or from an elevated prompt (`notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal), never by browsing `C:\BenTech` in Explorer: Explorer's "Continue" button adds your account to the folder's permissions, and the next re-run then refuses the folder with exit code 5. (To see it happen once on a VM: browse there in Explorer, click Continue, run the launcher again: exit 5.)
 - [ ] Final power settings: on AC never sleep and screen off after 15 minutes; on battery the Windows defaults (the originals are in `state.json` under `Power`). Fast Startup stays off. The lid action is back to what it was.
 
 ### 1.9 Release and re-run checks
@@ -124,6 +129,7 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
   In an **elevated** command prompt in the VM run `BenTechSetup.cmd -BaseUrl file:///C:/tamper -NoPause`. Expected: red `SECURITY CHECK FAILED - files are not signed by BenTech. Nothing was run.`, exit code **3**, no `C:\BenTech`, no resume task. Repeat with only `config.json` changed (still exit 3), with a `.sig` deleted (exit 4), and with a release signed by a different throwaway key (create it outside the repo with `tools\New-SigningKey.ps1 -PrivateKeyPath <p> -PublicKeyOut <p>`, sign with `tools\Sign-File.ps1 -PrivateKeyPath <p>`; exit 3). The `-BaseUrl` parameter is the one the launcher tests use. If it doesn't reach the launcher, the real release is downloaded and a normal run starts: roll the checkpoint back. `tests\Launcher.Tests.ps1` covers this against `file://` folders; this repeats it with the real launcher on a clean machine.
 - [ ] **(spec 8.8) Re-run on the same machine after GREEN.** The start screen shows `Previous run: dd/MM/yyyy HH:mm - GREEN`. The old state is archived as `Logs\state-<RunId>.json`, counters start at zero, and every step runs again but finishes quickly. Nothing is duplicated: one AnyDesk, one Chrome, the same PC name, the Hebrew keyboard added once.
 - [ ] Re-run after a RED run: updates that were hidden are un-hidden and get one more try.
+- [ ] **Re-run after an *unfinished* run keeps the real power settings (final review I2).** Before the first run note the originals: `powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE`, `... SUB_SLEEP HIBERNATEIDLE`, `... SUB_VIDEO VIDEOIDLE` and `... SUB_BUTTONS LIDACTION` (read only the hex AC/DC values). Start a run and stop it before Finalize (power the VM off during Windows Update, then remove the resume task with `Unregister-ScheduledTask BenTechSetup-Resume` so it cannot continue). Double-click the launcher again and let the new run finish. Expected: the start screen says `Previous run: ... - UNFINISHED`; afterwards, on battery (DC) the four values are the ones you noted (not 0), and on a laptop the lid action is back to what it was. If they are 0, the run must show the yellow note `Some power settings could not be restored`, never green.
 - [ ] Re-run with a corrupt `state.json` (cut the file in half): it is archived as `Logs\state.corrupt-<time>.json` and a new run starts without a crash.
 - [ ] Re-run on a machine that no longer looks fresh: no auto-start, Enter needed.
 - [ ] Once a second release exists: a new release published **during** a run does not change that run (resumes use the pinned local copy; the report keeps the old version), and the next launcher run uses the newest one.
@@ -158,6 +164,7 @@ Each list adds to section 1; run section 1 on all three VMs.
 - [ ] No endless update loop (for example KB5034441): a stuck update is hidden and reported in red, and the run still finishes.
 - [ ] **SPIKE#1 on Windows 10 Pro:** the default-browser policy result.
 - [ ] 7-Zip OFF and Office OFF on this VM, to check the optional-step skipping end to end.
+- [ ] **QuickEdit (final review I3), the classic console host:** click into the progress screen mid-run (section 1.4); the run must keep going.
 
 ---
 
@@ -206,7 +213,7 @@ Result sheet to fill per laptop:
 
 - [ ] Run on a **ThinkPad** and an **IdeaPad or Yoga** (SPIKE#4).
 - [ ] System Update installs through winget; its `tvsu.exe` signature is checked.
-- [ ] **WMI result fields.** After pass 1 run `Get-CimInstance -Namespace root\Lenovo -ClassName Lenovo_Updates | Format-List *` and keep the output. The result parsing in `Convert-LenovoUpdateRecords` is provisional (it matches `fail`, `reboot` and `restart` in a `Status` text): record the real property names and values, whether stale records from pass 1 show up in pass 2, and whether the `Status` text is English on a Hebrew-display Windows.
+- [ ] **WMI result fields.** After pass 1 run `Get-CimInstance -Namespace root\Lenovo -ClassName Lenovo_Updates | Format-List *` and keep the output. The result parsing in `Convert-LenovoUpdateRecords` is provisional (it matches `fail`, `reboot` and `restart` in a `Status` text, and a whole `Status` of `Installed`, `Success`, `Successful`, `Succeeded`, `Complete` or `Completed` as a success): record the real property names and values, whether stale records from pass 1 show up in pass 2, and whether the `Status` text is English on a Hebrew-display Windows. Until SPIKE#4 is folded in, records it does not recognize end the pass yellow with `Lenovo System Update result could not be verified; see Logs\lenovo-pass<N>` (final review I4): note whether that appeared.
 - [ ] **`-packagetypes` acceptance.** On battery the tool runs with `-packagetypes 1,2` (apps and drivers only; this is seen in the battery run of 3.1). Does `tvsu /CM` accept it? If it rejects it, the Lenovo battery run fails visibly (red) instead of flashing. Also check which reboot types BIOS and firmware packages use on this model.
 - [ ] **32-bit registry view.** `AdminCommandLine` is written to both `HKLM\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General` and the `WOW6432Node` copy. With Process Monitor (filter `tvsu.exe`, operation `RegQueryValue`, path contains `AdminCommandLine`) record which one `tvsu` reads.
 - [ ] A type 5 (BIOS) package forces a restart after Lenovo's own countdown. The run resumes afterwards and the step finishes. No type 4 (forced shutdown) package is installed.
@@ -236,3 +243,13 @@ For each Store app above (SupportAssist, Vantage, MyASUS):
 ## 4. When something fails
 
 Fix it in the owning task's files with a regression test, run the full suite (`Failed: 0`), publish `yyyy.MM.dd.N+1`, and re-run the failed item on a rolled-back checkpoint. Anything that is only verified by mocks should be added to this file.
+
+## 5. Known open items (deferred until VM data exists, ruling R32)
+
+Not fixed in v1 on purpose; each needs what the VM runs above show:
+
+- **Signer matching is a substring** (`HP Inc` also matches `CN=HP Incubator Ltd`). Record the real signer subjects of every installer in `setup.log`, then anchor the match to the exact CN.
+- **The resume task names the user, not the SID** (`<old name>\<user>`). Section 1.4's rename check decides whether it must move to the SID.
+- **State times are local, not UTC.** If OOBE left a non-Israel time zone, "Total time" and the step times can be off by the zone difference (the Region step changes the zone mid-run). Note any odd duration.
+- **The default-browser check may run before Explorer applied the policy** right after the final sign-in (a false "Chrome is not the default" note). Note whether it happens.
+- **Leftovers:** the empty `...\WindowsUpdate\AU` and Lenovo `UserSettings\General` policy keys, and `C:\Program Files\OfficeDeploymentTool`, stay after the run.

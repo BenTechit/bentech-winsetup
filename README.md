@@ -28,7 +28,7 @@ In this order (steps that don't apply to the machine are left out):
 
 ## Daily use
 
-1. **Put the launcher on a USB stick formatted exFAT or FAT32**: copy `dist\BenTechSetup.cmd` to the stick (see [Publishing](#publishing-a-new-version) for when to re-copy it). exFAT/FAT32 files carry no Mark-of-the-Web, so there is no SmartScreen warning. Keep it in the stick's root or a folder whose path has no apostrophe (an apostrophe breaks the elevation line).
+1. **Put the launcher on a USB stick formatted exFAT or FAT32**: copy `dist\BenTechSetup.cmd` to the stick (see [Publishing](#publishing-a-new-version) for when to re-copy it). exFAT/FAT32 files carry no Mark-of-the-Web, so there is no SmartScreen warning. Spaces, Hebrew letters and apostrophes in the launcher's path are fine.
 2. **On the fresh PC**: finish OOBE with a local account (no password), connect to the internet, double-click `BenTechSetup.cmd`, click **Yes** on the UAC prompt.
 3. **The start screen** counts down 10 seconds, then starts by itself. Keys:
 
@@ -38,7 +38,7 @@ In this order (steps that don't apply to the machine are left out):
    | `Z` | 7-Zip on/off |
    | `O` | Office cycles OFF, BUSINESS, HOME |
    | `Enter` | Start now |
-   | `Esc` | Cancel: nothing changes and any leftover resume task is removed |
+   | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. What the launcher already put in `C:\BenTech\Setup` stays: `setup.ps1`, `config.json` and `Logs\` |
 
    Any toggle resets the countdown to 10 s. On battery a yellow line warns that BIOS updates are skipped unless you plug in. If the PC does not look like a fresh install (Windows older than 14 days, or more than 1 GB in Desktop/Documents/Downloads) there is no countdown: press Enter to run anyway.
 4. **Walk away.** The machine reboots by itself (15 s countdown on screen), logs in by itself and carries on. Nothing asks for input.
@@ -49,7 +49,7 @@ In this order (steps that don't apply to the machine are left out):
 | Colour | Banner | Meaning |
 |---|---|---|
 | GREEN | `SETUP COMPLETE` | Every step done, no notes. |
-| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated, BitLocker still decrypting, Windows 10 (no security updates). |
+| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated (or its status could not be read), BitLocker still decrypting, Windows 10 (no security updates), a Lenovo result that could not be verified, power settings or the resume task that could not be put back. |
 | RED | `COMPLETED WITH ERRORS` | A step failed or never finished, a Windows update was hidden after repeated failures, a cap was hit (reboots or update rounds), the drive is still encrypted, or a restart was refused. |
 
 Each failed or skipped step is listed with a one-line reason.
@@ -65,6 +65,8 @@ Each failed or skipped step is listed with a one-line reason.
 | Run state | `C:\BenTech\Setup\state.json` (older runs: `Logs\state-<RunId>.json`) |
 
 `Downloads\`, the pinned `setup.ps1` and `config.json` are deleted at the end. `Logs\` stays.
+
+**Open the logs with R on the final screen or from an elevated prompt** (for example `notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal). Never browse to `C:\BenTech` in Explorer: its "You don't currently have permission... Continue" button adds your own account to the folder's permissions, and the next run then refuses the folder with exit code 5 (it is no longer admin-only), so you would have to delete it, logs included.
 
 ## Troubleshooting
 
@@ -88,7 +90,7 @@ A red screen reads `Setup crashed: <message> - see C:\BenTech\Setup\Logs`. Press
 1. Read the tail of `Logs\setup.log` and the newest `Logs\transcript-*.txt`. The log has the stack trace.
 2. Fix it in the repo and publish a new release, or re-run if it looks transient.
 3. **Re-run:** double-click the launcher again. It downloads the newest release, archives the old state to `Logs\state-<RunId>.json`, resets the counters, and runs every step again. Steps that were already done finish in seconds. The start screen shows `Previous run: <date> - <result>`.
-4. To stop the retries without running again: double-click the launcher and press **Esc**. That removes the leftover resume task and changes nothing else.
+4. To stop the retries without running again: double-click the launcher and press **Esc**. That removes the leftover resume task and runs no step (the launcher's fresh `setup.ps1`, `config.json` and the `Logs\` folder stay in `C:\BenTech\Setup`).
 
 An unreadable `state.json` (power cut mid-write) is archived as `Logs\state.corrupt-<time>.json` and a new run starts by itself.
 
@@ -111,7 +113,20 @@ Pushing to `main` does not reach any customer. Only a published GitHub Release d
    - Commit and push the updated `keys\launcher.sha256`; the next real publish needs a clean tree.
 5. Don't publish while a PC is downloading: the launcher fetches the four files one by one from `/releases/latest/`, so a publish in between could hand it files from two versions.
 
-**The very first publish** needs the GitHub repo `BenTechit/bentech-winsetup` to exist (public: it holds only the public key and no secrets), the branch pushed with an upstream, and `gh auth status` logged in. Creating the repo and publishing are outward-facing, so do them deliberately.
+**The very first publish** needs the GitHub repo `BenTechit/bentech-winsetup` to exist (public: it holds only the public key and no secrets), the branch pushed with an upstream, and `gh auth status` logged in. Creating the repo, pushing and publishing are outward-facing: **run these only after Ben's go-ahead**, from the repo root, with the work merged into `main` and the key backup done (see [Signing key](#signing-key)):
+
+```
+gh auth status
+git status                     # clean, on main
+gh repo create BenTechit/bentech-winsetup --public --source . --push
+git branch -vv                 # main now tracks origin/main
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\Publish.ps1 -Version 2026.10.19.1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\Publish.ps1 -Version 2026.10.19.1 -Notes "First release"
+```
+
+Then commit and push the updated `keys\launcher.sha256` if Publish changed it, and copy `dist\BenTechSetup.cmd` to the USB sticks.
+
+**Rebuilding the launcher on a fresh clone** (a new PC, or to check a stick): restore the signing key first ("Restore" below), then run `tools\Publish.ps1 -Version <any> -DryRun`. It builds `dist\BenTechSetup.cmd` from the template, the public key and the repo in `tools\publish.settings.json`, and prints `Launcher SHA-256: ...`. That hash must equal the one in the committed `keys\launcher.sha256`, and Publish says `WARNING: the launcher changed` when it does not. Because the dry run also records the new hash, run `git diff keys\launcher.sha256` afterwards: no change means the rebuilt launcher is byte-for-byte the one on the sticks; a change you did not expect means the template, the key or the repo setting differs, so find out why (and `git checkout keys\launcher.sha256`) before copying anything. To check a stick, compare `Get-FileHash <stick>\BenTechSetup.cmd -Algorithm SHA256` with the same file.
 
 A run in progress keeps using the verified copy already on its disk; a new release never changes a machine mid-run.
 
