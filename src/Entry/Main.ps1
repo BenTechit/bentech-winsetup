@@ -329,7 +329,7 @@ function Start-BenTechSetup {
     # Final review I3: never on the -WuRound path above (that child has no screen of its own).
     $null = Disable-ConsoleQuickEdit
     try {
-      $stamp =(Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+      $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
       $null = Start-Transcript -Path (Join-Path $logDir "transcript-$stamp.txt") -ErrorAction Stop
       $transcriptStarted = $true
     } catch {
