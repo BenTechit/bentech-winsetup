@@ -22,6 +22,71 @@ Describe 'run state' {
     $p = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v'; $p.HiddenUpdateIds = @('u1')
     (New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p).PreviousHiddenUpdateIds | Should -Be @('u1')
   }
+  It 'carries the union of the previous run''s hidden and still-to-unhide ids, without duplicates (M2)' {
+    # Run B re-ran A but never reached Windows Update round 1: A's ids are still in B's PreviousHiddenUpdateIds.
+    $p = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v'
+    $p.HiddenUpdateIds = @('u2', 'u1')
+    $p.PreviousHiddenUpdateIds = @('u1', 'U2', 'u3', '', $null)
+    $r = (New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p).PreviousHiddenUpdateIds
+    ($r -is [array]) | Should -BeTrue
+    $r | Should -Be @('u2', 'u1', 'u3')     # first spelling kept, ids compared without regard to case
+  }
+  It 'carries a one-element union as an array' {
+    $p = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v'
+    $p.PreviousHiddenUpdateIds = @('u9')
+    $r = (New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p).PreviousHiddenUpdateIds
+    ($r -is [array]) | Should -BeTrue
+    $r | Should -Be @('u9')
+  }
+}
+
+Describe 'power originals across re-runs (final review I2)' {
+  BeforeAll {
+    function New-PreviousState {
+      param([bool]$FinalRebootDone, [hashtable]$Original)
+      $p = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v'
+      $p.FinalRebootDone = $FinalRebootDone
+      $p.Power = @{ Original = $Original }
+      return $p
+    }
+    $script:realOriginal = @{ STANDBYIDLE = @{ AC = 1800; DC = 900 }; HIBERNATEIDLE = @{ AC = 10800; DC = 5400 }; VIDEOIDLE = @{ AC = 600; DC = 300 }; LIDACTION = @{ AC = 1; DC = 1 } }
+  }
+  It 'keeps the previous run''s originals when that run never reached its final power restore' {
+    $p = New-PreviousState -FinalRebootDone $false -Original $script:realOriginal
+    $s = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p
+    $s.Power.Original.Keys.Count | Should -Be 4
+    $s.Power.Original.STANDBYIDLE.AC | Should -Be 1800
+    $s.Power.Original.STANDBYIDLE.DC | Should -Be 900
+    $s.Power.Original.LIDACTION.DC | Should -Be 1
+  }
+  It 'copies them (changing the new state leaves the previous one alone)' {
+    $p = New-PreviousState -FinalRebootDone $false -Original @{ STANDBYIDLE = @{ AC = 1800; DC = 900 } }
+    $s = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p
+    $s.Power.Original.STANDBYIDLE.DC = 0
+    $s.Power.Original['VIDEOIDLE'] = @{ AC = 0; DC = 0 }
+    $p.Power.Original.STANDBYIDLE.DC | Should -Be 900
+    $p.Power.Original.ContainsKey('VIDEOIDLE') | Should -BeFalse
+  }
+  It 'starts empty (a fresh capture) when the previous run already restored them (FinalRebootDone)' {
+    $p = New-PreviousState -FinalRebootDone $true -Original $script:realOriginal
+    $s = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p
+    $s.Power.Original | Should -BeOfType [hashtable]
+    $s.Power.Original.Count | Should -Be 0
+  }
+  It 'starts empty when the previous run captured nothing, or has no Power at all' {
+    $s = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous (New-PreviousState -FinalRebootDone $false -Original @{})
+    $s.Power.Original.Count | Should -Be 0
+    $p = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v'; $p.Remove('Power')
+    (New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p).Power.Original.Count | Should -Be 0
+  }
+  It 'survives a save and read of the previous state (the real re-run path)' {
+    $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory $root -Force | Out-Null
+    Save-RunState -State (New-PreviousState -FinalRebootDone $false -Original $script:realOriginal) -Root $root
+    $p = Read-RunState -Root $root
+    $s = New-RunState -Machine @{} -Choices @{} -Plan @('a') -Version 'v' -Previous $p
+    $s.Power.Original.VIDEOIDLE.AC | Should -Be 600
+    $s.Power.Original.VIDEOIDLE.DC | Should -Be 300
+  }
 }
 Describe 'ConvertTo-HashtableDeep' {
   It 'turns nested objects into hashtables and keeps arrays as arrays' {

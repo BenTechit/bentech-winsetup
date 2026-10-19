@@ -103,9 +103,16 @@ function Save-OriginalPowerSettings {
   .DESCRIPTION
     Runs ONLY while Original is empty. After a reboot the run resumes with the setup values (0) in
     place, and capturing then would save those instead of the user's. A re-run therefore never
-    captures again. A setting whose query fails is logged and left out (Restore skips what it has
-    no original for). Returns $false if a required setting could not be captured; a missing
-    LIDACTION (a desktop) does not count.
+    captures again (New-RunState carries the originals of an earlier run that never restored them).
+    A setting whose query fails is logged and left out (Restore skips what it has no original for).
+    Returns $false if a required setting could not be captured; a missing LIDACTION (a desktop) does
+    not count.
+    Backstop (final review I2): a capture in which every required setting (STANDBYIDLE, HIBERNATEIDLE,
+    VIDEOIDLE) is AC 0 / DC 0 AND LIDACTION is AC 0 / DC 0 is exactly the setup values, i.e. an earlier
+    unfinished run's leftovers, not the user's settings. It is logged as a WARN and nothing is
+    recorded, so Restore-FinalPowerSettings returns $false at the end (Finalize's Note) instead of
+    putting "never sleep, lid does nothing" back on battery. That case still returns $true: nothing
+    failed here.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -119,13 +126,14 @@ function Save-OriginalPowerSettings {
   }
 
   $allOk = $true
+  $capture = @{}
   foreach ($entry in $script:PowerSettingMap) {
     $captured = $false
     $run = Invoke-PowerCfg -ArgumentList "/query SCHEME_CURRENT $($entry.Sub) $($entry.Setting)"
     if ($run.Ok) {
       try {
         $index = Get-PowerIndexFromQueryOutput -Text $run.Output
-        $State.Power.Original[$entry.Name] = @{ AC = $index.AC; DC = $index.DC }
+        $capture[$entry.Name] = @{ AC = $index.AC; DC = $index.DC }
         $captured = $true
       } catch {
         Write-SetupLog -Message 'Could not read the power setting' -Level WARN -Data @{ setting = $entry.Name; error = $_.Exception.Message }
@@ -133,6 +141,19 @@ function Save-OriginalPowerSettings {
     }
     if (-not $captured -and $entry.Name -notin $script:OptionalPowerSettings) { $allOk = $false }
   }
+
+  # Every mapped setting (LIDACTION included) captured, and every one AC 0 / DC 0: the setup values.
+  $looksLikeSetupValues = $true
+  foreach ($entry in $script:PowerSettingMap) {
+    $value = $capture[$entry.Name]
+    if ($null -eq $value -or [int]$value.AC -ne 0 -or [int]$value.DC -ne 0) { $looksLikeSetupValues = $false }
+  }
+  if ($looksLikeSetupValues) {
+    Write-SetupLog -Message 'The captured power settings are the setup values (never sleep, lid does nothing), left by an earlier unfinished run; not recording them as the originals' -Level WARN
+    return $allOk
+  }
+
+  foreach ($name in $capture.Keys) { $State.Power.Original[$name] = $capture[$name] }
   return $allOk
 }
 

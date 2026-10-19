@@ -413,6 +413,38 @@ Describe 'Save-OriginalPowerSettings' {
     $script:ok | Should -BeFalse
     $state.Power.Original.ContainsKey('HIBERNATEIDLE') | Should -BeFalse
   }
+  It 'treats an all-zero capture (the setup values: never sleep, lid does nothing) as suspect: WARN, no originals (I2 backstop)' {
+    foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 0; DC = 0 } }
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level }) }
+    $state = @{ Power = @{ Original = @{} } }
+    $ok = Save-OriginalPowerSettings -State $state
+    $ok | Should -BeTrue                                  # nothing failed to apply; Finalize reports the missing restore
+    $state.Power.Original.Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'setup values' }).Count | Should -Be 1
+    # ...so the final restore cannot put the zeros back, and says so (Finalize turns $false into its Note)
+    Restore-FinalPowerSettings -State $state -Config (New-PrepareConfig) | Should -BeFalse
+    @(Get-PowercfgSet -Kind 'dc').Count | Should -Be 0
+  }
+  It 'keeps a capture that is not all zero: <Case>' -ForEach @(
+    @{ Case = 'the lid does something'; Name = 'LIDACTION'; AC = 1; DC = 1 }
+    @{ Case = 'the screen turns off on battery'; Name = 'VIDEOIDLE'; AC = 0; DC = 300 }
+    @{ Case = 'it sleeps on AC'; Name = 'STANDBYIDLE'; AC = 1800; DC = 0 }
+  ) {
+    foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 0; DC = 0 } }
+    $script:queryValues[$script:PwrGuid[$Name].Setting] = @{ AC = $AC; DC = $DC }
+    $state = @{ Power = @{ Original = @{} } }
+    Save-OriginalPowerSettings -State $state | Should -BeTrue
+    $state.Power.Original.Count | Should -Be 4
+    $state.Power.Original[$Name].DC | Should -Be $DC
+  }
+  It 'keeps an all-zero capture when the lid setting could not be read (no lid evidence; a desktop)' {
+    foreach ($n in $script:PwrGuid.Keys) { $script:queryValues[$script:PwrGuid[$n].Setting] = @{ AC = 0; DC = 0 } }
+    $script:failExternal = @([regex]::Escape($script:PwrGuid.LIDACTION.Setting))
+    $state = @{ Power = @{ Original = @{} } }
+    Save-OriginalPowerSettings -State $state | Should -BeTrue
+    $state.Power.Original.Count | Should -Be 3
+  }
   It 'treats a powercfg that cannot be started as a failed query' {
     $script:throwExternal = @('powercfg')
     $state = @{ Power = @{ Original = @{} } }

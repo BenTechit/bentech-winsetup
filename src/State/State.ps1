@@ -54,7 +54,14 @@ function New-RunState {
     Builds a fresh State hashtable (see "Shared shapes" in the plan). Every plan step is pending.
   .DESCRIPTION
     PreviousRun stays $null: the entry point (Task 17) fills it from the previous run's verdict.
-    PreviousHiddenUpdateIds is copied from -Previous so Windows Update can re-offer what was hidden.
+    From -Previous (the earlier run's state, if any):
+      - PreviousHiddenUpdateIds = the union of its HiddenUpdateIds and its own PreviousHiddenUpdateIds,
+        without duplicates (compared without regard to case, first spelling kept), so Windows Update
+        can re-offer what was hidden even when that run never reached Windows Update round 1 (M2).
+      - Power.Original = a copy of its Power.Original when it holds values and that run never reached
+        its final power restore (FinalRebootDone not $true). Such a machine still has the setup values
+        (never sleep, lid does nothing); capturing again would save those as the "originals" and put
+        them back on battery at the end (final review I2).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -71,9 +78,24 @@ function New-RunState {
     $steps[$id] = @{ Status = 'pending'; Attempts = 0; Message = ''; StartedAt = $null; EndedAt = $null; Data = @{} }
   }
 
-  $previousHidden = @()
-  if ($null -ne $Previous -and $null -ne $Previous['HiddenUpdateIds']) {
-    $previousHidden = @($Previous['HiddenUpdateIds'])
+  $hiddenList = New-Object 'System.Collections.Generic.List[string]'
+  $hiddenSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+  if ($null -ne $Previous) {
+    foreach ($id in @(@($Previous['HiddenUpdateIds']) + @($Previous['PreviousHiddenUpdateIds']))) {
+      $text = [string]$id
+      if ($text -ne '' -and $hiddenSeen.Add($text)) { $hiddenList.Add($text) }
+    }
+  }
+  $previousHidden = @($hiddenList.ToArray())
+
+  $original = @{}
+  if ($null -ne $Previous -and $Previous['FinalRebootDone'] -ne $true -and $Previous['Power'] -is [System.Collections.IDictionary] -and
+      $Previous['Power']['Original'] -is [System.Collections.IDictionary]) {
+    $previousOriginal = $Previous['Power']['Original']
+    foreach ($name in @($previousOriginal.Keys)) {
+      $entry = $previousOriginal[$name]
+      if ($entry -is [System.Collections.IDictionary]) { $original[$name] = @{ AC = $entry['AC']; DC = $entry['DC'] } }
+    }
   }
 
   @{
@@ -95,7 +117,7 @@ function New-RunState {
     Notes                   = @()
     Errors                  = @()
     AnyDeskId               = $null
-    Power                   = @{ Original = @{} }
+    Power                   = @{ Original = $original }
     PreviousRun             = $null
   }
 }
