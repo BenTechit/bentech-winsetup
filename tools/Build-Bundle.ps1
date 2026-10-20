@@ -41,6 +41,7 @@ $configSource = Join-Path $repoRoot 'config\config.json'
 $BundleOrder = @(
   'Common\StepResult.ps1'
   'Common\Logging.ps1'
+  'Common\Activity.ps1'
   'Common\Config.ps1'
   'Common\Signature.ps1'
   'Common\Process.ps1'

@@ -2,7 +2,7 @@
 # Nothing here runs the real winget or the real Add-AppxPackage: every test that reaches them
 # mocks Invoke-External, Add-AppxPackage, Get-RemoteFile and Get-WingetPath.
 BeforeAll {
-  foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Process', 'Common\Download', 'Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Process', 'Common\Download', 'Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
 
   function New-WingetContext {
     param([double]$ReadyMinutes = 5)

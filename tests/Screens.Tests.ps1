@@ -8,7 +8,7 @@
 BeforeAll {
   foreach ($f in 'StartScreen','ProgressScreen','FinalScreen') { . "$PSScriptRoot\..\src\UI\$f.ps1" }
   # The real commands the screens call in production, so Pester can mock them.
-  . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Config.ps1"
+  . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Config.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
   . "$PSScriptRoot\..\src\Detect\Detection.ps1"
   . "$PSScriptRoot\..\src\Steps\Apps.ps1"; . "$PSScriptRoot\..\src\Steps\DefaultBrowser.ps1"

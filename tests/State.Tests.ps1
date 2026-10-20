@@ -1,5 +1,5 @@
 ﻿# tests/State.Tests.ps1
-BeforeAll { . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\State\State.ps1" }
+BeforeAll { . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\State\State.ps1" }
 Describe 'run state' {
   BeforeEach { $script:root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null }
   It 'round-trips through json as nested hashtables' {

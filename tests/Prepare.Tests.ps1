@@ -8,7 +8,7 @@
 # registry provider cmdlets report failures as NON-terminating errors, which a try/catch only sees when the
 # call carries -ErrorAction Stop (final review I1).
 BeforeAll {
-  . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
+  . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
 
   # The four settings and their GUIDs, spelled out here so a typo in Prepare.ps1 cannot hide.
   $script:PwrSleepSub = '238c9fa8-0aad-41ed-83f4-97be242c8f20'

@@ -19,7 +19,7 @@
 # Get-CimInstance / Get-ItemProperty themselves, so they read nothing real either.
 BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','Engine\Verdict','Engine\Reboot','Report\Report','Steps\Finalize') { . "$PSScriptRoot\..\src\$f.ps1" }
   # The helpers Finalize and the report reuse (the bundle holds every file), and the runner for the end-to-end tests.
-  foreach ($f in 'Common\Logging','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Logging','Common\Activity','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:st = New-RunState -Machine @{ Manufacturer='Dell Inc.'; FriendlyModel='Latitude 5440'; Serial='7HX2K93'; ComputerName='DESKTOP-AB12'; NewName='DELL-7HX2K93'; OsCaption='Windows 11 Pro'; OsDisplayVersion='25H2'; OsBuild=26200; Arch='x64'; IsLaptop=$true; IsVM=$false } -Choices @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'} -Plan @('chrome') -Version '2026.10.18.1'
   $st.StartedAt = '2026-10-18T09:05:00'; $st.EndedAt = '2026-10-18T10:17:00'; $st.AnyDeskId = '123456789'; $st.Steps.chrome.Status = 'Done'
 

@@ -10,7 +10,7 @@
 # P/Invoke wrapper). The only real file I/O is inside $TestDrive: the XML files the steps write, and
 # the placeholder "downloads" the Get-RemoteFile mock creates there.
 BeforeAll {
-  foreach ($f in 'StepResult', 'Logging', 'Process', 'Download') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+  foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Steps\Winget.ps1"
   foreach ($f in 'Apps', 'Office', 'DefaultBrowser') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
   . "$PSScriptRoot\..\src\Common\Config.ps1"

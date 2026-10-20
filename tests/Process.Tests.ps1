@@ -1,6 +1,7 @@
 ﻿# tests/Process.Tests.ps1
 BeforeAll {
   . "$PSScriptRoot\..\src\Common\Logging.ps1"
+  . "$PSScriptRoot\..\src\Common\Activity.ps1"
   . "$PSScriptRoot\..\src\Common\Process.ps1"
   . "$PSScriptRoot\..\src\Common\Download.ps1"
 
@@ -209,7 +210,7 @@ Describe 'Invoke-External standard input (triage 153)' {
     # own hidden console) and blocked until its timeout. Returns the host's stdout + stderr.
     function Invoke-InHostWithOpenStdin {
       param([Parameter(Mandatory)][string]$Script, [int]$TimeoutSeconds = 90)
-      $prefix = ". '{0}'; . '{1}'; " -f (Resolve-Path "$PSScriptRoot\..\src\Common\Logging.ps1").Path, (Resolve-Path "$PSScriptRoot\..\src\Common\Process.ps1").Path
+      $prefix = ". '{0}'; . '{1}'; . '{2}'; " -f (Resolve-Path "$PSScriptRoot\..\src\Common\Logging.ps1").Path, (Resolve-Path "$PSScriptRoot\..\src\Common\Activity.ps1").Path, (Resolve-Path "$PSScriptRoot\..\src\Common\Process.ps1").Path
       $psi = New-Object Diagnostics.ProcessStartInfo
       $psi.FileName = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
       $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prefix + $Script))

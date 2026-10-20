@@ -9,7 +9,7 @@
 # runner, the verdict, the finalization, the resume task and the Windows Update round. As a safety net,
 # Register-ScheduledTask, Unregister-ScheduledTask, Restart-Computer and Start-Process throw.
 BeforeAll {
-  foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
+  foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
                  'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
                  'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Main') {

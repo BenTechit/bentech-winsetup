@@ -11,7 +11,7 @@
 # really runs is in-memory: the CimInstance and WinUserLanguage objects are built without touching
 # WMI or the language settings, and Start-Sleep is real but only for a few milliseconds.
 BeforeAll {
-  foreach ($f in 'StepResult', 'Logging', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+  foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   # Set-RegistryDword (the "create the key if missing, then write the DWord" helper) lives in
   # Prepare.ps1, and Bloatware.ps1 runs its Appx calls through Invoke-PowerShellChild from Winget.ps1.
   # The bundle holds every file, so the steps below use them directly.

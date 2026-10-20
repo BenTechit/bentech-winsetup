@@ -1,5 +1,5 @@
 ﻿# tests/Download.Tests.ps1
-BeforeAll { . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Common\Download.ps1" }
+BeforeAll { . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Common\Download.ps1" }
 
 Describe 'downloads and signatures' {
   It 'copies a file:// url' { 'x' | Set-Content "$TestDrive\src.txt"; Get-RemoteFile -Url ([uri]"$TestDrive\src.txt").AbsoluteUri -Destination "$TestDrive\dst.txt" -BackoffSeconds 0 | Should -Exist }

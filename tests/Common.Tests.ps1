@@ -1,5 +1,5 @@
 ﻿# tests/Common.Tests.ps1
-BeforeAll { . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1" }
+BeforeAll { . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1" }
 Describe 'New-StepResult' {
   It 'defaults Reboot to None and arrays to empty' {
     $r = New-StepResult -Status Done -Message 'ok'

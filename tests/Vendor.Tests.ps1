@@ -16,7 +16,7 @@
 # conversion) need no mocks; the CimInstance used there is built in memory, without any WMI call.
 BeforeAll {
   . "$PSScriptRoot\..\src\Steps\Vendor.ps1"
-  foreach ($f in 'StepResult', 'Logging', 'Process', 'Download', 'Config') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+  foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download', 'Config') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Detect\Detection.ps1"
   foreach ($f in 'Winget', 'BitLocker') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
 

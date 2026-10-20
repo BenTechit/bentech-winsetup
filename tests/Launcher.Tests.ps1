@@ -526,7 +526,7 @@ Describe 'launcher and Prepare lockdown agree (R28b/R28c mirror)' {
   # The same scenarios through Protect-LauncherFolder and Protect-SetupFolder (src/Steps/Prepare.ps1), with
   # the same mocks: both must reach the same verdict through the same steps. Nothing real is touched.
   BeforeAll {
-    . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\StepResult.ps1"; . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"
     . "$PSScriptRoot\..\src\Common\Process.ps1"; . "$PSScriptRoot\..\src\Steps\Prepare.ps1"
     $tok = $null; $err = $null
     $ast = [Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText("$TestDrive\launcher.ps1"), [ref]$tok, [ref]$err)

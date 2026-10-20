@@ -1,6 +1,6 @@
 ﻿# tests/Runner.Tests.ps1
 BeforeAll {
-  foreach ($f in 'Common\StepResult','Common\Logging','State\State','Engine\Reboot','Engine\Runner') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','State\State','Engine\Reboot','Engine\Runner') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Ctx([string[]]$plan) {
     $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null
     $st = New-RunState -Machine @{} -Choices @{} -Plan $plan -Version 'v'

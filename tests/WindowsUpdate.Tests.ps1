@@ -43,7 +43,7 @@ Describe 'criteria' { It 'drivers' { Get-WuSearchCriteria -Type Driver | Should 
 # only real file I/O is state.json and the result JSON, both inside $TestDrive.
 Describe 'Windows Update round and step (mocked COM)' {
   BeforeAll {
-    foreach ($f in 'StepResult', 'Logging', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+    foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
     . "$PSScriptRoot\..\src\State\State.ps1"
 
     $script:WuConfigJson = [IO.File]::ReadAllText("$PSScriptRoot\..\config\config.json", [Text.Encoding]::UTF8)
@@ -886,6 +886,7 @@ Describe 'Windows Update round and step (mocked COM)' {
 Describe 'Invoke-WuInstall (COM wrapper, fake session)' {
   BeforeAll {
     . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\Activity.ps1"
     function New-FakeInstallerSession {
       param([switch]$RefuseQuiet)
       $script:installer = [pscustomobject]@{ Updates = $null; AllowSourcePrompts = $true; SeenAtInstall = $null }
