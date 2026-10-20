@@ -4,8 +4,8 @@
 #
 # Format-ProgressScreen is pure. Show-ProgressScreen takes the clock and the writer as injectable
 # script blocks. The markers are plain ASCII because conhost cannot reliably show check marks and
-# arrows. Uses ConvertTo-ScreenText, Limit-ScreenLine, ConvertFrom-StateTime and Format-HoursMinutes
-# from StartScreen.ps1.
+# arrows. Uses ConvertTo-ScreenText, Limit-ScreenLine, ConvertFrom-StateTime, Format-HoursMinutes and
+# Set-ScreenBlack (spec 9.1: the console is cleared to black) from StartScreen.ps1.
 
 function Format-ProgressScreen {
   <#
@@ -79,7 +79,7 @@ function Show-ProgressScreen {
     [Parameter(Mandatory)][hashtable]$State,
     [object[]]$Catalog = $script:StepCatalog,
     [scriptblock]$Now = { Get-Date },
-    [scriptblock]$Write = { param($lines) Clear-Host; $lines | ForEach-Object { Write-Host $_ -ForegroundColor Gray -BackgroundColor Black } }
+    [scriptblock]$Write = { param($lines) Set-ScreenBlack; Clear-Host; $lines | ForEach-Object { Write-Host $_ -ForegroundColor Gray -BackgroundColor Black } }
   )
 
   $lines = @(Format-ProgressScreen -State $State -Catalog $Catalog -Now ([datetime](& $Now)))

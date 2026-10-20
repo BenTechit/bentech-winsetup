@@ -189,11 +189,34 @@ Describe 'Format-StartScreen' {
 }
 
 Describe 'Show-StartScreen' {
-  # Safety net: this must only reach the console through its seams.
+  # Safety net: this must only reach the console through its seams. The production writer's colours
+  # land on a fake RawUI, never on the console running the tests.
   BeforeEach {
     Mock Clear-Host { throw 'Clear-Host must not run in tests' }
     Mock Write-Host { throw 'Write-Host must not run in tests' }
     Mock Start-Process { throw 'Start-Process must not run in tests' }
+    $script:fakeRawUI = [pscustomobject]@{ BackgroundColor = 'DarkBlue'; ForegroundColor = 'White' }
+    Mock Get-ConsoleRawUI { $script:fakeRawUI }
+    Mock Write-SetupLog { }
+  }
+  It 'the production writer sets a black background and gray text right before it clears (spec 9.1)' {
+    $script:atClear = $null
+    Mock Clear-Host { $script:atClear = @{ B = [string]$script:fakeRawUI.BackgroundColor; F = [string]$script:fakeRawUI.ForegroundColor } }
+    Mock Write-Host { }
+    Write-StartScreenLines -Lines @('   MODE')
+    $script:atClear.B | Should -Be 'Black'
+    $script:atClear.F | Should -Be 'Gray'
+  }
+  It 'a console that refuses the colours is a WARN each, and the screen is still drawn' {
+    $script:cleared = 0
+    $script:hostCalls = New-Object System.Collections.ArrayList
+    Mock Get-ConsoleRawUI { throw 'The handle is invalid.' }
+    Mock Clear-Host { $script:cleared++ }
+    Mock Write-Host { $null = $script:hostCalls.Add([string]$Object) }
+    { Write-StartScreenLines -Lines @('   MODE') } | Should -Not -Throw
+    Should -Invoke Write-SetupLog -Times 2 -Exactly -ParameterFilter { $Level -eq 'WARN' }
+    $script:cleared | Should -Be 1
+    $script:hostCalls | Should -Be @('   MODE')
   }
   It 'counts down from 10 and starts at 0 with the default choices' {
     $r = Invoke-StartScreen
@@ -419,11 +442,24 @@ Describe 'Format-ProgressScreen' {
 }
 
 Describe 'Show-ProgressScreen' {
-  # Safety net: this must only reach the console through its seams.
+  # Safety net: this must only reach the console through its seams. The production writer's colours
+  # land on a fake RawUI, never on the console running the tests.
   BeforeEach {
     Mock Clear-Host { throw 'Clear-Host must not run in tests' }
     Mock Write-Host { throw 'Write-Host must not run in tests' }
     Mock Start-Process { throw 'Start-Process must not run in tests' }
+    $script:fakeRawUI = [pscustomobject]@{ BackgroundColor = 'DarkBlue'; ForegroundColor = 'White' }
+    Mock Get-ConsoleRawUI { $script:fakeRawUI }
+    Mock Write-SetupLog { }
+  }
+  It 'the production writer sets a black background and gray text right before it clears (spec 9.1)' {
+    $script:atClear = $null
+    Mock Clear-Host { $script:atClear = @{ B = [string]$script:fakeRawUI.BackgroundColor; F = [string]$script:fakeRawUI.ForegroundColor } }
+    Mock Write-Host { }
+    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('finalize'); Steps = @{ finalize = @{ Status = 'Done' } } }
+    Show-ProgressScreen -State $st -Now { [datetime]'2026-10-18T09:00:05' }
+    $script:atClear.B | Should -Be 'Black'
+    $script:atClear.F | Should -Be 'Gray'
   }
   It 'draws the formatted lines through the write seam at the injected time' {
     $script:progressDrawn = $null

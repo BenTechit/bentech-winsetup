@@ -200,13 +200,37 @@ function Format-StartScreen {
   return $lines.ToArray()
 }
 
+function Get-ConsoleRawUI {
+  # The console's RawUI ($Host.UI.RawUI). A function of its own only so the tests can hand the screens
+  # a fake one: $Host itself cannot be replaced.
+  [CmdletBinding()]
+  param()
+
+  return $Host.UI.RawUI
+}
+
+function Set-ScreenBlack {
+  # Spec 9.1: the powershell.exe console profile paints the window PowerShell blue, and Clear-Host
+  # fills the window with the current background colour, so the black lines would show as strips on
+  # blue. The start and progress writers call this right before Clear-Host: background Black, text
+  # Gray. Each colour is best effort (a WARN, and the screen is drawn anyway). Never throws.
+  [CmdletBinding()]
+  param()
+
+  try { (Get-ConsoleRawUI).BackgroundColor = 'Black' }
+  catch { Write-SetupLog -Message 'Could not set the console background to black' -Level WARN -Data @{ error = $_.Exception.Message } }
+  try { (Get-ConsoleRawUI).ForegroundColor = 'Gray' }
+  catch { Write-SetupLog -Message 'Could not set the console text colour to gray' -Level WARN -Data @{ error = $_.Exception.Message } }
+}
+
 function Write-StartScreenLines {
-  # Production writer for the start screen: clear, then the lines in gray on black; the two warnings in
-  # yellow on black (spec 8.1, 9.1). Both colours are named on every line, so no line depends on the
-  # palette the console happens to have.
+  # Production writer for the start screen: a black console cleared, then the lines in gray on black;
+  # the two warnings in yellow on black (spec 8.1, 9.1). Both colours are named on every line, so no
+  # line depends on the palette the console happens to have.
   [CmdletBinding()]
   param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
 
+  Set-ScreenBlack
   Clear-Host
   foreach ($line in $Lines) {
     if ($line -like '*ON BATTERY: plug in*' -or $line -like "*doesn't look like a fresh install*") {
