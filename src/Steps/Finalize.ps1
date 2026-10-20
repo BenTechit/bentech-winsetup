@@ -1,5 +1,8 @@
 ﻿# src/Steps/Finalize.ps1
 # Step 17, "Finalize" (spec 8.3 step 17, 8.4, 8.7 and 12): the last step. It runs in two phases.
+#   Both start by waiting for a Microsoft 365 setup still running in the background (Wait-OfficeBackground,
+#     v2 spec 4.6; a no-op without one): Phase A restores power settings and Phase B deletes Downloads\
+#     (the ODT and office.xml), so neither may race a live install.
 #   Phase A (State.FinalRebootDone is $false): the final power settings, the no-auto-reboot policy
 #     value removed, FinalRebootDone saved, one attempt to activate Windows (spec 9.5), then ONE
 #     final restart when something needs it (Test-FinalRebootNeeded) and a restart is possible.
@@ -11,8 +14,8 @@
 #     ends with finalize not Done (the final restart failed), so no run is left without a report or
 #     with the resume task still registered (ruling R26). The entry point then shows the final screen.
 # Needs StepResult.ps1, Logging.ps1, State.ps1, Catalog.ps1 + Verdict.ps1, Reboot.ps1, Prepare.ps1,
-# Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild) and
-# Report.ps1; the bundle holds every file.
+# Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild), Office.ps1
+# (Wait-OfficeBackground) and Report.ps1; the bundle holds every file.
 #
 # Notes and errors: Finalize writes its own straight into State.Notes / State.Errors
 # (Add-FinalizeMessage), and its results never carry any. Phase B must have them in the State before
@@ -459,6 +462,8 @@ function Complete-SetupFinalization {
         the run can never look green after a failure. A failed restart also keeps its 'Restart
         failed: ...' Error, so that run stays red.
       - the state is saved at the end (a failed save is a WARN; the runner saves again anyway).
+    Before anything else it waits for a background Microsoft 365 setup that is still running
+    (Wait-OfficeBackground -Purpose Finish): step 8 deletes the ODT and office.xml.
     Then, in order:
       1. Chrome installed but not the default browser -> Note 'Chrome is not the default browser'
          (checked before its policy is removed). Spec 9.4: when the default-browser step set the
@@ -487,6 +492,7 @@ function Complete-SetupFinalization {
   [OutputType([pscustomobject])]
   param([Parameter(Mandatory)][hashtable]$Context)
 
+  $null = Wait-OfficeBackground -Context $Context -Purpose Finish
   $runState = $Context.State
   $machine = if ($runState.Machine -is [System.Collections.IDictionary]) { $runState.Machine } else { @{} }
   $hasFinalizeStep = ($runState.Steps -is [hashtable] -and $runState.Steps.ContainsKey($script:FinalizeStepId))
@@ -575,6 +581,8 @@ function Invoke-StepFinalize {
   .SYNOPSIS
     Step 17: Phase A, then (after the final restart, or at once) Phase B. See the file header.
   .DESCRIPTION
+    First waits for a Microsoft 365 setup still running in the background (Wait-OfficeBackground
+    -Purpose Finish; a no-op without one).
     FinalRebootDone $false: Phase A. When it asks for the final restart, returns
     Continue('Restarting to finish setup') with Reboot 'Now'; the runner restarts, and the next call
     runs Phase B. Otherwise Phase B runs in this same call. FinalRebootDone $true: Phase B.
@@ -586,6 +594,7 @@ function Invoke-StepFinalize {
   [OutputType([pscustomobject])]
   param([Parameter(Mandatory)][hashtable]$Context)
 
+  $null = Wait-OfficeBackground -Context $Context -Purpose Finish
   if ($Context.State.FinalRebootDone -ne $true) {
     if (Invoke-FinalizePhaseA -Context $Context) {
       return New-StepResult -Status Continue -Message 'Restarting to finish setup' -Reboot Now

@@ -4,13 +4,18 @@
 # SAFETY: this runs on a real PC, and the steps install and uninstall software, download files and
 # change file associations and policies. Nothing here may do any of that. Every test that reaches
 # the system runs after Initialize-AppMocks (each Describe calls it from BeforeEach), which replaces
-# EVERY command the steps can reach with a recorder: Invoke-External, Get-RemoteFile, Get-RemoteText,
+# EVERY command the steps can reach with a recorder: Invoke-External, Start-BackgroundExternal (the Office
+# setup.exe never starts), Get-RemoteFile, Get-RemoteText,
 # Test-FileSignature, Invoke-WingetInstall, Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
 # Get-Content, Start-Sleep, Write-SetupLog and Get-ShellDefaultBrowserProgId (the AssocQueryString
-# P/Invoke wrapper). The only real file I/O is inside $TestDrive: the XML files the steps write, and
-# the placeholder "downloads" the Get-RemoteFile mock creates there.
+# P/Invoke wrapper). The Office wait Describes also mock Get-Process, Stop-ProcessTree, Save-RunState and
+# Wait-SetupDelay, so no real process is looked up or killed. The only real file I/O is inside
+# $TestDrive: the XML files the steps write, and the placeholder "downloads" the Get-RemoteFile mock
+# creates there.
 BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+  # State.ps1 holds Save-RunState, which the Office background wait and office-finish call (mocked below).
+  . "$PSScriptRoot\..\src\State\State.ps1"
   . "$PSScriptRoot\..\src\Steps\Winget.ps1"
   foreach ($f in 'Apps', 'Office', 'DefaultBrowser') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
   # Report.ps1 holds Get-InstalledAppVersions, which the steps read for the activity feed (mocked below).
@@ -59,8 +64,11 @@ BeforeAll {
   #   $script:regKeys     the New-Item paths; $script:regValues one hashtable per New-ItemProperty call
   #   $script:fileText    path -> text for Get-Content
   #   $script:activity    one hashtable (Text, LogText) per Add-SetupActivity call
+  #   $script:bg          one hashtable (FilePath, ArgumentList) per Start-BackgroundExternal call
   function Initialize-AppMocks {
     $script:activity = New-Object System.Collections.ArrayList
+    $script:bg = New-Object System.Collections.ArrayList
+    $script:OfficeBackgroundProcess = $null
     $script:logs = New-Object System.Collections.ArrayList
     $script:sleeps = New-Object System.Collections.ArrayList
     $script:ext = New-Object System.Collections.ArrayList
@@ -89,6 +97,10 @@ BeforeAll {
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
     Mock Add-SetupActivity { [void]$script:activity.Add(@{ Text = $Text; LogText = $LogText }) }
+    Mock Start-BackgroundExternal {
+      [void]$script:bg.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList })
+      [pscustomobject]@{ Id = 4242; StartTime = [datetime]'2026-10-20T10:00:00'; HasExited = $false }
+    }
     Mock Get-InstalledAppVersions { @{} }
     Mock Start-Sleep { [void]$script:sleeps.Add(@{ Seconds = $Seconds; Milliseconds = $Milliseconds }) }
     Mock Test-Path { return ($script:existing -contains $LiteralPath) }
@@ -141,6 +153,49 @@ BeforeAll {
   }
 
   function Set-ChromeInstalled { $script:existing += "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" }
+
+  # The Office fixture (after Initialize-AppMocks): a fresh context, the paths the step uses, and an
+  # Invoke-External answer for the ODT self-extractor and the foreground /configure run.
+  #   $script:configureCode  the /configure exit code, or 'timeout'
+  #   $script:extractCode    the self-extractor's exit code (0 leaves setup.exe behind)
+  function Initialize-OfficeFixture {
+    $script:ctx = New-AppContext -Dir (New-TestDir)
+    $script:odt = $script:ctx.Config.apps.office.odtSetupPath
+    $script:xmlPath = Join-Path $script:ctx.DownloadDir 'office.xml'
+    $script:odtDir = Join-Path $script:ctx.DownloadDir 'ODT'
+    $script:odtExe = Join-Path $script:ctx.DownloadDir 'officedeploymenttool.exe'
+    $script:extractedSetup = Join-Path $script:odtDir 'setup.exe'
+    $script:releaseKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $script:configureCode = 0
+    $script:extractCode = 0
+    $script:extHandler = {
+      param($c)
+      if ($c.ArgumentList -like '/configure*') {
+        if ($script:configureCode -eq 'timeout') { return @{ ExitCode = $null; TimedOut = $true; Output = '' } }
+        return @{ ExitCode = $script:configureCode; TimedOut = $false; Output = '' }
+      }
+      # the self-extractor
+      if ($script:extractCode -eq 0) { $script:existing += $script:extractedSetup }
+      return @{ ExitCode = $script:extractCode; TimedOut = $false; Output = '' }
+    }
+    $script:pageHtml = '<a href="https://download.microsoft.com/download/2/7/A/27AF1BE6-DD20-4CB4-B154-EBAB8A7D4A7E/officedeploymenttool_17531-20046.exe">Download</a>'
+  }
+
+  # Adds a run state to $script:ctx: a plan with office and office-finish, office Done in the background
+  # (process 4242, started 09:59, StartedAt 10:00, DeadlineAt -DeadlineAt) and office-finish running.
+  function Add-OfficeRunState {
+    param([string]$DeadlineAt = '2026-10-20T11:00:00')
+    $script:started = [datetime]'2026-10-20T09:59:00'
+    $st = New-RunState -Machine @{ Arch = 'x64' } -Choices $script:ctx.State.Choices -Plan @('office', 'windows-update', 'office-finish') -Version 'v'
+    $st.Steps.office.Status = 'Done'
+    $st.Steps.office.Data = @{ Background = $true; ProcessId = 4242; ProcessStartUtc = $script:started.ToUniversalTime().ToString('o')
+      StartedAt = '2026-10-20T10:00:00'; DeadlineAt = $DeadlineAt }
+    $st.Steps['office-finish'].Status = 'running'
+    $script:ctx.State = $st
+  }
+
+  # The foreground install as office-finish runs it: the preparation, then /configure.
+  function Invoke-OfficeForeground { Invoke-OfficeForegroundInstall -Context $script:ctx -Prepared (Initialize-OfficeInstall -Context $script:ctx) }
 }
 
 # --- the brief's own tests (verbatim) ---------------------------------------------------------
@@ -649,29 +704,11 @@ Describe 'Get-AppVersionText' {
 }
 
 # --- Invoke-StepOffice ------------------------------------------------------------------------
+# The preparation (v1 checks); the /configure run itself now starts in the background (Task 13).
 Describe 'Invoke-StepOffice' {
   BeforeEach {
     Initialize-AppMocks
-    $script:ctx = New-AppContext -Dir (New-TestDir)
-    $script:odt = $script:ctx.Config.apps.office.odtSetupPath
-    $script:xmlPath = Join-Path $script:ctx.DownloadDir 'office.xml'
-    $script:odtDir = Join-Path $script:ctx.DownloadDir 'ODT'
-    $script:odtExe = Join-Path $script:ctx.DownloadDir 'officedeploymenttool.exe'
-    $script:extractedSetup = Join-Path $script:odtDir 'setup.exe'
-    $script:releaseKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
-    $script:configureCode = 0
-    $script:extractCode = 0
-    $script:extHandler = {
-      param($c)
-      if ($c.ArgumentList -like '/configure*') {
-        if ($script:configureCode -eq 'timeout') { return @{ ExitCode = $null; TimedOut = $true; Output = '' } }
-        return @{ ExitCode = $script:configureCode; TimedOut = $false; Output = '' }
-      }
-      # the self-extractor
-      if ($script:extractCode -eq 0) { $script:existing += $script:extractedSetup }
-      return @{ ExitCode = $script:extractCode; TimedOut = $false; Output = '' }
-    }
-    $script:pageHtml = '<a href="https://download.microsoft.com/download/2/7/A/27AF1BE6-DD20-4CB4-B154-EBAB8A7D4A7E/officedeploymenttool_17531-20046.exe">Download</a>'
+    Initialize-OfficeFixture
   }
   It 'is Skipped when Office was not selected' {
     $script:ctx.State.Choices.Office = 'OFF'
@@ -680,6 +717,7 @@ Describe 'Invoke-StepOffice' {
     $r.Message | Should -Be 'Office not selected'
     $script:wingetCalls.Count | Should -Be 0
     $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 0
   }
   It 'is Done without installing when the product is already installed' {
     $script:regRead[$script:releaseKey] = @{ ProductReleaseIds = 'O365BusinessRetail,ProofingTools' }
@@ -688,21 +726,23 @@ Describe 'Invoke-StepOffice' {
     $r.Message | Should -Be 'Office already installed'
     $script:wingetCalls.Count | Should -Be 0
     $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 0
+    $r.Data.Count | Should -Be 0
   }
   It 'still installs when only the other product is installed' {
     $script:regRead[$script:releaseKey] = @{ ProductReleaseIds = 'O365HomePremRetail' }
     $script:existing = @($script:odt)
     $r = Invoke-StepOffice -Context $script:ctx
     $r.Status | Should -Be 'Done'
-    $script:ext.Count | Should -Be 1
+    $script:bg.Count | Should -Be 1
   }
   It 'installs when Office is not installed at all' {
     $script:existing = @($script:odt)
     $r = Invoke-StepOffice -Context $script:ctx
     $r.Status | Should -Be 'Done'
-    $r.Message | Should -Be 'Office installed'
+    $r.Message | Should -Be 'Microsoft 365 installing in the background'
   }
-  It 'installs the ODT with winget, checks setup.exe and runs /configure' {
+  It 'installs the ODT with winget, checks setup.exe and starts /configure in the background' {
     $script:existing = @($script:odt)
     $r = Invoke-StepOffice -Context $script:ctx
     $r.Status | Should -Be 'Done'
@@ -711,10 +751,10 @@ Describe 'Invoke-StepOffice' {
     $script:sigCalls.Count | Should -Be 1
     $script:sigCalls[0].Path | Should -Be $script:odt
     $script:sigCalls[0].Signers | Should -Contain 'Microsoft Corporation'
-    $script:ext.Count | Should -Be 1
-    $script:ext[0].FilePath | Should -Be $script:odt
-    $script:ext[0].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
-    $script:ext[0].TimeoutMinutes | Should -Be 60
+    $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 1
+    $script:bg[0].FilePath | Should -Be $script:odt
+    $script:bg[0].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
     $script:pageCalls.Count | Should -Be 0
   }
   It 'builds the XML for the BUSINESS product' {
@@ -765,15 +805,15 @@ Describe 'Invoke-StepOffice' {
     $script:ext[0].ArgumentList | Should -Be "/quiet /extract:`"$($script:odtDir)`""
     $script:ext[0].TimeoutMinutes | Should -Be 30
     $script:sigCalls[1].Path | Should -Be $script:extractedSetup
-    $script:ext[1].FilePath | Should -Be $script:extractedSetup
-    $script:ext[1].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
+    $script:bg[0].FilePath | Should -Be $script:extractedSetup
+    $script:bg[0].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
   }
   It 'falls back to the download page when winget succeeds but setup.exe is missing' {
     $r = Invoke-StepOffice -Context $script:ctx
     $r.Status | Should -Be 'Done'
     $script:wingetCalls.Count | Should -Be 1
     $script:pageCalls.Count | Should -Be 1
-    $script:ext[1].FilePath | Should -Be $script:extractedSetup
+    $script:bg[0].FilePath | Should -Be $script:extractedSetup
   }
   It 'fails when the download page has no matching link' {
     $script:pageHtml = '<html>nothing here</html>'
@@ -781,6 +821,7 @@ Describe 'Invoke-StepOffice' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Office Deployment Tool download link not found'
     $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 0
   }
   It 'fails when the download page cannot be read' {
     $script:pageError = 'download failed after 3 attempts: https://www.microsoft.com'
@@ -803,6 +844,7 @@ Describe 'Invoke-StepOffice' {
     $r.Message | Should -Be 'Office Deployment Tool signature check failed'
     [IO.File]::Exists($script:odtExe) | Should -BeFalse
     $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 0
   }
   It 'fails when the self-extractor fails' {
     $script:extractCode = 5
@@ -823,56 +865,287 @@ Describe 'Invoke-StepOffice' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'Office setup.exe signature check failed'
     $script:ext.Count | Should -Be 0
-  }
-  It 'fails with the exit code when setup.exe returns non-zero' {
-    $script:existing = @($script:odt)
-    $script:configureCode = 1603
-    $r = Invoke-StepOffice -Context $script:ctx
-    $r.Status | Should -Be 'Failed'
-    $r.Message | Should -Be 'Office setup exit 1603'
-  }
-  It 'treats 3010 and 1641 (restart pending) as Done, ruling R17a' {
-    $script:existing = @($script:odt)
-    foreach ($code in 3010, 1641) {
-      $script:configureCode = $code
-      $r = Invoke-StepOffice -Context $script:ctx
-      $r.Status | Should -Be 'Done'
-      $r.Message | Should -Be 'Office installed (restart pending)'
-      $r.Reboot | Should -Be 'None'
-    }
-  }
-  It 'still fails on exit codes next to the success codes' {
-    $script:existing = @($script:odt)
-    foreach ($code in 1, 3011, 1642, -1) {
-      $script:configureCode = $code
-      $r = Invoke-StepOffice -Context $script:ctx
-      $r.Status | Should -Be 'Failed'
-      $r.Message | Should -Be "Office setup exit $code"
-    }
-  }
-  It 'reports a plain exit 0 as Office installed' {
-    $script:existing = @($script:odt)
-    (Invoke-StepOffice -Context $script:ctx).Message | Should -Be 'Office installed'
-  }
-  It 'fails when setup.exe times out' {
-    $script:existing = @($script:odt)
-    $script:configureCode = 'timeout'
-    $r = Invoke-StepOffice -Context $script:ctx
-    $r.Status | Should -Be 'Failed'
-    $r.Message | Should -Be 'Office setup timed out'
-  }
-  It 'fails when setup.exe cannot be started' {
-    $script:existing = @($script:odt)
-    $script:extHandler = { param($c) throw 'Cannot start setup.exe' }
-    $r = Invoke-StepOffice -Context $script:ctx
-    $r.Status | Should -Be 'Failed'
-    $r.Message | Should -Match '^Office setup could not be started'
+    $script:bg.Count | Should -Be 0
   }
   It 'fails for a choice that is neither OFF nor a configured product' {
     $script:ctx.State.Choices.Office = 'ENTERPRISE'
     $r = Invoke-StepOffice -Context $script:ctx
     $r.Status | Should -Be 'Failed'
     $script:ext.Count | Should -Be 0
+    $script:bg.Count | Should -Be 0
+  }
+}
+
+# The v1 /configure run, which now only runs inside office-finish (its one foreground retry).
+Describe 'Invoke-OfficeForegroundInstall' {
+  BeforeEach {
+    Initialize-AppMocks
+    Initialize-OfficeFixture
+    $script:existing = @($script:odt)
+  }
+  It 'runs /configure through Invoke-External with the office timeout' {
+    $r = Invoke-OfficeForeground
+    $r.Status | Should -Be 'Done'
+    $script:bg.Count | Should -Be 0
+    $script:ext.Count | Should -Be 1
+    $script:ext[0].FilePath | Should -Be $script:odt
+    $script:ext[0].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
+    $script:ext[0].TimeoutMinutes | Should -Be 60
+  }
+  It 'fails with the exit code when setup.exe returns non-zero' {
+    $script:configureCode = 1603
+    $r = Invoke-OfficeForeground
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Office setup exit 1603'
+  }
+  It 'treats 3010 and 1641 (restart pending) as Done and asks for the restart (R17a, amended by Task 13)' {
+    foreach ($code in 3010, 1641) {
+      $script:configureCode = $code
+      $r = Invoke-OfficeForeground
+      $r.Status | Should -Be 'Done'
+      $r.Message | Should -Be 'Office installed (restart pending)'
+      $r.Reboot | Should -Be 'Now'
+    }
+  }
+  It 'still fails on exit codes next to the success codes' {
+    foreach ($code in 1, 3011, 1642, -1) {
+      $script:configureCode = $code
+      $r = Invoke-OfficeForeground
+      $r.Status | Should -Be 'Failed'
+      $r.Message | Should -Be "Office setup exit $code"
+    }
+  }
+  It 'reports a plain exit 0 as Office installed' {
+    $r = Invoke-OfficeForeground
+    $r.Message | Should -Be 'Office installed'
+    $r.Reboot | Should -Be 'None'
+  }
+  It 'fails when setup.exe times out' {
+    $script:configureCode = 'timeout'
+    $r = Invoke-OfficeForeground
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Office setup timed out'
+  }
+  It 'fails when setup.exe cannot be started' {
+    $script:extHandler = { param($c) throw 'Cannot start setup.exe' }
+    $r = Invoke-OfficeForeground
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Match '^Office setup could not be started'
+  }
+}
+
+Describe 'office: background start' {
+  BeforeEach {
+    Initialize-AppMocks
+    Initialize-OfficeFixture
+  }
+  It 'starts /configure in the background and records the process' {
+    $script:existing = @($script:odt)
+    $r = Invoke-StepOffice -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Microsoft 365 installing in the background'
+    $script:bg[0].ArgumentList | Should -Be "/configure `"$($script:xmlPath)`""
+    @($script:ext | Where-Object { $_.ArgumentList -like '/configure*' }).Count | Should -Be 0
+    $r.Data.Background | Should -BeTrue; $r.Data.ProcessId | Should -Be 4242
+    ([datetime]$r.Data.DeadlineAt - [datetime]$r.Data.StartedAt).TotalMinutes | Should -Be 60
+  }
+  It 'a setup.exe that cannot start is Failed' { $script:existing = @($script:odt); Mock Start-BackgroundExternal { throw 'Cannot start' }; (Invoke-StepOffice -Context $script:ctx).Message | Should -Be 'Office setup could not be started' }
+  It 'keeps the process in memory, stores its start time in UTC and says so in the activity feed' {
+    $script:existing = @($script:odt)
+    $r = Invoke-StepOffice -Context $script:ctx
+    $script:OfficeBackgroundProcess.Id | Should -Be 4242
+    $r.Data.ProcessStartUtc | Should -Be (([datetime]'2026-10-20T10:00:00').ToUniversalTime().ToString('o'))
+    $r.Data.StartedAt | Should -Match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$'
+    @($script:activity.Text) | Should -Contain 'Microsoft 365 started installing in the background (he-il, en-us)'
+  }
+  It 'starts nothing in the background when the preparation fails' {
+    $script:existing = @($script:odt); $script:sigBad = @('setup.exe')
+    (Invoke-StepOffice -Context $script:ctx).Status | Should -Be 'Failed'
+    $script:bg.Count | Should -Be 0; $script:OfficeBackgroundProcess | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Get-OfficeBackgroundProcess' {
+  BeforeEach {
+    Initialize-AppMocks
+    $script:OfficeBackgroundProcess = $null; $script:started = [datetime]'2026-10-20T09:59:00'
+    $script:data = @{ ProcessId = 4242; ProcessStartUtc = $script:started.ToUniversalTime().ToString('o') }
+  }
+  It 'finds the process by id and start time' { Mock Get-Process { [pscustomobject]@{ Id = 4242; StartTime = $script:started; HasExited = $false; Handle = 1 } }; (Get-OfficeBackgroundProcess -Data $script:data).Id | Should -Be 4242 }
+  It 'a process with the same id but another start time is not Office (Review Focus 5)' { Mock Get-Process { [pscustomobject]@{ Id = 4242; StartTime = $script:started.AddMinutes(30); HasExited = $false; Handle = 1 } }; Get-OfficeBackgroundProcess -Data $script:data | Should -BeNullOrEmpty }
+  It 'no process is $null' { Mock Get-Process { }; Get-OfficeBackgroundProcess -Data $script:data | Should -BeNullOrEmpty }
+  It 'prefers the process kept in memory when its id matches' {
+    Mock Get-Process { throw 'must not be asked' }
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $true; ExitCode = 0 }
+    (Get-OfficeBackgroundProcess -Data $script:data).ExitCode | Should -Be 0
+    Should -Invoke Get-Process -Times 0 -Exactly
+  }
+  It 'looks the id up when the process in memory is another one' {
+    Mock Get-Process { [pscustomobject]@{ Id = 4242; StartTime = $script:started.AddSeconds(1); HasExited = $false; Handle = 1 } }
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 1; HasExited = $false }
+    (Get-OfficeBackgroundProcess -Data $script:data).Id | Should -Be 4242
+    Should -Invoke Get-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 4242 }
+  }
+  It 'without a recorded start time it cannot prove the process is Office: $null' {
+    Mock Get-Process { [pscustomobject]@{ Id = 4242; StartTime = $script:started; HasExited = $false; Handle = 1 } }
+    Get-OfficeBackgroundProcess -Data @{ ProcessId = 4242 } | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Wait-OfficeBackground' {
+  BeforeEach {
+    Initialize-AppMocks
+    Initialize-OfficeFixture
+    Add-OfficeRunState
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }; $script:polls = 0; $script:saves = 0
+    $script:t = [datetime]'2026-10-20T10:30:00'; $script:exitAfter = 0; $script:killed = $null
+    Mock Wait-SetupDelay { $script:t = $script:t.AddSeconds(1); $script:polls++; if ($script:exitAfter -and $script:polls -ge $script:exitAfter) { $script:OfficeBackgroundProcess.HasExited = $true } }
+    Mock Save-RunState { $script:saves++ }
+    Mock Stop-ProcessTree { $script:killed = $ProcessId }
+    Mock Get-Process { }
+    Clear-SetupNow
+  }
+  It 'without background data does nothing' { $script:ctx.State.Steps.office.Data = @{}; (Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }).Outcome | Should -Be 'None'; $script:saves | Should -Be 0 }
+  It 'waits, showing the restart title, then stores the exit code and saves' {
+    $script:exitAfter = 3; $script:titles = New-Object System.Collections.ArrayList; Mock Set-SetupNow { [void]$script:titles.Add($Title) }
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }
+    $r.Outcome | Should -Be 'Exited'; $r.ExitCode | Should -Be 0
+    $script:titles[0] | Should -Be 'Waiting for Microsoft 365 to finish before restarting'
+    $script:ctx.State.Steps.office.Data.ExitCode | Should -Be 0; $script:ctx.State.Steps.office.Data.Finished | Should -BeTrue; $script:saves | Should -BeGreaterThan 0
+  }
+  It 'kills the process tree at the deadline and stores the marker' {
+    $script:exitAfter = 0; $script:t = [datetime]'2026-10-20T10:59:58'
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }
+    $r.Outcome | Should -Be 'Killed'; $script:killed | Should -Be 4242; $script:ctx.State.Steps.office.Data.KilledAtDeadline | Should -BeTrue
+    $script:ctx.State.Steps.office.Data.Finished | Should -BeTrue
+    $script:ctx.State.Steps.office.Data.Contains('ExitCode') | Should -BeFalse
+    $script:polls | Should -Be 2
+    @($script:activity.Text) | Should -Contain 'Microsoft 365 setup stopped at its 60 min limit'
+    $script:saves | Should -BeGreaterThan 0
+  }
+  It 'a process that is gone ends the wait with no code' { $script:OfficeBackgroundProcess = $null; Mock Get-Process { }; (Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }).Outcome | Should -Be 'Gone'; $script:ctx.State.Steps.office.Data.Contains('ExitCode') | Should -BeFalse; $script:ctx.State.Steps.office.Data.Finished | Should -BeTrue }
+  It 'never throws when the state cannot be saved' { $script:exitAfter = 1; Mock Save-RunState { throw 'disk full' }; { Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t } } | Should -Not -Throw }
+  It 'a failed save is a WARN' {
+    $script:exitAfter = 1; Mock Save-RunState { throw 'disk full' }
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }).Outcome | Should -Be 'Exited'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -BeGreaterThan 0
+  }
+  It 'shows the finish title, the Office limit and StartedAt as the wait, and clears them afterwards' {
+    $script:exitAfter = 2; $script:titles = New-Object System.Collections.ArrayList; Mock Set-SetupNow { [void]$script:titles.Add($Title) }
+    Mock Enter-SetupWait { $script:waitSeen = @{ LimitMinutes = $LimitMinutes; StartedAt = $StartedAt } }
+    Mock Exit-SetupWait { $script:waitExited = $true }
+    $script:waitExited = $false
+    $null = Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }
+    @($script:titles) | Should -Be @('Waiting for Microsoft 365 to finish', '')
+    $script:waitSeen.LimitMinutes | Should -Be 60
+    $script:waitSeen.StartedAt | Should -Be ([datetime]'2026-10-20T10:00:00')
+    $script:waitExited | Should -BeTrue
+    Should -Invoke Wait-SetupDelay -Times 2 -Exactly -ParameterFilter { $Milliseconds -eq 1000 }
+  }
+  It 'says how the setup ended in the activity feed' {
+    $script:exitAfter = 1; $script:OfficeBackgroundProcess.ExitCode = 17002
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }).ExitCode | Should -Be 17002
+    @($script:activity.Text) | Should -Contain 'Microsoft 365 setup ended (exit 17002)'
+  }
+  It 'an exit code that cannot be read is stored as nothing and shown as unknown' {
+    $script:exitAfter = 1; $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = $null }
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }
+    $r.Outcome | Should -Be 'Exited'; $r.ExitCode | Should -BeNullOrEmpty
+    $script:ctx.State.Steps.office.Data.Contains('ExitCode') | Should -BeFalse
+    $script:ctx.State.Steps.office.Data.Finished | Should -BeTrue
+    @($script:activity.Text) | Should -Contain 'Microsoft 365 setup ended (exit unknown)'
+  }
+  It 'a process that already ended is not waited for' {
+    $script:OfficeBackgroundProcess.HasExited = $true
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }).Outcome | Should -Be 'Exited'
+    $script:polls | Should -Be 0
+  }
+  It 'does nothing when office is not in the plan, or its result is already known' {
+    $script:ctx.State.Plan = @('windows-update', 'office-finish')
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }).Outcome | Should -Be 'None'
+    $script:ctx.State.Plan = @('office', 'windows-update', 'office-finish'); $script:ctx.State.Steps.office.Data.Finished = $true
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }).Outcome | Should -Be 'None'
+    $script:saves | Should -Be 0; $script:polls | Should -Be 0
+  }
+  It 'finds the process again after a restart by id and start time' {
+    $script:OfficeBackgroundProcess = $null; $script:exitAfter = 0
+    $script:found = [pscustomobject]@{ Id = 4242; StartTime = $script:started; HasExited = $false; ExitCode = 0; Handle = 1 }
+    Mock Get-Process { $script:found }
+    Mock Wait-SetupDelay { $script:t = $script:t.AddSeconds(1); $script:polls++; if ($script:polls -ge 2) { $script:found.HasExited = $true } }
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }
+    $r.Outcome | Should -Be 'Exited'; $script:ctx.State.Steps.office.Data.ExitCode | Should -Be 0
+  }
+}
+
+Describe 'office-finish' {
+  BeforeEach {
+    Initialize-AppMocks
+    Initialize-OfficeFixture
+    # A deadline that has not passed on the real clock: Invoke-StepOfficeFinish waits with the default Clock.
+    Add-OfficeRunState -DeadlineAt ((Get-Date).AddMinutes(30).ToString('s', [Globalization.CultureInfo]::InvariantCulture))
+    $script:polls = 0; $script:exitAfter = 0
+    Mock Wait-SetupDelay { $script:polls++; if ($script:exitAfter -and $script:polls -ge $script:exitAfter) { $script:OfficeBackgroundProcess.HasExited = $true } }
+    Mock Save-RunState { }
+    Mock Get-Process { }
+    Mock Stop-ProcessTree { throw 'must not kill' }
+    $script:officeData = $script:ctx.State.Steps.office.Data
+  }
+  It 'a killed-at-deadline marker is Failed, with no foreground retry' {
+    $script:officeData.Finished = $true; $script:officeData.KilledAtDeadline = $true
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Office setup timed out'; $script:ext.Count | Should -Be 0
+  }
+  It 'a stored 3010 (a restart already followed) is Done without another restart' {
+    $script:officeData.Finished = $true; $script:officeData.ExitCode = 3010
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Office installed (restart pending)'; $r.Reboot | Should -Be 'None'
+  }
+  It '3010 seen by its own wait asks for a restart' {
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 3010 }; $script:exitAfter = 1
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Message | Should -Be 'Office installed (restart pending)'; $r.Reboot | Should -Be 'Now'
+  }
+  It 'exit 0 seen by its own wait is Office installed, with no restart' {
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }; $script:exitAfter = 1
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Office installed'; $r.Reboot | Should -Be 'None'
+    $script:ext.Count | Should -Be 0
+  }
+  It 'another stored code is Failed with the code, no retry' {
+    $script:officeData.Finished = $true; $script:officeData.ExitCode = 17002
+    (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office setup exit 17002'; $script:ext.Count | Should -Be 0
+  }
+  It 'no code but the product is installed is Done' {
+    $script:officeData.Finished = $true
+    $script:regRead[$script:releaseKey] = @{ ProductReleaseIds = 'O365BusinessRetail' }
+    (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office installed'
+    $script:ext.Count | Should -Be 0
+  }
+  It 'no code, not installed, no process: one foreground install, recorded before it starts' {
+    $script:officeData.Finished = $true; $script:existing = @($script:odt)
+    Mock Invoke-External { $script:triedSeen = $script:ctx.State.Steps['office-finish'].Data.ForegroundTried; @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+    (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office installed'; $script:triedSeen | Should -BeTrue
+    Should -Invoke Save-RunState -Times 1 -Exactly
+    Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter { $ArgumentList -like '/configure*' }
+  }
+  It 'a foreground install that fails is its Failed' {
+    $script:officeData.Finished = $true; $script:existing = @($script:odt); $script:configureCode = 1603
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Office setup exit 1603'
+    $script:ctx.State.Steps['office-finish'].Data.ForegroundTried | Should -BeTrue
+  }
+  It 'a second time without a code is Failed and never retries again' {
+    $script:officeData.Finished = $true; $script:ctx.State.Steps['office-finish'].Data = @{ ForegroundTried = $true }
+    (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office setup did not complete'; $script:ext.Count | Should -Be 0
+  }
+  It 'nothing to finish when office did not start' {
+    $script:ctx.State.Steps.office.Status = 'Failed'; $script:ctx.State.Steps.office.Data = @{}
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Nothing to finish: Microsoft 365 was not started'
+  }
+  It 'already installed Office is Done without waiting' {
+    $script:ctx.State.Steps.office.Data = @{}
+    (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office already installed'; Should -Invoke Get-Process -Times 0
+    $script:polls | Should -Be 0
   }
 }
 

@@ -28,6 +28,7 @@ Describe 'config.json' {
     $cfg.apps.office.products.HOME | Should -Be 'O365HomePremRetail'
     $cfg.apps.office.languages[0] | Should -Be 'he-il'
   }
+  It 'excludes every Office app except Word, Excel, PowerPoint, classic Outlook and OneNote' { @($cfg.apps.office.excludeApps) | Should -Be @('Access','Publisher','Teams','OneDrive','Groove','Lync','Bing','OutlookForWindows') }
   It 'never removes a protected package' {
     foreach ($r in $cfg.bloatware.remove) { foreach ($p in $cfg.bloatware.protect) { $r | Should -Not -BeLike $p } }
   }

@@ -1,6 +1,6 @@
 ﻿# tests/Runner.Tests.ps1
 BeforeAll {
-  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','State\State','Engine\Reboot','Engine\Runner') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','Common\Process','State\State','Engine\Reboot','Engine\Runner','Steps\Office') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Ctx([string[]]$plan) {
     $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null
     $st = New-RunState -Machine @{} -Choices @{} -Plan $plan -Version 'v'
@@ -264,6 +264,37 @@ Describe 'Invoke-ControlledReboot' {
     Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 3 s ...' }
     Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Restarting in 1 s ...' }
     Should -Invoke Start-Sleep -Times 3 -Exactly
+  }
+}
+
+# Task 13: every controlled restart first waits for a background Microsoft 365 setup (spec 4.6).
+Describe 'Invoke-ControlledReboot and Office' {
+  It 'waits for Office before counting and restarting' {
+    $script:order = New-Object System.Collections.ArrayList
+    Mock Wait-OfficeBackground { [void]$script:order.Add("wait $($Context.State.RebootCount) $Purpose"); @{ Outcome = 'Exited'; ExitCode = 0 } }
+    $c = New-Ctx @('office'); Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { [void]$script:order.Add('restart') } | Should -BeTrue
+    @($script:order) | Should -Be @('wait 0 Restart', 'restart')
+    $c.State.RebootCount | Should -Be 1
+  }
+  It 'never waits when the restart is refused (cap, no resume task)' {
+    Mock Wait-OfficeBackground { @{ Outcome = 'None' } }
+    $c = New-Ctx @('office'); $c.State.RebootCount = 2; Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { } | Should -BeFalse
+    $c2 = New-Ctx @('office'); $c2.State.ResumeTaskMissing = $true; Invoke-ControlledReboot -Context $c2 -CountdownSeconds 0 -RestartAction { } | Should -BeFalse
+    Should -Invoke Wait-OfficeBackground -Times 0 -Exactly
+  }
+  It 'still restarts after Office was killed at its deadline' { Mock Wait-OfficeBackground { @{ Outcome = 'Killed' } }; $script:restarts = 0; $c = New-Ctx @('office'); Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { $script:restarts++ } | Should -BeTrue; $script:restarts | Should -Be 1 }
+  It 'still restarts when the Office wait fails unexpectedly' {
+    Mock Wait-OfficeBackground { throw 'unexpected' }; Mock Write-SetupLog { }
+    $script:restarts = 0; $c = New-Ctx @('office')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { $script:restarts++ } | Should -BeTrue
+    $script:restarts | Should -Be 1
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' }
+  }
+  It 'without a background Office the restart does not wait (the real wait is a no-op)' {
+    Mock Wait-SetupDelay { throw 'must not wait' }; Mock Get-Process { throw 'must not look' }
+    $script:restarts = 0; $c = New-Ctx @('a')
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { $script:restarts++ } | Should -BeTrue
+    $script:restarts | Should -Be 1
   }
 }
 

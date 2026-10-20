@@ -6,7 +6,7 @@ BeforeAll {
   function P($brand, $mode, $z = $true, $o = 'BUSINESS') { Get-StepPlan -Machine @{Brand=$brand} -Choices @{Mode=$mode;SevenZip=$z;Office=$o} -Config $cfg }
 }
 Describe 'StepCatalog' {
-  It 'lists the 18 steps in spec order with their titles and functions' {
+  It 'lists the 19 steps in spec order with their titles and functions' {
     $rows = @($script:StepCatalog | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Title, $_.Function })
     $rows | Should -Be @(
       'prepare|Prepare machine|Invoke-StepPrepare'
@@ -19,10 +19,11 @@ Describe 'StepCatalog' {
       'chrome|Google Chrome|Invoke-StepChrome'
       'anydesk|AnyDesk|Invoke-StepAnyDesk'
       '7zip|7-Zip|Invoke-StepSevenZip'
-      'office|Microsoft 365|Invoke-StepOffice'
       'default-browser|Chrome as default browser|Invoke-StepDefaultBrowser'
       'vendor-pass1|Vendor drivers + BIOS (pass 1)|Invoke-StepVendorPass1'
+      'office|Microsoft 365|Invoke-StepOffice'
       'windows-update|Windows Update|Invoke-StepWindowsUpdate'
+      'office-finish|Microsoft 365 (finish)|Invoke-StepOfficeFinish'
       'vendor-pass2|Vendor drivers + BIOS (pass 2)|Invoke-StepVendorPass2'
       'consumer-app|Vendor app|Invoke-StepConsumerApp'
       'vendor-cleanup|Remove business updater|Invoke-StepVendorCleanup'
@@ -35,8 +36,8 @@ Describe 'StepCatalog' {
     @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
       'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons'
       'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', '7zip|7-Zip'
-      'office|Microsoft 365', 'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'windows-update|Windows Update'
-      'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
+      'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'office|Microsoft 365', 'windows-update|Windows Update'
+      'office-finish|Microsoft 365', 'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
     )
   }
 }
@@ -52,12 +53,13 @@ Describe 'Test-HasDriverTool' {
   }
 }
 Describe 'Get-StepPlan' {
-  It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,office,default-browser,vendor-pass1,windows-update,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
+  It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,default-browser,vendor-pass1,office,windows-update,office-finish,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
   It 'Dell desktop: vendor passes, no consumer app, no cleanup' { $p = P DELL DESKTOP; $p | Should -Contain 'vendor-pass1'; $p | Should -Not -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-cleanup' }
   It 'ASUS laptop: consumer app only' { $p = P ASUS LAPTOP; $p | Should -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-pass1'; $p | Should -Not -Contain 'vendor-cleanup' }
   It 'custom desktop: no vendor steps' { (P OTHER DESKTOP) -match 'vendor|consumer' | Should -BeNullOrEmpty }
   It 'VM in laptop mode: still no vendor steps' { (P VM LAPTOP) -match 'vendor|consumer' | Should -BeNullOrEmpty }
-  It 'toggles off' { $p = P DELL LAPTOP $false 'OFF'; $p | Should -Not -Contain '7zip'; $p | Should -Not -Contain 'office' }
+  It 'toggles off' { $p = P DELL LAPTOP $false 'OFF'; $p | Should -Not -Contain '7zip'; $p | Should -Not -Contain 'office'; $p | Should -Not -Contain 'office-finish' }
+  It 'office-finish comes with office, right after windows-update' { $p = @(P ASUS LAPTOP); $p.IndexOf('office-finish') | Should -Be ($p.IndexOf('windows-update') + 1); $p.IndexOf('office') | Should -Be ($p.IndexOf('windows-update') - 1) }
   It 'a brand with no vendors entry does not throw (SAMSUNG laptop)' {
     { P SAMSUNG LAPTOP } | Should -Not -Throw
     $p = P SAMSUNG LAPTOP; $p | Should -Not -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-pass1'
@@ -77,22 +79,22 @@ Describe 'Get-StepPlan' {
   }
   It 'emits the ids as plain strings (not one wrapped array)' {
     $p = P DELL LAPTOP
-    $p.Count | Should -Be 18
-    $p[0] | Should -BeOfType [string]; $p[0] | Should -Be 'prepare'; $p[17] | Should -Be 'finalize'
+    $p.Count | Should -Be 19
+    $p[0] | Should -BeOfType [string]; $p[0] | Should -Be 'prepare'; $p[18] | Should -Be 'finalize'
   }
   It 'the id list survives the caller patterns: @(), foreach, pipeline, New-RunState -Plan' {
     $m = @{Brand='DELL'}; $c = @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'}
-    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg).Count | Should -Be 18
+    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg).Count | Should -Be 19
     @(Get-StepPlan -Machine $m -Choices $c -Config $cfg)[0] | Should -Be 'prepare'
     $seen = 0; foreach ($id in Get-StepPlan -Machine $m -Choices $c -Config $cfg) { $seen++ }
-    $seen | Should -Be 18
-    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg | ForEach-Object { $_ }).Count | Should -Be 18
+    $seen | Should -Be 19
+    @(Get-StepPlan -Machine $m -Choices $c -Config $cfg | ForEach-Object { $_ }).Count | Should -Be 19
     $state = New-RunState -Machine @{} -Choices $c -Plan (Get-StepPlan -Machine $m -Choices $c -Config $cfg) -Version 'v'
-    @($state.Plan).Count | Should -Be 18
+    @($state.Plan).Count | Should -Be 19
     $state.Plan[0] | Should -Be 'prepare'
-    $state.Steps.Count | Should -Be 18
+    $state.Steps.Count | Should -Be 19
   }
-  It 'Office HOME keeps the office step' { (P DELL LAPTOP $true 'HOME') | Should -Contain 'office' }
+  It 'Office HOME keeps the office step' { (P DELL LAPTOP $true 'HOME') | Should -Contain 'office'; (P DELL LAPTOP $true 'HOME') | Should -Contain 'office-finish' }
 }
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'

@@ -10,6 +10,11 @@
 #
 # Title is what the verdict and the report print; Short (at most 20 characters) is what the progress
 # screen's checklist and NOW line print (v2 spec 4.2).
+#
+# Microsoft 365 (v2 spec 4.6): office starts setup.exe in the background right after vendor-pass1, so
+# every Windows Installer install and every restart a vendor tool forces happen before it; it runs
+# alongside Windows Update round 1. office-finish, right after windows-update, collects its result. The
+# progress screen folds office-finish into the office line.
 $script:StepCatalog = @(
   @{ Id = 'prepare';         Title = 'Prepare machine';                 Short = 'Prepare';              Function = 'Invoke-StepPrepare' }
   @{ Id = 'bitlocker';       Title = 'Turn off BitLocker';              Short = 'BitLocker off';        Function = 'Invoke-StepBitLocker' }
@@ -21,10 +26,11 @@ $script:StepCatalog = @(
   @{ Id = 'chrome';          Title = 'Google Chrome';                   Short = 'Chrome';               Function = 'Invoke-StepChrome' }
   @{ Id = 'anydesk';         Title = 'AnyDesk';                         Short = 'AnyDesk';              Function = 'Invoke-StepAnyDesk' }
   @{ Id = '7zip';            Title = '7-Zip';                           Short = '7-Zip';                Function = 'Invoke-StepSevenZip' }
-  @{ Id = 'office';          Title = 'Microsoft 365';                   Short = 'Microsoft 365';        Function = 'Invoke-StepOffice' }
   @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Short = 'Default browser';      Function = 'Invoke-StepDefaultBrowser' }
   @{ Id = 'vendor-pass1';    Title = 'Vendor drivers + BIOS (pass 1)';  Short = 'Drivers (pass 1)';     Function = 'Invoke-StepVendorPass1' }
+  @{ Id = 'office';          Title = 'Microsoft 365';                   Short = 'Microsoft 365';        Function = 'Invoke-StepOffice' }
   @{ Id = 'windows-update';  Title = 'Windows Update';                  Short = 'Windows Update';       Function = 'Invoke-StepWindowsUpdate' }
+  @{ Id = 'office-finish';   Title = 'Microsoft 365 (finish)';          Short = 'Microsoft 365';        Function = 'Invoke-StepOfficeFinish' }
   @{ Id = 'vendor-pass2';    Title = 'Vendor drivers + BIOS (pass 2)';  Short = 'Drivers (pass 2)';     Function = 'Invoke-StepVendorPass2' }
   @{ Id = 'consumer-app';    Title = 'Vendor app';                      Short = 'Laptop app';           Function = 'Invoke-StepConsumerApp' }
   @{ Id = 'vendor-cleanup';  Title = 'Remove business updater';         Short = 'Remove updater';       Function = 'Invoke-StepVendorCleanup' }
@@ -76,6 +82,7 @@ function Get-StepPlan {
   .DESCRIPTION
     Vendor passes: DELL/LENOVO/HP only. Vendor app: laptop mode and a configured consumerApp.
     Business-updater cleanup: laptop mode and DELL/LENOVO/HP. A VM never gets a vendor step.
+    office and office-finish: both, or (Office OFF) neither.
     The mode comes from Choices (what the technician picked), never from Machine.IsLaptop.
     The ids are emitted one by one, the normal PowerShell way, so `foreach`, the pipeline, `@(...)` and
     a `[string[]]` parameter such as New-RunState -Plan all see every id. A real plan always has at
@@ -105,6 +112,7 @@ function Get-StepPlan {
       'vendor-cleanup' { $isLaptopMode -and $hasBusinessTool }
       '7zip'           { [bool]$Choices['SevenZip'] }
       'office'         { $Choices['Office'] -ne 'OFF' }
+      'office-finish'  { $Choices['Office'] -ne 'OFF' }
       default          { $true }
     }
     if ($include) { $plan.Add($step.Id) }

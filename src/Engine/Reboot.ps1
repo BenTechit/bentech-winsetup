@@ -97,8 +97,12 @@ function Invoke-ControlledReboot {
     the state is saved, an ERROR is logged and $false is returned. RebootCapHit stays as it was,
     so the runner reports 'restart failed' and carries on.
     At or above Config.caps.maxReboots: sets State.RebootCapHit, saves, logs a WARN and returns
-    $false without restarting. Otherwise: increments State.RebootCount and saves *before* anything
-    else, so a restart that happens sooner than expected still counts against the cap; then adds
+    $false without restarting. A refused restart never waits for Office.
+    Otherwise it first waits for a background Microsoft 365 setup that is still running
+    (Wait-OfficeBackground -Purpose Restart, up to Office's deadline; at the deadline Office is killed
+    and its result recorded for office-finish). The restart is never refused because of Office.
+    Then it increments State.RebootCount and saves before anything else, so a restart that happens
+    sooner than expected still counts against the cap; then adds
     "Restarting (restart <RebootCount>)" to the activity feed, logs, shows "Restarting in N s ..."
     once per second (only when CountdownSeconds is above 0) and calls RestartAction.
     A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
@@ -144,6 +148,13 @@ function Invoke-ControlledReboot {
     Save-RunState -State $runState -Root $Context.Root
     Write-SetupLog -Level WARN -Message 'Reboot cap reached; not restarting' -Data @{ rebootCount = $rebootCount; maxReboots = $maxReboots }
     return $false
+  }
+
+  # Never throws by contract; the catch only makes sure Office can never stop the restart.
+  try {
+    $null = Wait-OfficeBackground -Context $Context -Purpose Restart
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Waiting for Microsoft 365 before the restart failed; restarting anyway' -Data @{ error = $_.Exception.Message }
   }
 
   $runState.RebootCount = $rebootCount + 1

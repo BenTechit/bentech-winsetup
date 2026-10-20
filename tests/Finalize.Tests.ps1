@@ -966,6 +966,40 @@ Describe 'Complete-SetupFinalization on its own (ruling R26)' {
   }
 }
 
+# Task 13: Phase A restores the power settings and Phase B deletes Downloads\ (the ODT and office.xml), so
+# neither may race a Microsoft 365 setup still running in the background.
+Describe 'Finalize waits for a background Microsoft 365 (Task 13)' {
+  BeforeEach { Initialize-FinalizeMocks; $script:order = New-Object System.Collections.ArrayList }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+
+  It 'waits for a live background Office first, in the step and in Complete-SetupFinalization (R26)' {
+    Mock Wait-OfficeBackground { [void]$script:order.Add('office'); @{ Outcome = 'None' } }
+    Mock Restore-FinalPowerSettings { [void]$script:order.Add('restore'); $true }
+    Mock Invoke-WindowsActivation { [void]$script:order.Add('activate'); 'NotNeeded' }
+    Mock Test-ChromeInstalled { [void]$script:order.Add('chrome'); $true }
+
+    $null = Invoke-StepFinalize -Context (New-FinalizeContext)   # Phase A
+    @($script:order)[0..1] | Should -Be @('office', 'restore')
+
+    $script:order.Clear()   # the R26 path: Phase A never ran
+    $ctx = New-FinalizeContext; $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $null = Complete-SetupFinalization -Context $ctx
+    @($script:order)[0..1] | Should -Be @('office', 'activate')
+
+    $script:order.Clear()   # Phase B after the final restart (through the step it waits twice; the second is a no-op)
+    $null = Complete-SetupFinalization -Context (New-FinalizeContext -PhaseB)
+    @($script:order)[0..1] | Should -Be @('office', 'chrome')
+
+    Should -Invoke Wait-OfficeBackground -ParameterFilter { $Purpose -eq 'Finish' }
+    Should -Invoke Wait-OfficeBackground -Times 0 -Exactly -ParameterFilter { $Purpose -ne 'Finish' }
+  }
+  It 'without a background Office the real wait does nothing' {
+    Mock Wait-SetupDelay { throw 'must not wait' }; Mock Get-Process { throw 'must not look' }
+    $ctx = New-FinalizeContext -PhaseB
+    (Invoke-StepFinalize -Context $ctx).Status | Should -Be 'Done'
+  }
+}
+
 Describe 'Invoke-StepFinalize through the runner' {
   BeforeEach { Initialize-FinalizeMocks }
   AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }

@@ -25,7 +25,8 @@
       "odtFallbackPage": "https://www.microsoft.com/en-us/download/details.aspx?id=49117",
       "odtLinkPattern": "https://download\\.microsoft\\.com/download/[^\"' ]+/officedeploymenttool_[0-9-]+\\.exe",
       "products": { "BUSINESS": "O365BusinessRetail", "HOME": "O365HomePremRetail" },
-      "languages": ["he-il", "en-us"], "excludeApps": ["Groove", "Lync"], "channel": "Current", "edition": "64"
+      "languages": ["he-il", "en-us"], "channel": "Current", "edition": "64",
+      "excludeApps": ["Access", "Publisher", "Teams", "OneDrive", "Groove", "Lync", "Bing", "OutlookForWindows"]
     }
   },
   "vendors": {
