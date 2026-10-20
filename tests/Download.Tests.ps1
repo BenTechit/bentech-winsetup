@@ -413,6 +413,29 @@ Describe 'Test-FileSignature' {
       Use-FakeSignature 'Valid' (New-DerSubject $Spec)
       Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
     }
+    # Fix round C-R7: -ceq is culture-aware and ignores invisible characters; the CN is compared ordinally
+    # and a subject with any character outside printable ASCII (0x20-0x7E) is refused.
+    It 'rejects (DER) a CN with U+<Hex> <Where>' -ForEach @(
+      foreach ($code in 0x00AD, 0x034F, 0x200C, 0x200D, 0x2060, 0xFEFF) {
+        $ch = [string][char]$code
+        @{ Hex = '{0:X4}' -f $code; Where = 'at the end'; Cn = 'Learning Machines Inc' + $ch }
+        @{ Hex = '{0:X4}' -f $code; Where = 'inside';     Cn = 'Learning' + $ch + ' Machines Inc' }
+      }
+    ) {
+      Use-FakeSignature 'Valid' (New-DerSubject ('C=US|O=Learning Machines Inc|CN=' + $Cn))
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
+    }
+    It 'rejects (DER) <Why>' -ForEach @(
+      @{ Why = 'a NEL (U+0085) in another value';     Spec = "C=US|O=a$([char]0x85)b|CN=Learning Machines Inc" }
+      @{ Why = 'a NEL (U+0085) at the end of the CN'; Spec = "C=US|CN=Learning Machines Inc$([char]0x85)" }
+      @{ Why = 'a non-ASCII letter in another value'; Spec = "C=US|L=Montr$([char]0xE9)al|CN=Learning Machines Inc" }
+      # These two fold to ASCII 'k' and 'i' under a case-insensitive match, so the check must be -cmatch.
+      @{ Why = 'a Kelvin sign (U+212A) in another value'; Spec = "C=US|L=$([char]0x212A)elvin|CN=Learning Machines Inc" }
+      @{ Why = 'a dotted capital I (U+0130) in another value'; Spec = "C=US|L=$([char]0x0130)stanbul|CN=Learning Machines Inc" }
+    ) {
+      Use-FakeSignature 'Valid' (New-DerSubject $Spec)
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
+    }
     It 'logs the subject and the CN it read when it rejects' {
       Use-FakeSignature 'Valid' 'CN=Learning Machines Incorporated, C=US'
       $d = Join-Path $TestDrive 'siglog4'

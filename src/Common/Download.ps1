@@ -231,12 +231,16 @@ function Get-CertificateCommonName {
     between RDNs and ' + ' between the attributes of a multi-valued RDN. Windows puts a value in quotes
     when it holds a comma, a plus, '=', ';', '<', '>', '#' first, a quote, a line break or an edge space,
     but not a tab or another control character (seen on .NET Framework 4.8, fix round C-R6). So:
-      - any '"' or control character in the subject is $null: a quoted value could hold a fake
-        'CN=...' after a line break (final re-review N1), and nothing usual needs either;
-      - with neither, ', ' and ' + ' can only be separators, so every attribute is one piece and every CN
-        is counted, also one inside a multi-valued RDN (O=Evil + CN=...); exactly one is required;
-      - Windows' own reading must agree: GetNameInfo(SimpleName) must equal that CN. (SimpleName alone is
-        not enough: with no CN it falls back to the OU= or O= value, and with two CNs it picks one.)
+      - a subject with any '"', or with any character outside printable ASCII (0x20-0x7E: a control
+        character of any kind, NEL, an invisible one such as U+00AD, U+200C or U+FEFF, a letter with an
+        accent), is $null. A quoted value could hold a fake 'CN=...' after a line break (final re-review
+        N1), an invisible character makes a look-alike name (C-R7), and the expected subject needs neither.
+        The test is -cmatch: a case-insensitive match folds U+212A (Kelvin sign) and U+0130 to ASCII;
+      - with no quote, ', ' and ' + ' can only be separators, so every attribute is one piece and every
+        CN is counted, also one inside a multi-valued RDN (O=Evil + CN=...); exactly one is required;
+      - Windows' own reading must agree: GetNameInfo(SimpleName) must equal that CN, compared ordinally.
+        (SimpleName alone is not enough: with no CN it falls back to the OU= or O= value, and with two
+        CNs it picks one.)
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -245,11 +249,11 @@ function Get-CertificateCommonName {
   try {
     if ($null -eq $Certificate -or $null -eq $Certificate.SubjectName) { return $null }
     $subject = [string]$Certificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::None)
-    if ([string]::IsNullOrEmpty($subject) -or $subject.Contains('"') -or $subject -match '[\x00-\x1F\x7F]') { return $null }
+    if ([string]::IsNullOrEmpty($subject) -or $subject.Contains('"') -or $subject -cmatch '[^\x20-\x7E]') { return $null }
     $names = @(($subject -split ', | \+ ') | Where-Object { $_ -clike 'CN=*' } | ForEach-Object { $_.Substring(3) })
     if ($names.Count -ne 1) { return $null }
     $simpleName = [string]$Certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-    if ($simpleName -cne $names[0]) { return $null }
+    if (-not [string]::Equals($simpleName, $names[0], [StringComparison]::Ordinal)) { return $null }
     return [string]$names[0]
   } catch {
     return $null
@@ -272,9 +276,11 @@ function Test-FileSignature {
     signer is ignored, so a bad config entry cannot allow everything.
 
     -ExactCN (the Craft MSIs, final review I1): the subject must hold exactly one CN, and its value
-    must equal an allowed signer, case-sensitively (-ceq): 'CN=Learning Machines Inc.' or the name in
-    O= only is refused. Without it the match stays a substring of the subject, for the vendors, until
-    their real subjects are recorded (v1 R32).
+    must equal an allowed signer ordinally, character by character ([string]::Equals Ordinal, C-R7;
+    -ceq is culture-aware and ignores invisible characters): 'CN=Learning Machines Inc.' or the name in
+    O= only is refused, and so is any subject Get-CertificateCommonName finds unusual (a quote, or a
+    character outside printable ASCII). Without it the match stays a substring of the subject, for the
+    vendors, until their real subjects are recorded (v1 R32).
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -306,7 +312,7 @@ function Test-FileSignature {
     foreach ($signer in $AllowedSigners) {
       if ([string]::IsNullOrWhiteSpace($signer)) { continue }
       if ($ExactCN) {
-        if ($null -ne $commonName -and $commonName -ceq $signer) { return $true }
+        if ($null -ne $commonName -and [string]::Equals($commonName, $signer, [StringComparison]::Ordinal)) { return $true }
       } elseif ($subject -like ('*CN=' + [Management.Automation.WildcardPattern]::Escape($signer) + '*')) {
         return $true
       }
