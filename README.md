@@ -1,10 +1,10 @@
 # bentech-winsetup
 
-Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool` and a few empty policy keys).
+Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool`, only after Microsoft 365, and a few empty policy keys).
 
 The launcher (`BenTechSetup.cmd`) is tiny and rarely changes. It downloads the newest signed `setup.ps1` and `config.json` from this repo's latest GitHub Release, verifies the signatures against the public key built into the launcher, and only then runs them. Updating the tool means publishing a release, never re-copying a file to the USB stick (usually; see [Publishing](#publishing-a-new-version)).
 
-Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md) and [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
+Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first) and, for the free Craft office suite that is now the default, [docs/specs/2026-10-20-craft-apps-design.md](docs/specs/2026-10-20-craft-apps-design.md) (it amends both). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md), [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md) and [docs/superpowers/plans/2026-10-20-craft-apps.md](docs/superpowers/plans/2026-10-20-craft-apps.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
 
 ## What it does
 
@@ -19,14 +19,15 @@ In this order (steps that don't apply to the machine are left out):
 7. **winget** ready (installs App Installer if missing).
 8. **Google Chrome** and **AnyDesk** (always; no unattended password, the customer accepts every connection).
 9. **7-Zip**, optional.
-10. **Chrome as default browser** (best effort). After the final restart Windows may take a while to apply it, so the end of the run waits up to 2 minutes for it before checking.
-11. **Vendor drivers + BIOS, pass 1** for Dell, Lenovo and HP (laptops and brand-name desktops).
-12. **Microsoft 365** (Hebrew + English), optional. It **starts here and installs in the background** while Windows Update round 1 runs. Only **Word, Excel, PowerPoint, Outlook (classic) and OneNote** are installed. A restart waits for it, for at most 60 minutes.
-13. **Windows Update** in rounds, **one update at a time**, with reboots, until the search comes back empty (capped). Driver updates are installed even when they ask for input; firmware updates only on mains power.
-14. **Microsoft 365, finish**: collects the result of the background install (this step has no line of its own on the screen) and puts **Word, Excel, PowerPoint and Outlook shortcuts on the desktop of all users**, also when Office was already installed.
-15. **Vendor drivers + BIOS, pass 2**, for what only became applicable after Windows Update.
-16. **Vendor consumer app** on laptops (SupportAssist, Vantage, HP Support Assistant, MyASUS, ...). When `config.json` says how to recognise the app (`verify`, see [Changing apps and lists](#changing-apps-and-lists)), the step checks that the app is really there after winget reports success, and fails if it is not. Then the business updater is removed if the consumer app installed.
-17. **Finalize**: final power settings, an attempt to activate Windows when it has a product key but is not activated, the final restart, cleanup, `Setup-Report.txt`, the final screen.
+10. **Craft apps** (Office CRAFT, the default): installs **WordCraft, GridCraft, DeckCraft and PdfCraft**, the free Word, Excel, PowerPoint and PDF reader, and then the **ArtCraft Launcher**, which keeps them up to date. Each one comes from the latest GitHub release of its project: the MSI for the PC's processor (x64, arm64 or x86), checked against the release's `SHA256SUMS.txt` and against the `Learning Machines Inc` signature before it runs, and skipped when the installed version is already current. GitHub allows 60 lookups an hour per IP and a laptop needs 5; when GitHub says no, the step waits 60 s and tries that item once more, and then reports `GitHub busy - try again later`. The step adds desktop shortcuts named `Word`, `Excel`, `PowerPoint` and `PDF Reader` for **all users**, and `ArtCraft Launcher` for the **signed-in user**. It never overwrites or deletes a shortcut: a shortcut with that name that is already on either desktop stays as it is, and when it cannot tell which Start-menu shortcut belongs to an app it makes none and adds a yellow note. The Craft apps are alpha, so a PC that must have Microsoft 365 is one key press away (**O** on the start screen).
+11. **Chrome as default browser** (best effort). After the final restart Windows may take a while to apply it, so the end of the run waits up to 2 minutes for it before checking.
+12. **Vendor drivers + BIOS, pass 1** for Dell, Lenovo and HP (laptops and brand-name desktops).
+13. **Microsoft 365** (Hebrew + English), with Office BUSINESS or HOME. It **starts here and installs in the background** while Windows Update round 1 runs. Only **Word, Excel, PowerPoint, Outlook (classic) and OneNote** are installed. A restart waits for it, for at most 60 minutes.
+14. **Windows Update** in rounds, **one update at a time**, with reboots, until the search comes back empty (capped). Driver updates are installed even when they ask for input; firmware updates only on mains power.
+15. **Microsoft 365, finish**, with Office BUSINESS or HOME: collects the result of the background install (this step has no line of its own on the screen) and puts **Word, Excel, PowerPoint and Outlook shortcuts on the desktop of all users**, also when Office was already installed.
+16. **Vendor drivers + BIOS, pass 2**, for what only became applicable after Windows Update.
+17. **Vendor consumer app** on laptops (SupportAssist, Vantage, HP Support Assistant, MyASUS, ...). When `config.json` says how to recognise the app (`verify`, see [Changing apps and lists](#changing-apps-and-lists)), the step checks that the app is really there after winget reports success, and fails if it is not. Then the business updater is removed if the consumer app installed.
+18. **Finalize**: final power settings, an attempt to activate Windows when it has a product key but is not activated, the final restart, cleanup, `Setup-Report.txt`, the final screen.
 
 ## Daily use
 
@@ -45,7 +46,7 @@ In this order (steps that don't apply to the machine are left out):
       Type     LAPTOP (driver tool + laptop app)        L = laptop   D = desktop
       Chrome + AnyDesk   always
       7-Zip    YES                                      Z = yes / no
-      Office   BUSINESS (Hebrew + English)              O = off / business / home
+      Office   CRAFT (free Word/Excel/PowerPoint/PDF)   O = craft / 365 / off
 
       Starts by itself in 30 s   ####################
       ENTER = start now           ESC = cancel, change nothing
@@ -54,6 +55,7 @@ In this order (steps that don't apply to the machine are left out):
 
    - **Top block:** the PC (make, model, serial number `SN`), whether it is on its charger or on battery, and the name it will get.
    - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app; a brand-name desktop gets the driver tool but no laptop app; a brand with no driver tool (ASUS, a VM) gets no driver tool and the line says `no driver tool for this brand` (an ASUS laptop still gets its laptop app, MyASUS; a VM gets neither). Chrome and AnyDesk always get installed.
+   - **Office:** the default is **CRAFT**, the free Craft apps (WordCraft, GridCraft, DeckCraft, PdfCraft and the ArtCraft Launcher; see "What it does", item 10). They are alpha, so Microsoft 365 is one key press away: **O** goes to BUSINESS, then HOME (both install Microsoft 365), then OFF, then back to CRAFT. The tool installs one suite or the other, never both.
    - **Colours:** on a black screen, the value of each choice is green (yes / on) or dark grey (`NO` / `OFF`); a yellow line is a warning.
    - **The countdown:** `Starts by itself in N s` and a bar that empties. **Every key you press restarts it at 30 s**, also a key that does nothing (Space, F5, ...), so the run starts by itself only when nobody touches the keyboard.
 
@@ -61,7 +63,7 @@ In this order (steps that don't apply to the machine are left out):
    |---|---|
    | `L` / `D` | Laptop / Desktop mode (auto-detected; a VM defaults to Desktop) |
    | `Z` | 7-Zip on/off |
-   | `O` | Office cycles OFF, BUSINESS, HOME |
+   | `O` | Office cycles CRAFT (the default), BUSINESS, HOME, OFF. CRAFT is the free Craft apps; BUSINESS and HOME are Microsoft 365 (Hebrew + English) |
    | `Enter` | Start now |
    | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing of setup's own is left. If an earlier run left its state, Esc deletes nothing: its logs stay for diagnosis |
    | any other key | Nothing changes, but the countdown goes back to 30 s |
@@ -115,7 +117,7 @@ Everything the run is doing is on one screen, redrawn about once a second while 
   12:30  Rename PC skipped - already named DELL-ABC1234
 ```
 
-(The names, times and counts in this example are made up.)
+(The names, times and counts in this example are made up, and it is a run with Office BUSINESS. With CRAFT the checklist has one `Craft apps` line right after `7-Zip` and no Microsoft 365 line, NOW reads for example `Craft apps - WordCraft 0.8.0: downloading`, and JUST HAPPENED gets one line per app, for example `WordCraft 0.8.0 installed - desktop shortcut: Word` or `PdfCraft 0.9.0 already up to date`.)
 
 - **Header:** the total time since the run started, how many times the PC restarted, and a **spinner** (`| / - \`) that turns on every redraw (in the example above it is the `/` in the first line, between `do not turn off` and `Total`; the `/` in the NOW line is only a separator). The spinner and the timers moving is the sign of life: if they stand still for more than a couple of minutes, something is probably stuck, and `Logs\setup.log` shows the last thing it did. (A few short waits, such as starting the Dell service, can stand still for up to a minute.)
 - **Checklist:** one line per step of this run, in order, in as many columns as fit. The whole screen is on a black background. Markers: `[OK]` done (green), `[>>]` running (cyan), `[X ]` failed (red), `[--]` skipped (dark grey), `[..]` still to do (plain). The reason of a failed or skipped step is not here; it is in JUST HAPPENED.
@@ -130,7 +132,7 @@ The final screen is white text on dark green (GREEN), **black text on yellow** (
 | Colour | Banner | Meaning |
 |---|---|---|
 | GREEN | `SETUP COMPLETE` | Every step done, no notes. |
-| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated (or its status could not be read), BitLocker still decrypting, Windows 10 (no security updates), a Lenovo result that could not be verified, BIOS or firmware updates left alone because the PC was on battery, the Office desktop shortcuts or the power settings or the resume task that could not be put back. |
+| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated (or its status could not be read), BitLocker still decrypting, Windows 10 (no security updates), a Lenovo result that could not be verified, BIOS or firmware updates left alone because the PC was on battery, the Office or Craft desktop shortcuts, the ArtCraft Launcher (the apps work without it), the power settings or the resume task that could not be put back. |
 | RED | `COMPLETED WITH ERRORS` | A step failed or never finished, a Windows update failed repeatedly (`left to Windows Update`: setup hid it during the run and un-hid it at the end; one it could not un-hide says `Windows update still hidden: ... - un-hide it in Windows Update`), a cap was hit (reboots or update rounds), the drive is still encrypted, or a restart was refused. |
 
 The final screen lists at most 3 failures and 2 notes, each with a one-line reason, then `... and N more: see the report`. The report lists them all.
@@ -151,7 +153,7 @@ The final screen lists at most 3 failures and 2 notes, each with a one-line reas
 
 `Downloads\`, the pinned `setup.ps1` and `config.json` are deleted when Finalize ends. `Logs\` and `state.json` stay until you press Enter on the final screen.
 
-**After a finished run** nothing of setup's own is left in `C:\BenTech`: Enter on the final screen copied the whole `Logs\` folder (and `state.json`, as `state-final.json`) to the USB stick, to `<stick>\BenTech-Logs\<PC name>\`, and deleted `C:\BenTech`. Read the report and the logs there. What setup does not remove (`C:\Program Files\OfficeDeploymentTool`, a few empty policy keys) is listed in [docs/testing.md](docs/testing.md) section 5. (With no stick, they are gone: see step 5 of [Daily use](#daily-use).)
+**After a finished run** nothing of setup's own is left in `C:\BenTech`: Enter on the final screen copied the whole `Logs\` folder (and `state.json`, as `state-final.json`) to the USB stick, to `<stick>\BenTech-Logs\<PC name>\`, and deleted `C:\BenTech`. Read the report and the logs there. What setup does not remove (`C:\Program Files\OfficeDeploymentTool` after Microsoft 365, a few empty policy keys) is listed in [docs/testing.md](docs/testing.md) section 5. (With CRAFT, the default, no `OfficeDeploymentTool` folder is left at all. With no stick, the logs are gone: see step 5 of [Daily use](#daily-use).)
 
 **While `C:\BenTech` exists, open the logs with R on the final screen or from an elevated prompt** (for example `notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal). Never browse to `C:\BenTech` in Explorer: its "You don't currently have permission... Continue" button adds your own account to the folder's permissions, and the next run then refuses the folder with exit code 5 (it is no longer admin-only), so you would have to delete it, logs included.
 
@@ -286,6 +288,16 @@ Edit it, run the tests (they check that the remove and protect lists don't overl
 Settings worth knowing:
 
 - **`windowsUpdate.installMode`**: `"OneAtATime"` (the default) downloads and installs each Windows update on its own, so the screen shows `Installing 3 of 7`; `"Batch"` is the v1 way, all updates in one go, and the screen then shows only the phase and the list. Switch to `"Batch"` if one at a time turns out too slow on a machine. The round limit (`timeoutsMinutes.wuRound`, 90 minutes) and the round cap (`caps.maxWuRounds`) apply to both.
+- **`apps.craft`** (with **`signers.craft`**): the Craft apps, installed in the order of `items` (the four apps, then the launcher). Each item has these fields:
+  - `name`: shown on screen and in the report;
+  - `repo`: the GitHub `owner/name` whose latest release holds the MSI;
+  - `assetPrefix`: the release's installer is `<assetPrefix>-<version>-windows-<x64|arm64|x86>.msi`, and exactly one asset may match (two matches install nothing);
+  - `displayName`: a regex for the program's `DisplayName` under Uninstall. It finds the installed version, so the report lists the app and a second run skips it as `already up to date`;
+  - `startMenuName`: a regex for the program's Start-menu shortcut names. The shortcut named exactly like the app wins, else a single match is used, and two or more loose matches give no shortcut and a yellow note;
+  - `shortcut`: the name of the desktop shortcut (`Word`, `Excel`, `PowerPoint`, `PDF Reader`);
+  - `launcher` (only on the ArtCraft Launcher): `true` puts its shortcut on the signed-in user's desktop instead of the public one, and its failure is a yellow note instead of a red failure.
+
+  **`displayName` and `startMenuName` are best guesses** (`^WordCraft` and so on) until [docs/testing.md](docs/testing.md) section 1.17 confirms the real names on a laptop: if the report lacks a Craft app's version, or a desktop shortcut is missing, correct the regex there. `signers.craft` is the company name the MSIs' Authenticode signature must carry (`Learning Machines Inc`). It is matched by name and never by thumbprint, because their certificates live 3 days.
 - **`apps.office.excludeApps`**: the Office apps left out of the install. The default leaves exactly Word, Excel, PowerPoint, Outlook (classic) and OneNote. An id the Office Deployment Tool rejects must be removed from the list. `timeoutsMinutes.office` (60) is how long a background install and a restart waiting for it may take.
 - **`vendors.<BRAND>.consumerApp.verify`** (optional): how the vendor-app step recognises the app after winget reports success.
 
