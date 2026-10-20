@@ -9,8 +9,8 @@
 # Initialize-CraftMocks, which replaces Get-RemoteText, Get-RemoteFile (it writes a placeholder MSI into
 # $TestDrive), Test-FileSignature, Invoke-External, Wait-SetupDelay, Set-SetupNow and Write-SetupLog. The
 # Add-CraftShortcut tests use $TestDrive folders for the desktops and Start menus; the one test that lets it
-# find this PC's real folders mocks Test-Path, Get-ChildItem, Copy-Item and Move-Item first. The step tests
-# mock Install-CraftItem, Add-CraftShortcut, Get-InstalledAppVersions and Add-SetupActivity.
+# find this PC's real folders mocks Test-Path, Get-ChildItem, Copy-CraftShortcutFile and Move-Item first.
+# The step tests mock Install-CraftItem, Add-CraftShortcut, Get-InstalledAppVersions and Add-SetupActivity.
 BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download', 'Config') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Report\Report.ps1"
@@ -425,10 +425,11 @@ Describe 'Add-CraftShortcut' {
     Add-Lnk $pub 'WordCraft' 'msi'; Mock Move-Item { Write-Error 'access denied' }
     { $script:r = S $items[0] } | Should -Not -Throw; $script:r.Status | Should -Be 'Failed'
     Test-Path -LiteralPath (Join-Path $pub 'WordCraft.lnk') | Should -BeTrue; Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } }
-  It 'moves the MSI''s shortcut from the user''s desktop to the public desktop' {
-    Add-Lnk $usr 'PdfCraft' 'msi'; $r = S $items[3]
-    $r.Status | Should -Be 'Renamed'; $r.Path | Should -Be (Join-Path $pub 'PDF Reader.lnk')
-    Test-Path -LiteralPath (Join-Path $usr 'PdfCraft.lnk') | Should -BeFalse }
+  It 'an exact WordCraft.lnk on the user''s desktop is renamed to Word.lnk there, never moved (D6, M3)' {
+    Add-Lnk $usr 'WordCraft' 'msi'; Add-Lnk $menu 'WordCraft' 'start'; $r = S $items[0]
+    $r.Status | Should -Be 'Renamed'; $r.Path | Should -Be (Join-Path $usr 'Word.lnk')
+    [IO.File]::ReadAllText((Join-Path $usr 'Word.lnk')) | Should -Be 'msi'; Test-Path -LiteralPath (Join-Path $usr 'WordCraft.lnk') | Should -BeFalse
+    Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse }
   It 'never copies a folder that happens to match' {
     [void][IO.Directory]::CreateDirectory((Join-Path $menu 'WordCraft.lnk')); (S $items[0]).Status | Should -Be 'Failed' }
 
@@ -442,10 +443,10 @@ Describe 'Add-CraftShortcut' {
     Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and @($Data.candidates).Count -eq 2 } }
   It 'one match not named exactly like the app is taken' {
     Add-Lnk $menu 'WordCraft 0.8' 'start'; (S $items[0]).Status | Should -Be 'Created'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'start' }
-  It 'the same rule on the desktops: two loose matches are Failed, nothing moved or copied' {
-    Add-Lnk $pub 'WordCraft Help'; Add-Lnk $usr 'WordCraft Beta'; Add-Lnk $menu 'WordCraft' 'start'
-    (S $items[0]).Status | Should -Be 'Failed'; Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse
-    Test-Path -LiteralPath (Join-Path $pub 'WordCraft Help.lnk') | Should -BeTrue; Test-Path -LiteralPath (Join-Path $usr 'WordCraft Beta.lnk') | Should -BeTrue }
+  It 'loose desktop matches are ignored: never moved or renamed, and the Start-menu shortcut is copied (D7)' {
+    Add-Lnk $pub 'WordCraft Help' 'help'; Add-Lnk $usr 'WordCraft Beta' 'beta'; Add-Lnk $menu 'WordCraft' 'start'
+    (S $items[0]).Status | Should -Be 'Created'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'start'
+    [IO.File]::ReadAllText((Join-Path $pub 'WordCraft Help.lnk')) | Should -Be 'help'; [IO.File]::ReadAllText((Join-Path $usr 'WordCraft Beta.lnk')) | Should -Be 'beta' }
   It 'the MSI''s own desktop shortcut named like the app wins over a loose match there' {
     Add-Lnk $pub 'WordCraft Help' 'help'; Add-Lnk $pub 'WordCraft' 'msi'
     (S $items[0]).Status | Should -Be 'Renamed'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'msi'
@@ -465,6 +466,18 @@ Describe 'Add-CraftShortcut' {
     Add-Lnk $usr 'Word' 'mine'; Add-Lnk $menu 'WordCraft' 'start'
     $r = S $items[0]; $r.Status | Should -Be 'Exists'; $r.Path | Should -Be (Join-Path $usr 'Word.lnk')
     Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse }
+  # Final fix wave (D6, M3): on the desktops only the app's own <name>.lnk is renamed, in place.
+  It 'a lone WordCraft Help.lnk on the <Where> desktop is not touched' -ForEach @(@{ Where = 'public' }, @{ Where = 'user''s' }) {
+    $folder = if ($Where -eq 'public') { $pub } else { $usr }
+    Add-Lnk $folder 'WordCraft Help' 'help'; (S $items[0]).Status | Should -Be 'Failed'
+    [IO.File]::ReadAllText((Join-Path $folder 'WordCraft Help.lnk')) | Should -Be 'help'
+    Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse; Test-Path -LiteralPath (Join-Path $usr 'Word.lnk') | Should -BeFalse }
+  It 'the app''s own name is matched without regard to case' {
+    Add-Lnk $pub 'WORDCRAFT' 'msi'; (S $items[0]).Status | Should -Be 'Renamed'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'msi' }
+  It 'the MSI''s own shortcut on both desktops: only the one on the app''s desktop is renamed' {
+    Add-Lnk $pub 'WordCraft' 'public'; Add-Lnk $usr 'WordCraft' 'user'; $r = S $items[0]
+    $r.Status | Should -Be 'Renamed'; $r.Path | Should -Be (Join-Path $pub 'Word.lnk'); [IO.File]::ReadAllText($r.Path) | Should -Be 'public'
+    [IO.File]::ReadAllText((Join-Path $usr 'WordCraft.lnk')) | Should -Be 'user'; Test-Path -LiteralPath (Join-Path $usr 'Word.lnk') | Should -BeFalse }
   It 'the launcher''s shortcut already on the public desktop is Exists: never moved to the user''s desktop' {
     Add-Lnk $pub 'ArtCraft Launcher' 'msi'; $r = S $items[4]
     $r.Status | Should -Be 'Exists'; $r.Path | Should -Be (Join-Path $pub 'ArtCraft Launcher.lnk')

@@ -433,14 +433,18 @@ function Add-CraftShortcut {
     CommonPrograms and Programs Start menus.
       1. <Item.shortcut>.lnk is already on either desktop (a real Microsoft Word shortcut, an earlier run,
          the launcher's own): Exists with that path, nothing touched, so there is never a second icon.
-      2. Else the MSI's own desktop shortcut, a .lnk directly on the public or the user's desktop whose
-         name matches Item.startMenuName, is moved to that name: Renamed (no duplicate icon).
-      3. Else a matching .lnk under the Start menus (in their sub-folders too) is copied: Created.
+      2. Else the MSI's own desktop shortcut, <Item.name>.lnk exactly (case-insensitive) directly on a
+         desktop, is renamed to <Item.shortcut>.lnk in that same folder: Renamed with that path (no
+         duplicate icon). The item's own desktop is looked at first, then the other; only one is renamed.
+         A shortcut is never moved between desktops (it would keep the other desktop's permissions), and
+         a desktop shortcut that only resembles the app's name (WordCraft Help.lnk) is never touched.
+      3. Else a .lnk under the Start menus (in their sub-folders too) whose name matches
+         Item.startMenuName is copied: Created. It never guesses (Select-CraftShortcutFile, C-R3): the
+         match named exactly like the app wins, else the only match; two or more loose matches are Failed
+         with the candidates in the WARN.
       4. Else, or on any error: Failed, logged at WARN.
-    Steps 2 and 3 never guess (Select-CraftShortcutFile, C-R3): the match named exactly like the app
-    (Item.name) wins, else the only match; two or more loose matches are Failed with the candidates in the
-    WARN. Nothing is ever overwritten or deleted (craft Review Focus 5): the move and the copy both refuse
-    an existing target, even one that appeared after step 1. An empty startMenuName would match every
+    Nothing is ever overwritten or deleted (craft Review Focus 5): the rename and the copy both refuse an
+    existing target, even one that appeared after step 1. An empty startMenuName would match every
     shortcut, so it is Failed.
   #>
   [CmdletBinding()]
@@ -478,16 +482,21 @@ function Add-CraftShortcut {
       if (Test-Path -LiteralPath $existing) { return @{ Status = 'Exists'; Path = $existing } }
     }
 
-    $own = Select-CraftShortcutFile -Folders @($PublicDesktop, $UserDesktop) -Pattern $pattern -Name $name
-    if ($null -ne $own.File) {
-      # Without -Force, Move-Item refuses a target that exists.
-      Move-Item -LiteralPath $own.File.FullName -Destination $target -ErrorAction Stop
-      Write-SetupLog -Message 'Craft desktop shortcut renamed' -Data @{ from = $own.File.FullName; to = $target }
-      return @{ Status = 'Renamed'; Path = $target }
-    }
-    if ($own.Candidates.Count -gt 1) {
-      Write-SetupLog -Message 'More than one desktop shortcut could be the Craft app''s own; none chosen' -Level WARN -Data @{ item = $name; startMenuName = $pattern; candidates = $own.Candidates }
-      return @{ Status = 'Failed'; Path = $target }
+    # The MSI's own desktop shortcut, renamed in place: the item's desktop first, then the other. A name
+    # is needed: an empty one would take a file called just '.lnk'.
+    $otherDesktop = if ($Item.launcher -eq $true) { $PublicDesktop } else { $UserDesktop }
+    foreach ($folder in @($desktop, $otherDesktop)) {
+      if ([string]::IsNullOrWhiteSpace($folder) -or [string]::IsNullOrWhiteSpace($name)) { continue }
+      # Extension too: on 8.3 names the *.lnk filter can also match a longer extension.
+      $own = @(Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object {
+        $_ -is [IO.FileInfo] -and $_.Extension -ieq '.lnk' -and $_.BaseName -ieq $name
+      }) | Select-Object -First 1
+      if ($null -eq $own) { continue }
+      $renamed = Join-Path $folder "$shortcut.lnk"
+      # Without -Force, Move-Item refuses a target that exists. Same folder: a rename, the file keeps its place.
+      Move-Item -LiteralPath $own.FullName -Destination $renamed -ErrorAction Stop
+      Write-SetupLog -Message 'Craft desktop shortcut renamed' -Data @{ from = $own.FullName; to = $renamed }
+      return @{ Status = 'Renamed'; Path = $renamed }
     }
 
     $start = Select-CraftShortcutFile -Folders $StartMenuFolders -Pattern $pattern -Name $name -Recurse
