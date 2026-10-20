@@ -674,14 +674,30 @@ Describe 'Windows Update round and step (mocked COM)' {
         $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
         $p.Total | Should -Be 1; @($p.Updates.Title) | Should -Be @('Update net')
       }
-      It 'an earlier non-zero install HResult stays ErrorCode when a later download ends the round' {
+      # Ruling V2-R11: the code that stopped the loop is ErrorCode, so the parent keeps v1's meaning (R23, R23b).
+      It 'the download code that stopped the loop is ErrorCode, even after an earlier non-zero install HResult' {
         $script:searchResults[$script:SoftwareCriteria] = @('a', 'b', 'c' | ForEach-Object { New-FakeUpdate -Id $_ })
         $script:installHResultFor = @{ a = 0x80070643 }; $script:downloadHResultFor = @{ b = 0x80240016 }; $script:downloadCodes = @{ b = 4 }
         $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
-        $r.ErrorCode | Should -Be '0x80070643'; @($script:downloadCalls | ForEach-Object { $_ }) | Should -Be @('a', 'b')
+        $r.ErrorCode | Should -Be '0x80240016'; @($script:downloadCalls | ForEach-Object { $_ }) | Should -Be @('a', 'b')
         @($r.Failed.Id) | Should -Be @('b'); @($r.Installed.Id) | Should -Be @('a')
         $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
         @($p.Updates.Status) | Should -Be @('installed', 'failed', 'skipped')
+      }
+      It 'the install code that stopped the loop is ErrorCode, even after an earlier non-zero install HResult' {
+        $script:searchResults[$script:SoftwareCriteria] = @('a', 'b', 'c' | ForEach-Object { New-FakeUpdate -Id $_ })
+        $script:installHResultFor = @{ a = 0x80070643; b = 0x80242014 }; $script:installCodes = @{ a = 4; b = 4 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $r.ErrorCode | Should -Be '0x80242014'; $r.Error | Should -BeNullOrEmpty
+        @($script:installCalls | ForEach-Object { $_ }) | Should -Be @('a', 'b'); @($r.Failed.Id) | Should -Be @('a', 'b')
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        @($p.Updates.Status) | Should -Be @('failed', 'failed', 'skipped')
+      }
+      It 'keeps the restart flag of an install that finished before a later install threw' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+        $script:installRebootFor = @{ a = $true }; $script:installThrowFor = @{ b = (New-Object Runtime.InteropServices.COMException('busy', 0x80240016)) }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $r.RebootRequired | Should -BeTrue; $r.Error | Should -Be 'busy'; $r.ErrorCode | Should -Be '0x80240016'; @($r.Installed.Id) | Should -Be @('a')
       }
       It 'when no install ran at all, ErrorCode is the first non-zero download HResult (v1 rule)' {
         $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
@@ -876,6 +892,18 @@ Describe 'Windows Update round and step (mocked COM)' {
       $warns = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'busy' })
       $warns.Count | Should -Be 1
       $warns[0].Data.errorCode | Should -Be $code
+    }
+    # Ruling V2-R11: a one-at-a-time round that stopped at a busy code writes that code with no Error
+    # (here: a failed with 0x80070643, then b failed with 0x80240016, c not attempted). The parent gives it
+    # v1's meaning: no failure counts for the round (R23b) and the busy wait (R23).
+    It 'gives a one-at-a-time round stopped by a busy code the v1 busy meaning: no failure counts, wait, Continue' {
+      $script:ctx = New-WuContext -FailureCounts @{ a = 1 }
+      $res = New-ChildResult -Failed @([ordered]@{ Id = 'a'; Title = 'A'; ResultCode = 4 }, [ordered]@{ Id = 'b'; Title = 'B'; ResultCode = 4 }) -ErrorCode '0x80240016'
+      $res['FirmwareDeferred'] = 0; $res['Found'] = 3; $script:childResult = $res
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'; $r.Reboot | Should -Be 'None'; @($script:sleeps) | Should -Be @(120)
+      $script:ctx.State.WuFailureCounts['a'] | Should -Be 1; $script:ctx.State.WuFailureCounts.ContainsKey('b') | Should -BeFalse
+      $r.Data.FailedTitles['a'] | Should -Be 'A'; $r.Data.FailedTitles['b'] | Should -Be 'B'
     }
     It 'uses the injected busy wait' {
       $script:ctx = New-WuContext

@@ -605,7 +605,8 @@ function Invoke-WuInstallEach {
   <#
   .SYNOPSIS
     Private. Downloads and installs the updates one at a time, in search order (spec 4.5), so the parent
-    can show "Installing 3 of 7". Returns @{ RebootRequired = <bool>; ErrorCode = <string|$null> }.
+    can show "Installing 3 of 7". Fills the caller's Outcome in place: RebootRequired = <bool> and
+    ErrorCode = <string|$null>.
   .DESCRIPTION
     Infos is the round's Install selection, in the same order as Progress.Updates. For each update
     (Current = its 1-based number):
@@ -619,14 +620,15 @@ function Invoke-WuInstallEach {
        busy or restart pending), the loop stops after it. The rest get status 'skipped' and appear in
        neither list: they were not attempted, and the parent's v1 handling of the code applies. Any
        other non-zero HResult does not stop the loop.
-    4. ErrorCode: the first non-zero install HResult; when there is none, the round-ending download
-       HResult that stopped the loop; when no install ran at all, the first non-zero download HResult
-       (v1's rule); otherwise $null.
-    Installed and Failed are the round's own lists, filled in place. An exception propagates:
-    Invoke-WuRound's catch keeps what is already listed (v1 behaviour).
+    4. ErrorCode (ruling V2-R11): the HResult that stopped the loop (download or install), so the parent
+       gives the round the same meaning as v1 (R23 busy wait or restart, R23b no failure counts);
+       otherwise the first non-zero install HResult; otherwise, when no install ran at all, the first
+       non-zero download HResult (v1's rule); otherwise $null.
+    Installed, Failed and Outcome belong to the caller and are filled in place; Outcome.RebootRequired is
+    set as soon as an install reports it. An exception propagates: Invoke-WuRound's catch keeps what is
+    already listed (v1 behaviour) and the RebootRequired of the installs that finished.
   #>
   [CmdletBinding()]
-  [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)]$Session,
     [Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$ById,
@@ -634,14 +636,16 @@ function Invoke-WuInstallEach {
     [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Installed,
     [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Failed,
     [Parameter(Mandatory)][System.Collections.IDictionary]$Progress,
-    [Parameter(Mandatory)][string]$ProgressPath
+    [Parameter(Mandatory)][string]$ProgressPath,
+    [Parameter(Mandatory)][hashtable]$Outcome
   )
 
-  $rebootRequired = $false
+  $Outcome['RebootRequired'] = $false
+  $Outcome['ErrorCode'] = $null
   $installRan = $false
   $firstInstallCode = $null
   $firstDownloadCode = $null
-  $stoppingDownloadCode = $null
+  $stoppingCode = $null
 
   for ($i = 0; $i -lt $Infos.Count; $i++) {
     $info = $Infos[$i]
@@ -659,10 +663,7 @@ function Invoke-WuInstallEach {
         $hresult = Format-WuHResult -HResult $download.HResult
         Write-SetupLog -Message 'Windows Update download reported an error code' -Level WARN -Data @{ id = $info.Id; title = $info.Title; errorCode = $hresult }
         if ($null -eq $firstDownloadCode) { $firstDownloadCode = $hresult }
-        if (Test-WuRoundEndingCode -Code $hresult) {
-          $endCode = $hresult
-          $stoppingDownloadCode = $hresult
-        }
+        if (Test-WuRoundEndingCode -Code $hresult) { $endCode = $hresult }
       }
       if ($code -ne 2 -and $code -ne 3) {
         $downloadOk = $false
@@ -677,7 +678,7 @@ function Invoke-WuInstallEach {
       Update-WuProgress -Path $ProgressPath -Progress $Progress -Phase 'installing' -Index $i -Status 'installing'
       $install = Invoke-WuInstall -Session $Session -Updates @($update)
       $installRan = $true
-      if ([bool]$install.RebootRequired) { $rebootRequired = $true }
+      if ([bool]$install.RebootRequired) { $Outcome['RebootRequired'] = $true }
       $codes = @(ConvertTo-WuList -Value $install.ResultCodes)
       $code = if ($codes.Count -gt 0) { [int]$codes[0] } else { 0 }
       if ($null -ne $install.HResult -and [int64]$install.HResult -ne 0) {
@@ -697,6 +698,7 @@ function Invoke-WuInstallEach {
     }
 
     if ($null -ne $endCode) {
+      $stoppingCode = $endCode
       $updates = @(ConvertTo-WuList -Value $Progress['Updates'])
       for ($j = $i + 1; $j -lt $updates.Count; $j++) { $updates[$j]['Status'] = 'skipped' }
       Update-WuProgress -Path $ProgressPath -Progress $Progress
@@ -705,15 +707,13 @@ function Invoke-WuInstallEach {
     }
   }
 
-  $errorCode = $null
-  if ($null -ne $firstInstallCode) {
-    $errorCode = $firstInstallCode
-  } elseif ($null -ne $stoppingDownloadCode) {
-    $errorCode = $stoppingDownloadCode
+  if ($null -ne $stoppingCode) {
+    $Outcome['ErrorCode'] = $stoppingCode
+  } elseif ($null -ne $firstInstallCode) {
+    $Outcome['ErrorCode'] = $firstInstallCode
   } elseif (-not $installRan) {
-    $errorCode = $firstDownloadCode
+    $Outcome['ErrorCode'] = $firstDownloadCode
   }
-  return @{ RebootRequired = $rebootRequired; ErrorCode = $errorCode }
 }
 
 function Get-WuRoundNumber {
@@ -777,9 +777,12 @@ function Invoke-WuRound {
 
     -InstallMode (spec 4.5, config windowsUpdate.installMode): 'OneAtATime' (the default) replaces
     steps 7 and 8 with Invoke-WuInstallEach: each update is downloaded and installed on its own, in
-    search order, and the loop stops at the first round-ending HRESULT (the rest are not attempted);
-    ErrorCode then follows Invoke-WuInstallEach's rule. 'Batch' is v1's one download and one install.
-    The hide, EULA and SearchOnly paths are the same in both modes.
+    search order, and the loop stops at the first round-ending HRESULT (the rest are not attempted).
+    ErrorCode is then the code that stopped the loop, so the parent applies v1's busy / restart
+    handling unchanged (ruling V2-R11); without one it follows Invoke-WuInstallEach's other rules. An
+    exception in the loop keeps the RebootRequired of the installs that finished before it, and the
+    exception's own code is ErrorCode as for any exception. 'Batch' is v1's one download and one
+    install. The hide, EULA and SearchOnly paths are the same in both modes.
 
     Progress (spec 4.5): <ResultPath without .json>.progress.json (Get-WuProgressPath), written by
     Update-WuProgress and read by the parent's NOW on every tick: Phase 'searching' once the state is
@@ -813,6 +816,9 @@ function Invoke-WuRound {
   $errorCode = $null
   # Set once the selection exists; a round that fails before it deferred nothing.
   $firmwareDeferred = 0
+  # Filled in place by Invoke-WuInstallEach (OneAtATime), so an exception in its loop still keeps the
+  # RebootRequired of the installs that finished.
+  $eachOutcome = @{ RebootRequired = $false; ErrorCode = $null }
 
   $progressPath = Get-WuProgressPath -ResultPath $ResultPath
   $progress = [ordered]@{ Round = 0; Mode = $InstallMode; Phase = 'searching'; Current = 0; Total = 0; Updates = @(); UpdatedAt = $null }
@@ -902,9 +908,9 @@ function Invoke-WuRound {
       }
 
       if ($InstallMode -eq 'OneAtATime') {
-        $each = Invoke-WuInstallEach -Session $session -ById $byId -Infos $selection.Install -Installed $installed -Failed $failed -Progress $progress -ProgressPath $progressPath
-        $rebootRequired = [bool]$each.RebootRequired
-        $errorCode = $each.ErrorCode
+        Invoke-WuInstallEach -Session $session -ById $byId -Infos $selection.Install -Installed $installed -Failed $failed -Progress $progress -ProgressPath $progressPath -Outcome $eachOutcome
+        $rebootRequired = [bool]$eachOutcome.RebootRequired
+        $errorCode = $eachOutcome.ErrorCode
       } else {
         # Batch (v1). Progress: each update's place in the progress list, for its final status.
         $progressIndex = @{}
@@ -971,6 +977,8 @@ function Invoke-WuRound {
     $errorText = [string]$_.Exception.Message
     if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = [string]$_ }
     $errorCode = Get-WuExceptionErrorCode -Exception $_.Exception
+    # One at a time: the installs that finished before the exception may need a restart.
+    if ($eachOutcome.RebootRequired -eq $true) { $rebootRequired = $true }
     Write-SetupLog -Message 'Windows Update round failed' -Level ERROR -Data @{ error = $errorText; errorCode = $errorCode }
   } finally {
     # Spec 4.5: the round's downloads and installs are over, whatever happened.
