@@ -13,8 +13,9 @@
 # Remove-Item -Recurse on Windows PowerShell 5.1 would follow it and delete whatever it points to. It refuses
 # a path that is not fully qualified, whose leaf is not BenTech, a drive root, and a reparse point, and
 # Invoke-SetupCleanup calls it only for %SystemDrive%\BenTech. The old logs on the stick are replaced with rd
-# too, and a BenTech-Logs that is a link is left alone. Needs Logging.ps1, Activity.ps1 (Wait-SetupDelay) and
-# Process.ps1 (Invoke-External).
+# too, and a BenTech-Logs that is a link is left alone. C:\BenTech is kept while the resume task is still
+# registered (final review I1). Needs Logging.ps1, Activity.ps1 (Wait-SetupDelay), Process.ps1
+# (Invoke-External) and Prepare.ps1 (Unregister-ResumeTask).
 #
 # None of these functions throws.
 
@@ -317,8 +318,12 @@ function Invoke-SetupCleanup {
        is a file with the extension .cmd. A launcher anywhere else is never touched.
     4. The process (PowerShell and .NET) moves out of the folder, to %SystemRoot%.
     5. Remove-SetupFolder on the parent of -Root, but only when that is %SystemDrive%\BenTech (full paths,
-       case-insensitive; otherwise one line 'Not deleting <path>: not C:\BenTech'). A failure is shown and
-       waits for any key.
+       case-insensitive; otherwise one line 'Not deleting <path>: not C:\BenTech'), and only after
+       Unregister-ResumeTask, called once more, says the resume task is gone (final review I1). While it is
+       still registered (or the call throws) the folder is kept: the task runs its setup.ps1 elevated at
+       every logon, and only the admin-only folder stops anyone else from putting one there. That is shown
+       ('Resume task BenTechSetup-Resume is still registered: C:\BenTech kept - delete the task, then the
+       folder, as administrator') and waits for any key. A failed deletion is shown and waits for any key.
     6. -ProgramDataFolder is removed when it exists and is empty.
     Cancel (Esc on the start screen, no earlier run) runs 1 and 4-6 only.
     Both waits empty the key buffer first (-FlushInput), so a key pressed earlier cannot skip them.
@@ -407,8 +412,17 @@ function Invoke-SetupCleanup {
   } catch {
     $isSetupFolder = $false
   }
+  # Final review I1: the resume task runs <folder>\Setup\setup.ps1 elevated at every logon. The admin-only
+  # folder is what keeps anyone else from putting a setup.ps1 there, so it stays while the task does.
+  $taskGone = $false
+  if ($isSetupFolder) {
+    try { $taskGone = ((Unregister-ResumeTask) -eq $true) } catch { $taskGone = $false }
+  }
   if (-not $isSetupFolder) {
     & $say ('Not deleting {0}: not {1}' -f $folder, $expected)
+  } elseif (-not $taskGone) {
+    & $say ('Resume task BenTechSetup-Resume is still registered: {0} kept - delete the task, then the folder, as administrator' -f $folder)
+    & $waitKey $false
   } elseif (-not (Remove-SetupFolder -Path $folder)) {
     & $say ('Could not delete {0} - delete it by hand' -f $folder)
     & $waitKey $false

@@ -3,11 +3,12 @@
 # C:\BenTech are deleted when the technician finishes the final screen.
 #
 # SAFETY: nothing outside $TestDrive is ever deleted. Invoke-SetupCleanup runs only with Remove-SetupFolder,
-# Remove-Item and Set-Location mocked. The only real deletion is the one `rd` test (plus `mklink /J`), on a
-# folder named BenTech inside $TestDrive whose junction target is also inside $TestDrive. Every refusal test
-# mocks Invoke-External to throw.
+# Remove-Item, Set-Location, Unregister-ResumeTask and Wait-SetupDelay mocked. The only real deletion is the
+# one `rd` test (plus `mklink /J`), on a folder named BenTech inside $TestDrive whose junction target is also
+# inside $TestDrive. Every refusal test mocks Invoke-External to throw.
 BeforeAll {
-  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
+  # Steps\Prepare: Unregister-ResumeTask (final review I1), always mocked in the Invoke-SetupCleanup tests.
+  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'Steps\Prepare', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Disk($id, $serial, $type = 2) { [pscustomobject]@{ DeviceID = $id; VolumeSerialNumber = $serial; DriveType = $type } }
 }
 Describe 'Get-LauncherInfo' {
@@ -233,6 +234,10 @@ Describe 'Invoke-SetupCleanup' {
     Mock Copy-SetupLogsToStick { [void]$script:order.Add("copy $PcName logging=$([bool]$script:SetupLogPath)"); @{ Ok = $true; Target = 'E:\BenTech-Logs\DELL-J0C7QK4' } }
     Mock Test-DesktopLauncher { $true }; Mock Remove-Item { [void]$script:order.Add("del $LiteralPath") }; Mock Set-Location { }
     Mock Remove-SetupFolder { [void]$script:order.Add("rd $Path"); $true }
+    # SAFETY: the real ones would touch Task Scheduler and sleep. The resume task is gone by default.
+    Mock Unregister-ResumeTask { $true }
+    $script:waits = New-Object System.Collections.ArrayList
+    Mock Wait-SetupDelay { [void]$script:waits.Add($Seconds) }
     # The fake Desktop launcher "is a file" (V2-R13 M4); every other Test-Path is the real one.
     Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq 'C:\Users\ben\Desktop\BenTechSetup.cmd' -and $PathType -eq 'Leaf' }
     $script:st = @{ Machine = @{ NewName = 'DELL-J0C7QK4' }; Launcher = @{ Path = 'C:\Users\ben\Desktop\BenTechSetup.cmd'; VolumeSerial = '1A2B3C4D' } }
@@ -344,5 +349,35 @@ Describe 'Invoke-SetupCleanup' {
   It 'never throws, even when the key read fails' {
     Mock Remove-SetupFolder { $false }
     { Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no console' } } | Should -Not -Throw
+  }
+
+  # Final review I1: the resume task runs C:\BenTech\Setup\setup.ps1 elevated at every logon. C:\BenTech is
+  # admin-only; once it is gone any user could create that file. So it stays while the task is registered.
+  It '<_>: a resume task that is still registered keeps C:\BenTech, says so and waits for a key (flushed first)' -ForEach @('Finish', 'Cancel') {
+    Mock Unregister-ResumeTask { [void]$script:events.Add('unregister'); $false }
+    $script:events = New-Object System.Collections.ArrayList
+    $script:keys = New-Object Collections.Queue; $script:keys.Enqueue('Q')
+    $r = $run.Clone(); $r.FlushInput = { [void]$script:events.Add('flush') }
+    Invoke-SetupCleanup @r -Mode $_ -ReadKey { [void]$script:events.Add('read'); $script:keys.Dequeue() }
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+    $lines | Should -Contain 'Resume task BenTechSetup-Resume is still registered: C:\BenTech kept - delete the task, then the folder, as administrator'
+    @($events) | Should -Be @('unregister', 'flush', 'read')
+    $script:keys.Count | Should -Be 0
+  }
+  It 'removes the resume task once more right before deleting C:\BenTech, and deletes when it is gone' {
+    Mock Unregister-ResumeTask { [void]$script:order.Add('unregister'); $true }
+    Invoke-SetupCleanup @run -Mode Cancel -ReadKey { throw 'no key expected' }
+    @($order) | Should -Be @('unregister', 'rd C:\BenTech')
+  }
+  It 'a resume-task check that throws keeps the folder too' {
+    Mock Unregister-ResumeTask { throw 'Task Scheduler is not available' }
+    Invoke-SetupCleanup @run -Mode Finish -ReadKey { 'Q' }
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+    $lines | Should -Contain 'Resume task BenTechSetup-Resume is still registered: C:\BenTech kept - delete the task, then the folder, as administrator'
+  }
+  It 'never asks about the resume task for a folder it would not delete anyway' {
+    $r = $run.Clone(); $r.Root = "$TestDrive\x\Setup"
+    Invoke-SetupCleanup @r -Mode Finish -ReadKey { throw 'no key expected' }
+    Should -Invoke Unregister-ResumeTask -Times 0 -Exactly
   }
 }
