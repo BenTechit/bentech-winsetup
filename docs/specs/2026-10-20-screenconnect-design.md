@@ -117,7 +117,7 @@ He wants ScreenConnect next to AnyDesk, with a choice of AnyDesk, ScreenConnect 
 - **Activity line:** `ScreenConnect installed - this PC will appear in your ScreenConnect list`.
 - **Final screen:**
   - The AnyDesk ID block shows only when AnyDesk was chosen: `Choices.Remote` is ANYDESK or BOTH, read under 4.1's rule. With SCREENCONNECT alone there is no AnyDesk line at all.
-  - When `screenconnect` was in the plan, the `New name` line gains its status, for example `  New name : BT-12345     ScreenConnect: installed` (or `NOT installed`). The name Ben looks for in his list sits right beside the status.
+  - When ScreenConnect was chosen (SCREENCONNECT or BOTH, read under 4.1's rule), the `New name` line gains its status, for example `  New name : BT-12345     ScreenConnect: installed` (or `NOT installed`). The name Ben looks for in his list sits right beside the status.
   - The status goes on an existing line because the screen is already at its 29-line limit with every list full.
   - **Why the new name is the right one to show** (my call):
     - The step runs before the rename takes effect.
