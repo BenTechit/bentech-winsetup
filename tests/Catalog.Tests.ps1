@@ -40,6 +40,17 @@ Describe 'StepCatalog' {
     )
   }
 }
+Describe 'Test-HasDriverTool' {
+  It 'Test-HasDriverTool: Dell yes, ASUS no, a Dell VM no' {
+    Test-HasDriverTool -Machine @{ Brand = 'DELL' } | Should -BeTrue
+    Test-HasDriverTool -Machine @{ Brand = 'ASUS' } | Should -BeFalse
+    Test-HasDriverTool -Machine @{ Brand = 'DELL'; IsVM = $true } | Should -BeFalse
+  }
+  It 'Lenovo and HP yes; the VM brand, an unknown brand and a missing brand no' {
+    foreach ($b in 'LENOVO', 'HP') { Test-HasDriverTool -Machine @{ Brand = $b } | Should -BeTrue -Because $b }
+    foreach ($mach in @{ Brand = 'VM' }, @{ Brand = 'OTHER' }, @{ Brand = '' }, @{ }) { Test-HasDriverTool -Machine $mach | Should -BeFalse }
+  }
+}
 Describe 'Get-StepPlan' {
   It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,office,default-browser,vendor-pass1,windows-update,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
   It 'Dell desktop: vendor passes, no consumer app, no cleanup' { $p = P DELL DESKTOP; $p | Should -Contain 'vendor-pass1'; $p | Should -Not -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-cleanup' }

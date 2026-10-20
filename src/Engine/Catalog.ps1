@@ -55,6 +55,20 @@ function Test-HasConsumerApp {
   return ($null -ne $consumerApp -and $null -ne $consumerApp.Value)
 }
 
+function Test-HasDriverTool {
+  # True when the vendor tool (Dell Command | Update, Lenovo System Update, HP Image Assistant) runs on
+  # this machine: the brand is one of BusinessUpdaterBrands and it is not a virtual machine. Resolve-Brand
+  # already reports a VM as 'VM'; checking IsVM too keeps "a VM never gets a vendor step" true even if the
+  # two fields ever disagree. The start screen and Get-StepPlan both ask this.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][hashtable]$Machine)
+
+  $brand = [string]$Machine['Brand']
+  $isVm = ($brand -eq 'VM') -or ($Machine['IsVM'] -eq $true)
+  return ((-not $isVm) -and ($script:BusinessUpdaterBrands -contains $brand))
+}
+
 function Get-StepPlan {
   <#
   .SYNOPSIS
@@ -77,11 +91,9 @@ function Get-StepPlan {
   )
 
   $brand = [string]$Machine['Brand']
-  # Resolve-Brand already reports a VM as 'VM'; checking IsVM too keeps "a VM never gets a vendor
-  # step" true even if the two fields ever disagree.
   $isVm = ($brand -eq 'VM') -or ($Machine['IsVM'] -eq $true)
   $isLaptopMode = ($Choices['Mode'] -eq 'LAPTOP')
-  $hasBusinessTool = (-not $isVm) -and ($script:BusinessUpdaterBrands -contains $brand)
+  $hasBusinessTool = Test-HasDriverTool -Machine $Machine
   $hasConsumerApp = (-not $isVm) -and (Test-HasConsumerApp -Config $Config -Brand $brand)
 
   $plan = New-Object System.Collections.Generic.List[string]

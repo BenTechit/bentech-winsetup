@@ -117,7 +117,11 @@ Describe 'Update-StartChoices' {
   It 'O cycles OFF -> BUSINESS -> HOME -> OFF' { $r = Update-StartChoices -Choices $c -Key 'O'; $r.Choices.Office | Should -Be 'BUSINESS'; $r = Update-StartChoices -Choices $r.Choices -Key 'o'; $r.Choices.Office | Should -Be 'HOME'; (Update-StartChoices -Choices $r.Choices -Key 'O').Choices.Office | Should -Be 'OFF' }
   It 'Z toggles and resets the countdown' { $r = Update-StartChoices -Choices $c -Key 'Z'; $r.Choices.SevenZip | Should -BeFalse; $r.ResetCountdown | Should -BeTrue }
   It 'D switches to desktop' { (Update-StartChoices -Choices $c -Key 'D').Choices.Mode | Should -Be 'DESKTOP' }
-  It 'Enter starts, Esc cancels, X does nothing' { (Update-StartChoices -Choices $c -Key 'Enter').Action | Should -Be 'Start'; (Update-StartChoices -Choices $c -Key 'Escape').Action | Should -Be 'Cancel'; $r = Update-StartChoices -Choices $c -Key 'X'; $r.Action | Should -Be 'None'; $r.ResetCountdown | Should -BeFalse }
+  It 'Enter starts, Esc cancels, and any other key resets the countdown (Q1)' {
+    (Update-StartChoices -Choices $c -Key 'Enter').Action | Should -Be 'Start'; (Update-StartChoices -Choices $c -Key 'Escape').Action | Should -Be 'Cancel'
+    $r = Update-StartChoices -Choices $c -Key 'X'; $r.Action | Should -Be 'None'; $r.ResetCountdown | Should -BeTrue; $r.Choices.Mode | Should -Be 'LAPTOP'
+    foreach ($k in 'Spacebar', 'F5', 'D7', 'Tab') { (Update-StartChoices -Choices $c -Key $k).ResetCountdown | Should -BeTrue -Because $k }
+  }
   It 'L switches to laptop, case-insensitively, and resets the countdown' {
     $desktop = @{ Mode='DESKTOP'; SevenZip=$true; Office='OFF' }
     $r = Update-StartChoices -Choices $desktop -Key 'l'
@@ -135,6 +139,8 @@ Describe 'Update-StartChoices' {
   It 'treats an empty or null key as no key' {
     (Update-StartChoices -Choices $c -Key '').Action | Should -Be 'None'
     (Update-StartChoices -Choices $c -Key $null).Action | Should -Be 'None'
+    (Update-StartChoices -Choices $c -Key '').ResetCountdown | Should -BeFalse
+    (Update-StartChoices -Choices $c -Key $null).ResetCountdown | Should -BeFalse
   }
 }
 
@@ -158,112 +164,120 @@ Describe 'New-DefaultChoices' {
   }
 }
 
-Describe 'Format-StartScreen' {
-  It 'shows mode, toggles, countdown' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'} -SecondsLeft 7 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null
-    $l | Should -Contain '   MODE   [L] Laptop  <==        [D] Desktop'; $l | Should -Contain '          [Z] 7-Zip                ON'
-    $l | Should -Contain '          [O] Office 365 (HE+EN)   BUSINESS   (OFF/BUSINESS/HOME)'; ($l -join "`n") | Should -Match 'Starting in 7s'
+Describe 'Format-StartScreen (v2)' {
+  BeforeAll { function F([hashtable]$c, [int]$s = 25, [bool]$ac = $true, [bool]$fresh = $true, [bool]$tool = $true, $prev = $null) {
+    Format-StartScreen -Machine $m -Choices $c -SecondsLeft $s -Version '2026.10.20.1' -OnAC $ac -IsFresh $fresh -Previous $prev -HasDriverTool $tool -MaxAgeDays 14 } }
+  It 'shows the v2 layout for a fresh laptop on AC' {
+    $l = F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'BUSINESS' }
+    $l[0] | Should -Be (' ' + ('=' * 77)); $l[1] | Should -Be ('   BENTECH WINDOWS SETUP' + 'v2026.10.20.1'.PadLeft(54))
+    $l | Should -Contain '   Dell Inc. Latitude 5440    SN: 7HX2K93    ON CHARGER'
+    $l | Should -Contain '   New PC name: DELL-7HX2K93'
+    $l | Should -Contain ('   WHAT WILL HAPPEN'.PadRight(53) + 'TO CHANGE IT, PRESS')
+    $l | Should -Contain ('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop')
+    $l | Should -Contain '   Chrome + AnyDesk   always'
+    $l | Should -Contain ('   7-Zip    YES'.PadRight(53) + 'Z = yes / no')
+    $l | Should -Contain ('   Office   BUSINESS (Hebrew + English)'.PadRight(53) + 'O = off / business / home')
+    $l | Should -Contain ('   Starts by itself in 25 s   ' + ('#' * 17) + ('.' * 3))
+    $l | Should -Contain '   ENTER = start now           ESC = cancel, change nothing'
+    @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0
   }
-  It 'warns on battery and does not count down when not fresh' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='DESKTOP';SevenZip=$false;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $false -IsFresh $false -Previous $null
+  It 'says what the mode means, also for a brand without a driver tool' {
+    (F @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }) | Should -Contain ('   Type     DESKTOP (no laptop app)'.PadRight(53) + 'L = laptop   D = desktop')
+    (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'HOME' } -tool $false) | Should -Contain ('   Type     LAPTOP (no driver tool for this brand)'.PadRight(53) + 'L = laptop   D = desktop')
+    (F @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }) | Should -Contain ('   Office   OFF'.PadRight(53) + 'O = off / business / home')
+  }
+  It 'a full and an empty countdown bar' {
+    (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -s 30) | Should -Contain ('   Starts by itself in 30 s   ' + ('#' * 20))
+    (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -s 1) | Should -Contain ('   Starts by itself in 1 s   #' + ('.' * 19))
+  }
+  It 'not fresh: no countdown, the two-line message and ESC' {
+    $l = F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -fresh $false
+    $l | Should -Contain '   This PC already has user files or is older than 14 days -'
+    $l | Should -Contain '   press ENTER to run anyway'; $l | Should -Contain '   ESC = cancel, change nothing'
+    ($l -join "`n") | Should -Not -Match 'Starts by itself'
+    @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0
+  }
+  It 'keeps the battery and previous-run lines and stays ASCII' {
+    $odd = $m.Clone(); $odd.FriendlyModel = 'Latitude ' + [char]0x05D1
+    $l = Format-StartScreen -Machine $odd -Choices @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -SecondsLeft 9 -Version 'v1' -OnAC $false -IsFresh $true -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'RED' }
     $l | Should -Contain '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.'
-    ($l -join "`n") | Should -Match "This doesn't look like a fresh install: press Enter to run anyway"; ($l -join "`n") | Should -Not -Match 'Starting in'
-  }
-  It 'marks DESKTOP mode, 7-Zip OFF and the full countdown line' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='DESKTOP';SevenZip=$false;Office='HOME'} -SecondsLeft 10 -Version '2026.10.18.1' -OnAC $true -IsFresh $true -Previous $null
-    $l | Should -Contain '   MODE   [L] Laptop           [D] Desktop  <=='
-    $l | Should -Contain '          [Z] 7-Zip                OFF'
-    $l | Should -Contain '          [O] Office 365 (HE+EN)   HOME   (OFF/BUSINESS/HOME)'
-    $l | Should -Contain '   Starting in 10s ...  [Enter] start now   [Esc] cancel'
-    $l | Should -Contain '   (any toggle resets the countdown to 10s)'
-  }
-  It 'prints the not-fresh line exactly and drops the countdown hint' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='LAPTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $false -Previous $null
-    $l | Should -Contain "   This doesn't look like a fresh install: press Enter to run anyway"
-    ($l -join "`n") | Should -Not -Match 'toggle resets'
-  }
-  It 'prints the machine header lines' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='LAPTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version '2026.10.18.1' -OnAC $true -IsFresh $true -Previous $null
-    $l | Should -Contain '   BENTECH WINDOWS SETUP                    v2026.10.18.1'
-    $l | Should -Contain '   Machine  : Dell Inc.  Latitude 5440        SN: 7HX2K93'
-    $l | Should -Contain '   Detected : LAPTOP'
-    $l | Should -Contain '   Windows  : Windows 11 Pro 25H2 (26200)   x64'
-    $l | Should -Contain '   Power    : ON CHARGER'
-    $l | Should -Contain '   New name : DELL-7HX2K93'
-    $l | Should -Contain '   APPS   Chrome, AnyDesk          always'
-  }
-  It 'does not double the v when the version already starts with one' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='LAPTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null
-    $l | Should -Contain '   BENTECH WINDOWS SETUP                    v1'
-  }
-  It 'says ON BATTERY on the Power line and DESKTOP / VM in Detected' {
-    $desk = $m.Clone(); $desk.IsLaptop = $false
-    $l = Format-StartScreen -Machine $desk -Choices @{Mode='DESKTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $false -IsFresh $true -Previous $null
-    $l | Should -Contain '   Power    : ON BATTERY'; $l | Should -Contain '   Detected : DESKTOP'
-    $vm = $m.Clone(); $vm.IsVM = $true
-    (Format-StartScreen -Machine $vm -Choices @{Mode='DESKTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null) | Should -Contain '   Detected : VM'
-  }
-  It 'shows the previous run as dd/MM/yyyy HH:mm - Color, from a string or a datetime' {
-    $c = @{Mode='LAPTOP';SevenZip=$true;Office='OFF'}
-    $l = Format-StartScreen -Machine $m -Choices $c -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $true -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'RED' }
     $l | Should -Contain '   Previous run: 17/10/2026 14:05 - RED'
-    $l = Format-StartScreen -Machine $m -Choices $c -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $true -Previous @{ StartedAt = [datetime]'2026-01-02T03:04:05'; Color = 'GREEN' }
+    ($l -join "`n") -match '[^\x20-\x7E\n]' | Should -BeFalse
+  }
+  It 'says ON BATTERY on the machine line, and shows no battery warning on AC' {
+    (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -ac $false) | Should -Contain '   Dell Inc. Latitude 5440    SN: 7HX2K93    ON BATTERY'
+    (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' }) -join "`n" | Should -Not -Match 'plug in the charger'
+  }
+  It 'does not double the v of the version, and the previous run may be a datetime or absent' {
+    $c = @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' }
+    $l = Format-StartScreen -Machine $m -Choices $c -SecondsLeft 9 -Version 'v1' -OnAC $true -IsFresh $true -Previous @{ StartedAt = [datetime]'2026-01-02T03:04:05'; Color = 'GREEN' }
+    $l[1] | Should -Be ('   BENTECH WINDOWS SETUP' + 'v1'.PadLeft(54))
     $l | Should -Contain '   Previous run: 02/01/2026 03:04 - GREEN'
-    @($l | Where-Object { $_ -like '*Previous run*' }).Count | Should -Be 1
+    (F $c) -join "`n" | Should -Not -Match 'Previous run'
   }
-  It 'has no previous-run line without a previous run' {
-    $l = Format-StartScreen -Machine $m -Choices @{Mode='LAPTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null
-    ($l -join "`n") | Should -Not -Match 'Previous run'
-  }
-  It 'is ASCII only, even when the machine fields are not' {
-    $odd = $m.Clone(); $odd.FriendlyModel = 'Latitude 5440 ' + [char]0x05D1 + [char]0x2122; $odd.Manufacturer = "Dell`r`nInc."
-    $l = Format-StartScreen -Machine $odd -Choices @{Mode='LAPTOP';SevenZip=$true;Office='OFF'} -SecondsLeft 10 -Version 'v1' -OnAC $false -IsFresh $false -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'RED' }
-    ($l -join "`n") -match '[^\x20-\x7E\r\n]' | Should -BeFalse
-    $l | Should -Contain '   Machine  : Dell Inc.  Latitude 5440 ??        SN: 7HX2K93'
-    $l.Count | Should -BeGreaterThan 10
+  It 'a DESKTOP choice or a VM keeps the same layout (ASCII, no line over 79)' {
+    $vm = $m.Clone(); $vm.IsVM = $true; $vm.Manufacturer = "Dell`r`nInc."
+    $l = Format-StartScreen -Machine $vm -Choices @{ Mode = 'DESKTOP'; SevenZip = $true; Office = 'HOME' } -SecondsLeft 3 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null -HasDriverTool $false
+    $l | Should -Contain '   Dell Inc. Latitude 5440    SN: 7HX2K93    ON CHARGER'
     @($l | Where-Object { $_ -match "[`r`n]" }).Count | Should -Be 0
+    @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0
+  }
+}
+Describe 'start screen colours' {
+  It 'the chosen value is green when on, dark grey when off; warnings are yellow' {
+    $on = @(Get-StartScreenSegments -Line ('   7-Zip    YES'.PadRight(53) + 'Z = yes / no')); $on[1].Text | Should -Be 'YES'; $on[1].Color | Should -Be 'Green'
+    $off = @(Get-StartScreenSegments -Line ('   Office   OFF'.PadRight(53) + 'O = off / business / home')); $off[1].Text | Should -Be 'OFF'; $off[1].Color | Should -Be 'DarkGray'
+    @(Get-StartScreenSegments -Line '   press ENTER to run anyway')[0].Color | Should -Be 'Yellow'
+  }
+  It 'the segments of a line add up to the line, and the labels stay uncoloured' {
+    foreach ($line in @(('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop'), ('   7-Zip    NO'.PadRight(53) + 'Z = yes / no'), '   Chrome + AnyDesk   always', '')) {
+      (@(Get-StartScreenSegments -Line $line) | ForEach-Object { $_.Text }) -join '' | Should -Be $line
+    }
+    $type = @(Get-StartScreenSegments -Line ('   Type     DESKTOP (no laptop app)'.PadRight(53) + 'L = laptop   D = desktop'))
+    $type[0].Text | Should -Be '   Type     '; $type[0].Color | Should -BeNullOrEmpty
+    $type[1].Text | Should -Be 'DESKTOP'; $type[1].Color | Should -Be 'Green'
+    $type[2].Color | Should -BeNullOrEmpty
+    $no = @(Get-StartScreenSegments -Line ('   7-Zip    NO'.PadRight(53) + 'Z = yes / no')); $no[1].Text | Should -Be 'NO'; $no[1].Color | Should -Be 'DarkGray'
+  }
+  It 'the battery line and both not-fresh text lines are one yellow segment; other lines are one plain segment' {
+    foreach ($line in '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', '   This PC already has user files or is older than 14 days -', '   press ENTER to run anyway') {
+      $s = @(Get-StartScreenSegments -Line $line); $s.Count | Should -Be 1; $s[0].Color | Should -Be 'Yellow'; $s[0].Text | Should -Be $line
+    }
+    foreach ($line in '   Chrome + AnyDesk   always', '   WHAT WILL HAPPEN', '   ESC = cancel, change nothing', '   Starts by itself in 30 s   ####', '') {
+      $s = @(Get-StartScreenSegments -Line $line); $s.Count | Should -Be 1; $s[0].Color | Should -BeNullOrEmpty; $s[0].Text | Should -Be $line
+    }
   }
 }
 
 Describe 'Show-StartScreen' {
-  # Safety net: this must only reach the console through its seams. The production writer's colours
-  # land on a fake RawUI, never on the console running the tests.
+  # Safety net: this must only reach the console through its seams. The screen draws through a fake
+  # console writer (never the real [Console]); Clear-Host and Write-Host throw, since the v2 start screen
+  # uses neither.
   BeforeEach {
     Mock Clear-Host { throw 'Clear-Host must not run in tests' }
     Mock Write-Host { throw 'Write-Host must not run in tests' }
     Mock Start-Process { throw 'Start-Process must not run in tests' }
-    $script:fakeRawUI = [pscustomobject]@{ BackgroundColor = 'DarkBlue'; ForegroundColor = 'White' }
-    Mock Get-ConsoleRawUI { $script:fakeRawUI }
     Mock Write-SetupLog { }
+    $script:fw = @{ Calls = New-Object System.Collections.ArrayList; Size = @{ Width = 100; Height = 30; Top = 0 } }
+    $script:writer = @{ GetSize = { [pscustomobject]$script:fw.Size }; Clear = { param($b) [void]$script:fw.Calls.Add('clear'); $script:fw.ClearBack = $b }
+      MoveTo = { param($row) [void]$script:fw.Calls.Add("row $row") }; Write = { param($t, $c, $b) [void]$script:fw.Calls.Add(@{ T = $t; C = $c; B = $b }) } }
+    Reset-ConsoleFrame
   }
-  It 'the production writer sets a black background and gray text right before it clears (spec 9.1)' {
-    $script:atClear = $null
-    Mock Clear-Host { $script:atClear = @{ B = [string]$script:fakeRawUI.BackgroundColor; F = [string]$script:fakeRawUI.ForegroundColor } }
-    Mock Write-Host { }
-    Write-StartScreenLines -Lines @('   MODE')
-    $script:atClear.B | Should -Be 'Black'
-    $script:atClear.F | Should -Be 'Gray'
-  }
-  It 'a console that refuses the colours is a WARN each, and the screen is still drawn' {
-    $script:cleared = 0
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Get-ConsoleRawUI { throw 'The handle is invalid.' }
-    Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add([string]$Object) }
-    { Write-StartScreenLines -Lines @('   MODE') } | Should -Not -Throw
-    Should -Invoke Write-SetupLog -Times 2 -Exactly -ParameterFilter { $Level -eq 'WARN' }
-    $script:cleared | Should -Be 1
-    $script:hostCalls | Should -Be @('   MODE')
-  }
-  It 'counts down from 10 and starts at 0 with the default choices' {
+  It 'counts down from 30 and starts at 0 with the default choices (Q1)' {
     $r = Invoke-StartScreen
     $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'BUSINESS'
-    Get-ElapsedSeconds | Should -Be 10
-    # One redraw per second: the first screen and then 9 ticks (10s down to 1s), nothing at 0.
-    $screens.Count | Should -Be 10
-    $screens[0] | Should -Match 'Starting in 10s'
-    $screens[9] | Should -Match 'Starting in 1s'
-    $screens[5] | Should -Match 'Starting in 5s'
+    Get-ElapsedSeconds | Should -Be 30
+    # One redraw per second: the first screen and then 29 ticks (30 s down to 1 s), nothing at 0.
+    $screens.Count | Should -Be 30
+    $screens[0] | Should -Match 'Starts by itself in 30 s'
+    $screens[29] | Should -Match 'Starts by itself in 1 s'
+    $screens[5] | Should -Match 'Starts by itself in 25 s'
+  }
+  It 'the countdown bar shrinks as the seconds run out' {
+    Invoke-StartScreen | Out-Null
+    $screens[0] | Should -Match ('Starts by itself in 30 s   ' + ('#' * 20) + '\r?\n')
+    $screens[15] | Should -Match ('Starts by itself in 15 s   ' + ('#' * 10) + ('\.' * 10))
+    $screens[29] | Should -Match ('Starts by itself in 1 s   #' + ('\.' * 19))
   }
   It 'starts at once on Enter without waiting for the countdown' {
     $r = Invoke-StartScreen -KeyAt { param($s) if ($s -ge 2) { 'Enter' } }
@@ -274,17 +288,40 @@ Describe 'Show-StartScreen' {
     Invoke-StartScreen -KeyAt { param($s) if ($s -ge 3) { 'Escape' } } | Should -BeNullOrEmpty
     Get-ElapsedSeconds | Should -BeLessThan 3.5
   }
-  It 'a toggle resets the countdown to 10 and is part of the result' {
+  It 'a toggle resets the countdown to 30 and is part of the result' {
     $script:zSent = $false
     $r = Invoke-StartScreen -KeyAt { param($s) if (-not $script:zSent -and $s -ge 4) { $script:zSent = $true; 'Z' } }
     $r.SevenZip | Should -BeFalse
-    # Seven ticks happened before the toggle, so a reset run lasts 4s + 10s.
-    Get-ElapsedSeconds | Should -BeGreaterOrEqual 14
-    Get-ElapsedSeconds | Should -BeLessThan 14.5
-    $toggleScreen = @($screens | Where-Object { $_ -match '\[Z\] 7-Zip\s+OFF' })[0]
-    $toggleScreen | Should -Match 'Starting in 10s'
-    # The screen just before the toggle was at 6s.
-    $screens[$screens.IndexOf($toggleScreen) - 1] | Should -Match 'Starting in 6s'
+    # Four ticks happened before the toggle, so a reset run lasts 4 s + 30 s.
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 34
+    Get-ElapsedSeconds | Should -BeLessThan 34.5
+    $toggleScreen = @($screens | Where-Object { $_ -match '7-Zip    NO\b' })[0]
+    $toggleScreen | Should -Match 'Starts by itself in 30 s'
+    # The screen just before the toggle was at 26 s.
+    $screens[$screens.IndexOf($toggleScreen) - 1] | Should -Match 'Starts by itself in 26 s'
+  }
+  It 'an unknown key restarts the countdown at 30 (Q1)' {
+    $script:sent = $false
+    $r = Invoke-StartScreen -KeyAt { param($s) if (-not $script:sent -and $s -ge 4) { $script:sent = $true; 'X' } }
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 34
+    Get-ElapsedSeconds | Should -BeLessThan 34.5
+    # An unknown key changes nothing but the clock.
+    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'BUSINESS'
+    $screens[4] | Should -Match 'Starts by itself in 26 s'
+    $screens[5] | Should -Match 'Starts by itself in 30 s'   # redrawn at once, not a second later
+  }
+  It 'any key restarts the countdown, however often it is pressed' {
+    $script:presses = 0
+    $r = Invoke-StartScreen -KeyAt { param($s) if ($script:presses -lt 3 -and $s -ge (10 * ($script:presses + 1))) { $script:presses++; 'Spacebar' } }
+    $r | Should -Not -BeNullOrEmpty
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 60
+    Get-ElapsedSeconds | Should -BeLessThan 60.5
+  }
+  It 'a stray key on a machine that does not look fresh never starts it' {
+    $script:sent = $false
+    $r = Invoke-StartScreen -IsFresh $false -KeyAt { param($s) if (-not $script:sent -and $s -ge 5) { $script:sent = $true; 'X' } elseif ($s -ge 40) { 'Escape' } }
+    $r | Should -BeNullOrEmpty
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 40
   }
   It 'the L, D and O toggles change the returned choices' {
     $script:sent = New-Object System.Collections.Queue
@@ -297,8 +334,8 @@ Describe 'Show-StartScreen' {
     $r | Should -BeNullOrEmpty
     Get-ElapsedSeconds | Should -BeGreaterOrEqual 30
     $screens.Count | Should -BeGreaterOrEqual 30
-    @($screens | Where-Object { $_ -match 'Starting in' }).Count | Should -Be 0
-    @($screens | Where-Object { $_ -match "press Enter to run anyway" }).Count | Should -Be $screens.Count
+    @($screens | Where-Object { $_ -match 'Starts by itself' }).Count | Should -Be 0
+    @($screens | Where-Object { $_ -match 'press ENTER to run anyway' }).Count | Should -Be $screens.Count
   }
   It 'starts on Enter when the machine is not fresh' {
     $r = Invoke-StartScreen -IsFresh $false -KeyAt { param($s) if ($s -ge 12) { 'Enter' } }
@@ -312,8 +349,18 @@ Describe 'Show-StartScreen' {
     $screens[0] | Should -Match 'ON CHARGER'
     $screens[3] | Should -Not -Match 'ON BATTERY'   # drawn at t=3s, still on AC
     $screens[4] | Should -Match 'ON BATTERY: plug in the charger'   # drawn at t=4s
-    $screens[4] | Should -Match 'Power    : ON BATTERY'
+    $screens[4] | Should -Match 'SN: 7HX2K93    ON BATTERY'
     $screens[9] | Should -Match 'ON BATTERY'
+  }
+  It 'tells a brand without a driver tool apart, and shows the configured age limit when not fresh' {
+    $dell = $m.Clone(); $dell.Brand = 'DELL'
+    $asus = $m.Clone(); $asus.Brand = 'ASUS'
+    $dellVm = $dell.Clone(); $dellVm.IsVM = $true
+    $esc = { param($s) if ($s -ge 1) { 'Escape' } }
+    Invoke-StartScreen -Machine $dell -KeyAt $esc | Out-Null; $screens[0] | Should -Match 'Type     LAPTOP \(driver tool \+ laptop app\)'
+    Invoke-StartScreen -Machine $asus -KeyAt $esc | Out-Null; $screens[0] | Should -Match 'Type     LAPTOP \(no driver tool for this brand\)'
+    Invoke-StartScreen -Machine $dellVm -KeyAt $esc | Out-Null; $screens[0] | Should -Match 'Type     DESKTOP \(no driver tool for this brand\)'
+    Invoke-StartScreen -Machine $dell -IsFresh $false -KeyAt $esc | Out-Null; $screens[0] | Should -Match 'older than 14 days'
   }
   It 'shows the previous run on every redraw' {
     Invoke-StartScreen -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'YELLOW' } -KeyAt { param($s) if ($s -ge 2) { 'Escape' } } | Out-Null
@@ -327,7 +374,7 @@ Describe 'Show-StartScreen' {
       -ReadKey { $script:readCalls++; if ($script:readCalls -gt 5000) { throw 'runaway loop' } } `
       -Now { $script:t0 } -Sleep { param($ms) } -OnAC { $true } -FlushInput { } -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
     $r | Should -Not -BeNullOrEmpty
-    $screens.Count | Should -Be 10
+    $screens.Count | Should -Be 30
   }
   It 'still counts down when the clock jumps backwards' {
     Reset-FakeClock
@@ -338,34 +385,36 @@ Describe 'Show-StartScreen' {
       -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds(-$ms) } -OnAC { $true } -FlushInput { } `
       -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
     $r | Should -Not -BeNullOrEmpty
-    $screens.Count | Should -Be 10
+    $screens.Count | Should -Be 30
   }
-  It 'the production writer clears the screen, writes every line (blank ones too) in gray on black and paints the warnings yellow on black' {
-    $script:cleared = 0
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor; Back = $BackgroundColor }) }
-    Write-StartScreenLines -Lines @('   MODE', '', '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', "   This doesn't look like a fresh install: press Enter to run anyway")
-    $cleared | Should -Be 1
-    $hostCalls.Count | Should -Be 4
-    $hostCalls[1].Text | Should -Be ''
-    $hostCalls[0].Color | Should -Be 'Gray'
-    $hostCalls[1].Color | Should -Be 'Gray'
-    $hostCalls[2].Color | Should -Be 'Yellow'
-    $hostCalls[3].Color | Should -Be 'Yellow'
-    @($hostCalls | Where-Object { $_.Back -ne 'Black' }).Count | Should -Be 0
+  It 'Write-StartScreenLines draws through the writer: one clear on Black, the value green, the warnings yellow, nothing else coloured' {
+    Write-StartScreenLines -Writer $writer -Lines @(('   7-Zip    YES'.PadRight(53) + 'Z = yes / no'), '', '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', '   press ENTER to run anyway', '   Chrome + AnyDesk   always')
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 1
+    $fw.ClearBack | Should -Be 'Black'
+    $w = @($fw.Calls | Where-Object { $_ -is [hashtable] })
+    @($w | Where-Object { -not $_.C -or $_.B -ne 'Black' }).Count | Should -Be 0   # spec 9.1: both colours on every write
+    @($w | Where-Object { $_.T -eq 'YES' })[0].C | Should -Be 'Green'
+    @($w | Where-Object { $_.T -like '   ON BATTERY*' })[0].C | Should -Be 'Yellow'
+    @($w | Where-Object { $_.T -like '   press ENTER*' })[0].C | Should -Be 'Yellow'
+    @($w | Where-Object { $_.T -like '   Chrome + AnyDesk*' })[0].C | Should -Be 'Gray'
+    @($w | Where-Object { $_.T -like '   7-Zip    ' })[0].C | Should -Be 'Gray'
+  }
+  It 'Write-StartScreenLines never uses Write-Host or Clear-Host, and does not clear again for the same window size' {
+    Write-StartScreenLines -Writer $writer -Lines @('   a')
+    Write-StartScreenLines -Writer $writer -Lines @('   b')
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 1
+    Should -Invoke Write-Host -Times 0 -Exactly
+    Should -Invoke Clear-Host -Times 0 -Exactly
   }
   It 'draws through the production writer when no -Write seam is given' {
-    $script:cleared = 0
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor }) }
+    Mock New-ConsoleWriter { $script:writer }
     Reset-FakeClock
     $r = Show-StartScreen -Machine $m -Config $cfg -Version '2026.10.18.1' -Previous $null -IsFresh $true `
       -ReadKey { 'Enter' } -Now { $script:clock } -Sleep { param($ms) } -OnAC { $true } -FlushInput { }
     $r | Should -Not -BeNullOrEmpty
-    $cleared | Should -Be 1
-    ($hostCalls | ForEach-Object { $_.Text }) | Should -Contain '   Starting in 10s ...  [Enter] start now   [Esc] cancel'
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 1
+    @($fw.Calls | Where-Object { $_ -is [hashtable] } | ForEach-Object { $_.T }) | Should -Contain (('   Starts by itself in 30 s   ' + ('#' * 20)).PadRight(99))
+    Should -Invoke New-ConsoleWriter -Times 1 -Exactly
   }
   It 'empties the key buffer once, before the first draw' {
     Invoke-StartScreen -KeyAt { param($s) if ($s -ge 2) { 'Escape' } } | Out-Null
@@ -393,7 +442,23 @@ Describe 'Show-StartScreen' {
   It 'still shows the screen when emptying the key buffer fails' {
     $r = Invoke-StartScreen -FlushInput { throw 'no console input here' }
     $r | Should -Not -BeNullOrEmpty
-    $screens.Count | Should -Be 10
+    $screens.Count | Should -Be 30
+  }
+  It 'a writer that fails (the window resized mid-frame) is one WARN per failure; the next frame clears and the run goes on' {
+    $script:warns = 0; Mock Write-SetupLog { if ($Level -eq 'WARN') { $script:warns++ } }
+    $script:failNext = $true
+    $fw.Size = @{ Width = 100; Height = 30; Top = 0 }
+    $writer.MoveTo = { param($row) if ($script:failNext) { $script:failNext = $false; throw 'The cursor position cannot be smaller than zero or larger than the buffer' }; [void]$script:fw.Calls.Add("row $row") }
+    Mock New-ConsoleWriter { $script:writer }
+    Reset-FakeClock; $script:readCalls = 0
+    $r = Show-StartScreen -Machine $m -Config $cfg -Version 'v1' -Previous $null -IsFresh $true `
+      -ReadKey { $script:readCalls++; if ($script:readCalls -gt 5000) { throw 'runaway loop' } } `
+      -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } -OnAC { $true } -FlushInput { }
+    $r | Should -Not -BeNullOrEmpty
+    $warns | Should -Be 1
+    # The first frame died after its clear; the second frame (one second later) clears again and draws.
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 2
+    @($fw.Calls | Where-Object { $_ -is [hashtable] -and $_.T -like '   Starts by itself in 29 s*' }).Count | Should -Be 1
   }
   It 'keeps going when the power reader throws' {
     $r = Invoke-StartScreen -OnAC { throw 'WMI is unhappy' }
