@@ -370,6 +370,8 @@ Describe 'Install-CraftItem' {
     (I -Arch x86).Version | Should -BeExactly ''
     $script:extHandler = { param($c) @{ ExitCode = 1603; TimedOut = $false } }; (I).Version | Should -Be '0.8.0' }
   It 'never waits for anything but a 1618' { $script:extHandler = { param($c) @{ ExitCode = 1603; TimedOut = $false } }; $null = I; $script:waits.Count | Should -Be 0 }
+  It 'a checksum that cannot be computed is an unexpected error, and msiexec never runs (C-R3)' {
+    Mock Get-FileHash { Write-Error 'locked' }; (I).Reason | Should -Be 'unexpected error'; $script:ext.Count | Should -Be 0 }
 }
 
 Describe 'Add-CraftShortcut' {
@@ -405,15 +407,17 @@ Describe 'Add-CraftShortcut' {
   It 'takes only a shortcut whose name starts as startMenuName says' {
     Add-Lnk $menu 'Uninstall WordCraft'; Add-Lnk $menu 'GridCraft'; (S $items[0]).Status | Should -Be 'Failed'
     Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } }
+  # The copy goes through Copy-CraftShortcutFile ([IO.File]::Copy, which throws on failure) since C-R3, so
+  # the next two mock that seam where the brief mocked Copy-Item.
   It 'a copy that fails is Failed and never throws' {
-    Add-Lnk $menu 'WordCraft'; Mock Copy-Item { Write-Error 'access denied' }
+    Add-Lnk $menu 'WordCraft'; Mock Copy-CraftShortcutFile { throw 'access denied' }
     { $script:r = S $items[0] } | Should -Not -Throw; $script:r.Status | Should -Be 'Failed' }
   It 'with no folders given it looks at both desktops and both Start menus of this PC, and copies nothing' {
-    Mock Test-Path { $false }; Mock Get-ChildItem { }; Mock Copy-Item { }; Mock Move-Item { }
+    Mock Test-Path { $false }; Mock Get-ChildItem { }; Mock Copy-CraftShortcutFile { }; Mock Move-Item { }
     (Add-CraftShortcut -Item $items[0]).Status | Should -Be 'Failed'
     foreach ($f in 'CommonDesktopDirectory', 'DesktopDirectory', 'CommonPrograms', 'Programs') {
       $script:want = [Environment]::GetFolderPath($f); Should -Invoke Get-ChildItem -ParameterFilter { $LiteralPath -eq $script:want } }
-    Should -Invoke Copy-Item -Times 0 -Exactly; Should -Invoke Move-Item -Times 0 -Exactly }
+    Should -Invoke Copy-CraftShortcutFile -Times 0 -Exactly; Should -Invoke Move-Item -Times 0 -Exactly }
 
   # Beyond the brief's table.
   It 'a rename that fails is Failed, never a throw, and the MSI''s own shortcut stays' {
@@ -426,6 +430,44 @@ Describe 'Add-CraftShortcut' {
     Test-Path -LiteralPath (Join-Path $usr 'PdfCraft.lnk') | Should -BeFalse }
   It 'never copies a folder that happens to match' {
     [void][IO.Directory]::CreateDirectory((Join-Path $menu 'WordCraft.lnk')); (S $items[0]).Status | Should -Be 'Failed' }
+
+  # Fix round 1 (C-R3): never guess, never overwrite, never duplicate.
+  It 'takes the shortcut named exactly like the app over Help and Uninstall, which NTFS lists first' {
+    Add-Lnk $menu 'WordCraft Help' 'help'; Add-Lnk $menu 'WordCraft Uninstall' 'uninstall'; Add-Lnk $menu 'WordCraft' 'start'
+    (S $items[0]).Status | Should -Be 'Created'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'start' }
+  It 'two matches and none named like the app is Failed: nothing copied, the candidates in a WARN' {
+    Add-Lnk $menu 'WordCraft Help'; Add-Lnk $menu 'WordCraft Uninstall'
+    (S $items[0]).Status | Should -Be 'Failed'; Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and @($Data.candidates).Count -eq 2 } }
+  It 'one match not named exactly like the app is taken' {
+    Add-Lnk $menu 'WordCraft 0.8' 'start'; (S $items[0]).Status | Should -Be 'Created'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'start' }
+  It 'the same rule on the desktops: two loose matches are Failed, nothing moved or copied' {
+    Add-Lnk $pub 'WordCraft Help'; Add-Lnk $usr 'WordCraft Beta'; Add-Lnk $menu 'WordCraft' 'start'
+    (S $items[0]).Status | Should -Be 'Failed'; Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse
+    Test-Path -LiteralPath (Join-Path $pub 'WordCraft Help.lnk') | Should -BeTrue; Test-Path -LiteralPath (Join-Path $usr 'WordCraft Beta.lnk') | Should -BeTrue }
+  It 'the MSI''s own desktop shortcut named like the app wins over a loose match there' {
+    Add-Lnk $pub 'WordCraft Help' 'help'; Add-Lnk $pub 'WordCraft' 'msi'
+    (S $items[0]).Status | Should -Be 'Renamed'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'msi'
+    Test-Path -LiteralPath (Join-Path $pub 'WordCraft Help.lnk') | Should -BeTrue }
+  It 'a Word.lnk that appears between the check and the copy is never overwritten' {
+    Add-Lnk $pub 'Word' 'microsoft word'; Add-Lnk $menu 'WordCraft' 'start'; Mock Test-Path { $false }   # the check misses it
+    (S $items[0]).Status | Should -Be 'Failed'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'microsoft word' }
+  It 'a Word.lnk that appears between the check and the rename is never overwritten' {
+    Add-Lnk $pub 'Word' 'microsoft word'; Add-Lnk $pub 'WordCraft' 'msi'; Mock Test-Path { $false }
+    (S $items[0]).Status | Should -Be 'Failed'; [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'microsoft word'
+    [IO.File]::ReadAllText((Join-Path $pub 'WordCraft.lnk')) | Should -Be 'msi' }
+  It 'Copy-CraftShortcutFile refuses an existing destination and leaves it as it was' {
+    Add-Lnk $pub 'Word' 'microsoft word'; Add-Lnk $menu 'WordCraft' 'start'
+    { Copy-CraftShortcutFile -Path (Join-Path $menu 'WordCraft.lnk') -Destination (Join-Path $pub 'Word.lnk') } | Should -Throw
+    [IO.File]::ReadAllText((Join-Path $pub 'Word.lnk')) | Should -Be 'microsoft word' }
+  It 'a Word.lnk on the user''s own desktop is enough: no second Word icon on the public desktop' {
+    Add-Lnk $usr 'Word' 'mine'; Add-Lnk $menu 'WordCraft' 'start'
+    $r = S $items[0]; $r.Status | Should -Be 'Exists'; $r.Path | Should -Be (Join-Path $usr 'Word.lnk')
+    Test-Path -LiteralPath (Join-Path $pub 'Word.lnk') | Should -BeFalse }
+  It 'the launcher''s shortcut already on the public desktop is Exists: never moved to the user''s desktop' {
+    Add-Lnk $pub 'ArtCraft Launcher' 'msi'; $r = S $items[4]
+    $r.Status | Should -Be 'Exists'; $r.Path | Should -Be (Join-Path $pub 'ArtCraft Launcher.lnk')
+    Test-Path -LiteralPath (Join-Path $usr 'ArtCraft Launcher.lnk') | Should -BeFalse }
 }
 
 Describe 'Invoke-StepCraftApps' {
@@ -507,4 +549,12 @@ Describe 'Invoke-StepCraftApps' {
     $null = Invoke-StepCraftApps -Context $ctx
     Should -Invoke Install-CraftItem -Times 4 -Exactly -ParameterFilter { $InstalledVersion -eq '' } }
   It 'no Reboot and no Data' { $r = Invoke-StepCraftApps -Context $ctx; $r.Reboot | Should -Be 'None'; $r.Data.Count | Should -Be 0 }
+  It 'nothing installed (apps current, launcher failed) is Done(Craft apps already up to date) with the launcher Note (C-R3)' {
+    foreach ($n in 'WordCraft', 'GridCraft', 'DeckCraft', 'PdfCraft') { $script:outcome[$n] = @{ Status = 'Current'; Version = '1.0'; Reason = '' } }
+    $script:outcome['ArtCraft Launcher'] = @{ Status = 'Failed'; Version = ''; Reason = 'release lookup failed' }
+    $r = Invoke-StepCraftApps -Context $ctx; $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Craft apps already up to date'
+    @($r.Notes) | Should -Be @('ArtCraft Launcher could not be installed') }
+  It 'one item installed and the rest current is Craft apps installed' {
+    foreach ($n in 'WordCraft', 'GridCraft', 'PdfCraft', 'ArtCraft Launcher') { $script:outcome[$n] = @{ Status = 'Current'; Version = '1.0'; Reason = '' } }
+    (Invoke-StepCraftApps -Context $ctx).Message | Should -Be 'Craft apps installed' }
 }

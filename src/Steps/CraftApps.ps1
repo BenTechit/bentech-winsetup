@@ -366,28 +366,60 @@ function Install-CraftItem {
   }
 }
 
-function Find-CraftShortcutFile {
+function Select-CraftShortcutFile {
   <#
   .SYNOPSIS
-    Private. The first .lnk file directly in Folders (in their order; with -Recurse also below them) whose
-    BaseName -match Pattern, or $null. A folder that is empty, missing or partly unreadable is passed over.
+    Private. Picks one app's shortcut among the .lnk files directly in Folders (with -Recurse also below
+    them) whose BaseName -match Pattern. Returns @{ File = <FileInfo or $null>; Candidates = <their paths> }.
+  .DESCRIPTION
+    Never a guess (C-R3, the same rule as Select-CraftAsset): a match whose BaseName is the app's Name
+    (case-insensitive; the first in folder order) is taken; else a match that is the only one; else none.
+    NTFS lists 'WordCraft Help.lnk' and 'WordCraft Uninstall.lnk' before 'WordCraft.lnk', so "the first
+    match" could have put an uninstaller behind the customer's Word icon. A folder that is empty, missing or
+    partly unreadable is passed over.
   #>
   [CmdletBinding()]
-  [OutputType([IO.FileInfo])]
+  [OutputType([hashtable])]
   param(
     [AllowEmptyCollection()][string[]]$Folders,
     [Parameter(Mandatory)][string]$Pattern,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
     [switch]$Recurse
   )
 
+  $found = New-Object 'System.Collections.Generic.List[IO.FileInfo]'
   foreach ($folder in @($Folders)) {
     if ([string]::IsNullOrWhiteSpace($folder)) { continue }
     # Extension too: on 8.3 names the *.lnk filter can also match a longer extension.
-    $found = @(Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -Recurse:$Recurse -ErrorAction SilentlyContinue |
-      Where-Object { $_ -is [IO.FileInfo] -and $_.Extension -ieq '.lnk' -and $_.BaseName -match $Pattern } | Select-Object -First 1)
-    if ($found.Count -gt 0) { return $found[0] }
+    foreach ($file in @(Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -Recurse:$Recurse -ErrorAction SilentlyContinue)) {
+      if ($file -is [IO.FileInfo] -and $file.Extension -ieq '.lnk' -and $file.BaseName -match $Pattern) { $found.Add($file) }
+    }
   }
-  return $null
+
+  $pick = $null
+  foreach ($file in $found) {
+    if (-not [string]::IsNullOrEmpty($Name) -and $file.BaseName -ieq $Name) { $pick = $file; break }
+  }
+  if ($null -eq $pick -and $found.Count -eq 1) { $pick = $found[0] }
+  return @{ File = $pick; Candidates = @($found | ForEach-Object { $_.FullName }) }
+}
+
+function Copy-CraftShortcutFile {
+  <#
+  .SYNOPSIS
+    Private. Copies the shortcut Path to Destination and never overwrites: [IO.File]::Copy with overwrite
+    off throws when Destination exists, even one that appeared after the caller's check. Throws on failure.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Destination
+  )
+
+  # [IO.File] resolves a relative path against the process's directory; resolve against PowerShell's.
+  $from = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+  $to = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+  [IO.File]::Copy($from, $to, $false)
 }
 
 function Add-CraftShortcut {
@@ -399,12 +431,16 @@ function Add-CraftShortcut {
     The shortcut is <PublicDesktop>\<Item.shortcut>.lnk, or <UserDesktop>\... for the launcher
     (Item.launcher). Empty folders are this PC's: CommonDesktopDirectory, DesktopDirectory and the
     CommonPrograms and Programs Start menus.
-      1. It exists already (a real Microsoft Word shortcut, an earlier run): Exists, nothing touched.
-      2. Else the MSI's own desktop shortcut, the first .lnk directly on the public then the user's desktop
-         whose name matches Item.startMenuName, is moved to that name: Renamed (no duplicate icon).
-      3. Else the first matching .lnk under the Start menus (in their sub-folders too) is copied: Created.
+      1. <Item.shortcut>.lnk is already on either desktop (a real Microsoft Word shortcut, an earlier run,
+         the launcher's own): Exists with that path, nothing touched, so there is never a second icon.
+      2. Else the MSI's own desktop shortcut, a .lnk directly on the public or the user's desktop whose
+         name matches Item.startMenuName, is moved to that name: Renamed (no duplicate icon).
+      3. Else a matching .lnk under the Start menus (in their sub-folders too) is copied: Created.
       4. Else, or on any error: Failed, logged at WARN.
-    Nothing is ever overwritten or deleted (craft Review Focus 5). An empty startMenuName would match every
+    Steps 2 and 3 never guess (Select-CraftShortcutFile, C-R3): the match named exactly like the app
+    (Item.name) wins, else the only match; two or more loose matches are Failed with the candidates in the
+    WARN. Nothing is ever overwritten or deleted (craft Review Focus 5): the move and the copy both refuse
+    an existing target, even one that appeared after step 1. An empty startMenuName would match every
     shortcut, so it is Failed.
   #>
   [CmdletBinding()]
@@ -433,24 +469,39 @@ function Add-CraftShortcut {
     }
     [void][regex]::new($pattern)   # a bad pattern fails here, not half-way through a folder
     $target = Join-Path $desktop "$shortcut.lnk"
+    $name = [string]$Item.name
 
-    if (Test-Path -LiteralPath $target) { return @{ Status = 'Exists'; Path = $target } }
+    # The target first, then the same name on the other desktop.
+    foreach ($folder in @($desktop, $PublicDesktop, $UserDesktop)) {
+      if ([string]::IsNullOrWhiteSpace($folder)) { continue }
+      $existing = Join-Path $folder "$shortcut.lnk"
+      if (Test-Path -LiteralPath $existing) { return @{ Status = 'Exists'; Path = $existing } }
+    }
 
-    $own = Find-CraftShortcutFile -Folders @($PublicDesktop, $UserDesktop) -Pattern $pattern
-    if ($null -ne $own) {
-      Move-Item -LiteralPath $own.FullName -Destination $target -ErrorAction Stop
-      Write-SetupLog -Message 'Craft desktop shortcut renamed' -Data @{ from = $own.FullName; to = $target }
+    $own = Select-CraftShortcutFile -Folders @($PublicDesktop, $UserDesktop) -Pattern $pattern -Name $name
+    if ($null -ne $own.File) {
+      # Without -Force, Move-Item refuses a target that exists.
+      Move-Item -LiteralPath $own.File.FullName -Destination $target -ErrorAction Stop
+      Write-SetupLog -Message 'Craft desktop shortcut renamed' -Data @{ from = $own.File.FullName; to = $target }
       return @{ Status = 'Renamed'; Path = $target }
     }
-
-    $start = Find-CraftShortcutFile -Folders $StartMenuFolders -Pattern $pattern -Recurse
-    if ($null -ne $start) {
-      Copy-Item -LiteralPath $start.FullName -Destination $target -ErrorAction Stop
-      Write-SetupLog -Message 'Craft desktop shortcut created' -Data @{ from = $start.FullName; to = $target }
-      return @{ Status = 'Created'; Path = $target }
+    if ($own.Candidates.Count -gt 1) {
+      Write-SetupLog -Message 'More than one desktop shortcut could be the Craft app''s own; none chosen' -Level WARN -Data @{ item = $name; startMenuName = $pattern; candidates = $own.Candidates }
+      return @{ Status = 'Failed'; Path = $target }
     }
 
-    Write-SetupLog -Message 'No Start-menu shortcut found for a Craft app' -Level WARN -Data @{ item = [string]$Item.name; startMenuName = $pattern; folders = @($StartMenuFolders) }
+    $start = Select-CraftShortcutFile -Folders $StartMenuFolders -Pattern $pattern -Name $name -Recurse
+    if ($null -ne $start.File) {
+      Copy-CraftShortcutFile -Path $start.File.FullName -Destination $target
+      Write-SetupLog -Message 'Craft desktop shortcut created' -Data @{ from = $start.File.FullName; to = $target }
+      return @{ Status = 'Created'; Path = $target }
+    }
+    if ($start.Candidates.Count -gt 1) {
+      Write-SetupLog -Message 'More than one Start-menu shortcut could be the Craft app''s; none chosen' -Level WARN -Data @{ item = $name; startMenuName = $pattern; candidates = $start.Candidates }
+      return @{ Status = 'Failed'; Path = $target }
+    }
+
+    Write-SetupLog -Message 'No Start-menu shortcut found for a Craft app' -Level WARN -Data @{ item = $name; startMenuName = $pattern; folders = @($StartMenuFolders) }
     return @{ Status = 'Failed'; Path = $target }
   } catch {
     Write-SetupLog -Message 'A Craft desktop shortcut could not be created' -Level WARN -Data @{ item = [string]$Item.name; path = $target; error = $_.Exception.Message }
@@ -475,8 +526,9 @@ function Invoke-StepCraftApps {
       the apps and their updates' instead; a failure is '<Name> not installed - <reason>'.
     Any app failing is Failed('Not installed: <Name> (<reason>), ...') in config order. The launcher failing
     alone is only the Note '<Name> could not be installed': the apps work without it. Otherwise Done('Craft
-    apps installed'), or Done('Craft apps already up to date') when every item was Current. The Notes come
-    with Done and Failed alike.
+    apps installed') when at least one item was installed now, else Done('Craft apps already up to date')
+    (C-R3: also when the apps were current and only the launcher failed). The Notes come with Done and
+    Failed alike.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -501,7 +553,7 @@ function Invoke-StepCraftApps {
   $installed = Get-InstalledAppVersions -Config $Context.Config
   $notes = New-Object 'System.Collections.Generic.List[string]'
   $failures = New-Object 'System.Collections.Generic.List[string]'
-  $allCurrent = $true
+  $anyInstalled = $false
 
   foreach ($item in $items) {
     $name = [string]$item.name
@@ -511,7 +563,7 @@ function Invoke-StepCraftApps {
 
     $outcome = Install-CraftItem -Context $Context -Item $item -Arch $arch -Signers $signers -InstalledVersion $installedVersion
     $status = [string]$outcome.Status
-    if ($status -ne 'Current') { $allCurrent = $false }
+    if ($status -eq 'Installed') { $anyInstalled = $true }
 
     if ($status -eq 'Installed' -or $status -eq 'Current') {
       $shortcut = Add-CraftShortcut -Item $item
@@ -536,6 +588,6 @@ function Invoke-StepCraftApps {
   if ($failures.Count -gt 0) {
     return New-StepResult -Status Failed -Message ('Not installed: ' + ($failures -join ', ')) -Notes $notes.ToArray()
   }
-  $message = if ($allCurrent) { 'Craft apps already up to date' } else { 'Craft apps installed' }
+  $message = if ($anyInstalled) { 'Craft apps installed' } else { 'Craft apps already up to date' }
   return New-StepResult -Status Done -Message $message -Notes $notes.ToArray()
 }
