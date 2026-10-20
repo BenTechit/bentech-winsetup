@@ -6,7 +6,7 @@ BeforeAll {
   function P($brand, $mode, $z = $true, $o = 'BUSINESS') { Get-StepPlan -Machine @{Brand=$brand} -Choices @{Mode=$mode;SevenZip=$z;Office=$o} -Config $cfg }
 }
 Describe 'StepCatalog' {
-  It 'lists the 19 steps in spec order with their titles and functions' {
+  It 'lists the 20 steps in spec order with their titles and functions' {
     $rows = @($script:StepCatalog | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Title, $_.Function })
     $rows | Should -Be @(
       'prepare|Prepare machine|Invoke-StepPrepare'
@@ -19,6 +19,7 @@ Describe 'StepCatalog' {
       'chrome|Google Chrome|Invoke-StepChrome'
       'anydesk|AnyDesk|Invoke-StepAnyDesk'
       '7zip|7-Zip|Invoke-StepSevenZip'
+      'craft-apps|Craft apps|Invoke-StepCraftApps'
       'default-browser|Chrome as default browser|Invoke-StepDefaultBrowser'
       'vendor-pass1|Vendor drivers + BIOS (pass 1)|Invoke-StepVendorPass1'
       'office|Microsoft 365|Invoke-StepOffice'
@@ -35,7 +36,7 @@ Describe 'StepCatalog' {
   It 'has the progress screen''s Short titles (v2 spec 4.2)' {
     @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
       'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons'
-      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', '7zip|7-Zip'
+      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', '7zip|7-Zip', 'craft-apps|Craft apps'
       'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'office|Microsoft 365', 'windows-update|Windows Update'
       'office-finish|Microsoft 365', 'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
     )
@@ -95,6 +96,10 @@ Describe 'Get-StepPlan' {
     $state.Steps.Count | Should -Be 19
   }
   It 'Office HOME keeps the office step' { (P DELL LAPTOP $true 'HOME') | Should -Contain 'office'; (P DELL LAPTOP $true 'HOME') | Should -Contain 'office-finish' }
+  It 'CRAFT: craft-apps right after 7zip, and no Microsoft 365 steps' {
+    (P DELL LAPTOP $true 'CRAFT') -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,craft-apps,default-browser,vendor-pass1,windows-update,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
+  It 'CRAFT without 7-Zip: craft-apps right after anydesk' { $p = @(P ASUS DESKTOP $false 'CRAFT'); $p.IndexOf('craft-apps') | Should -Be ($p.IndexOf('anydesk') + 1) }
+  It 'BUSINESS, HOME and OFF never get craft-apps' { foreach ($o in 'BUSINESS', 'HOME', 'OFF') { (P DELL LAPTOP $true $o) | Should -Not -Contain 'craft-apps' } }
 }
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'

@@ -15,6 +15,9 @@
 # every Windows Installer install and every restart a vendor tool forces happen before it; it runs
 # alongside Windows Update round 1. office-finish, right after windows-update, collects its result. The
 # progress screen folds office-finish into the office line.
+#
+# Craft apps (craft spec 3.2): the free office suite runs right after 7zip, so its MSI installs come before
+# the vendor tools. It replaces office and office-finish: no plan holds both.
 $script:StepCatalog = @(
   @{ Id = 'prepare';         Title = 'Prepare machine';                 Short = 'Prepare';              Function = 'Invoke-StepPrepare' }
   @{ Id = 'bitlocker';       Title = 'Turn off BitLocker';              Short = 'BitLocker off';        Function = 'Invoke-StepBitLocker' }
@@ -26,6 +29,7 @@ $script:StepCatalog = @(
   @{ Id = 'chrome';          Title = 'Google Chrome';                   Short = 'Chrome';               Function = 'Invoke-StepChrome' }
   @{ Id = 'anydesk';         Title = 'AnyDesk';                         Short = 'AnyDesk';              Function = 'Invoke-StepAnyDesk' }
   @{ Id = '7zip';            Title = '7-Zip';                           Short = '7-Zip';                Function = 'Invoke-StepSevenZip' }
+  @{ Id = 'craft-apps';      Title = 'Craft apps';                      Short = 'Craft apps';           Function = 'Invoke-StepCraftApps' }
   @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Short = 'Default browser';      Function = 'Invoke-StepDefaultBrowser' }
   @{ Id = 'vendor-pass1';    Title = 'Vendor drivers + BIOS (pass 1)';  Short = 'Drivers (pass 1)';     Function = 'Invoke-StepVendorPass1' }
   @{ Id = 'office';          Title = 'Microsoft 365';                   Short = 'Microsoft 365';        Function = 'Invoke-StepOffice' }
@@ -82,7 +86,9 @@ function Get-StepPlan {
   .DESCRIPTION
     Vendor passes: DELL/LENOVO/HP only. Vendor app: laptop mode and a configured consumerApp.
     Business-updater cleanup: laptop mode and DELL/LENOVO/HP. A VM never gets a vendor step.
-    office and office-finish: both, or (Office OFF) neither.
+    Choices.Office picks the office suite: CRAFT gives craft-apps and neither office nor office-finish;
+    OFF gives none of the three; any other value (BUSINESS, HOME) gives office and office-finish and no
+    craft-apps.
     The mode comes from Choices (what the technician picked), never from Machine.IsLaptop.
     The ids are emitted one by one, the normal PowerShell way, so `foreach`, the pipeline, `@(...)` and
     a `[string[]]` parameter such as New-RunState -Plan all see every id. A real plan always has at
@@ -111,8 +117,9 @@ function Get-StepPlan {
       'consumer-app'   { $isLaptopMode -and $hasConsumerApp }
       'vendor-cleanup' { $isLaptopMode -and $hasBusinessTool }
       '7zip'           { [bool]$Choices['SevenZip'] }
-      'office'         { $Choices['Office'] -ne 'OFF' }
-      'office-finish'  { $Choices['Office'] -ne 'OFF' }
+      'craft-apps'     { $Choices['Office'] -eq 'CRAFT' }
+      'office'         { $Choices['Office'] -notin 'OFF', 'CRAFT' }
+      'office-finish'  { $Choices['Office'] -notin 'OFF', 'CRAFT' }
       default          { $true }
     }
     if ($include) { $plan.Add($step.Id) }
