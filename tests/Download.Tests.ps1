@@ -310,8 +310,34 @@ Describe 'Test-FileSignature' {
     # Real certificates with the subject under test, made in memory: an ephemeral CNG key signs them and is
     # not attached, so nothing reaches a key or certificate store. Get-AuthenticodeSignature is mocked to
     # hand one back with the Status under test, because no real file is signed by these subjects.
+    # Subject is a string for CertificateRequest, or an X500DistinguishedName built from DER by
+    # New-DerSubject for subjects that text cannot express (a line break inside a value).
     BeforeAll {
-      function New-TestCertificate([string]$Subject) {
+      # DER of a subject Name from a spec: RDNs split by '|', the attributes of one multi-valued RDN by '&',
+      # each '<type>=<value>' split at the first '='. Every value is a UTF8String.
+      function New-DerSubject([string]$Spec) {
+        $oids = @{ CN = 0x03; C = 0x06; L = 0x07; S = 0x08; O = 0x0A; OU = 0x0B }
+        function Der([byte]$Tag, [byte[]]$Content) {
+          $out = New-Object 'System.Collections.Generic.List[byte]'
+          $out.Add($Tag)
+          if ($Content.Length -lt 0x80) { $out.Add([byte]$Content.Length) } else { $out.Add(0x81); $out.Add([byte]$Content.Length) }
+          $out.AddRange($Content)
+          return ,($out.ToArray())
+        }
+        $name = New-Object 'System.Collections.Generic.List[byte]'
+        foreach ($rdn in ($Spec -split '\|')) {
+          $set = New-Object 'System.Collections.Generic.List[byte]'
+          foreach ($atv in ($rdn -split '&')) {
+            $at = $atv.IndexOf('=')
+            $oid = Der 0x06 ([byte[]](0x55, 0x04, $oids[$atv.Substring(0, $at)]))
+            $value = Der 0x0C ([Text.Encoding]::UTF8.GetBytes($atv.Substring($at + 1)))
+            $set.AddRange([byte[]](Der 0x30 ([byte[]]($oid + $value))))
+          }
+          $name.AddRange([byte[]](Der 0x31 $set.ToArray()))
+        }
+        New-Object Security.Cryptography.X509Certificates.X500DistinguishedName (, [byte[]](Der 0x30 $name.ToArray()))
+      }
+      function New-TestCertificate($Subject) {
         $rsa = New-Object Security.Cryptography.RSACng 2048
         try {
           $pkcs1 = [Security.Cryptography.RSASignaturePadding]::Pkcs1
@@ -322,7 +348,7 @@ Describe 'Test-FileSignature' {
         } finally { $rsa.Dispose() }
       }
       $script:craftSubject = 'CN=Learning Machines Inc, O=Learning Machines Inc, L=Atlanta, S=Georgia, C=US'
-      function Use-FakeSignature([string]$Status, [string]$Subject) {
+      function Use-FakeSignature([string]$Status, $Subject) {
         $script:fake = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]$Status; SignerCertificate = (New-TestCertificate $Subject) }
         Mock Get-AuthenticodeSignature { $script:fake }
       }
@@ -364,6 +390,28 @@ Describe 'Test-FileSignature' {
     It 'without -ExactCN the match stays a substring, as for the vendors (R32)' {
       Use-FakeSignature 'Valid' 'CN=Learning Machines Inc., O=Learning Machines Inc., C=US'
       Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') | Should -BeTrue
+    }
+    # Fix round C-R6 (N1): subjects built from DER that a text subject cannot express. The check fails closed
+    # on a quote or a control character anywhere in the subject, and counts every CN, also one inside a
+    # multi-valued RDN (O=... + CN=...).
+    It 'accepts the real Craft subject built from DER' {
+      Use-FakeSignature 'Valid' (New-DerSubject 'C=US|S=Georgia|L=Atlanta|O=Learning Machines Inc|CN=Learning Machines Inc')
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeTrue
+    }
+    It 'rejects (DER) <Why>' -ForEach @(
+      @{ Why = 'no real CN, and CN=<signer> inside a quoted O value with line breaks'; Spec = "C=US|O=x`nCN=Learning Machines Inc`ny" }
+      @{ Why = 'the CN=<signer> inside a multi-valued RDN next to another CN';        Spec = 'CN=Evil Corp|O=Evil&CN=Learning Machines Inc' }
+      @{ Why = 'a second CN hidden in a multi-valued RDN after CN=<signer>';           Spec = 'CN=Learning Machines Inc|O=Evil&CN=Evil Corp' }
+      @{ Why = 'two CNs in one multi-valued RDN';                                      Spec = 'C=US|CN=Learning Machines Inc&CN=Evil Corp' }
+      @{ Why = 'a tab in another value (Windows does not quote it)';                   Spec = "O=a`tb|CN=Learning Machines Inc" }
+      @{ Why = 'a control character in another value';                                 Spec = "O=a$([char]1)b|CN=Learning Machines Inc" }
+      @{ Why = 'a DEL in another value';                                               Spec = "O=a$([char]0x7f)b|CN=Learning Machines Inc" }
+      @{ Why = 'a quote in another value';                                             Spec = 'O=a"b|CN=Learning Machines Inc' }
+      @{ Why = 'a comma in another value (quoted by Windows)';                         Spec = 'O=Learning Machines, Inc|CN=Learning Machines Inc' }
+      @{ Why = 'a carriage return after the CN';                                       Spec = "C=US|CN=Learning Machines Inc`r" }
+    ) {
+      Use-FakeSignature 'Valid' (New-DerSubject $Spec)
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
     }
     It 'logs the subject and the CN it read when it rejects' {
       Use-FakeSignature 'Valid' 'CN=Learning Machines Incorporated, C=US'

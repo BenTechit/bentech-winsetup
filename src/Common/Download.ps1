@@ -225,12 +225,18 @@ function Get-CertificateCommonName {
   <#
   .SYNOPSIS
     Private. The value of the one CN in a certificate's subject, or $null when the subject has no CN,
-    more than one, or cannot be read. Never throws.
+    more than one, anything unusual, or cannot be read. Fails closed; never throws.
   .DESCRIPTION
-    Reads the subject as Windows renders it, one attribute per line (X500DistinguishedName.Decode with
-    UseNewLines); a value with a comma, a quote, a line break or an edge space comes back in quotes, so
-    it can never equal a plain company name. Not GetNameInfo(SimpleName): with no CN in the subject that
-    falls back to the OU= or O= value (seen on .NET Framework 4.8), so 'O=<company>' alone would pass.
+    Reads the subject as Windows renders it on one line (X500DistinguishedName.Decode, no flags): ', '
+    between RDNs and ' + ' between the attributes of a multi-valued RDN. Windows puts a value in quotes
+    when it holds a comma, a plus, '=', ';', '<', '>', '#' first, a quote, a line break or an edge space,
+    but not a tab or another control character (seen on .NET Framework 4.8, fix round C-R6). So:
+      - any '"' or control character in the subject is $null: a quoted value could hold a fake
+        'CN=...' after a line break (final re-review N1), and nothing usual needs either;
+      - with neither, ', ' and ' + ' can only be separators, so every attribute is one piece and every CN
+        is counted, also one inside a multi-valued RDN (O=Evil + CN=...); exactly one is required;
+      - Windows' own reading must agree: GetNameInfo(SimpleName) must equal that CN. (SimpleName alone is
+        not enough: with no CN it falls back to the OU= or O= value, and with two CNs it picks one.)
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -238,9 +244,12 @@ function Get-CertificateCommonName {
 
   try {
     if ($null -eq $Certificate -or $null -eq $Certificate.SubjectName) { return $null }
-    $lines = $Certificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseNewLines) -split "`r?`n"
-    $names = @($lines | Where-Object { $_ -clike 'CN=*' } | ForEach-Object { $_.Substring(3) })
+    $subject = [string]$Certificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::None)
+    if ([string]::IsNullOrEmpty($subject) -or $subject.Contains('"') -or $subject -match '[\x00-\x1F\x7F]') { return $null }
+    $names = @(($subject -split ', | \+ ') | Where-Object { $_ -clike 'CN=*' } | ForEach-Object { $_.Substring(3) })
     if ($names.Count -ne 1) { return $null }
+    $simpleName = [string]$Certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($simpleName -cne $names[0]) { return $null }
     return [string]$names[0]
   } catch {
     return $null

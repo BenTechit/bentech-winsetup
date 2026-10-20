@@ -21,7 +21,7 @@ In this order (steps that don't apply to the machine are left out):
 9. **7-Zip**, optional.
 10. **Craft apps** (Office CRAFT, the default): the free **WordCraft, GridCraft, DeckCraft and PdfCraft** (Word, Excel, PowerPoint and a PDF reader), then the **ArtCraft Launcher**, meant to keep them up to date (checked on the first laptop, [docs/testing.md](docs/testing.md) 1.17).
     - Each is the MSI for the PC's processor (x64 or arm64) from the latest GitHub release of its project. It runs only after its `SHA256SUMS.txt` line and its `Learning Machines Inc` signature check out, and an app already at that version is skipped.
-    - Desktop shortcuts `Word`, `Excel`, `PowerPoint` and `PDF Reader` for **all users**, `ArtCraft Launcher` for the **signed-in user**. A shortcut of that name already on a desktop stays; nothing is overwritten or deleted.
+    - Desktop shortcuts `Word`, `Excel`, `PowerPoint` and `PDF Reader`, normally on the public desktop (**all users**). When an MSI put its own shortcut on the signed-in user's desktop, it is renamed there and stays that user's only. `ArtCraft Launcher` goes on the **signed-in user's** desktop, unless the MSI already put it on a desktop. A shortcut of that name already on a desktop stays; nothing is overwritten or deleted.
     - A failed app is red; the launcher or a shortcut alone is a yellow note. GitHub limits and the fields: [Changing apps and lists](#changing-apps-and-lists).
 11. **Chrome as default browser** (best effort). After the final restart Windows may take a while to apply it, so the end of the run waits up to 2 minutes for it before checking.
 12. **Vendor drivers + BIOS, pass 1** for Dell, Lenovo and HP (laptops and brand-name desktops).
