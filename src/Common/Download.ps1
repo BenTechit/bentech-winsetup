@@ -57,16 +57,29 @@ function Invoke-DownloadAttempt {
   throw (New-Object System.Exception ($message, $lastError))
 }
 
+# Stall limits of one download attempt (Receive-RemoteFile), in seconds: the .part file must change
+# within the first limit while no byte has arrived, and within the second once bytes have arrived.
+# They are the timeouts the synchronous WebClient.DownloadFile honoured (HttpWebRequest.Timeout 100 s,
+# ReadWriteTimeout 300 s) and DownloadFileTaskAsync ignores. Tests shrink them.
+$script:DownloadStallFirstByteSeconds = 100
+$script:DownloadStallSeconds = 300
+
 function Receive-RemoteFile {
   <#
   .SYNOPSIS
     Private. One attempt of Get-RemoteFile: downloads Url to Path with Client, waiting at most
-    TimeoutMinutes. Throws when the download fails or times out.
+    TimeoutMinutes. Throws when the download fails, stalls or times out.
   .DESCRIPTION
     DownloadFileTaskAsync, waited for in slices of at most 250 ms with the tick after each, so the
-    progress screen stays alive; TimeoutMinutes is the published wait limit meanwhile. At the
-    deadline the download is cancelled (CancelAsync), given at most 2 s to stop, and a
-    TimeoutException "download timed out after <n> min: <url>" is thrown. A finished download is
+    progress screen stays alive; TimeoutMinutes is the published wait limit meanwhile.
+    - Stall: every slice reads the length of Path (a missing file is 0). When it has not changed
+      for $script:DownloadStallFirstByteSeconds while it is still 0, or for
+      $script:DownloadStallSeconds once bytes have arrived, the download is cancelled and a
+      TimeoutException "download stalled for <n> s: <url>" is thrown. (DownloadProgressChanged is
+      not used: its handler would run on a thread-pool thread that has no runspace.)
+    - Deadline: after TimeoutMinutes the download is cancelled and a TimeoutException "download
+      timed out after <n> min: <url>" is thrown.
+    Cancelling is CancelAsync, then at most 2 s for the download to stop. A finished download is
     completed with GetAwaiter().GetResult(), which rethrows its WebException.
   #>
   [CmdletBinding()]
@@ -78,19 +91,34 @@ function Receive-RemoteFile {
   )
 
   $timeoutMs = [long][Math]::Ceiling($TimeoutMinutes * 60000)
+  $firstByteSeconds = $script:DownloadStallFirstByteSeconds
+  $stallSeconds = $script:DownloadStallSeconds
+  $file = New-Object IO.FileInfo $Path
   $clock = [Diagnostics.Stopwatch]::StartNew()
   Enter-SetupWait -LimitMinutes $TimeoutMinutes
   try {
     $task = $Client.DownloadFileTaskAsync([uri]$Url, $Path)
+    $length = [long]0
+    $changedMs = [long]0
+    $failure = $null
     while (-not $task.IsCompleted) {
-      $remaining = $timeoutMs - $clock.ElapsedMilliseconds
-      if ($remaining -le 0) {
-        $Client.CancelAsync()
-        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), 2000)
-        throw (New-Object TimeoutException ("download timed out after $TimeoutMinutes min: $Url"))
-      }
-      [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), [int][Math]::Min(250, $remaining))
+      $nowMs = $clock.ElapsedMilliseconds
+      if ($nowMs -ge $timeoutMs) { $failure = "download timed out after $TimeoutMinutes min: $Url"; break }
+
+      $file.Refresh()
+      $current = [long]0
+      if ($file.Exists) { $current = $file.Length }
+      if ($current -ne $length) { $length = $current; $changedMs = $nowMs }
+      $limitSeconds = $(if ($length -gt 0) { $stallSeconds } else { $firstByteSeconds })
+      if (($nowMs - $changedMs) -ge ([double]$limitSeconds * 1000)) { $failure = "download stalled for $limitSeconds s: $Url"; break }
+
+      [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), [int][Math]::Min(250, $timeoutMs - $nowMs))
       Invoke-SetupTick
+    }
+    if ($null -ne $failure) {
+      $Client.CancelAsync()
+      [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), 2000)
+      throw (New-Object TimeoutException $failure)
     }
     $null = $task.GetAwaiter().GetResult()
   } finally {
@@ -106,9 +134,9 @@ function Get-RemoteFile {
     Downloads to <Destination>.part and moves it into place only when complete, so a partial or
     failed download never looks like a finished file. Creates the destination folder if needed. An
     existing destination is replaced only after a download succeeded. Each attempt may take at most
-    TimeoutMinutes (Receive-RemoteFile: it ticks while it waits); a timed-out attempt is a failed
-    one. Waits BackoffSeconds * attempt between tries. Throws "download failed after <n> attempts:
-    <url>".
+    TimeoutMinutes and gives up earlier when it stalls (Receive-RemoteFile: it ticks while it
+    waits); a stalled or timed-out attempt is a failed one. Waits BackoffSeconds * attempt between
+    tries. Throws "download failed after <n> attempts: <url>".
   #>
   [CmdletBinding()]
   [OutputType([string])]

@@ -11,7 +11,24 @@ Describe 'downloads and signatures' {
 }
 
 Describe 'Get-RemoteFile' {
+  BeforeAll {
+    $script:stallDefaults = @($script:DownloadStallFirstByteSeconds, $script:DownloadStallSeconds)
+    # A fake WebClient for the stall tests. DownloadFileTaskAsync writes $script:fakeBytes bytes to the
+    # .part file (none when 0) and returns a task that never completes; CancelAsync is counted.
+    function New-StallingClient {
+      $c = [pscustomobject]@{}
+      $c | Add-Member ScriptMethod DownloadFileTaskAsync {
+        param($u, $p)
+        if ($script:fakeBytes -gt 0) { [IO.File]::WriteAllBytes($p, (New-Object byte[] $script:fakeBytes)) }
+        (New-Object 'Threading.Tasks.TaskCompletionSource[object]').Task
+      }
+      $c | Add-Member ScriptMethod CancelAsync { $script:cancels++ }
+      $c | Add-Member ScriptMethod Dispose { }
+      $c
+    }
+  }
   BeforeEach { 'payload' | Set-Content "$TestDrive\src.txt" }
+  AfterEach { $script:DownloadStallFirstByteSeconds, $script:DownloadStallSeconds = $script:stallDefaults }
   It 'returns the destination path and copies the content' {
     $dest = "$TestDrive\out1.txt"
     Get-RemoteFile -Url ([uri]"$TestDrive\src.txt").AbsoluteUri -Destination $dest -BackoffSeconds 0 | Should -Be $dest
@@ -82,8 +99,75 @@ Describe 'Get-RemoteFile' {
     $script:cancels | Should -Be 1
   }
   It 'ticks while downloading and still copies the file' {
+    # The fake download writes the file and finishes on its own after 300 ms, so the loop must wait.
+    Mock New-SetupWebClient {
+      $c = [pscustomobject]@{}
+      $c | Add-Member ScriptMethod DownloadFileTaskAsync { param($u, $p) [IO.File]::WriteAllText($p, 'done'); [Threading.Tasks.Task]::Delay(300) }
+      $c | Add-Member ScriptMethod CancelAsync { }
+      $c | Add-Member ScriptMethod Dispose { }
+      $c }
     $script:ticks = 0; Register-SetupTick -Context @{} -Handler { $script:ticks++ }
-    try { Get-RemoteFile -Url ([uri]"$TestDrive\src.txt").AbsoluteUri -Destination "$TestDrive\t.txt" -BackoffSeconds 0 | Should -Exist } finally { Unregister-SetupTick }
+    try { Get-RemoteFile -Url 'https://example.invalid/t.exe' -Destination "$TestDrive\t.txt" -BackoffSeconds 0 | Should -Exist } finally { Unregister-SetupTick }
+    $script:ticks | Should -BeGreaterThan 0
+  }
+  It 'gives up on a download that receives nothing within the first-byte limit, and cancels it' {
+    $script:DownloadStallFirstByteSeconds = 0.3; $script:DownloadStallSeconds = 60
+    $script:cancels = 0; $script:fakeBytes = 0
+    Mock New-SetupWebClient { New-StallingClient }
+    $err = $null; $clock = [Diagnostics.Stopwatch]::StartNew()
+    try { Get-RemoteFile -Url 'https://example.invalid/s.exe' -Destination "$TestDrive\s.exe" -Retries 1 -BackoffSeconds 0 -TimeoutMinutes 0.5 } catch { $err = $_ }
+    $clock.Stop()
+    $err.Exception.Message | Should -BeExactly 'download failed after 1 attempts: https://example.invalid/s.exe'
+    $err.Exception.InnerException.Message | Should -BeExactly 'download stalled for 0.3 s: https://example.invalid/s.exe'
+    $script:cancels | Should -Be 1
+    $clock.Elapsed.TotalSeconds | Should -BeLessThan 15     # the 30 s deadline was not what ended it
+    "$TestDrive\s.exe" | Should -Not -Exist
+  }
+  It 'uses the between-bytes stall limit once bytes have arrived, on every attempt' {
+    $script:DownloadStallFirstByteSeconds = 60; $script:DownloadStallSeconds = 0.4
+    $script:cancels = 0; $script:fakeBytes = 5
+    Mock New-SetupWebClient { New-StallingClient }
+    $err = $null
+    try { Get-RemoteFile -Url 'https://example.invalid/s2.exe' -Destination "$TestDrive\s2.exe" -Retries 2 -BackoffSeconds 0 -TimeoutMinutes 0.5 } catch { $err = $_ }
+    $err.Exception.Message | Should -BeExactly 'download failed after 2 attempts: https://example.invalid/s2.exe'
+    $err.Exception.InnerException.Message | Should -BeExactly 'download stalled for 0.4 s: https://example.invalid/s2.exe'
+    $script:cancels | Should -Be 2       # every attempt was cancelled: the retries apply
+    "$TestDrive\s2.exe.part" | Should -Not -Exist
+  }
+  It 'does not give up on a slow download whose .part file keeps growing' {
+    if (-not ('BenTechTests.TrickleDownload' -as [type])) {
+      Add-Type -TypeDefinition @'
+namespace BenTechTests {
+  public static class TrickleDownload {
+    // A slow download that keeps moving: appends one byte to path every gapMs, count times, then completes.
+    public static System.Threading.Tasks.Task Start(string path, int count, int gapMs) {
+      return System.Threading.Tasks.Task.Run(() => {
+        for (int i = 0; i < count; i++) {
+          System.Threading.Thread.Sleep(gapMs);
+          using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Append, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite)) { fs.WriteByte(65); }
+        }
+      });
+    }
+  }
+}
+'@
+    }
+    # 20 bytes, 100 ms apart: 2 s in all, twice the 1 s stall limit, but the file never stands still for 1 s.
+    $script:DownloadStallFirstByteSeconds = 1; $script:DownloadStallSeconds = 1
+    $script:cancels = 0
+    Mock New-SetupWebClient {
+      $c = [pscustomobject]@{}
+      $c | Add-Member ScriptMethod DownloadFileTaskAsync { param($u, $p) [BenTechTests.TrickleDownload]::Start($p, 20, 100) }
+      $c | Add-Member ScriptMethod CancelAsync { $script:cancels++ }
+      $c | Add-Member ScriptMethod Dispose { }
+      $c }
+    $out = Get-RemoteFile -Url 'https://example.invalid/slow.bin' -Destination "$TestDrive\slow.bin" -Retries 1 -BackoffSeconds 0 -TimeoutMinutes 0.5
+    $out | Should -Exist
+    (Get-Item -LiteralPath $out).Length | Should -Be 20
+    $script:cancels | Should -Be 0
+  }
+  It 'gives a stalled download 100 s for its first byte and 300 s between bytes' {
+    $script:stallDefaults | Should -Be @(100, 300)
   }
   It 'shows its timeout as the wait limit while it downloads, and removes it after' {
     Clear-SetupNow
