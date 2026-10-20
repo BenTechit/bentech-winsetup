@@ -1,14 +1,17 @@
 ﻿# src/Steps/WindowsUpdate.ps1
 # Step 13 (spec 8.3, 13): the bounded Windows Update loop over the native Windows Update Agent (WUA)
-# COM API. Needs StepResult.ps1, Logging.ps1, Process.ps1 (Invoke-External) and State.ps1
-# (Read-RunState, Save-RunState); the bundle holds every file.
+# COM API. Needs StepResult.ps1, Logging.ps1, Process.ps1 (Invoke-External), State.ps1 (Read-RunState,
+# Save-RunState), Activity.ps1 (Read-FileTail, Set-SetupNow, Add-SetupActivity, Wait-SetupDelay) and
+# StartScreen.ps1 (ConvertTo-ScreenText); the bundle holds every file.
 #
 # Two halves:
 # - The parent step, Invoke-StepWindowsUpdate, runs in the runner. Each call is ONE round: it bumps
 #   Data.Rounds (capped by caps.maxWuRounds), saves the state, starts the bundle again as a child with
 #   -WuRound (timeout timeoutsMinutes.wuRound, the whole process tree is killed on timeout), reads the
 #   child's result JSON, and books it into the state. It returns Continue (with Reboot 'Now' when
-#   needed) until a round finds nothing to do, then Done.
+#   needed) until a round finds nothing to do, then Done. While the child runs, NOW shows
+#   "round N (max cap)" and the lines Get-WuProgressLines reads from the child's progress file; each
+#   booked round adds one activity line, and the installed updates are kept for the report.
 # - The child round, Invoke-WuRound, does the COM work in that separate process: search, hide, accept
 #   EULAs, download, install (one update at a time by default, or v1's batch: config
 #   windowsUpdate.installMode, spec 4.5). It ALWAYS writes its result JSON; any exception becomes its
@@ -1012,6 +1015,88 @@ function Invoke-WuRound {
 
 # --- the parent step --------------------------------------------------------------------------
 
+function Format-WuUpdateLine {
+  <#
+  .SYNOPSIS
+    One NOW line for an entry of the progress file's Updates list (spec 4.5): '<marker> <Kb> <Title>',
+    plus ' (412 MB)' when SizeMB is above 0. Pure.
+  .DESCRIPTION
+    Markers by Status: installed [OK], failed [X ], downloading and installing [>>], pending [..],
+    skipped [--]; an unknown or missing status counts as pending. The KB number comes first, so the line
+    is still useful when the title is cut or came out as '?' marks; Kb and Title both go through
+    ConvertTo-ScreenText (ASCII only). Without a KB: the marker and the title. Size is whole MB.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)]$Update)
+
+  $marker = switch ([string]$Update.Status) {
+    'installed' { '[OK]' }
+    'failed' { '[X ]' }
+    'downloading' { '[>>]' }
+    'installing' { '[>>]' }
+    'skipped' { '[--]' }
+    default { '[..]' }
+  }
+  $parts = New-Object 'System.Collections.Generic.List[string]'
+  $parts.Add($marker)
+  foreach ($text in @((ConvertTo-ScreenText $Update.Kb), (ConvertTo-ScreenText $Update.Title))) {
+    if ($text -ne '') { $parts.Add($text) }
+  }
+  $line = $parts.ToArray() -join ' '
+  $sizeMb = $Update.SizeMB -as [double]
+  if ($null -ne $sizeMb -and $sizeMb -gt 0) {
+    $line += ' (' + $sizeMb.ToString('0', [Globalization.CultureInfo]::InvariantCulture) + ' MB)'
+  }
+  return $line
+}
+
+function Get-WuProgressLines {
+  <#
+  .SYNOPSIS
+    The NOW lines of a Windows Update round, from the child's progress file (spec 4.5): a phase line,
+    then one Format-WuUpdateLine per update. The progress screen's provider; display only, it never
+    throws. Callers wrap the call in @().
+  .DESCRIPTION
+    The file is read with Read-FileTail (at most the last 64 KB, never throws). A missing, empty,
+    half-written or not-JSON file, JSON that is not an object, and a file over 64 KB (its cut tail is
+    not valid JSON) all give @(): the child replaces the file atomically, so the next tick has the
+    real one. The phase line:
+      OneAtATime  'Downloading <Current> of <Total>' / 'Installing <Current> of <Total>'
+      Batch       'Downloading <Total> updates' / 'Installing <Total> updates'
+      'Searching for updates' / 'Round finished' (either mode)
+    An unknown phase has no phase line; the updates are still listed.
+  #>
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param([AllowNull()][AllowEmptyString()][string]$Path)
+
+  try {
+    if ([string]::IsNullOrEmpty($Path)) { return @() }
+    $text = Read-FileTail -Path $Path -MaxBytes 65536
+    if ([string]::IsNullOrWhiteSpace($text)) { return @() }
+    $progress = ConvertFrom-Json -InputObject $text -ErrorAction Stop
+    if ($progress -isnot [System.Management.Automation.PSCustomObject]) { return @() }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $current = [int]($progress.Current -as [int])
+    $total = [int]($progress.Total -as [int])
+    $oneAtATime = ([string]$progress.Mode -eq 'OneAtATime')
+    switch ([string]$progress.Phase) {
+      'searching' { $lines.Add('Searching for updates') }
+      'downloading' { $lines.Add($(if ($oneAtATime) { "Downloading $current of $total" } else { "Downloading $total updates" })) }
+      'installing' { $lines.Add($(if ($oneAtATime) { "Installing $current of $total" } else { "Installing $total updates" })) }
+      'done' { $lines.Add('Round finished') }
+    }
+    foreach ($update in @(ConvertTo-WuList -Value $progress.Updates)) {
+      $lines.Add((Format-WuUpdateLine -Update $update))
+    }
+    return $lines.ToArray()
+  } catch {
+    return @()
+  }
+}
+
 function Get-WuStepData {
   # Private. Steps['windows-update'].Data of the state (created when missing, with FailedTitles), as the
   # live hashtable the runner saves. A state without the windows-update step throws.
@@ -1032,17 +1117,19 @@ function Get-WuStepData {
 
 function Get-WuResultData {
   # Private. The step result's Data: Rounds, Installed (running total of distinct installs),
-  # InstalledIds (string array, for re-offer detection) and FailedTitles (id -> title). Never
-  # Interruptions: that key belongs to the runner.
+  # InstalledIds (string array, for re-offer detection), InstalledLines (string array, one line per
+  # install for the report) and FailedTitles (id -> title). Never Interruptions: that key belongs to
+  # the runner.
   [CmdletBinding()]
   [OutputType([hashtable])]
   param([Parameter(Mandatory)][System.Collections.IDictionary]$Data)
 
   return @{
-    Rounds       = [int]$Data['Rounds']
-    Installed    = [int]$Data['Installed']
-    InstalledIds = [string[]]@(ConvertTo-WuList -Value $Data['InstalledIds'])
-    FailedTitles = $Data['FailedTitles']
+    Rounds         = [int]$Data['Rounds']
+    Installed      = [int]$Data['Installed']
+    InstalledIds   = [string[]]@(ConvertTo-WuList -Value $Data['InstalledIds'])
+    InstalledLines = [string[]]@(ConvertTo-WuList -Value $Data['InstalledLines'])
+    FailedTitles   = $Data['FailedTitles']
   }
 }
 
@@ -1083,6 +1170,23 @@ function Read-WuRoundResult {
   }
 }
 
+function Format-WuInstalledLine {
+  # Private. The report line of one installed update: 'Round <Round>: <Kb> <Title>', or 'Round <Round>: <Title>'
+  # when it has no KB. The raw text goes into the state; the report makes it ASCII (ConvertTo-ScreenText).
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory)][int]$Round,
+    [Parameter(Mandatory)]$Item
+  )
+
+  $kb = ([string]$Item.Kb).Trim()
+  $title = ([string]$Item.Title).Trim()
+  $name = (@($kb, $title) | Where-Object { $_ -ne '' }) -join ' '
+  if ($name -eq '') { $name = [string]$Item.Id }
+  return "Round ${Round}: $name"
+}
+
 function Update-WuRunState {
   <#
   .SYNOPSIS
@@ -1096,6 +1200,9 @@ function Update-WuRunState {
       it. A new id goes into InstalledIds and Data.Installed + 1. Defender definition updates
       (IsDefinition) keep their UpdateID across new revisions, so they are never re-offers: they only
       add to Data.Installed.
+    - InstalledLines (for the report): one line "Round <Rounds>: <Kb> <Title>" ("Round <Rounds>: <Title>"
+      without a KB) appended to Data.InstalledLines for every Installed entry that is booked as installed:
+      a new id, and a definition update each time it installs. A re-offer (R24c) gets no line.
     - Hidden: appended to HiddenUpdateIds (no duplicates, ignoring case).
     - HideFailed (ruling R24b): 'Windows update could not be hidden: <title or id>' appended to
       State.Errors once (red in the verdict).
@@ -1133,10 +1240,16 @@ function Update-WuRunState {
     if ($text -and $known.Add($text)) { $installedIds.Add($text) }
   }
   $total = [int]$Data['Installed']
+  $installedLines = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($line in @(ConvertTo-WuList -Value $Data['InstalledLines'])) { $installedLines.Add([string]$line) }
   foreach ($item in @(ConvertTo-WuList -Value $Result.Installed)) {
     $id = [string]$item.Id
     if (-not $id) { continue }
-    if ($item.IsDefinition -eq $true) { $total++; continue }
+    if ($item.IsDefinition -eq $true) {
+      $total++
+      $installedLines.Add((Format-WuInstalledLine -Round ([int]$Data['Rounds']) -Item $item))
+      continue
+    }
     if ($known.Contains($id)) {
       $counts[$id] = [int]$counts[$id] + 1
       $titles[$id] = [string]$item.Title
@@ -1146,9 +1259,11 @@ function Update-WuRunState {
     [void]$known.Add($id)
     $installedIds.Add($id)
     $total++
+    $installedLines.Add((Format-WuInstalledLine -Round ([int]$Data['Rounds']) -Item $item))
   }
   $Data['InstalledIds'] = $installedIds.ToArray()
   $Data['Installed'] = $total
+  $Data['InstalledLines'] = $installedLines.ToArray()
 
   foreach ($id in @(ConvertTo-WuList -Value $Result.HideFailed)) {
     $text = [string]$id
@@ -1169,7 +1284,10 @@ function Invoke-StepWindowsUpdate {
     1. Data.Rounds + 1. Above caps.maxWuRounds -> Failed('Windows Update round cap reached (<cap>)'),
        without starting a round.
     2. Saves the state: the child reads the new round number and the failure counts from state.json.
-    3. Removes a stale <Logs>\wu-round<N>.json (Logs survive earlier runs), then runs
+    3. Removes a stale <Logs>\wu-round<N>.json and its wu-round<N>.progress.json (Logs survive earlier
+       runs; a progress file that cannot be removed is only a WARN: it is display only), sets NOW
+       (Set-SetupNow: SubTitle "round <N> (max <cap>)", provider Get-WuProgressLines on the progress
+       file), then runs
        "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass
        -File "<ScriptPath>" -WuRound -ResultPath "<Logs>\wu-round<N>.json" with timeoutsMinutes.wuRound
        (the whole process tree is killed on timeout). Timeout -> Failed('Windows Update round timed
@@ -1178,7 +1296,8 @@ function Invoke-StepWindowsUpdate {
     5. Books the result into the state (Update-WuRunState), even when it carries an Error, so an update
        the round hid before failing is still reported. On a round with one of the three mapped codes
        below, failed updates get their FailedTitles entry but NOT a WuFailureCounts increment (ruling
-       R23b: a busy agent says nothing about whether an update is bad).
+       R23b: a busy agent says nothing about whether an update is bad). Then one activity line:
+       "Windows Update round <N>: found <Found>, installed <n>, failed <n>" (this round's lists).
     6. ErrorCode (ruling R23; the numeric code, never the localized text), before the Error check:
          0x80240016 / 0x8024A000 (another install in progress, or a mandatory restart pending / no AU
            service): with RebootRequired, WARN and Continue with Reboot 'Now' at once (ruling R24a);
@@ -1195,9 +1314,9 @@ function Invoke-StepWindowsUpdate {
     Spec 9.2: a round whose FirmwareDeferred is above 0 (firmware left alone on battery) carries the
     Note $script:WuBatteryNote on its Continue or Done result. Deferred updates are neither installed
     nor failed, so they never keep the loop going; the verdict shows the Note once (exact match, M1).
-    Data = @{ Rounds; Installed; InstalledIds; FailedTitles } (shallow: the report prints hidden
-    updates by title). Installed counts distinct updates; a re-offer is counted as a failure instead
-    (ruling R24c, see Update-WuRunState).
+    Data = @{ Rounds; Installed; InstalledIds; InstalledLines; FailedTitles } (shallow: the report
+    prints hidden updates by title and the installed updates from InstalledLines). Installed counts
+    distinct updates; a re-offer is counted as a failure instead (ruling R24c, see Update-WuRunState).
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -1219,12 +1338,21 @@ function Invoke-StepWindowsUpdate {
   Save-RunState -State $state -Root $Context.Root
 
   $resultPath = Join-Path $Context.LogDir "wu-round$round.json"
+  $progressPath = Get-WuProgressPath -ResultPath $resultPath
   $exe = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
   $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -WuRound -ResultPath "{1}"' -f $Context.ScriptPath, $resultPath
   $timeout = [double]$Context.Config.timeoutsMinutes.wuRound
   Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; cap = $cap; resultPath = $resultPath }
   try {
     if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force -ErrorAction Stop }
+    # A stale progress file (Logs survive earlier runs) would show an old round on screen. It is display
+    # only, so one that cannot be removed is a WARN and never fails the round.
+    try {
+      if (Test-Path -LiteralPath $progressPath) { Remove-Item -LiteralPath $progressPath -Force -ErrorAction Stop }
+    } catch {
+      Write-SetupLog -Message 'Windows Update progress file could not be removed; the round goes on' -Level WARN -Data @{ round = $round; path = $progressPath; error = $_.Exception.Message }
+    }
+    Set-SetupNow -SubTitle "round $round (max $cap)" -Provider { param($path) Get-WuProgressLines -Path $path } -ProviderArgument $progressPath
     $run = Invoke-External -FilePath $exe -ArgumentList $arguments -TimeoutMinutes $timeout
   } catch {
     Write-SetupLog -Message 'Windows Update round could not be started' -Level ERROR -Data @{ round = $round; error = $_.Exception.Message }
@@ -1252,6 +1380,10 @@ function Invoke-StepWindowsUpdate {
   $batteryNotes = @()
   if ($deferredNow -gt 0) { $batteryNotes = @($script:WuBatteryNote) }
   Write-SetupLog -Message 'Windows Update round finished' -Data @{ round = $round; exitCode = $run.ExitCode; installed = $installedNow; failed = $failedNow; hidden = @(ConvertTo-WuList -Value $result.Hidden).Count; firmwareDeferred = $deferredNow; rebootRequired = $rebootNow; error = [string]$result.Error; errorCode = $errorCode }
+  # One activity line per round (the runner writes none for a Continue). -as never throws: a result
+  # without Found (or an odd value) found 0.
+  $foundNow = [int]($result.Found -as [int])
+  Add-SetupActivity -Text "Windows Update round ${round}: found $foundNow, installed $installedNow, failed $failedNow"
 
   # Ruling R23: codes that mean "not now" are retried; the round still counts toward the cap.
   # Ruling R24a: 0x80240016 also means "a mandatory restart is pending"; when the machine says a

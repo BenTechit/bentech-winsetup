@@ -208,7 +208,7 @@ Describe 'Format-SetupReport content' {
     $rs.Steps['windows-update'].Status = 'Done'; $rs.Steps['windows-update'].Message = 'Installed 7 updates in 3 rounds'
     $rs.Steps['windows-update'].StartedAt = '2026-10-18T23:00:00'; $rs.Steps['windows-update'].EndedAt = '2026-10-18T23:41:07'
     $rs.Steps['vendor-pass1'].StartedAt = '2026-10-18T22:50:00'; $rs.Steps['vendor-pass1'].EndedAt = '2026-10-18T23:52:03'
-    $rs.Steps['windows-update'].Data = @{ Rounds = 3; Installed = 7; FailedTitles = @{ 'id-1' = "Cumulative Update KB5050001 $script:Hebrew"; 'id-3' = 'Not hidden' } }
+    $rs.Steps['windows-update'].Data = @{ Rounds = 3; Installed = 7; FailedTitles = @{ 'id-1' = "Cumulative Update KB5050001 $script:Hebrew"; 'id-3' = 'Not hidden' }; InstalledLines = @('Round 1: KB5070001 Cumulative', "Round 2: KB5070002 $script:Hebrew") }
     $rs.HiddenUpdateIds = @('id-1', 'id-2')
     $rs.Steps['vendor-pass1'].Status = 'Failed'; $rs.Steps['vendor-pass1'].Message = "DCU exited 3001 $script:Hebrew"
     $rs.Notes = @('Windows not activated')
@@ -258,6 +258,18 @@ Describe 'Format-SetupReport content' {
   It 'summarises Windows Update with hidden updates by title, else by id' {
     $red | Should -Contain 'Windows Update: 3 rounds, 7 installed, hidden: Cumulative Update KB5050001 ????, id-2'
     $green | Should -Contain 'Windows Update: 0 rounds, 0 installed, hidden: none'
+  }
+  It 'lists Windows updates installed per round, and none when there are none' {
+    $red | Should -Contain 'Windows updates installed:'
+    $i = [array]::IndexOf($red, 'Windows updates installed:')
+    $red[$i - 2] | Should -BeLike 'Windows Update: 3 rounds*'
+    $red[$i - 1] | Should -Be ''
+    $red[$i + 1] | Should -Be '  Round 1: KB5070001 Cumulative'
+    $red[$i + 2] | Should -Be '  Round 2: KB5070002 ????'
+    $red[$i + 3] | Should -Be ''
+    $red[$i + 4] | Should -Be 'Steps:'
+    $green | Should -Contain 'Windows updates installed:'
+    $green[[array]::IndexOf($green, 'Windows updates installed:') + 1] | Should -Be '  none'
   }
   It 'lists every plan step with its padded status, title, message and time' {
     $i = [array]::IndexOf($red, 'Steps:')

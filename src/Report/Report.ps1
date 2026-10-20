@@ -169,6 +169,8 @@ function Format-SetupReport {
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, hidden: <titles, or ids, or 'none'>
+      Windows updates installed: '  <Round N: KB title>' per Data.InstalledLines of the windows-update
+             step, in the order they were installed ('  none' when there are none)
       Steps: '  <Status padded to 8> <Title> - <Message> (<time>)' per plan step. ' - <Message>' is
              left out when there is no message. ' (<time>)' (m:ss, or h:mm:ss from an hour on) is
              added only when the step has both StartedAt and EndedAt (ruling R25). The runner sets
@@ -240,6 +242,14 @@ function Format-SetupReport {
   $hiddenText = if ($hidden.Count -gt 0) { $hidden.ToArray() -join ', ' } else { 'none' }
   $lines.Add('')
   $lines.Add(('Windows Update: {0} rounds, {1} installed, hidden: {2}' -f [int]$wuData['Rounds'], [int]$wuData['Installed'], $hiddenText))
+
+  # The updates each round installed, one line per update (Data.InstalledLines, written by the Windows
+  # Update step); the text is made ASCII here, like every free-text value of the report.
+  $lines.Add('')
+  $lines.Add('Windows updates installed:')
+  $installedLines = @(foreach ($item in @($wuData['InstalledLines'])) { $text = ConvertTo-ScreenText $item; if ($text -ne '') { $text } })
+  if ($installedLines.Count -eq 0) { $lines.Add('  none') }
+  foreach ($text in $installedLines) { $lines.Add('  ' + $text) }
 
   $lines.Add('')
   $lines.Add('Steps:')

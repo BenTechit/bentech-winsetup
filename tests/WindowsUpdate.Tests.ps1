@@ -45,6 +45,7 @@ Describe 'Windows Update round and step (mocked COM)' {
   BeforeAll {
     foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
     . "$PSScriptRoot\..\src\State\State.ps1"
+    . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText, for the NOW provider
 
     $script:WuConfigJson = [IO.File]::ReadAllText("$PSScriptRoot\..\config\config.json", [Text.Encoding]::UTF8)
     $script:MuId = '7971f918-a847-4430-9279-4a52d1efe18d'
@@ -1007,6 +1008,89 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r.Data.Installed | Should -Be 3
     }
 
+    # Task 12 (spec 4.5): NOW shows the round and the child's progress file, each round has an activity
+    # line, and the installed updates are kept for the report.
+    It 'shows round N (max cap) and reads that round''s progress file' {
+      Clear-SetupNow
+      $script:ctx = New-WuContext -Data @{ Rounds = 1 }
+      Mock Invoke-External { $script:nowSeen = Get-SetupNow; @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $nowSeen.SubTitle | Should -Be 'round 2 (max 6)'
+      $nowSeen.ProviderArgument | Should -Be (Join-Path $script:ctx.LogDir 'wu-round2.progress.json')
+    }
+    It 'gives NOW a provider that turns the progress file into lines' {
+      Clear-SetupNow
+      $script:ctx = New-WuContext
+      Mock Invoke-External {
+        $now = Get-SetupNow
+        $script:linesBefore = @(& $now.Provider $now.ProviderArgument)
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $now.ProviderArgument))
+        [IO.File]::WriteAllText($now.ProviderArgument, (ConvertTo-Json -Depth 4 -InputObject @{ Round = 1; Mode = 'OneAtATime'; Phase = 'installing'; Current = 1; Total = 1; Updates = @(@{ Kb = 'KB5070001'; Title = 'Cumulative'; SizeMB = 0; Status = 'installing' }) }))
+        $script:linesDuring = @(& $now.Provider $now.ProviderArgument)
+        @{ ExitCode = 0; TimedOut = $false; Output = '' }
+      }
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $linesBefore.Count | Should -Be 0
+      $linesDuring | Should -Be @('Installing 1 of 1', '[>>] KB5070001 Cumulative')
+    }
+    It 'removes a stale progress file before the round' {
+      $script:ctx = New-WuContext; $stale = Join-Path $script:ctx.LogDir 'wu-round1.progress.json'
+      [void][IO.Directory]::CreateDirectory($script:ctx.LogDir); 'old' | Set-Content $stale
+      Mock Invoke-External { $script:staleSeen = Test-Path $stale; @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx; $staleSeen | Should -BeFalse
+    }
+    It 'a stale progress file that cannot be removed is a WARN; the round still runs (display only)' {
+      $script:ctx = New-WuContext; $stale = Join-Path $script:ctx.LogDir 'wu-round1.progress.json'
+      [void][IO.Directory]::CreateDirectory($script:ctx.LogDir); 'old' | Set-Content $stale
+      Mock Remove-Item { if ("$LiteralPath" -like '*.progress.json') { Write-Error 'locked' } }
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ext.Count | Should -Be 1
+      $r.Message | Should -Not -BeLike 'Windows Update round could not be started*'
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like '*progress file*' }).Count | Should -Be 1
+    }
+    It 'writes one activity line per round with found, installed and failed' {
+      $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) }
+      $script:ctx = New-WuContext
+      $res = New-ChildResult -Installed @([ordered]@{ Id = 'a'; Title = 'A'; Kb = 'KB1' }) -Failed @([ordered]@{ Id = 'b'; Title = 'B'; ResultCode = 4 }); $res['Found'] = 5; $script:childResult = $res
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($act) | Should -Be @('Windows Update round 1: found 5, installed 1, failed 1')
+    }
+    It 'counts a round from a child that wrote no Found as found 0, and logs every booked round' {
+      $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) }
+      $script:ctx = New-WuContext -Data @{ Rounds = 2 }
+      $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x80070005'
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($act) | Should -Be @('Windows Update round 3: found 0, installed 0, failed 0')
+    }
+    It 'writes no activity line when the round produced no result' {
+      $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) }
+      $script:ctx = New-WuContext; $script:childResult = $null
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $act.Count | Should -Be 0
+    }
+    It 'records installed updates per round for the report, but not a re-offer' {
+      $script:ctx = New-WuContext -Data @{ Rounds = 1; Installed = 1; InstalledIds = @('a') }
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'a'; Title = 'A'; Kb = 'KB1' }, [ordered]@{ Id = 'c'; Title = 'Cumulative'; Kb = 'KB5070001' })
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($r.Data.InstalledLines) | Should -Be @('Round 2: KB5070001 Cumulative')
+    }
+    It 'keeps the installed lines of earlier rounds, adds a definition update every time, and leaves out the KB when there is none' {
+      $script:ctx = New-WuContext
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'cu'; Title = 'Cumulative'; Kb = 'KB5070001'; IsDefinition = $false }, [ordered]@{ Id = 'def'; Title = 'Defender'; Kb = 'KB2267602'; IsDefinition = $true }, [ordered]@{ Id = 'drv'; Title = 'Intel driver'; Kb = ''; IsDefinition = $false })
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'def'; Title = 'Defender'; Kb = 'KB2267602'; IsDefinition = $true }) -OnlyDefinitions $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($r.Data.InstalledLines) | Should -Be @('Round 1: KB5070001 Cumulative', 'Round 1: KB2267602 Defender', 'Round 1: Intel driver', 'Round 2: KB2267602 Defender')
+      @($script:ctx.State.Steps['windows-update'].Data.InstalledLines) | Should -Be @($r.Data.InstalledLines)
+      $r.Data.InstalledLines -is [string[]] | Should -BeTrue
+    }
+    It 'has an empty InstalledLines list when nothing was installed' {
+      $script:ctx = New-WuContext
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($r.Data.InstalledLines).Count | Should -Be 0
+      $r.Data.InstalledLines -is [string[]] | Should -BeTrue
+    }
+
     # Ruling R24d: Done with failed updates carries a yellow Note.
     It 'is Done with a Note when a definitions-only round had a failed update' {
       $script:ctx = New-WuContext
@@ -1228,5 +1312,100 @@ Describe 'ConvertTo-WuUpdateInfo SizeBytes and New-WuInstalledEntry Kb' {
   It 'Kb is KB plus the first KB article, or empty' {
     (New-WuInstalledEntry -Info ([pscustomobject]@{ Id = 'a'; Title = 'A'; KBs = @('5070001', '5070002'); CategoryIds = @() })).Kb | Should -Be 'KB5070001'
     (New-WuInstalledEntry -Info ([pscustomobject]@{ Id = 'b'; Title = 'B'; KBs = @(); CategoryIds = @() })).Kb | Should -Be ''
+  }
+}
+# Task 12 (spec 4.5): the lines NOW shows for a Windows Update round. Pure helpers plus a file read; the
+# only I/O is inside $TestDrive.
+Describe 'Windows Update NOW' {
+  BeforeAll {
+    foreach ($f in 'Logging', 'Activity') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+    . "$PSScriptRoot\..\src\UI\StartScreen.ps1"
+    $script:Hebrew = -join [char[]](0x05E2, 0x05D3, 0x05DB, 0x05D5, 0x05DF)   # five Hebrew letters
+    function Write-TestProgress {
+      param([string]$Path, [string]$Mode = 'OneAtATime', [string]$Phase = 'installing', [int]$Current = 0, [int]$Total = 0, [object[]]$Updates = @())
+      [IO.File]::WriteAllText($Path, (ConvertTo-Json -Depth 4 -InputObject @{ Round = 1; Mode = $Mode; Phase = $Phase; Current = $Current; Total = $Total; Updates = $Updates }))
+    }
+    function New-TestUpdates { param([int]$Count, [string]$Status = 'pending') @(1..$Count | ForEach-Object { @{ Kb = "KB$_"; Title = "T$_"; SizeMB = 0; Status = $Status } }) }
+  }
+  It 'Format-WuUpdateLine puts the KB first and stays ASCII' {
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB5070001'; Title = '2026-10 Cumulative Update'; SizeMB = 412.4; Status = 'installing' }) | Should -Be '[>>] KB5070001 2026-10 Cumulative Update (412 MB)'
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB5070002'; Title = $script:Hebrew; SizeMB = 0; Status = 'installed' }) | Should -Be '[OK] KB5070002 ?????'
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = ''; Title = 'Intel driver'; SizeMB = 0; Status = 'skipped' }) | Should -Be '[--] Intel driver'
+  }
+  It 'Format-WuUpdateLine has a marker for every status' {
+    $expected = @{ installed = '[OK]'; failed = '[X ]'; downloading = '[>>]'; installing = '[>>]'; pending = '[..]'; skipped = '[--]' }
+    foreach ($status in $expected.Keys) {
+      Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB1'; Title = 'T'; SizeMB = 0; Status = $status }) | Should -Be ($expected[$status] + ' KB1 T')
+    }
+  }
+  It 'Format-WuUpdateLine treats an unknown status as pending and copes with missing fields' {
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB1'; Title = 'T'; SizeMB = 0; Status = 'weird' }) | Should -Be '[..] KB1 T'
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Status = 'pending' }) | Should -Be '[..]'
+  }
+  It 'Format-WuUpdateLine shows no size for 0 and whole MB otherwise' {
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB1'; Title = 'T'; SizeMB = 0.0; Status = 'pending' }) | Should -Be '[..] KB1 T'
+    Format-WuUpdateLine -Update ([pscustomobject]@{ Kb = 'KB1'; Title = 'T'; SizeMB = 1536.6; Status = 'pending' }) | Should -Be '[..] KB1 T (1537 MB)'
+  }
+  It 'Get-WuProgressLines: "Installing 3 of 7" one at a time, "Installing 7 updates" in batch' {
+    $p = "$TestDrive\p.json"
+    $u = @(1..7 | ForEach-Object { @{ Kb = "KB$_"; Title = "T$_"; SizeMB = 0; Status = 'pending' } })
+    [IO.File]::WriteAllText($p, (ConvertTo-Json -Depth 4 -InputObject @{ Round = 1; Mode = 'OneAtATime'; Phase = 'installing'; Current = 3; Total = 7; Updates = $u }))
+    $l = @(Get-WuProgressLines -Path $p); $l[0] | Should -Be 'Installing 3 of 7'; $l.Count | Should -Be 8
+    [IO.File]::WriteAllText($p, (ConvertTo-Json -Depth 4 -InputObject @{ Round = 1; Mode = 'Batch'; Phase = 'installing'; Current = 0; Total = 7; Updates = $u }))
+    (Get-WuProgressLines -Path $p)[0] | Should -Be 'Installing 7 updates'
+  }
+  It 'Get-WuProgressLines: the first line for each phase and mode' {
+    $p = "$TestDrive\phases.json"
+    $cases = @(
+      @('OneAtATime', 'searching', 0, 0, 'Searching for updates'),
+      @('Batch', 'searching', 0, 0, 'Searching for updates'),
+      @('OneAtATime', 'downloading', 2, 5, 'Downloading 2 of 5'),
+      @('Batch', 'downloading', 0, 5, 'Downloading 5 updates'),
+      @('OneAtATime', 'installing', 5, 5, 'Installing 5 of 5'),
+      @('Batch', 'installing', 0, 5, 'Installing 5 updates'),
+      @('OneAtATime', 'done', 5, 5, 'Round finished'),
+      @('Batch', 'done', 0, 5, 'Round finished')
+    )
+    foreach ($c in $cases) {
+      Write-TestProgress -Path $p -Mode $c[0] -Phase $c[1] -Current $c[2] -Total $c[3]
+      @(Get-WuProgressLines -Path $p) | Should -Be @($c[4])
+    }
+  }
+  It 'Get-WuProgressLines lists the updates with their markers after the first line, ASCII only' {
+    $p = "$TestDrive\list.json"
+    Write-TestProgress -Path $p -Phase 'installing' -Current 2 -Total 3 -Updates @(
+      @{ Kb = 'KB1'; Title = 'First'; SizeMB = 12.3; Status = 'installed' },
+      @{ Kb = 'KB2'; Title = $script:Hebrew; SizeMB = 0; Status = 'installing' },
+      @{ Kb = ''; Title = 'Third'; SizeMB = 0; Status = 'pending' })
+    @(Get-WuProgressLines -Path $p) | Should -Be @('Installing 2 of 3', '[OK] KB1 First (12 MB)', '[>>] KB2 ?????', '[..] Third')
+  }
+  It 'Get-WuProgressLines lists a single update (a one-element array in the file)' {
+    $p = "$TestDrive\one.json"
+    Write-TestProgress -Path $p -Phase 'downloading' -Current 1 -Total 1 -Updates @(@{ Kb = 'KB9'; Title = 'Only'; SizeMB = 0; Status = 'downloading' })
+    @(Get-WuProgressLines -Path $p) | Should -Be @('Downloading 1 of 1', '[>>] KB9 Only')
+  }
+  It 'a half-written or missing progress file gives no lines' {
+    [IO.File]::WriteAllText("$TestDrive\half.json", '{ "Round": 1, "Upda'); @(Get-WuProgressLines -Path "$TestDrive\half.json").Count | Should -Be 0
+    @(Get-WuProgressLines -Path "$TestDrive\none.json").Count | Should -Be 0
+  }
+  It 'an empty file, JSON that is not an object, a null or blank path, and a folder give no lines' {
+    [IO.File]::WriteAllText("$TestDrive\empty.json", '')
+    [IO.File]::WriteAllText("$TestDrive\array.json", '[1, 2, 3]')
+    [IO.File]::WriteAllText("$TestDrive\text.json", 'not json at all')
+    foreach ($path in "$TestDrive\empty.json", "$TestDrive\array.json", "$TestDrive\text.json", $TestDrive, '', $null) {
+      { Get-WuProgressLines -Path $path } | Should -Not -Throw
+      @(Get-WuProgressLines -Path $path).Count | Should -Be 0
+    }
+  }
+  It 'a progress file over 64 KB gives no lines' {
+    $p = "$TestDrive\big.json"
+    Write-TestProgress -Path $p -Phase 'installing' -Current 1 -Total 300 -Updates @(1..300 | ForEach-Object { @{ Kb = "KB$_"; Title = ('Long update title ' * 12) + $_; SizeMB = 1; Status = 'pending' } })
+    (Get-Item $p).Length | Should -BeGreaterThan 65536
+    @(Get-WuProgressLines -Path $p).Count | Should -Be 0
+  }
+  It 'a progress file with an unknown phase still lists the updates' {
+    $p = "$TestDrive\odd.json"
+    Write-TestProgress -Path $p -Phase 'weird' -Updates (New-TestUpdates -Count 2)
+    @(Get-WuProgressLines -Path $p) | Should -Be @('[..] KB1 T1', '[..] KB2 T2')
   }
 }
