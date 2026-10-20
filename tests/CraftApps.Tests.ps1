@@ -10,7 +10,8 @@
 # $TestDrive), Test-FileSignature, Invoke-External, Wait-SetupDelay, Set-SetupNow and Write-SetupLog. The
 # Add-CraftShortcut tests use $TestDrive folders for the desktops and Start menus; the one test that lets it
 # find this PC's real folders mocks Test-Path, Get-ChildItem, Copy-CraftShortcutFile and Move-Item first.
-# The step tests mock Install-CraftItem, Add-CraftShortcut, Get-InstalledAppVersions and Add-SetupActivity.
+# The step tests mock Install-CraftItem, Add-CraftShortcut, Get-InstalledAppVersions and Add-SetupActivity;
+# the 'GitHub is busy' step test keeps the real Install-CraftItem behind Initialize-CraftMocks instead.
 BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download', 'Config') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Report\Report.ps1"
@@ -104,6 +105,15 @@ BeforeAll {
       $sumsUrl = "https://github.com/storytold/$Prefix/releases/download/v$Version/SHA256SUMS.txt"
       $script:texts[$sumsUrl] = (@(foreach ($a in $SumsArch) { '{0}  {1}-{2}-windows-{3}.msi' -f $script:sumsHash, $Prefix, $Version, $a }) -join "`n") + "`n"
     }
+  }
+
+  # Points the asset Name of the release that Set-CraftRelease stored (the one API answer in
+  # $script:texts) at Url, as if GitHub had answered that link.
+  function Set-CraftAssetUrl([string]$Name, [string]$Url) {
+    $api = @($script:texts.Keys | Where-Object { $_ -like 'https://api.github.com/*' })[0]
+    $release = $script:texts[$api] | ConvertFrom-Json
+    foreach ($asset in $release.assets) { if ($asset.name -ceq $Name) { $asset.browser_download_url = $Url } }
+    $script:texts[$api] = ConvertTo-Json -InputObject $release -Depth 5
   }
 
   # A release as ConvertFrom-Json gives it. -Prefix/-Version/-Arch builds the installers of every given
@@ -268,11 +278,23 @@ Describe 'Get-WebStatusCode' {
     Get-WebStatusCode -Exception (New-Object Exception ('download failed after 3 attempts: u', $invocation)) | Should -Be $code
     Get-WebStatusCode -Exception $web | Should -Be $code
   }
+  It 'is 0 and never throws when the status of the answer cannot be read (M9)' {
+    # A disposed HttpWebResponse: its StatusCode getter throws ObjectDisposedException on .NET Framework.
+    $field = [Net.HttpWebResponse].GetField('m_propertiesDisposed', [Reflection.BindingFlags]'NonPublic,Instance')
+    if ($null -eq $field) { Set-ItResult -Skipped -Because 'this .NET has no m_propertiesDisposed field'; return }
+    $response = [Runtime.Serialization.FormatterServices]::GetUninitializedObject([Net.HttpWebResponse])
+    $field.SetValue($response, $true)
+    { [Net.HttpWebResponse].GetProperty('StatusCode').GetValue($response) } | Should -Throw   # the getter really throws
+    $web = New-Object Net.WebException ('The remote server returned an error.', $null, [Net.WebExceptionStatus]::ProtocolError, $response)
+    { $script:code = Get-WebStatusCode -Exception (New-Object Exception ('download failed after 1 attempts: u', $web)) } | Should -Not -Throw
+    $script:code | Should -Be 0
+  }
 }
 
 Describe 'Get-CraftRelease' {
   BeforeEach {
-    Mock Write-SetupLog { }; Mock Wait-SetupDelay { }
+    $script:waits = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { }; Mock Wait-SetupDelay { [void]$script:waits.Add($Seconds) }
     $script:calls = 0; $script:fail = 0; $script:status = 0
     Mock Get-RemoteText { $script:calls++; if ($script:calls -le $script:fail) { throw 'download failed after 3 attempts' }; '{"tag_name":"v0.8.0","assets":[{"name":"SHA256SUMS.txt","browser_download_url":"u"}]}' }
     Mock Get-WebStatusCode { $script:status }
@@ -306,9 +328,26 @@ Describe 'Get-CraftRelease' {
   }
   It 'a rate limit then another failure is a lookup failure, after the one wait' {
     $script:fail = 2
-    Mock Get-WebStatusCode { if ($script:calls -le 1) { 403 } else { 500 } }
+    Mock Get-WebStatusCode { if ($script:calls -le 1) { 403 } else { 404 } }
     { Get-CraftRelease -Repo 'storytold/wordcraft' } | Should -Throw 'release lookup failed'
     $script:calls | Should -Be 2; Should -Invoke Wait-SetupDelay -Times 1 -Exactly
+  }
+  # Final fix wave (D3): one request per call, so a rate-limited API is not asked three times before the wait.
+  It 'asks with one attempt per call (Get-RemoteText -Retries 1)' {
+    $script:fail = 1; $script:status = 403
+    $null = Get-CraftRelease -Repo 'storytold/wordcraft'
+    Should -Invoke Get-RemoteText -Times 2 -Exactly -ParameterFilter { $Retries -eq 1 }
+    Should -Invoke Get-RemoteText -Times 0 -Exactly -ParameterFilter { $Retries -ne 1 }
+  }
+  It 'a network blip (status <_>) is asked again 5 s and 10 s later, then a lookup failure' -ForEach 0, 503 {
+    $script:fail = 3; $script:status = $_
+    { Get-CraftRelease -Repo 'storytold/wordcraft' } | Should -Throw 'release lookup failed'
+    $script:calls | Should -Be 3; @($script:waits) | Should -Be @(5, 10)
+  }
+  It 'a network blip and then an answer is the release' {
+    $script:fail = 1; $script:status = 0
+    (Get-CraftRelease -Repo 'storytold/wordcraft').tag_name | Should -Be 'v0.8.0'
+    $script:calls | Should -Be 2; @($script:waits) | Should -Be @(5)
   }
   It 'logs the retry, and each failure, at WARN' {
     $script:fail = 2; $script:status = 429
@@ -327,7 +366,8 @@ Describe 'Install-CraftItem' {
     $script:sigCalls[0].Path | Should -Be $msi; @($script:sigCalls[0].Signers) | Should -Be @('Learning Machines Inc')
     $script:sigCalls[0].ExactCN | Should -BeTrue   # the exact CN, not a substring (final review I1)
     $script:ext.Count | Should -Be 1; $script:ext[0].FilePath | Should -Be (Join-Path $env:windir 'System32\msiexec.exe')
-    $script:ext[0].ArgumentList | Should -BeExactly "/i `"$msi`" /qn /norestart"; $script:ext[0].TimeoutMinutes | Should -Be 20
+    $log = Join-Path $script:ctx.LogDir 'craft-wordcraft.log'   # msiexec's own log (M7)
+    $script:ext[0].ArgumentList | Should -BeExactly "/i `"$msi`" /qn /norestart /l*v `"$log`""; $script:ext[0].TimeoutMinutes | Should -Be 20
   }
   It 'shows each phase in NOW' { $null = I; @($script:now) | Should -Be @('WordCraft: looking up the latest release', 'WordCraft 0.8.0: downloading', 'WordCraft 0.8.0: checking', 'WordCraft 0.8.0: installing') }
   It 'installed <_> is Current: nothing downloaded or run' -ForEach '0.8.0', '0.8.0.0', '0.9.1' {
@@ -373,6 +413,31 @@ Describe 'Install-CraftItem' {
   It 'never waits for anything but a 1618' { $script:extHandler = { param($c) @{ ExitCode = 1603; TimedOut = $false } }; $null = I; $script:waits.Count | Should -Be 0 }
   It 'a checksum that cannot be computed is an unexpected error, and msiexec never runs (C-R3)' {
     Mock Get-FileHash { Write-Error 'locked' }; (I).Reason | Should -Be 'unexpected error'; $script:ext.Count | Should -Be 0 }
+
+  # Final fix wave (M5): both links must be the repo's own release downloads, before anything is fetched.
+  It 'an installer link <Why> is release lookup failed, and nothing is downloaded' -ForEach @(
+    @{ Why = 'on another host';                   Url = 'https://evil.example/storytold/wordcraft/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'over http';                         Url = 'http://github.com/storytold/wordcraft/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'of another repo';                   Url = 'https://github.com/someone/wordcraft/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'of a repo that only starts alike';  Url = 'https://github.com/storytold/wordcraft-x/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'outside releases/download';         Url = 'https://github.com/storytold/wordcraft/raw/main/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'that climbs out with ..';           Url = 'https://github.com/storytold/wordcraft/releases/download/v0.8.0/../../../../someone/x/releases/download/v1/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'that climbs out with backslashes';  Url = 'https://github.com/storytold/wordcraft/releases/download\..\..\..\..\someone\wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'with an encoded dot';               Url = 'https://github.com/storytold/wordcraft/releases/download/%2e%2e/%2E%2E/x/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'with a user name before the host';  Url = 'https://user@github.com/storytold/wordcraft/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi' }
+    @{ Why = 'that is not a full link';           Url = 'wordcraft-0.8.0-windows-x64.msi' }
+  ) {
+    Set-CraftAssetUrl -Name 'wordcraft-0.8.0-windows-x64.msi' -Url $Url
+    $r = I; $r.Status | Should -Be 'Failed'; $r.Reason | Should -Be 'release lookup failed'
+    $script:downloads.Count | Should -Be 0; $script:ext.Count | Should -Be 0
+    Should -Invoke Get-RemoteText -Times 1 -Exactly   # the lookup only, not the checksum list
+  }
+  It 'a SHA256SUMS.txt link outside the repo''s release downloads is release lookup failed, and nothing is downloaded' {
+    Set-CraftAssetUrl -Name 'SHA256SUMS.txt' -Url 'https://evil.example/storytold/wordcraft/releases/download/v0.8.0/SHA256SUMS.txt'
+    (I).Reason | Should -Be 'release lookup failed'; $script:downloads.Count | Should -Be 0; Should -Invoke Get-RemoteText -Times 1 -Exactly }
+  It 'a link that differs only in letter case is still the repo''s' {
+    Set-CraftAssetUrl -Name 'wordcraft-0.8.0-windows-x64.msi' -Url 'https://GitHub.com/Storytold/WordCraft/releases/download/v0.8.0/wordcraft-0.8.0-windows-x64.msi'
+    (I).Status | Should -Be 'Installed' }
 }
 
 Describe 'Add-CraftShortcut' {
@@ -526,9 +591,9 @@ Describe 'Invoke-StepCraftApps' {
     (Invoke-StepCraftApps -Context $ctx).Message | Should -Be 'Craft apps already up to date'; Should -Invoke Add-CraftShortcut -Times 5 -Exactly }
   It 'one app failing does not stop the others: Failed with the names and reasons' {
     $script:outcome['GridCraft'] = @{ Status = 'Failed'; Version = '0.8.0'; Reason = 'checksum mismatch' }
-    $script:outcome['PdfCraft'] = @{ Status = 'Failed'; Version = ''; Reason = 'GitHub busy - try again later' }
+    $script:outcome['PdfCraft'] = @{ Status = 'Failed'; Version = ''; Reason = 'release lookup failed' }
     $r = Invoke-StepCraftApps -Context $ctx; $r.Status | Should -Be 'Failed'
-    $r.Message | Should -BeExactly 'Not installed: GridCraft (checksum mismatch), PdfCraft (GitHub busy - try again later)'
+    $r.Message | Should -BeExactly 'Not installed: GridCraft (checksum mismatch), PdfCraft (release lookup failed)'
     Should -Invoke Install-CraftItem -Times 5 -Exactly; Should -Invoke Add-CraftShortcut -Times 0 -Exactly -ParameterFilter { $Item.name -in 'GridCraft', 'PdfCraft' }
     @($script:activity.Text) | Should -Contain 'GridCraft not installed - checksum mismatch' }
   It 'only the launcher failing is Done with a yellow Note' {
@@ -571,4 +636,41 @@ Describe 'Invoke-StepCraftApps' {
   It 'one item installed and the rest current is Craft apps installed' {
     foreach ($n in 'WordCraft', 'GridCraft', 'PdfCraft', 'ArtCraft Launcher') { $script:outcome[$n] = @{ Status = 'Current'; Version = '1.0'; Reason = '' } }
     (Invoke-StepCraftApps -Context $ctx).Message | Should -Be 'Craft apps installed' }
+
+  # Final fix wave (M2): once GitHub is busy, the items after it fail at once with the same reason.
+  It 'after GitHub busy the remaining items fail with the same reason, without a lookup' {
+    $script:outcome['GridCraft'] = @{ Status = 'Failed'; Version = ''; Reason = 'GitHub busy - try again later' }
+    $r = Invoke-StepCraftApps -Context $ctx
+    @($script:order) | Should -Be @('WordCraft', 'GridCraft'); $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Not installed: GridCraft (GitHub busy - try again later), DeckCraft (GitHub busy - try again later), PdfCraft (GitHub busy - try again later)'
+    @($r.Notes) | Should -Be @('ArtCraft Launcher could not be installed')
+    @($script:activity.Text) | Should -Be @('WordCraft 0.8.0 installed - desktop shortcut: Word', 'GridCraft not installed - GitHub busy - try again later',
+      'DeckCraft not installed - GitHub busy - try again later', 'PdfCraft not installed - GitHub busy - try again later',
+      'ArtCraft Launcher not installed - GitHub busy - try again later') }
+  It 'any other lookup failure does not stop the next lookups' {
+    $script:outcome['WordCraft'] = @{ Status = 'Failed'; Version = ''; Reason = 'release lookup failed' }
+    $null = Invoke-StepCraftApps -Context $ctx; Should -Invoke Install-CraftItem -Times 5 -Exactly }
+}
+
+Describe 'Invoke-StepCraftApps when GitHub is busy (M2, D3)' {
+  # The real Install-CraftItem and Get-CraftRelease; every lookup is answered with a rate limit.
+  BeforeEach {
+    Initialize-CraftMocks
+    $script:ctx = New-CraftContext
+    $script:activity = New-Object System.Collections.ArrayList
+    Mock Get-WebStatusCode { 403 }
+    Mock Get-InstalledAppVersions { @{} }
+    Mock Add-CraftShortcut { @{ Status = 'Created'; Path = 'X:\Desktop\x.lnk' } }
+    Mock Add-SetupActivity { [void]$script:activity.Add($Text) }
+  }
+  It 'five items and the first is busy: one 60 s wait and two lookups in all, every item failed' {
+    $r = Invoke-StepCraftApps -Context $script:ctx
+    Should -Invoke Get-RemoteText -Times 2 -Exactly
+    Should -Invoke Get-RemoteText -Times 2 -Exactly -ParameterFilter { $Retries -eq 1 -and $Url -eq 'https://api.github.com/repos/storytold/wordcraft/releases/latest' }
+    @($script:waits) | Should -Be @(60)
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Not installed: WordCraft (GitHub busy - try again later), GridCraft (GitHub busy - try again later), DeckCraft (GitHub busy - try again later), PdfCraft (GitHub busy - try again later)'
+    @($r.Notes) | Should -Be @('ArtCraft Launcher could not be installed'); @($script:activity).Count | Should -Be 5
+    $script:downloads.Count | Should -Be 0; $script:ext.Count | Should -Be 0; Should -Invoke Add-CraftShortcut -Times 0 -Exactly
+  }
 }

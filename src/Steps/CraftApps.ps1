@@ -5,6 +5,7 @@
 # The pure helpers and the release lookup:
 #   ConvertTo-CraftArch       processor name -> the x64 / arm64 / x86 of the release asset names
 #   Select-CraftAsset         the one MSI of that processor in a release, its version and its checksum list
+#   Test-CraftDownloadUrl     a link is one of the repo's own release downloads (https://github.com/<repo>/...)
 #   Get-Sha256FromSums        the SHA-256 of one file in a SHA256SUMS.txt
 #   ConvertTo-CraftVersion    version text -> [version], and Test-CraftVersionCurrent (installed >= release)
 #   Get-WebStatusCode         the HTTP status behind a failed download
@@ -80,6 +81,37 @@ function Select-CraftAsset {
     if ([string]$asset.name -ceq 'SHA256SUMS.txt') { $sumsUrl = [string]$asset.browser_download_url; break }
   }
   return @{ Name = $found[0]['Name']; Url = $found[0]['Url']; Version = $found[0]['Version']; SumsUrl = $sumsUrl }
+}
+
+function Test-CraftDownloadUrl {
+  <#
+  .SYNOPSIS
+    $true only when Url is a download of Repo's own releases: it starts with
+    https://github.com/<Repo>/releases/download/ (letter case aside). Never throws.
+  .DESCRIPTION
+    Final review M5, defense in depth: GitHub writes these links itself, so anything else is refused.
+    The link is read as the downloader reads it ([uri], which resolves '..' and '\'), so a link that
+    starts right and then climbs out of the repo is refused; so is one with an encoded dot, slash or
+    backslash (%2e, %2f, %5c), which [uri] leaves for the server to resolve. A link that is not a full
+    one is refused too.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Url,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Repo
+  )
+
+  try {
+    if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($Repo)) { return $false }
+    $uri = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return $false }
+    $link = $uri.AbsoluteUri
+    if ($link -match '%2[eEfF]|%5[cC]') { return $false }
+    return $link.StartsWith(('https://github.com/{0}/releases/download/' -f $Repo), [StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    return $false
+  }
 }
 
 function Get-Sha256FromSums {
@@ -167,12 +199,18 @@ function Get-WebStatusCode {
   [OutputType([int])]
   param([Parameter(Mandatory)][AllowNull()][Exception]$Exception)
 
-  $current = $Exception
-  while ($null -ne $current) {
-    if ($current -is [Net.WebException] -and $current.Response -is [Net.HttpWebResponse]) {
-      return [int]$current.Response.StatusCode
+  # Guarded (M9): on .NET Framework the StatusCode getter of a disposed response throws. PowerShell 5.1's
+  # member access turns that into $null today; the catch keeps the contract if it ever does not.
+  try {
+    $current = $Exception
+    while ($null -ne $current) {
+      if ($current -is [Net.WebException] -and $current.Response -is [Net.HttpWebResponse]) {
+        return [int]$current.Response.StatusCode
+      }
+      $current = $current.InnerException
     }
-    $current = $current.InnerException
+  } catch {
+    return 0
   }
   return 0
 }
@@ -182,11 +220,16 @@ function Get-CraftRelease {
   .SYNOPSIS
     The latest release of a GitHub repo (owner/name) as the parsed JSON of releases/latest.
   .DESCRIPTION
-    GitHub allows 60 lookups per hour per IP, and one laptop needs five. A 403 or 429 gets one retry
-    after Wait-SetupDelay -Seconds 60 (the setup screen stays alive meanwhile); a second one throws
-    'GitHub busy - try again later'. Any other failure, and an answer that is not a JSON object, throws
-    'release lookup failed'. The detail of each failure is logged at WARN; the thrown message stays short
-    because it ends up on the report.
+    GitHub allows 60 lookups per hour per IP, and one laptop needs five. Every request is a single
+    attempt (Get-RemoteText -Retries 1, D3): the retries are decided here, by the HTTP status, so a
+    rate-limited API is not asked three times before the wait.
+      - 403 or 429 gets one retry after Wait-SetupDelay -Seconds 60 (the setup screen stays alive
+        meanwhile); a second one throws 'GitHub busy - try again later'.
+      - No HTTP answer (status 0: a name that did not resolve, a dropped connection) or a 5xx is a network
+        blip: asked again after 5 s, then after 10 s; a third one throws 'release lookup failed'.
+      - Any other answer (a 404), and an answer that is not a JSON object, throws 'release lookup failed'.
+    The detail of each failure is logged at WARN; the thrown message stays short because it ends up on
+    the report.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -194,23 +237,33 @@ function Get-CraftRelease {
 
   $url = "https://api.github.com/repos/$Repo/releases/latest"
   $text = $null
-  for ($attempt = 1; $attempt -le 2; $attempt++) {
+  $rateLimited = 0
+  $blips = 0
+  while ($true) {
     try {
-      $text = Get-RemoteText -Url $url
+      $text = Get-RemoteText -Url $url -Retries 1
       break
     } catch {
       $status = Get-WebStatusCode -Exception $_.Exception
-      $detail = @{ repo = $Repo; attempt = $attempt; status = $status; error = $_.Exception.Message }
-      if ($status -ne 403 -and $status -ne 429) {
-        Write-SetupLog -Message 'Release lookup failed' -Level WARN -Data $detail
-        throw 'release lookup failed'
+      $detail = @{ repo = $Repo; status = $status; rateLimited = $rateLimited; blips = $blips; error = $_.Exception.Message }
+      if ($status -eq 403 -or $status -eq 429) {
+        $rateLimited++
+        if ($rateLimited -ge 2) {
+          Write-SetupLog -Message 'GitHub is still rate limiting the release lookup; giving up' -Level WARN -Data $detail
+          throw 'GitHub busy - try again later'
+        }
+        Write-SetupLog -Message 'GitHub is rate limiting the release lookup; trying once more in 60 s' -Level WARN -Data $detail
+        Wait-SetupDelay -Seconds 60
+        continue
       }
-      if ($attempt -ge 2) {
-        Write-SetupLog -Message 'GitHub is still rate limiting the release lookup; giving up' -Level WARN -Data $detail
-        throw 'GitHub busy - try again later'
+      if (($status -eq 0 -or $status -ge 500) -and $blips -lt 2) {
+        $blips++
+        Write-SetupLog -Message 'Release lookup failed; trying again' -Level WARN -Data ($detail + @{ waitSeconds = 5 * $blips })
+        Wait-SetupDelay -Seconds (5 * $blips)
+        continue
       }
-      Write-SetupLog -Message 'GitHub is rate limiting the release lookup; trying once more in 60 s' -Level WARN -Data $detail
-      Wait-SetupDelay -Seconds 60
+      Write-SetupLog -Message 'Release lookup failed' -Level WARN -Data $detail
+      throw 'release lookup failed'
     }
   }
 
@@ -257,17 +310,22 @@ function Install-CraftItem {
       2. Select-CraftAsset for Item.assetPrefix and Arch; none is 'no <Arch> installer in the latest release'.
       3. InstalledVersion the same as the release or newer (Test-CraftVersionCurrent) is Current: nothing is
          downloaded or run.
-      4. A release without SHA256SUMS.txt is 'no SHA256SUMS.txt in the release', before any download.
+      4. A release without SHA256SUMS.txt is 'no SHA256SUMS.txt in the release', and an MSI or
+         SHA256SUMS.txt link that is not one of the repo's own release downloads (Test-CraftDownloadUrl,
+         final review M5) is 'release lookup failed', both before any download.
       5. '<Name> <ver>: downloading': the checksum list (Get-RemoteText; 'checksum list could not be read'),
          then the MSI to <DownloadDir>\<asset name> (Get-RemoteFile; 'download failed').
       6. '<Name> <ver>: checking': the MSI's SHA-256 must equal its line in the list ('no checksum for
-         <file>', 'checksum mismatch'), then its Authenticode signer must be one of Signers ('signature
-         check failed'). An MSI that fails either check is deleted and never run; nothing else is ever
-         deleted (V2-R13).
-      7. '<Name> <ver>: installing': msiexec /i "<msi>" /qn /norestart through Invoke-External with
-         timeoutsMinutes.msi. 0, 3010 and 1641 are Installed, with no restart of its own (the Windows Update
-         loop restarts). 1618 (another installation is running) waits 60 s and tries again, three tries in
-         all. Anything else is 'msiexec <code>', 'msiexec timed out' or 'msiexec could not be started'.
+         <file>', 'checksum mismatch'), then its Authenticode signature must be Valid with a signer
+         certificate whose one CN is exactly one of Signers (Test-FileSignature -ExactCN, final review I1;
+         'signature check failed'). An MSI that fails either check is deleted and never run; nothing else
+         is ever deleted (V2-R13).
+      7. '<Name> <ver>: installing': msiexec /i "<msi>" /qn /norestart
+         /l*v "<LogDir>\craft-<assetPrefix>.log" through Invoke-External with timeoutsMinutes.msi (msiexec's
+         own log goes to the stick with the others, final review M7). 0, 3010 and 1641 are Installed, with
+         no restart of its own (the Windows Update loop restarts). 1618 (another installation is running)
+         waits 60 s and tries again, three tries in all. Anything else is 'msiexec <code>', 'msiexec timed
+         out' or 'msiexec could not be started'.
     Version is the release version, '' while it is unknown. Anything unexpected is 'unexpected error'.
   #>
   [CmdletBinding()]
@@ -302,6 +360,12 @@ function Install-CraftItem {
       return @{ Status = 'Current'; Version = $version; Reason = '' }
     }
     if ([string]::IsNullOrEmpty([string]$asset.SumsUrl)) { return (New-CraftItemFailure -Name $name -Version $version -Reason 'no SHA256SUMS.txt in the release') }
+    foreach ($link in @([string]$asset.Url, [string]$asset.SumsUrl)) {
+      if (-not (Test-CraftDownloadUrl -Url $link -Repo ([string]$Item.repo))) {
+        Write-SetupLog -Message 'A release link is not one of the repo''s own release downloads; nothing downloaded' -Level WARN -Data @{ item = $name; repo = [string]$Item.repo; url = $link }
+        return (New-CraftItemFailure -Name $name -Version $version -Reason 'release lookup failed')
+      }
+    }
 
     Set-SetupNow -SubTitle ('{0} {1}: downloading' -f $name, $version)
     try {
@@ -336,7 +400,8 @@ function Install-CraftItem {
 
     Set-SetupNow -SubTitle ('{0} {1}: installing' -f $name, $version)
     $msiexec = Join-Path $env:windir 'System32\msiexec.exe'
-    $arguments = "/i `"$msi`" /qn /norestart"
+    $msiLog = Join-Path $Context.LogDir ('craft-{0}.log' -f [string]$Item.assetPrefix)
+    $arguments = "/i `"$msi`" /qn /norestart /l*v `"$msiLog`""
     $timeout = [double]$Context.Config.timeoutsMinutes.msi
     $maxTries = 3
     for ($try = 1; $try -le $maxTries; $try++) {
@@ -527,7 +592,9 @@ function Invoke-StepCraftApps {
     No items, or a signer key that signers does not hold (or that holds no name), is Failed('Craft apps
     are not configured') and installs nothing. Otherwise the installed versions are read once
     (Get-InstalledAppVersions -Config) and each item goes through Install-CraftItem with the processor
-    (ConvertTo-CraftArch of Machine.Arch) and the craft signer; one failing never stops the others.
+    (ConvertTo-CraftArch of Machine.Arch) and the craft signer; one failing never stops the others, with
+    one exception (final review M2): once an item failed 'GitHub busy - try again later', the items after
+    it fail with that reason at once, without a lookup or a wait (the same IP stays limited for the hour).
     An item Installed or Current gets its desktop shortcut (Add-CraftShortcut); a shortcut that fails is
     the Note '<shortcut> desktop shortcut could not be created'. Every item writes one activity line:
       '<Name> <ver> installed' or '<Name> <ver> already up to date', plus ' - desktop shortcut: <shortcut>'
@@ -563,6 +630,8 @@ function Invoke-StepCraftApps {
   $notes = New-Object 'System.Collections.Generic.List[string]'
   $failures = New-Object 'System.Collections.Generic.List[string]'
   $anyInstalled = $false
+  $busyReason = 'GitHub busy - try again later'
+  $gitHubBusy = $false
 
   foreach ($item in $items) {
     $name = [string]$item.name
@@ -570,7 +639,13 @@ function Invoke-StepCraftApps {
     $installedVersion = ''
     if ($installed -is [System.Collections.IDictionary] -and $installed.Contains($name)) { $installedVersion = [string]$installed[$name] }
 
-    $outcome = Install-CraftItem -Context $Context -Item $item -Arch $arch -Signers $signers -InstalledVersion $installedVersion
+    if ($gitHubBusy) {
+      # M2: the other lookups would be rate limited too (same IP, same hour): no lookup and no wait.
+      $outcome = New-CraftItemFailure -Name $name -Version '' -Reason $busyReason
+    } else {
+      $outcome = Install-CraftItem -Context $Context -Item $item -Arch $arch -Signers $signers -InstalledVersion $installedVersion
+      if ([string]$outcome.Status -eq 'Failed' -and [string]$outcome.Reason -ceq $busyReason) { $gitHubBusy = $true }
+    }
     $status = [string]$outcome.Status
     if ($status -eq 'Installed') { $anyInstalled = $true }
 
