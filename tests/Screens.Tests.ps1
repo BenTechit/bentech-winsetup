@@ -3,10 +3,11 @@
 #
 # SAFETY: these are console screens. Nothing here may touch the real console, read a real key, change
 # the console colour or start a process. Every Show-* call passes all of its seams (-ReadKey, -Now,
-# -Sleep, -OnAC, -Write, -Writer, -SetColor, -Launch, -FlushInput), and BeforeEach also replaces
+# -Sleep, -OnAC, -Stick, -Write, -Writer, -SetColor, -Launch, -FlushInput), and BeforeEach also replaces
 # Clear-Host, Write-Host and Start-Process with commands that throw, so a forgotten seam fails loudly.
 BeforeAll {
   foreach ($f in 'ConsoleFrame','StartScreen','ProgressScreen','FinalScreen') { . "$PSScriptRoot\..\src\UI\$f.ps1" }
+  . "$PSScriptRoot\..\src\Entry\Cleanup.ps1"   # Format-StickLine and Find-SetupStick, for the final screen's stick line
   # The real commands the screens call in production, so Pester can mock them.
   . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Config.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
@@ -75,12 +76,18 @@ BeforeAll {
       -Write { param($lines) $null = $script:startEvents.Add('write'); $null = $script:screens.Add(($lines -join "`n")) }
   }
 
-  # Runs Show-FinalScreen with a scripted key sequence. Records colours, drawn screens, launches
-  # and the order of flush/read events.
+  # Runs Show-FinalScreen against the fake clock with a scripted key sequence: one key per poll, then
+  # empty polls; 2000 empty polls (200 s of fake time) mean no Enter ever came. -KeyAt (elapsed seconds
+  # -> key name or nothing) replaces -Keys when given. -Stick is the stick reader (default: the stick in
+  # $script:stick). Records colours, drawn screens, launches and the order of flush/read events.
   function Invoke-FinalScreen {
-    param([string[]]$Keys = @('Q'), [string]$Color = 'YELLOW', [string[]]$Failures = @(), [string[]]$Notes = @('x'), [scriptblock]$Launch = $null)
+    param([string[]]$Keys = @('Enter'), [scriptblock]$KeyAt = $null, [string]$Color = 'YELLOW', [string[]]$Failures = @(), [string[]]$Notes = @('x'),
+          [scriptblock]$Launch = $null, [scriptblock]$Stick = { $script:stick })
+    Reset-FakeClock
     $script:keyQueue = New-Object System.Collections.Queue
     foreach ($k in $Keys) { $script:keyQueue.Enqueue($k) }
+    $script:finalKeyAt = $KeyAt
+    $script:emptyPolls = 0
     $script:colors = New-Object System.Collections.ArrayList
     $script:fores = New-Object System.Collections.ArrayList
     $script:drawn = New-Object System.Collections.ArrayList
@@ -90,7 +97,14 @@ BeforeAll {
     $st = @{ Machine = $script:m; AnyDeskId = '123456789'; RebootCount = 2; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T10:12:00' }
     $verdict = @{ Color = $Color; Banner = 'COMPLETE - CHECK NOTES'; Failures = $Failures; Notes = $Notes }
     Show-FinalScreen -State $st -Verdict $verdict -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' `
-      -ReadKey { $null = $script:events.Add('read'); if ($script:keyQueue.Count -gt 0) { $script:keyQueue.Dequeue() } } `
+      -ReadKey {
+        $null = $script:events.Add('read')
+        $k = if ($script:finalKeyAt) { & $script:finalKeyAt (Get-ElapsedSeconds) } elseif ($script:keyQueue.Count -gt 0) { $script:keyQueue.Dequeue() }
+        if ($k) { return $k }
+        $script:emptyPolls++
+        if ($script:emptyPolls -gt 2000) { throw 'runaway: no Enter' }
+      } `
+      -Stick $Stick -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } `
       -SetColor { param($b, $f) $null = $script:events.Add('color'); $null = $script:colors.Add($b); $null = $script:fores.Add($f) } `
       -Write { param($lines) $null = $script:events.Add('write'); $null = $script:drawn.Add(($lines -join "`n")) } `
       -ResetColor { $null = $script:events.Add('reset') } `
@@ -778,7 +792,7 @@ Describe 'Format-FinalScreen' {
       $l.IndexOf('  Machine  : Dell Inc.  Latitude 5440        SN: 7HX2K93'), $l.IndexOf('  AnyDesk ID:'), $l.IndexOf('  Total time: 1:12   Reboots: 3'),
       $l.IndexOf('  X  F1'), $l.IndexOf('  !  N1'),
       $l.IndexOf("  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'"),
-      $l.IndexOf('  Report: C:\r.txt   [R] open report   [any other key] close')
+      $l.IndexOf('  Report: C:\r.txt   [R] open report   [ENTER] finish')
     )
     @($idx | Where-Object { $_ -lt 0 }).Count | Should -Be 0
     $sorted = @($idx | Sort-Object)
@@ -787,25 +801,33 @@ Describe 'Format-FinalScreen' {
   }
   It 'ends with the report line' {
     $l = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $true)
-    $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [any other key] close'
+    $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [ENTER] finish'
   }
-  It 'caps long lists (4 failures, 3 notes) so the banner and the ID stay on screen, and cuts long lines' {
+  It 'puts the stick line right above the report line, below the Chrome hint; no line without one' {
+    $stickLine = '  USB stick found (E:) - logs will be saved there'
+    $l = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $false -StickLine $stickLine)
+    $l[$l.Count - 2] | Should -Be $stickLine
+    $l[$l.Count - 3] | Should -Be "  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'"
+    $without = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $false)
+    $without.Count | Should -Be ($l.Count - 1)
+  }
+  It 'caps long lists (3 failures, 2 notes) so the banner and the ID stay on screen, and cuts long lines' {
     $many = 1..9 | ForEach-Object { "Failure number $_" }
     $long = 'Windows Update: ' + ('y' * 200)
     $l = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures (@($long) + $many) -Notes @(1..6 | ForEach-Object { "Note $_" })) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
-    @($l | Where-Object { $_ -like '  X  *' -and $_ -notlike '*more*' }).Count | Should -Be 4
-    @($l | Where-Object { $_ -like '  !  *' -and $_ -notlike '*more*' }).Count | Should -Be 3
-    $l | Should -Contain '  X  ... and 6 more: see the report'
-    $l | Should -Contain '  !  ... and 3 more: see the report'
+    @($l | Where-Object { $_ -like '  X  *' -and $_ -notlike '*more*' }).Count | Should -Be 3
+    @($l | Where-Object { $_ -like '  !  *' -and $_ -notlike '*more*' }).Count | Should -Be 2
+    $l | Should -Contain '  X  ... and 7 more: see the report'
+    $l | Should -Contain '  !  ... and 4 more: see the report'
     @($l | Where-Object { $_ -like '  X  *' -and $_.Length -gt 79 }).Count | Should -Be 0
   }
-  It 'fits a 30-row console in the worst case: every list over its cap, the Chrome hint and a 10-digit ID (triage 240)' {
+  It 'the worst-case final screen fits 29 lines (Review Focus 3)' {
     $st = New-FinalState; $st.AnyDeskId = '1234567890'
-    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | ForEach-Object { "Failure $_" }) -Notes @(1..20 | ForEach-Object { "Note $_" })) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false)
-    $l.Count | Should -BeLessOrEqual 30
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | % { "Failure $_" }) -Notes @(1..20 | % { "Note $_" })) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false -StickLine '  No BenTech USB stick - plug it in now to keep the logs')
+    $l.Count | Should -BeLessOrEqual 29; $l[$l.Count - 2] | Should -Be '  No BenTech USB stick - plug it in now to keep the logs'
     $l[0] | Should -Be ('=' * 80)                                       # the frame and the banner are the first lines
     $l | Should -Contain "  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'"
-    $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [any other key] close'
+    $l[$l.Count - 1] | Should -Be '  Report: C:\BenTech\Setup\Logs\Setup-Report.txt   [R] open report   [ENTER] finish'
   }
   It 'cuts one very long failure to fit 79 columns' {
     $long = 'Windows Update: ' + ('y' * 200)
@@ -827,9 +849,17 @@ Describe 'Show-FinalScreen' {
     Mock Clear-Host { throw 'Clear-Host must not run in tests' }
     Mock Write-Host { throw 'Write-Host must not run in tests' }
     Mock Start-Process { throw 'Start-Process must not run in tests' }
+    Mock Write-SetupLog { }
     Mock Test-ChromeInstalled { $true }
     Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
     Mock Get-ChromeRegisteredAppName { 'Google Chrome' }
+    $script:stick = @{ Root = 'E:\'; Drive = 'E:' }
+    # A fake console writer for the tests of the production -Write (never the real [Console]).
+    $script:fw = @{ Calls = New-Object System.Collections.ArrayList; Size = @{ Width = 100; Height = 30; Top = 0 } }
+    $script:writer = @{ GetSize = { [pscustomobject]$script:fw.Size }; Clear = { param($b) [void]$script:fw.Calls.Add('clear'); $script:fw.ClearBack = $b }
+      MoveTo = { param($row) [void]$script:fw.Calls.Add("row $row") }; Write = { param($t, $c, $b) [void]$script:fw.Calls.Add(@{ T = $t; C = $c; B = $b }) } }
+    Reset-ConsoleFrame
+    $script:finalState = @{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }
   }
   It 'paints Black on Yellow, White on DarkGreen and White on DarkRed (spec 9.1)' {
     Invoke-FinalScreen -Color 'YELLOW'; $colors[0] | Should -Be 'Yellow'; $fores[0] | Should -Be 'Black'
@@ -847,14 +877,28 @@ Describe 'Show-FinalScreen' {
       $r = Get-VerdictColors -Color $other; $r.Background | Should -Be 'DarkRed'; $r.Foreground | Should -Be 'White'
     }
   }
-  It 'the production writer sets both colours on every line' {
-    $script:hostCalls = New-Object System.Collections.ArrayList; Mock Clear-Host { }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ F = $ForegroundColor; B = $BackgroundColor }) }
-    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
-      -Verdict @{ Color = 'YELLOW'; Banner = 'COMPLETE - CHECK NOTES'; Failures = @(); Notes = @('n') } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
-    $hostCalls.Count | Should -BeGreaterThan 10
-    @($hostCalls | Where-Object { $_.F -ne 'Black' -or $_.B -ne 'Yellow' }).Count | Should -Be 0
+  It 'the production writer draws through the console writer in the verdict colours' {
+    Mock New-ConsoleWriter { $script:writer }
+    Reset-FakeClock
+    Show-FinalScreen -State $finalState -Verdict @{ Color = 'YELLOW'; Banner = 'COMPLETE - CHECK NOTES'; Failures = @(); Notes = @('n') } -ReportPath 'C:\r.txt' `
+      -ReadKey { 'Enter' } -Stick { $script:stick } -Now { $script:clock } -Sleep { param($ms) } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+    $w = @($fw.Calls | Where-Object { $_ -is [hashtable] })
+    $w.Count | Should -BeGreaterThan 10
+    @($w | Where-Object { $_.C -ne 'Black' -or $_.B -ne 'Yellow' }).Count | Should -Be 0
+    @($w | Where-Object { $_.T -like '  USB stick found (E:)*' }).Count | Should -Be 1
+    Should -Invoke Write-Host -Times 0 -Exactly
+    Should -Invoke Clear-Host -Times 0 -Exactly
+  }
+  It 'the production writer clears the whole window once in the verdict colour, also after a progress frame of the same size' {
+    Write-ConsoleFrame -Lines @('  progress') -Writer $writer   # the last progress frame, on Black
+    Mock New-ConsoleWriter { $script:writer }
+    Reset-FakeClock
+    Show-FinalScreen -State $finalState -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { if ((Get-ElapsedSeconds) -ge 2) { 'Enter' } } -Stick { $script:stick } -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } `
+      -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 2   # the progress frame's, then the final screen's first frame only
+    $fw.ClearBack | Should -Be 'DarkGreen'
+    @($fw.Calls | Where-Object { $_ -is [hashtable] -and $_.T -match 'SETUP COMPLETE' }).Count | Should -Be 3   # drawn at 0, 1 and 2 s
   }
   It 'the production colour setter sets both the background and the foreground of the console' {
     # $Host cannot be replaced, so read the -SetColor default out of the param block.
@@ -864,8 +908,12 @@ Describe 'Show-FinalScreen' {
     $text | Should -Match 'RawUI\.BackgroundColor = \$background'
     $text | Should -Match 'RawUI\.ForegroundColor = \$foreground'
   }
+  It 'the production key reader never blocks: it reads only a waiting key' {
+    $param = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'ReadKey' }
+    $param.DefaultValue.Extent.Text | Should -Match 'if \(\[Console\]::KeyAvailable\) \{ \[Console\]::ReadKey\(\$true\)\.Key\.ToString\(\) \}'
+  }
   It 'puts the console colours back last, when the screen closes' {
-    Invoke-FinalScreen -Keys 'R', 'Q'
+    Invoke-FinalScreen -Keys 'R', 'Enter'
     @($events | Where-Object { $_ -eq 'reset' }).Count | Should -Be 1
     $events[$events.Count - 1] | Should -Be 'reset'
   }
@@ -890,44 +938,20 @@ Describe 'Show-FinalScreen' {
     $drawn[0] | Should -Not -Match 'press B'
     Should -Invoke Get-DefaultBrowserProgId -Times 0 -Exactly
   }
-  It 'clears the screen and writes the lines in white on dark green when no -Write seam is given' {
-    $script:cleared = 0
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Clear-Host { $script:cleared++ }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; Color = $ForegroundColor; Back = $BackgroundColor }) }
-    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
-      -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
-    $cleared | Should -Be 1
-    @($hostCalls | Where-Object { $_.Text -match 'SETUP COMPLETE' }).Count | Should -Be 1
-    @($hostCalls | Where-Object { $_.Color -ne 'White' -or $_.Back -ne 'DarkGreen' }).Count | Should -Be 0
-  }
-  It 'writes the last line without a newline, so a screen of exactly 30 lines does not scroll its top line away' {
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Clear-Host { }
-    Mock Write-Host { $null = $script:hostCalls.Add(@{ Text = [string]$Object; NoNewline = [bool]$NoNewline }) }
-    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
-      -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) }
-    $hostCalls.Count | Should -BeGreaterThan 10
-    $hostCalls[$hostCalls.Count - 1].Text | Should -Match '^  Report: '
-    $hostCalls[$hostCalls.Count - 1].NoNewline | Should -BeTrue
-    @($hostCalls | Select-Object -First ($hostCalls.Count - 1) | Where-Object { $_.NoNewline }).Count | Should -Be 0
-  }
   It 'treats an unknown default browser as not Chrome' {
     Mock Get-DefaultBrowserProgId { $null }
     Invoke-FinalScreen
     $drawn[0] | Should -Match 'press B'
   }
   It 'B opens Default Apps for Chrome with the registered name URL-encoded, then keeps waiting' {
-    Invoke-FinalScreen -Keys 'B', 'Q'
+    Invoke-FinalScreen -Keys 'B', 'Enter'
     $launched.Count | Should -Be 1
     $launched[0].Target | Should -Be 'ms-settings:defaultapps?registeredAppMachine=Google%20Chrome'
     @($events | Where-Object { $_ -eq 'read' }).Count | Should -Be 2
     $drawn.Count | Should -Be 1
   }
   It 'R opens the report in notepad with the path quoted, then keeps waiting' {
-    Invoke-FinalScreen -Keys 'R', 'Escape'
+    Invoke-FinalScreen -Keys 'R', 'Enter'
     $launched.Count | Should -Be 1
     $launched[0].Target | Should -Be 'notepad.exe'
     $launched[0].Arguments | Should -Be '"C:\BenTech\Setup\Logs\Setup-Report.txt"'
@@ -936,30 +960,60 @@ Describe 'Show-FinalScreen' {
     Invoke-FinalScreen -Keys 'R', 'B', 'R', 'Enter'
     @($launched | ForEach-Object { $_.Target }) | Should -Be @('notepad.exe', 'ms-settings:defaultapps?registeredAppMachine=Google%20Chrome', 'notepad.exe')
   }
-  It 'any other key returns without launching anything' {
-    foreach ($k in 'Enter', 'Escape', 'Spacebar', 'X') {
-      Invoke-FinalScreen -Keys $k, 'B'
-      $launched.Count | Should -Be 0
-      @($events | Where-Object { $_ -eq 'read' }).Count | Should -Be 1
-    }
-  }
-  It 'returns instead of looping forever when no key can be read' {
-    Invoke-FinalScreen -Keys @()
-    $launched.Count | Should -Be 0
+  It 'only Enter finishes; every other key is ignored' { Invoke-FinalScreen -Keys 'Escape', 'Spacebar', 'X', 'Q', 'Enter'; $launched.Count | Should -Be 0; @($events | Where-Object { $_ -eq 'read' }).Count | Should -BeGreaterOrEqual 5 }
+  It 'keeps waiting while no key comes, and never returns by itself' {
+    { Invoke-FinalScreen -Keys @() } | Should -Throw '*runaway: no Enter*'
+    @($events | Where-Object { $_ -eq 'reset' }).Count | Should -Be 1
   }
   It 'empties the key buffer after drawing and before it waits, so a stray key cannot close the screen' {
     Invoke-FinalScreen
     $events.IndexOf('write') | Should -BeLessThan $events.IndexOf('flush')
     $events.IndexOf('flush') | Should -BeLessThan $events.IndexOf('read')
   }
+  It 'shows the stick line live: a stick plugged in while waiting appears within a second' {
+    $script:stick = @{ Root = $null }; $script:plugAt = 3
+    Invoke-FinalScreen -Stick { if ((Get-ElapsedSeconds) -ge $script:plugAt) { @{ Root = 'F:\'; Drive = 'F:' } } else { @{ Root = $null } } } -KeyAt { param($s) if ($s -ge 5) { 'Enter' } }
+    $drawn[0] | Should -Match 'No BenTech USB stick'; $drawn[$drawn.Count - 1] | Should -Match 'USB stick found \(F:\)'
+    $drawn.Count | Should -Be 6                      # one redraw a second: 0, 1, 2, 3, 4 and 5 s
+    $drawn[2] | Should -Match 'No BenTech USB stick'; $drawn[3] | Should -Match 'USB stick found \(F:\)'
+  }
+  It 'a stick check that throws shows "no stick" and keeps going' {
+    Invoke-FinalScreen -Stick { throw 'WMI down' } -KeyAt { param($s) if ($s -ge 3) { 'Enter' } }
+    $drawn[0] | Should -Match 'No BenTech USB stick'
+    $drawn.Count | Should -Be 4
+    @($drawn | Where-Object { $_ -match 'No BenTech USB stick' }).Count | Should -Be 4
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.error -eq 'WMI down' }
+  }
+  It 'the default stick reader looks for the launcher recorded in the state' {
+    Mock Find-SetupStick { @{ Root = 'G:\'; Drive = 'G:' } }
+    $script:drawn = New-Object System.Collections.ArrayList
+    $st = $finalState.Clone(); $st.Launcher = @{ Path = 'E:\BenTechSetup.cmd'; Drive = 'E:'; VolumeSerial = '1A2B3C4D' }
+    Show-FinalScreen -State $st -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { 'Enter' } -Now { [datetime]'2026-10-18T09:00:00' } -Sleep { param($ms) } -SetColor { param($b, $f) } -ResetColor { } `
+      -Write { param($lines) $null = $script:drawn.Add(($lines -join "`n")) } -FlushInput { } -Launch { param($t, $a) }
+    $drawn[0] | Should -Match 'USB stick found \(G:\)'
+    Should -Invoke Find-SetupStick -Times 1 -Exactly -ParameterFilter { $Launcher.VolumeSerial -eq '1A2B3C4D' }
+  }
+  It 'a draw that fails (the window resized mid-frame) is logged once, and the next second draws again' {
+    $script:failDraws = 2
+    $script:drawn = New-Object System.Collections.ArrayList
+    Reset-FakeClock
+    Show-FinalScreen -State $finalState -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { if ((Get-ElapsedSeconds) -ge 3) { 'Enter' } } -Stick { $script:stick } -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } `
+      -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Launch { param($t, $a) } `
+      -Write { param($lines) if ($script:failDraws -gt 0) { $script:failDraws--; throw 'The cursor position cannot be smaller than zero' }; $null = $script:drawn.Add(($lines -join "`n")) }
+    $drawn.Count | Should -Be 2                      # 0 and 1 s failed, 2 and 3 s drew
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -match 'draw' }
+  }
   It 'restores the console colour even when the key read throws' {
     $script:colors = New-Object System.Collections.ArrayList
     $script:fores = New-Object System.Collections.ArrayList
     $script:resets = 0
     {
-      Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
+      Show-FinalScreen -State $finalState `
         -Verdict @{ Color = 'RED'; Banner = 'COMPLETED WITH ERRORS'; Failures = @('F'); Notes = @() } -ReportPath 'C:\r.txt' `
         -ReadKey { throw 'console went away' } -SetColor { param($b, $f) $null = $script:colors.Add($b); $null = $script:fores.Add($f) } -ResetColor { $script:resets++ } `
+        -Stick { $script:stick } -Now { [datetime]'2026-10-18T09:00:00' } -Sleep { param($ms) } `
         -Write { param($lines) } -FlushInput { } -Launch { param($t, $a) }
     } | Should -Throw '*console went away*'
     $colors.Count | Should -Be 1
@@ -968,15 +1022,16 @@ Describe 'Show-FinalScreen' {
     $resets | Should -Be 1
   }
   It 'survives a launch failure and keeps waiting' {
-    Invoke-FinalScreen -Keys 'R', 'B', 'Q' -Launch { param($t, $a) throw 'no notepad here' }
+    Invoke-FinalScreen -Keys 'R', 'B', 'Enter' -Launch { param($t, $a) throw 'no notepad here' }
     $launched.Count | Should -Be 2
     @($events | Where-Object { $_ -eq 'read' }).Count | Should -Be 3
   }
   It 'survives a colour change that fails and still draws the screen' {
     $script:drawn = New-Object System.Collections.ArrayList
-    Show-FinalScreen -State (@{ Machine = $m; AnyDeskId = '123456789'; RebootCount = 0; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T09:10:00' }) `
+    Show-FinalScreen -State $finalState `
       -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
-      -ReadKey { 'Q' } -SetColor { param($b, $f) throw 'cannot set colour' } -ResetColor { throw 'cannot reset colour' } `
+      -ReadKey { 'Enter' } -SetColor { param($b, $f) throw 'cannot set colour' } -ResetColor { throw 'cannot reset colour' } `
+      -Stick { $script:stick } -Now { [datetime]'2026-10-18T09:00:00' } -Sleep { param($ms) } `
       -Write { param($lines) $null = $script:drawn.Add(($lines -join "`n")) } -FlushInput { throw 'cannot flush' } -Launch { param($t, $a) }
     $drawn.Count | Should -Be 1
     $drawn[0] | Should -Match 'SETUP COMPLETE'

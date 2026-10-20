@@ -4,18 +4,19 @@
 # named outright, foreground and background (spec 9.1): the powershell.exe console profile remaps
 # DarkYellow to near white, so a YELLOW screen of white text on DarkYellow could not be read.
 #
-# Format-BigDigits and Format-FinalScreen are pure. Show-FinalScreen reaches the console, the keyboard
-# and the launcher only through injectable script blocks with production defaults, so the tests drive
-# it with a scripted key sequence. Uses ConvertTo-ScreenText, Limit-ScreenLine, ConvertFrom-StateTime
-# and Format-HoursMinutes from StartScreen.ps1, and the default-browser helpers from
-# DefaultBrowser.ps1 and Apps.ps1.
+# Format-BigDigits and Format-FinalScreen are pure. Show-FinalScreen reaches the console, the keyboard,
+# the clock, the USB stick and the launcher only through injectable script blocks with production
+# defaults, so the tests drive it with a scripted key sequence and a fake clock. Uses ConvertTo-ScreenText,
+# Limit-ScreenLine, ConvertFrom-StateTime and Format-HoursMinutes from StartScreen.ps1, the console frame
+# writer from ConsoleFrame.ps1, Find-SetupStick and Format-StickLine from Entry\Cleanup.ps1, and the
+# default-browser helpers from DefaultBrowser.ps1 and Apps.ps1.
 
 $script:FinalScreenWidth = 80
-# Triage 240: with both lists over their caps, the Chrome hint and a 10-digit AnyDesk ID, the screen is 30
-# lines, the height of a default console window. Show-FinalScreen writes the last one without a newline, so
-# nothing scrolls the banner away.
-$script:FinalMaxFailures = 4
-$script:FinalMaxNotes = 3
+# Triage 240, v2 spec 10: with both lists over their caps, the Chrome hint, the USB stick line and a
+# 10-digit AnyDesk ID, the screen is 29 lines. The frame writer keeps the last row of the window free, so
+# that fits a default 30-row console window without scrolling the banner away.
+$script:FinalMaxFailures = 3
+$script:FinalMaxNotes = 2
 
 # A 5x5 font for the AnyDesk ID. Every glyph is exactly 5 columns wide and 5 rows tall.
 $script:BigDigitFont = @{
@@ -109,10 +110,10 @@ function Format-FinalScreen {
     In order: the banner centred in an 80-column frame of '=', the machine and new name, the AnyDesk
     ID in big digits grouped 3-3-3 (or "not available"), the total time and reboot count, each
     failure ("  X  ..."), each note ("  !  ..."), the Chrome hint when Chrome is not the default
-    browser (right above the report line), and the report line. The total time runs from
-    State.StartedAt to State.EndedAt, or to -Now while the run has no end time. At most 4 failures and
-    3 notes are listed (then "... and N more"), and each is cut to 79 columns, so the worst case is
-    30 lines (one default console window).
+    browser, the -StickLine (right above the report line; left out when empty), and the report line.
+    The total time runs from State.StartedAt to State.EndedAt, or to -Now while the run has no end
+    time. At most 3 failures and 2 notes are listed (then "... and N more"), and each is cut to 79
+    columns, so the worst case is 29 lines (a 30-row window less the row the frame writer keeps free).
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -121,7 +122,8 @@ function Format-FinalScreen {
     [Parameter(Mandatory)][hashtable]$Verdict,
     [Parameter(Mandatory)][string]$ReportPath,
     [Parameter(Mandatory)][bool]$DefaultBrowserIsChrome,
-    [datetime]$Now = (Get-Date)
+    [datetime]$Now = (Get-Date),
+    [AllowNull()][AllowEmptyString()][string]$StickLine = ''
   )
 
   $machine = if ($State['Machine'] -is [hashtable]) { $State['Machine'] } else { @{} }
@@ -167,7 +169,8 @@ function Format-FinalScreen {
   if (-not $DefaultBrowserIsChrome) {
     $lines.Add("  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'")
   }
-  $lines.Add(('  Report: {0}   [R] open report   [any other key] close' -f $ReportPath))
+  if (-not [string]::IsNullOrEmpty($StickLine)) { $lines.Add($StickLine) }
+  $lines.Add(('  Report: {0}   [R] open report   [ENTER] finish' -f $ReportPath))
 
   return $lines.ToArray()
 }
@@ -191,52 +194,72 @@ function Get-VerdictColors {
 function Show-FinalScreen {
   <#
   .SYNOPSIS
-    Paints the console green / yellow / red, draws the final screen and waits for a key.
+    Paints the console green / yellow / red, draws the final screen and waits for Enter.
   .DESCRIPTION
-    B opens Settings > Default apps for Chrome, R opens the report in Notepad; both keep the screen
-    up. Any other key returns. The Chrome hint is left out when Chrome is the default browser or is
-    not installed. Keys already waiting in the console buffer are thrown away first, so a stray key
+    Enter finishes (v2 spec 10.1: the caller then saves the logs and deletes C:\BenTech, so a stray key
+    must not end the screen). B opens Settings > Default apps for Chrome, R opens the report in Notepad;
+    both keep the screen up. Every other key is ignored. The Chrome hint is left out when Chrome is the
+    default browser or is not installed.
+
+    The screen has a live USB stick line: the stick is looked for again every second and the screen
+    redrawn, so a stick plugged in while the screen waits shows within a second. A stick check that throws
+    counts as no stick (one WARN). The key is polled every 100 ms; a second has passed when the clock says
+    so or when the sleeps add up to it (the start screen's rule), so a clock that stands still or jumps
+    back cannot stop the redraws. A draw that fails (the window resized mid-frame) is logged once and the
+    next frame clears the window and draws everything again.
+
+    Keys already waiting in the console buffer are thrown away after the first draw, so a stray key
     pressed during the last step cannot close the screen before anyone has read the AnyDesk ID. The
-    console colour is put back when the screen closes, also when something throws.
+    console colour is put back when the screen closes, also when something throws; a -ReadKey that throws
+    still propagates (a crash keeps the folder for diagnosis).
 
     The seams (production defaults shown):
-      -ReadKey    waits for a key and returns its [ConsoleKey] name (nothing = treated as "any key")
+      -ReadKey    returns the waiting key's [ConsoleKey] name, or nothing when no key is waiting
       -SetColor   sets the console colours: param($background, $foreground), colour names
       -ResetColor puts the console colours back (runs when the screen closes, also after an error)
-      -Write      clears and draws the lines in the given colours: param($lines, $foreground, $background)
-                  (the last line without a newline)
+      -Write      draws the lines in the given colours: param($lines, $foreground, $background). The
+                  production writer draws over the window through the console frame writer: no flicker,
+                  and nothing in the transcript
       -Launch     starts a program or opens a URI: param($target, $arguments)
       -FlushInput throws away waiting key presses
+      -Stick      the USB stick: @{ Root; Drive } (Find-SetupStick with the launcher recorded in the state)
+      -Now        the clock
+      -Sleep      waits the given milliseconds
   #>
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$State,
     [Parameter(Mandatory)][hashtable]$Verdict,
     [Parameter(Mandatory)][string]$ReportPath,
-    [scriptblock]$ReadKey = { [Console]::ReadKey($true).Key.ToString() },
+    [scriptblock]$ReadKey = { if ([Console]::KeyAvailable) { [Console]::ReadKey($true).Key.ToString() } },
     [scriptblock]$SetColor = { param($background, $foreground) $Host.UI.RawUI.BackgroundColor = $background; $Host.UI.RawUI.ForegroundColor = $foreground },
     [scriptblock]$ResetColor = { [Console]::ResetColor() },
-    [scriptblock]$Write = {
-      param($lines, $foreground, $background)
-      Clear-Host
-      $all = @($lines)
-      # The last line has no newline: a full 30-line screen in a 30-row window must not scroll.
-      for ($i = 0; $i -lt $all.Count; $i++) { Write-Host $all[$i] -ForegroundColor $foreground -BackgroundColor $background -NoNewline:($i -eq $all.Count - 1) }
-    },
+    [scriptblock]$Write = { param($lines, $foreground, $background) Write-ConsoleFrame -Lines $lines -Writer (New-ConsoleWriter) -Foreground $foreground -Background $background },
     [scriptblock]$Launch = {
       param($target, $arguments)
       if ([string]::IsNullOrEmpty($arguments)) { Start-Process -FilePath $target }
       else { Start-Process -FilePath $target -ArgumentList $arguments }
     },
-    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) } }
+    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) } },
+    [scriptblock]$Stick = { Find-SetupStick -Launcher $State['Launcher'] },
+    [scriptblock]$Now = { Get-Date },
+    [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms }
   )
+
+  # The clock runs with this function's own $Now out of the way: PowerShell finds a variable in the
+  # callers' scopes, so a caller's `-Now { $now }` would otherwise get this parameter back.
+  $clockBlock = $Now
+  Remove-Variable -Name Now -Scope Local
 
   $isChrome = if (Test-ChromeInstalled) { (Get-DefaultBrowserProgId) -eq 'ChromeHTML' } else { $true }
   $colors = Get-VerdictColors -Color ([string]$Verdict['Color'])
-  $lines = @(Format-FinalScreen -State $State -Verdict $Verdict -ReportPath $ReportPath -DefaultBrowserIsChrome $isChrome)
+  $stickInfo = @{ Root = $null; Drive = $null }
+  $stickWarned = $false
+  $drawWarned = $false
 
-  # Colours, input flushing and launching are conveniences: a failure there must not stop the
-  # screen from showing the AnyDesk ID.
+  # Colours, input flushing, launching, the stick check and drawing are conveniences: a failure there must
+  # not stop the screen from showing the AnyDesk ID. $readStick and $draw are dot-sourced, so their
+  # assignments land in this function's scope.
   $paint = {
     try { $null = & $SetColor $colors.Background $colors.Foreground }
     catch { Write-SetupLog -Message 'Could not set the console colour for the final screen' -Level WARN -Data @{ error = $_.Exception.Message } }
@@ -246,15 +269,47 @@ function Show-FinalScreen {
     try { $null = & $Launch $target $arguments }
     catch { Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = $_.Exception.Message } }
   }
+  $readStick = {
+    try {
+      $found = & $Stick
+      $stickInfo = if ($found -is [hashtable]) { $found } else { @{ Root = $null; Drive = $null } }
+    } catch {
+      $stickInfo = @{ Root = $null; Drive = $null }
+      if (-not $stickWarned) {
+        $stickWarned = $true
+        Write-SetupLog -Message 'Could not look for the USB stick on the final screen' -Level WARN -Data @{ error = $_.Exception.Message }
+      }
+    }
+  }
+  $draw = {
+    $lines = @(Format-FinalScreen -State $State -Verdict $Verdict -ReportPath $ReportPath -DefaultBrowserIsChrome $isChrome `
+      -Now ([datetime](& $clockBlock)) -StickLine (Format-StickLine -Stick $stickInfo))
+    try { $null = & $Write $lines $colors.Foreground $colors.Background }
+    catch {
+      # The next frame (a second later) clears the window and draws everything again.
+      Reset-ConsoleFrame
+      if (-not $drawWarned) {
+        $drawWarned = $true
+        Write-SetupLog -Message 'Could not draw the final screen' -Level WARN -Data @{ error = $_.Exception.Message }
+      }
+    }
+  }
 
   try {
     & $paint
-    $null = & $Write $lines $colors.Foreground $colors.Background
+    . $readStick
+    # The first frame clears the whole window in the verdict colour, also when the progress screen's last
+    # frame had the same size.
+    Reset-ConsoleFrame
+    . $draw
     try { $null = & $FlushInput }
     catch { Write-SetupLog -Message 'Could not empty the console key buffer' -Level WARN -Data @{ error = $_.Exception.Message } }
 
+    $lastTick = & $clockBlock
+    $sleptMs = 0
     while ($true) {
       $key = [string](& $ReadKey)
+      if ($key -eq 'Enter') { return }
       if ($key -eq 'B') {
         & $open 'Default Apps' ('ms-settings:defaultapps?registeredAppMachine=' + [Uri]::EscapeDataString((Get-ChromeRegisteredAppName))) $null
         continue
@@ -263,7 +318,16 @@ function Show-FinalScreen {
         & $open 'the report' 'notepad.exe' ('"{0}"' -f $ReportPath)
         continue
       }
-      return
+      # No key, or any other key (ignored): wait a moment, and once a second look for the stick and redraw.
+      $null = & $Sleep 100
+      $sleptMs += 100
+      $current = & $clockBlock
+      if ([math]::Max($sleptMs, ($current - $lastTick).TotalMilliseconds) -ge 1000) {
+        $lastTick = $current
+        $sleptMs = 0
+        . $readStick
+        . $draw
+      }
     }
   } finally {
     try { $null = & $ResetColor }

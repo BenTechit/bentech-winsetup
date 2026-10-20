@@ -8,11 +8,13 @@
 # transcript, Write-Host, the lock, config and state I/O, machine detection, the screens, the plan, the
 # runner, the verdict, the finalization, the resume task and the Windows Update round. As a safety net,
 # Register-ScheduledTask, Unregister-ScheduledTask, Restart-Computer and Start-Process throw.
+# Task 15: Invoke-SetupCleanup deletes the parent of -Root (here the temp folder above $TestDrive), so
+# BeforeEach always mocks it, and Get-LauncherInfo (no CIM query from these tests).
 BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
                  'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
-                 'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Main') {
+                 'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Cleanup', 'Entry\Main') {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
@@ -82,6 +84,8 @@ Describe 'Start-BenTechSetup' {
     Mock Unregister-ScheduledTask { throw 'blocked: Unregister-ScheduledTask' }
     Mock Restart-Computer { throw 'blocked: Restart-Computer' }
     Mock Start-Process { throw 'blocked: Start-Process' }
+    Mock Invoke-SetupCleanup { }                  # SAFETY: the real one deletes the parent of -Root
+    Mock Get-LauncherInfo { @{ Path = 'E:\BenTechSetup.cmd'; Drive = 'E:'; VolumeSerial = '1A2B3C4D' } }
   }
 
   AfterEach {
@@ -492,6 +496,56 @@ Describe 'Start-BenTechSetup' {
       Mock Register-SetupTick { }
       Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
       Should -Invoke Register-SetupTick -Times 0 -Exactly; Should -Invoke Resize-SetupConsole -Times 0 -Exactly; Should -Invoke Initialize-SetupActivity -Times 0 -Exactly
+    }
+  }
+
+  # v2 spec 10: no leftover folder.
+  Context 'cleanup' {
+    It 'a new run records the launcher; a resume does not' {
+      $env:BT_SELF = 'E:\BenTechSetup.cmd'
+      try { Invoke-Entry | Out-Null; Should -Invoke Get-LauncherInfo -Times 1 -Exactly -ParameterFilter { $Path -eq 'E:\BenTechSetup.cmd' }; $script:newState.Launcher.VolumeSerial | Should -Be '1A2B3C4D' } finally { Remove-Item Env:\BT_SELF }
+      Mock Read-RunState { New-FakeState }; Invoke-Entry -Resume $true | Out-Null; Should -Invoke Get-LauncherInfo -Times 1 -Exactly
+    }
+    It 'records the launcher before the new state is saved' {
+      Invoke-Entry | Out-Null
+      Should -Invoke Save-RunState -Times 1 -Exactly -ParameterFilter { $State.Launcher.Path -eq 'E:\BenTechSetup.cmd' }
+    }
+    It 'a finished run cleans up after the lock is released and the transcript stopped' {
+      $script:order = New-Object System.Collections.ArrayList
+      Mock Exit-RunLock { [void]$script:order.Add('unlock') }; Mock Stop-Transcript { [void]$script:order.Add('transcript') }
+      Mock Invoke-SetupCleanup { [void]$script:order.Add("cleanup $Mode"); $script:cleanState = $State }
+      Invoke-Entry | Out-Null
+      $order.IndexOf('cleanup Finish') | Should -BeGreaterThan $order.IndexOf('unlock'); $order.IndexOf('cleanup Finish') | Should -BeGreaterThan $order.IndexOf('transcript')
+      $cleanState.RunId | Should -Be 'new-run'
+      Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
+    }
+    It 'a finished resumed run cleans up too, and the exit code stays 0' {
+      Mock Read-RunState { New-FakeState -FinalizeStatus 'Done' }
+      Invoke-Entry -Resume $true | Should -Be 0
+      Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Finish' -and $State.RunId -eq 'resumed-run' }
+    }
+    It 'Escape with no earlier run cleans up (Cancel); after an unfinished earlier run it keeps the folder' {
+      Mock Show-StartScreen { $null }; Invoke-Entry | Out-Null; Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Cancel' }
+      Mock Read-RunState { New-FakeState }; Invoke-Entry | Out-Null; Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly
+    }
+    It 'a crash, a restart or a held lock cleans nothing' {
+      Mock Invoke-SetupRun { throw 'boom' }; Invoke-Entry | Out-Null
+      Mock Invoke-SetupRun { 'Rebooting' }; Invoke-Entry | Out-Null
+      Mock Enter-RunLock { $false }; Invoke-Entry | Out-Null
+      Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly
+    }
+    It 'a resume without a state cleans nothing' {
+      Invoke-Entry -Resume $true | Should -Be 0
+      Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly
+    }
+    It 'a crash on the final screen keeps the folder' {
+      Mock Show-FinalScreen { throw 'console went away' }
+      Invoke-Entry | Should -Be 1
+      Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly
+    }
+    It 'a cleanup that throws anyway does not change the exit code' {
+      Mock Invoke-SetupCleanup { throw 'unexpected' }
+      Invoke-Entry | Should -Be 0
     }
   }
 }

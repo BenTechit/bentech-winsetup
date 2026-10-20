@@ -14,6 +14,6 @@ Describe 'every long wait ticks' {
   It 'Start-Sleep is left only where no tick may run' {
     ($sleepers | Sort-Object -Unique) | Should -Be @(
       'Common\Activity.ps1|Wait-SetupDelay', 'Common\Logging.ps1|Write-SetupLog', 'Engine\Reboot.ps1|Invoke-ControlledReboot',
-      'State\State.ps1|Save-RunState', 'UI\StartScreen.ps1|Show-StartScreen')
+      'State\State.ps1|Save-RunState', 'UI\FinalScreen.ps1|Show-FinalScreen', 'UI\StartScreen.ps1|Show-StartScreen')
   }
 }

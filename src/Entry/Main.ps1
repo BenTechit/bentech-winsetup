@@ -211,12 +211,17 @@ function Complete-SetupRun {
 }
 
 function Invoke-SetupMainFlow {
-  # Private. Everything that runs while this process holds the run lock. Returns 'Cancelled' (Escape on
-  # the start screen: a leftover resume task is removed, nothing else changes), 'NoState' (resumed
-  # without a state), 'Rebooting' or 'Completed'. Exceptions propagate to Start-BenTechSetup's crash
-  # handler.
+  # Private; Start-BenTechSetup is its only caller. Everything that runs while this process holds the run
+  # lock. Returns @{ Outcome; State; HadPrevious }: Outcome is 'Cancelled' (Escape on the start screen: a
+  # leftover resume task is removed, nothing else changes), 'NoState' (resumed without a state),
+  # 'Rebooting' or 'Completed'; State is the run state ($null when there is none); HadPrevious says
+  # whether a run state was already there when this process started (an earlier run on a new run, the
+  # saved run on a resume). Exceptions propagate to Start-BenTechSetup's crash handler.
+  # A new run records the launcher (Get-LauncherInfo on $env:BT_SELF, which the launcher sets) in the
+  # state, so the final screen can find the USB stick (spec 10.2). A resume records nothing: the resume
+  # task has no BT_SELF.
   [CmdletBinding()]
-  [OutputType([string])]
+  [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][string]$Root,
     [Parameter(Mandatory)][string]$ScriptPath,
@@ -234,14 +239,16 @@ function Invoke-SetupMainFlow {
     if ($null -eq $runState) {
       Write-SetupLog -Level WARN -Message 'Resumed at logon, but there is no run state; removing the resume task'
       $null = Unregister-ResumeTask
-      return 'NoState'
+      return @{ Outcome = 'NoState'; State = $null; HadPrevious = $false }
     }
+    $hadPrevious = $true
     $config = Read-SetupConfig -Path $configPath
     Write-SetupLog -Message 'Resuming the run' -Data @{ runId = $runState['RunId'] }
     Add-SetupActivity -Text ('Back after restart {0}' -f [int]$runState['RebootCount'])
   } else {
     $config = Read-SetupConfig -Path $configPath
     $previous = Read-RunState -Root $Root -LogDir $logDir
+    $hadPrevious = ($null -ne $previous)
     $previousSummary = Get-PreviousRunSummary -State $previous
     $machine = Get-MachineInfo
     $fresh = Test-SetupMachineFresh -Machine $machine -Config $config
@@ -251,7 +258,7 @@ function Invoke-SetupMainFlow {
       # earlier, unfinished run is removed too. No state is saved.
       Write-SetupLog -Message 'Cancelled on the start screen; removing any leftover resume task, nothing else is changed'
       $null = Unregister-ResumeTask
-      return 'Cancelled'
+      return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious }
     }
     # A new run starts an empty feed: the previous run's activity.txt is archived under its RunId.
     $previousRunId = if ($null -ne $previous) { [string]$previous['RunId'] } else { $null }
@@ -259,6 +266,7 @@ function Invoke-SetupMainFlow {
     if ($null -ne $previous) { $null = Backup-RunState -Root $Root -LogDir $logDir }
     $plan = @(Get-StepPlan -Machine $machine -Choices $choices -Config $config)
     $runState = New-RunState -Machine $machine -Choices $choices -Plan $plan -Version $Version -Previous $previous
+    $runState.Launcher = Get-LauncherInfo -Path $env:BT_SELF
     $runState.PreviousRun = $previousSummary
     $null = Save-RunState -State $runState -Root $Root
     Write-SetupLog -Message 'New run started' -Data @{ runId = $runState['RunId']; choices = $choices; steps = $plan.Count }
@@ -272,10 +280,10 @@ function Invoke-SetupMainFlow {
   Reset-ConsoleFrame
   Register-SetupTick -Context $ctx -Handler { param($tickContext) Show-ProgressScreen -State $tickContext.State -Catalog $script:StepCatalog }
   $outcome = Invoke-SetupRun -Context $ctx -OnProgress { param($progressContext) Invoke-SetupTick -Force }
-  if ($outcome -eq 'Rebooting') { return 'Rebooting' }
+  if ($outcome -eq 'Rebooting') { return @{ Outcome = 'Rebooting'; State = $ctx.State; HadPrevious = $hadPrevious } }
 
   $null = Complete-SetupRun -Context $ctx -Root $Root
-  return 'Completed'
+  return @{ Outcome = 'Completed'; State = $ctx.State; HadPrevious = $hadPrevious }
 }
 
 function Start-BenTechSetup {
@@ -310,9 +318,14 @@ function Start-BenTechSetup {
          lock stale.
          'Completed': the finalization is completed when the finalize step is not Done (R26); if that
          throws, the error is logged and added to State.Errors (red), not a crash. The resume task is
-         removed in any case, the tick unregistered, and the final screen is shown. 0.
+         removed in any case, the tick unregistered, and the final screen is shown until Enter. 0.
     The tick is unregistered and the lock released in a finally block (also on Ctrl+C on the start
     screen), the lock except after 'Rebooting'. The transcript is stopped in the same finally block.
+    After that finally block (v2 spec 10): 'Completed' runs Invoke-SetupCleanup -Mode Finish (the logs to
+    the USB stick, the Desktop launcher and C:\BenTech deleted), and Escape on the start screen with no
+    earlier run state runs -Mode Cancel (C:\BenTech deleted, because nothing ran). A crash, 'Rebooting',
+    'NoState', a cancel after an unfinished earlier run and a lock held by another run delete nothing.
+    The exit code does not change.
 
     Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash
     text "Setup crashed: <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with
@@ -357,6 +370,7 @@ function Start-BenTechSetup {
   $lockHeld = $false
   $keepLock = $false
   $transcriptStarted = $false
+  $cleanup = $null
   try {
     $null = Initialize-SetupLog -LogDirectory $logDir
     # The activity feed reads its history back from Logs\activity.txt, so it survives a restart.
@@ -380,14 +394,20 @@ function Start-BenTechSetup {
       $exitCode = 2
     } else {
       $lockHeld = $true
-      $outcome = Invoke-SetupMainFlow -Root $Root -ScriptPath $ScriptPath -Resume $Resume -Version $version
-      if ($outcome -eq 'Rebooting') {
+      $flow = Invoke-SetupMainFlow -Root $Root -ScriptPath $ScriptPath -Resume $Resume -Version $version
+      if ($flow.Outcome -eq 'Rebooting') {
         $keepLock = $true
         Write-SetupLog -Message 'Restarting; the run lock is kept until the machine restarts'
+      } elseif ($flow.Outcome -eq 'Completed') {
+        $cleanup = @{ Mode = 'Finish'; State = $flow.State }
+      } elseif ($flow.Outcome -eq 'Cancelled' -and -not $flow.HadPrevious) {
+        $cleanup = @{ Mode = 'Cancel' }
       }
       $exitCode = 0
     }
   } catch {
+    # A crash keeps everything for diagnosis (spec 10.6).
+    $cleanup = $null
     # First: no progress-screen redraw may land on the crash text.
     Unregister-SetupTick
     $message = $_.Exception.Message
@@ -417,6 +437,19 @@ function Start-BenTechSetup {
       } catch {
         Write-SetupLog -Level WARN -Message 'Could not stop the console transcript' -Data @{ error = $_.Exception.Message }
       }
+    }
+  }
+
+  # Only now: the tick is gone, the run lock and its mutex are released and the transcript (a file in
+  # Logs) is closed, so nothing of this run holds the folder open.
+  if ($null -ne $cleanup) {
+    try {
+      $null = Invoke-SetupCleanup -Root $Root @cleanup
+    } catch {
+      # Not expected (Invoke-SetupCleanup catches its own failures). Logging may already be stopped, so the
+      # screen is the only place this is sure to reach.
+      Write-SetupLog -Level ERROR -Message 'Cleanup failed' -Data @{ error = $_.Exception.Message }
+      Write-Host ('Cleanup failed: {0}' -f $_.Exception.Message) -ForegroundColor White -BackgroundColor DarkRed
     }
   }
   return $exitCode

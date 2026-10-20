@@ -71,6 +71,7 @@ $BundleOrder = @(
   'UI\StartScreen.ps1'
   'UI\ProgressScreen.ps1'
   'UI\FinalScreen.ps1'
+  'Entry\Cleanup.ps1'
   'Entry\Main.ps1'
   'Entry\Run.ps1'
 )
