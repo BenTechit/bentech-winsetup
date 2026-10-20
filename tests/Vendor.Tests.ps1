@@ -1119,6 +1119,12 @@ Describe 'Lenovo System Update' {
     $script:regRemoved[0].Path | Should -Be $script:LenovoPolicyKey
     $script:regPresent.Count | Should -Be 0
   }
+  It 'Wait-LenovoProcessExit shows its limit while it waits and removes it after' {
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock Get-Process { [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes); @() }
+    Wait-LenovoProcessExit -TimeoutSeconds 120 -PollSeconds 0.001 | Should -BeTrue
+    $limits[0] | Should -Be 2; (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }
 
 # --- HP Image Assistant -----------------------------------------------------------------------

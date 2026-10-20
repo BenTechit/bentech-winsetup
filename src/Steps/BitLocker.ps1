@@ -200,35 +200,40 @@ function Wait-BitLockerDecrypted {
   $clock = [Diagnostics.Stopwatch]::StartNew()
   $timeoutMs = $TimeoutMinutes * 60000
   $lastStatus = -1
-  while ($true) {
-    $state = Get-BitLockerState
-    if ($state.Presence -eq 'Absent') {
-      Write-SetupLog -Message 'No BitLocker; nothing to wait for'
-      return $true
+  Enter-SetupWait -LimitMinutes $TimeoutMinutes
+  try {
+    while ($true) {
+      $state = Get-BitLockerState
+      if ($state.Presence -eq 'Absent') {
+        Write-SetupLog -Message 'No BitLocker; nothing to wait for'
+        return $true
+      }
+      if ($state.Presence -ne 'Present' -or $null -eq $state.Status) {
+        Write-SetupLog -Message 'BitLocker state could not be read; not treating it as decrypted' -Level WARN -Data @{ presence = $state.Presence; waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
+        return $false
+      }
+      $status = [int]$state.Status
+      if ($status -eq 0) {
+        Write-SetupLog -Message 'BitLocker is decrypted' -Data @{ waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
+        return $true
+      }
+      if ($status -ne 3) {
+        Write-SetupLog -Message 'BitLocker is not decrypting; not waiting' -Level WARN -Data @{ status = $status }
+        return $false
+      }
+      if ($status -ne $lastStatus) {
+        Write-SetupLog -Message 'Waiting for BitLocker decryption' -Data @{ timeoutMinutes = $TimeoutMinutes }
+        $lastStatus = $status
+      }
+      $remainingMs = $timeoutMs - $clock.ElapsedMilliseconds
+      if ($remainingMs -le 0) {
+        Write-SetupLog -Message 'Timed out waiting for BitLocker decryption' -Level WARN -Data @{ timeoutMinutes = $TimeoutMinutes }
+        return $false
+      }
+      Wait-SetupDelay -Milliseconds ([int][Math]::Max(1, [Math]::Min($PollSeconds * 1000, $remainingMs)))
     }
-    if ($state.Presence -ne 'Present' -or $null -eq $state.Status) {
-      Write-SetupLog -Message 'BitLocker state could not be read; not treating it as decrypted' -Level WARN -Data @{ presence = $state.Presence; waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
-      return $false
-    }
-    $status = [int]$state.Status
-    if ($status -eq 0) {
-      Write-SetupLog -Message 'BitLocker is decrypted' -Data @{ waitedSeconds = [int]$clock.Elapsed.TotalSeconds }
-      return $true
-    }
-    if ($status -ne 3) {
-      Write-SetupLog -Message 'BitLocker is not decrypting; not waiting' -Level WARN -Data @{ status = $status }
-      return $false
-    }
-    if ($status -ne $lastStatus) {
-      Write-SetupLog -Message 'Waiting for BitLocker decryption' -Data @{ timeoutMinutes = $TimeoutMinutes }
-      $lastStatus = $status
-    }
-    $remainingMs = $timeoutMs - $clock.ElapsedMilliseconds
-    if ($remainingMs -le 0) {
-      Write-SetupLog -Message 'Timed out waiting for BitLocker decryption' -Level WARN -Data @{ timeoutMinutes = $TimeoutMinutes }
-      return $false
-    }
-    Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Min($PollSeconds * 1000, $remainingMs)))
+  } finally {
+    Exit-SetupWait
   }
 }
 

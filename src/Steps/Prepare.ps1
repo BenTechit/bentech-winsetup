@@ -609,7 +609,7 @@ function Invoke-StepPrepare {
       $retrying = ($attempt -eq 1)
       Write-SetupLog -Message $(if ($retrying) { 'Resume task could not be registered; retrying once' } else { 'Resume task could not be registered' }) `
         -Level $(if ($retrying) { 'WARN' } else { 'ERROR' }) -Data @{ attempt = $attempt; error = $_.Exception.Message }
-      if ($retrying -and $ResumeTaskRetrySeconds -gt 0) { Start-Sleep -Seconds $ResumeTaskRetrySeconds }
+      if ($retrying -and $ResumeTaskRetrySeconds -gt 0) { Wait-SetupDelay -Seconds $ResumeTaskRetrySeconds }
     }
   }
   if (-not $taskRegistered) {

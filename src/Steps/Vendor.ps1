@@ -498,7 +498,7 @@ function Invoke-DellUpdate {
     if ($mapped -eq 'RetryService' -and $try -lt $maxTries) {
       Write-SetupLog -Message 'The Dell service is not ready; starting it, waiting and applying once more' -Level WARN -Data @{ exitCode = $run.ExitCode; service = $script:DcuServiceName; waitSeconds = $RetrySeconds }
       Start-DellClientService
-      Start-Sleep -Seconds $RetrySeconds
+      Wait-SetupDelay -Seconds $RetrySeconds
       continue
     }
     if ($mapped -eq 'RetryService') { $mapped = 'Failed' }
@@ -575,14 +575,19 @@ function Wait-LenovoProcessExit {
   )
 
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  while ($true) {
-    $remaining = $TimeoutSeconds - $clock.Elapsed.TotalSeconds
-    if ($remaining -gt 0) {
-      Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000)))
+  Enter-SetupWait -LimitMinutes ($TimeoutSeconds / 60)
+  try {
+    while ($true) {
+      $remaining = $TimeoutSeconds - $clock.Elapsed.TotalSeconds
+      if ($remaining -gt 0) {
+        Wait-SetupDelay -Milliseconds ([int][Math]::Max(1, [Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000)))
+      }
+      $running = @(Get-Process -Name $script:LenovoProcessNames -ErrorAction SilentlyContinue)
+      if ($running.Count -eq 0) { return $true }
+      if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { return $false }
     }
-    $running = @(Get-Process -Name $script:LenovoProcessNames -ErrorAction SilentlyContinue)
-    if ($running.Count -eq 0) { return $true }
-    if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { return $false }
+  } finally {
+    Exit-SetupWait
   }
 }
 
@@ -866,7 +871,7 @@ function Invoke-HpUpdate {
     $mapped = Convert-HpiaExitCode -ExitCode $run.ExitCode
     if ($mapped -eq 'Retry' -and $try -lt $maxTries) {
       Write-SetupLog -Message 'HPIA has no internet connection; waiting and trying once more' -Level WARN -Data @{ exitCode = $run.ExitCode; waitSeconds = $RetrySeconds }
-      Start-Sleep -Seconds $RetrySeconds
+      Wait-SetupDelay -Seconds $RetrySeconds
       continue
     }
     if ($mapped -eq 'Retry') { $mapped = 'Failed' }

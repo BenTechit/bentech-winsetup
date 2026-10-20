@@ -534,6 +534,13 @@ Describe 'Invoke-StepAnyDesk' {
     $r = Invoke-StepAnyDesk -Context $script:ctx
     ($r | ConvertTo-Json -Depth 6 -Compress) | Should -Not -Match '123456789'
   }
+  It 'Find-AnyDeskId shows its limit while it polls and removes it after' {
+    Clear-SetupNow
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock Read-AnyDeskIdFromServiceConf { [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes); '123456789' }
+    Find-AnyDeskId -Exe $script:anyExe -TimeoutMinutes 3 -PollSeconds 0.01 | Should -Be '123456789'
+    @($script:limits) | Should -Be @(3); (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }
 
 # --- Invoke-StepSevenZip ----------------------------------------------------------------------

@@ -49,12 +49,53 @@ function Invoke-DownloadAttempt {
       if ($client) { $client.Dispose() }
     }
     if ($attempt -lt $Retries -and $BackoffSeconds -gt 0) {
-      Start-Sleep -Milliseconds ([int]($BackoffSeconds * $attempt * 1000))
+      Wait-SetupDelay -Milliseconds ([int]($BackoffSeconds * $attempt * 1000))
     }
   }
   $message = "download failed after $Retries attempts: $Url"
   Write-SetupLog -Message $message -Level ERROR
   throw (New-Object System.Exception ($message, $lastError))
+}
+
+function Receive-RemoteFile {
+  <#
+  .SYNOPSIS
+    Private. One attempt of Get-RemoteFile: downloads Url to Path with Client, waiting at most
+    TimeoutMinutes. Throws when the download fails or times out.
+  .DESCRIPTION
+    DownloadFileTaskAsync, waited for in slices of at most 250 ms with the tick after each, so the
+    progress screen stays alive; TimeoutMinutes is the published wait limit meanwhile. At the
+    deadline the download is cancelled (CancelAsync), given at most 2 s to stop, and a
+    TimeoutException "download timed out after <n> min: <url>" is thrown. A finished download is
+    completed with GetAwaiter().GetResult(), which rethrows its WebException.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]$Client,
+    [Parameter(Mandatory)][string]$Url,
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][double]$TimeoutMinutes
+  )
+
+  $timeoutMs = [long][Math]::Ceiling($TimeoutMinutes * 60000)
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  Enter-SetupWait -LimitMinutes $TimeoutMinutes
+  try {
+    $task = $Client.DownloadFileTaskAsync([uri]$Url, $Path)
+    while (-not $task.IsCompleted) {
+      $remaining = $timeoutMs - $clock.ElapsedMilliseconds
+      if ($remaining -le 0) {
+        $Client.CancelAsync()
+        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), 2000)
+        throw (New-Object TimeoutException ("download timed out after $TimeoutMinutes min: $Url"))
+      }
+      [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($task), [int][Math]::Min(250, $remaining))
+      Invoke-SetupTick
+    }
+    $null = $task.GetAwaiter().GetResult()
+  } finally {
+    Exit-SetupWait
+  }
 }
 
 function Get-RemoteFile {
@@ -64,8 +105,10 @@ function Get-RemoteFile {
   .DESCRIPTION
     Downloads to <Destination>.part and moves it into place only when complete, so a partial or
     failed download never looks like a finished file. Creates the destination folder if needed. An
-    existing destination is replaced only after a download succeeded. Waits BackoffSeconds * attempt
-    between tries. Throws "download failed after <n> attempts: <url>".
+    existing destination is replaced only after a download succeeded. Each attempt may take at most
+    TimeoutMinutes (Receive-RemoteFile: it ticks while it waits); a timed-out attempt is a failed
+    one. Waits BackoffSeconds * attempt between tries. Throws "download failed after <n> attempts:
+    <url>".
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -73,7 +116,8 @@ function Get-RemoteFile {
     [Parameter(Mandatory)][string]$Url,
     [Parameter(Mandatory)][string]$Destination,
     [ValidateRange(1, 100)][int]$Retries = 3,
-    [ValidateRange(0, 3600)][double]$BackoffSeconds = 5
+    [ValidateRange(0, 3600)][double]$BackoffSeconds = 5,
+    [ValidateRange(0.001, 1440)][double]$TimeoutMinutes = 30
   )
 
   # Resolve against PowerShell's location, not the process's current directory (WebClient and
@@ -89,7 +133,7 @@ function Get-RemoteFile {
   Invoke-DownloadAttempt -Url $Url -Retries $Retries -BackoffSeconds $BackoffSeconds -Action {
     param($client)
     try {
-      $client.DownloadFile($Url, $part)
+      Receive-RemoteFile -Client $client -Url $Url -Path $part -TimeoutMinutes $TimeoutMinutes
       Move-Item -LiteralPath $part -Destination $target -Force -ErrorAction Stop
     } finally {
       # Gone after a successful move; after a failure this is the partial download.

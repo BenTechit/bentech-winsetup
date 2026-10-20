@@ -67,6 +67,42 @@ Describe 'Get-RemoteFile' {
       [Net.ServicePointManager]::SecurityProtocol | Should -Be ([Net.SecurityProtocolType]::Tls12)
     } finally { [Net.ServicePointManager]::SecurityProtocol = $saved }
   }
+  It 'gives up on a download that never finishes, cancels it, and reports the attempts' {
+    $script:cancels = 0
+    Mock New-SetupWebClient {
+      $c = [pscustomobject]@{}
+      $c | Add-Member ScriptMethod DownloadFileTaskAsync { param($u, $p) (New-Object 'Threading.Tasks.TaskCompletionSource[object]').Task }
+      $c | Add-Member ScriptMethod CancelAsync { $script:cancels++ }
+      $c | Add-Member ScriptMethod Dispose { }
+      $c }
+    $err = $null
+    try { Get-RemoteFile -Url 'https://example.invalid/x.exe' -Destination "$TestDrive\x.exe" -Retries 1 -BackoffSeconds 0 -TimeoutMinutes 0.001 } catch { $err = $_ }
+    $err.Exception.Message | Should -BeExactly 'download failed after 1 attempts: https://example.invalid/x.exe'
+    $err.Exception.InnerException.Message | Should -Match 'timed out'
+    $script:cancels | Should -Be 1
+  }
+  It 'ticks while downloading and still copies the file' {
+    $script:ticks = 0; Register-SetupTick -Context @{} -Handler { $script:ticks++ }
+    try { Get-RemoteFile -Url ([uri]"$TestDrive\src.txt").AbsoluteUri -Destination "$TestDrive\t.txt" -BackoffSeconds 0 | Should -Exist } finally { Unregister-SetupTick }
+  }
+  It 'shows its timeout as the wait limit while it downloads, and removes it after' {
+    Clear-SetupNow
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock New-SetupWebClient {
+      $c = [pscustomobject]@{}
+      $c | Add-Member ScriptMethod DownloadFileTaskAsync {
+        param($u, $p)
+        [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes)
+        [IO.File]::WriteAllText($p, 'done')
+        $tcs = New-Object 'Threading.Tasks.TaskCompletionSource[object]'; $tcs.SetResult($null); $tcs.Task
+      }
+      $c | Add-Member ScriptMethod CancelAsync { }
+      $c | Add-Member ScriptMethod Dispose { }
+      $c }
+    Get-RemoteFile -Url 'https://example.invalid/y.exe' -Destination "$TestDrive\y.exe" -BackoffSeconds 0 -TimeoutMinutes 12 | Should -Exist
+    @($script:limits) | Should -Be @(12)
+    (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }
 
 Describe 'Get-RemoteText' {

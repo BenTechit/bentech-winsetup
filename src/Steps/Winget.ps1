@@ -422,12 +422,17 @@ function Wait-WingetPath {
   )
 
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  while ($true) {
-    $path = Get-WingetPath
-    if ($path -and (Test-WingetUsable -Path $path)) { return $path }
-    $remaining = $TimeoutMinutes * 60 - $clock.Elapsed.TotalSeconds
-    if ($remaining -le 0) { return $null }
-    Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000))
+  Enter-SetupWait -LimitMinutes $TimeoutMinutes
+  try {
+    while ($true) {
+      $path = Get-WingetPath
+      if ($path -and (Test-WingetUsable -Path $path)) { return $path }
+      $remaining = $TimeoutMinutes * 60 - $clock.Elapsed.TotalSeconds
+      if ($remaining -le 0) { return $null }
+      Wait-SetupDelay -Milliseconds ([int][Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000))
+    }
+  } finally {
+    Exit-SetupWait
   }
 }
 

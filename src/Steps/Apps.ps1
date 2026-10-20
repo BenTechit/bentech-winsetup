@@ -124,7 +124,7 @@ function Invoke-StepChrome {
     if ($outcome -eq 'DoneReboot') { return New-StepResult -Status Done -Message 'Chrome installed (reboot needed)' }
     if ($outcome -eq 'Retry' -and $try -lt $maxTries) {
       Write-SetupLog -Message 'Another installation is running; waiting before trying Chrome again' -Level WARN -Data @{ attempt = $try; of = $maxTries; waitSeconds = $RetrySeconds }
-      Start-Sleep -Seconds $RetrySeconds
+      Wait-SetupDelay -Seconds $RetrySeconds
       continue
     }
     return New-StepResult -Status Failed -Message "Chrome install failed (msiexec $($run.ExitCode))"
@@ -219,22 +219,27 @@ function Find-AnyDeskId {
 
   $limitSeconds = $TimeoutMinutes * 60
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  while ($true) {
-    $id = $null
-    if (Test-Path -LiteralPath $Exe -PathType Leaf) {
-      try {
-        $run = Invoke-External -FilePath $Exe -ArgumentList '--get-id' -TimeoutMinutes 1 -CaptureOutput
-        if (-not $run.TimedOut) { $id = Get-AnyDeskIdFromText -Text $run.Output }
-      } catch {
-        Write-SetupLog -Message 'AnyDesk --get-id could not be run' -Level WARN -Data @{ error = $_.Exception.Message }
+  Enter-SetupWait -LimitMinutes $TimeoutMinutes
+  try {
+    while ($true) {
+      $id = $null
+      if (Test-Path -LiteralPath $Exe -PathType Leaf) {
+        try {
+          $run = Invoke-External -FilePath $Exe -ArgumentList '--get-id' -TimeoutMinutes 1 -CaptureOutput
+          if (-not $run.TimedOut) { $id = Get-AnyDeskIdFromText -Text $run.Output }
+        } catch {
+          Write-SetupLog -Message 'AnyDesk --get-id could not be run' -Level WARN -Data @{ error = $_.Exception.Message }
+        }
       }
-    }
-    if (-not $id) { $id = Read-AnyDeskIdFromServiceConf }
-    if ($id) { return $id }
+      if (-not $id) { $id = Read-AnyDeskIdFromServiceConf }
+      if ($id) { return $id }
 
-    $remaining = $limitSeconds - $clock.Elapsed.TotalSeconds
-    if ($remaining -le 0) { return $null }
-    Start-Sleep -Milliseconds ([int][Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000))
+      $remaining = $limitSeconds - $clock.Elapsed.TotalSeconds
+      if ($remaining -le 0) { return $null }
+      Wait-SetupDelay -Milliseconds ([int][Math]::Ceiling([Math]::Min($PollSeconds, $remaining) * 1000))
+    }
+  } finally {
+    Exit-SetupWait
   }
 }
 

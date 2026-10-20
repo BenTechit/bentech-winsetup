@@ -299,12 +299,17 @@ function Wait-ChromeDefault {
     [ValidateRange(0, 3600)][int]$PollSeconds = 5
   )
 
-  for ($read = 1; $read -le $Attempts; $read++) {
-    if ((Get-DefaultBrowserProgId) -eq 'ChromeHTML') {
-      Write-SetupLog -Message 'Chrome is the default browser' -Data @{ reads = $read; waitedSeconds = ($read - 1) * $PollSeconds }
-      return $true
+  Enter-SetupWait -LimitMinutes (($Attempts - 1) * $PollSeconds / 60)
+  try {
+    for ($read = 1; $read -le $Attempts; $read++) {
+      if ((Get-DefaultBrowserProgId) -eq 'ChromeHTML') {
+        Write-SetupLog -Message 'Chrome is the default browser' -Data @{ reads = $read; waitedSeconds = ($read - 1) * $PollSeconds }
+        return $true
+      }
+      if ($read -lt $Attempts) { Wait-SetupDelay -Seconds $PollSeconds }
     }
-    if ($read -lt $Attempts) { Start-Sleep -Seconds $PollSeconds }
+  } finally {
+    Exit-SetupWait
   }
   Write-SetupLog -Message 'Chrome is still not the default browser after the wait' -Level WARN -Data @{ reads = $Attempts; waitedSeconds = ($Attempts - 1) * $PollSeconds }
   return $false

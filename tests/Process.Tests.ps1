@@ -269,6 +269,48 @@ $r = Invoke-External -FilePath "$env:windir\System32\cmd.exe" -ArgumentList '/c 
   }
 }
 
+Describe 'Invoke-External and the tick' {
+  BeforeEach { Unregister-SetupTick; Clear-SetupNow; $script:seen = New-Object System.Collections.ArrayList }
+  AfterEach { Unregister-SetupTick }
+  It 'ticks while it waits, shows its timeout as the wait limit, and clears it after' {
+    Register-SetupTick -Context @{} -Handler { [void]$script:seen.Add((Get-SetupNow).Wait) }
+    (Invoke-External -FilePath "$env:windir\System32\PING.EXE" -ArgumentList '-n 3 127.0.0.1' -TimeoutMinutes 0.5).ExitCode | Should -Be 0
+    $seen.Count | Should -BeGreaterThan 0; $seen[0].LimitMinutes | Should -Be 0.5
+    (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
+  It 'a throwing tick never breaks Invoke-External' {
+    Register-SetupTick -Context @{} -Handler { throw 'screen gone' }
+    (Invoke-External -FilePath "$env:windir\System32\cmd.exe" -ArgumentList '/c ping -n 2 127.0.0.1 >nul & exit 3' -TimeoutMinutes 1).ExitCode | Should -Be 3
+  }
+  It 'removes its wait limit when the program cannot be started, leaving the caller''s own wait in place' {
+    Enter-SetupWait -LimitMinutes 7
+    try {
+      { Invoke-External -FilePath "$TestDrive\no-such-program.exe" -TimeoutMinutes 0.5 } | Should -Throw '*Cannot start*'
+      (Get-SetupNow).Wait.LimitMinutes | Should -Be 7
+    } finally { Exit-SetupWait }
+    (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
+}
+Describe 'Start-BackgroundExternal' {
+  It 'returns at once and keeps the exit code readable' {
+    $p = Start-BackgroundExternal -FilePath "$env:windir\System32\cmd.exe" -ArgumentList '/c exit 7'
+    $p.Id | Should -BeGreaterThan 0; $p.WaitForExit(10000) | Should -BeTrue; $p.ExitCode | Should -Be 7
+  }
+  It 'throws for a program that does not exist' { { Start-BackgroundExternal -FilePath "$TestDrive\nope.exe" } | Should -Throw '*Cannot start*' }
+  It 'logs the file, the arguments and the process id' {
+    $d = Join-Path $TestDrive 'bglog'
+    Initialize-SetupLog -LogDirectory $d
+    try {
+      $p = Start-BackgroundExternal -FilePath "$env:windir\System32\cmd.exe" -ArgumentList '/c exit 0'
+      $p.WaitForExit(10000) | Should -BeTrue
+    } finally { $script:SetupLogPath = $null }
+    $log = Get-Content "$d\setup.log" -Raw
+    $log | Should -Match '\[INFO\] .*cmd\.exe'
+    $log | Should -Match '/c exit 0'
+    $log | Should -Match ('"processId":' + $p.Id)
+  }
+}
+
 Describe 'Convert-MsiExitCode' {
   It '<c> -> <r>' -ForEach @(@{c=0;r='Done'},@{c=3010;r='DoneReboot'},@{c=1641;r='DoneReboot'},@{c=1618;r='Retry'},@{c=1603;r='Failed'}) { Convert-MsiExitCode -ExitCode $c | Should -Be $r }
   It 'treats a null exit code (a timed-out run) as Failed, never Done' { Convert-MsiExitCode -ExitCode $null | Should -Be 'Failed' }

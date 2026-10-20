@@ -713,4 +713,11 @@ Describe 'Invoke-StepWinget' {
     Invoke-StepWinget -Context $ctx | Out-Null
     Should -Invoke Test-WingetUsable -ParameterFilter { $Path -eq 'C:\present\winget.exe' } -Times 1 -Exactly
   }
+  It 'Wait-WingetPath shows its limit while it polls and removes it after' {
+    Clear-SetupNow
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock Get-WingetPath { [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes); 'C:\present\winget.exe' }
+    Wait-WingetPath -TimeoutMinutes 4 -PollSeconds 0.01 | Should -Be 'C:\present\winget.exe'
+    @($script:limits) | Should -Be @(4); (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }

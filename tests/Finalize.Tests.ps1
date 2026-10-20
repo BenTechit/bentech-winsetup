@@ -1147,6 +1147,14 @@ Describe 'Wait-ChromeDefault' {
     Should -Invoke Get-DefaultBrowserProgId -Times 3 -Exactly
     @($script:sleeps) | Should -Be @(2, 2)
   }
+  It 'shows its 2-minute limit while it waits and removes it after' {
+    Clear-SetupNow
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock Get-DefaultBrowserProgId { [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes); $null }
+    Wait-ChromeDefault | Should -BeFalse
+    $script:limits.Count | Should -Be 25; $script:limits[0] | Should -Be 2
+    (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }
 
 Describe 'Windows activation attempt (spec 9.5)' {

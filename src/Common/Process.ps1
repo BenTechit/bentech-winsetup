@@ -193,6 +193,9 @@ function Invoke-External {
     - A .cmd or .bat file is started through cmd.exe, because a batch file cannot be started
       directly when UseShellExecute is $false (and a path with spaces needs the extra quoting).
     - A program that cannot be started throws (the runner catches it).
+    - While it waits, TimeoutMinutes is the published wait limit (Enter-SetupWait, removed again in
+      the finally) and the tick runs after every slice of the wait loop, so the progress screen
+      stays alive. A tick never throws (Activity.ps1).
     - Start and end are logged at INFO with file, arguments, exit code and elapsed time. The
       captured Output is NEVER logged: it can hold an AnyDesk ID and logs must stay small.
   #>
@@ -240,6 +243,9 @@ function Invoke-External {
 
   $proc = New-Object Diagnostics.Process
   $proc.StartInfo = $psi
+  # Paired with Exit-SetupWait in the finally below, so a program that cannot start removes only
+  # its own entry and never a caller's wait.
+  Enter-SetupWait -LimitMinutes $TimeoutMinutes
   try {
     try {
       [void]$proc.Start()
@@ -265,6 +271,7 @@ function Invoke-External {
       if ($remaining -le 0) { $timedOut = $true; break }
       $slice = [int][Math]::Min($remaining, 200)
       if (-not (Wait-PipeReader -Reader $readers -Milliseconds $slice)) { [void]$proc.WaitForExit($slice) }
+      Invoke-SetupTick
     }
 
     if ($timedOut) {
@@ -291,9 +298,55 @@ function Invoke-External {
     }
   } finally {
     $proc.Dispose()
+    Exit-SetupWait
   }
 
   $clock.Stop()
   Write-SetupLog -Message 'External process finished' -Data @{ file = $FilePath; exitCode = $exitCode; timedOut = $timedOut; elapsedMs = $clock.ElapsedMilliseconds }
   return @{ ExitCode = $exitCode; TimedOut = $timedOut; Output = $output }
+}
+
+function Start-BackgroundExternal {
+  <#
+  .SYNOPSIS
+    Starts a program in the background and returns its System.Diagnostics.Process at once. The
+    caller owns the wait and its deadline.
+  .DESCRIPTION
+    The one exception to "every child goes through Invoke-External" (Global Constraints): its only
+    caller is the office step, whose Wait-OfficeBackground enforces timeoutsMinutes.office.
+    - UseShellExecute = $true with a hidden window: the child gets its own (hidden) console and
+      inherits no handles, so nothing it writes lands on the setup screen and the operator's keys
+      never reach it.
+    - .Handle is read right after the start, so ExitCode stays readable once the process has ended.
+    - A program that cannot be started throws InvalidOperationException("Cannot start '<file>':
+      <reason>"), like Invoke-External.
+    - File, arguments and process id are logged at INFO.
+  #>
+  [CmdletBinding()]
+  [OutputType([System.Diagnostics.Process])]
+  param(
+    [Parameter(Mandatory)][string]$FilePath,
+    [string]$ArgumentList = ''
+  )
+
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = $FilePath
+  $psi.Arguments = $ArgumentList
+  $psi.UseShellExecute = $true
+  $psi.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+
+  $proc = New-Object Diagnostics.Process
+  $proc.StartInfo = $psi
+  try {
+    # Start() is $false when the shell reused a process instead of starting one: nothing to wait on.
+    if (-not $proc.Start()) { throw (New-Object InvalidOperationException 'no new process was started') }
+    $null = $proc.Handle
+  } catch {
+    $proc.Dispose()
+    Write-SetupLog -Message 'Background process failed to start' -Level ERROR -Data @{ file = $FilePath; error = $_.Exception.Message }
+    throw (New-Object InvalidOperationException ("Cannot start '$FilePath': $($_.Exception.Message)", $_.Exception))
+  }
+
+  Write-SetupLog -Message 'Background process started' -Data @{ file = $FilePath; args = $ArgumentList; processId = $proc.Id }
+  return $proc
 }

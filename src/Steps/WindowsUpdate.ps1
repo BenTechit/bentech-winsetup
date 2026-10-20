@@ -947,7 +947,7 @@ function Invoke-StepWindowsUpdate {
   }
   if ($isBusy) {
     Write-SetupLog -Message 'Windows Update agent is busy; waiting, then retrying' -Level WARN -Data @{ round = $round; errorCode = $errorCode; waitSeconds = $BusyWaitSeconds; cap = $cap }
-    Start-Sleep -Seconds $BusyWaitSeconds
+    Wait-SetupDelay -Seconds $BusyWaitSeconds
     return New-StepResult -Status Continue -Message "Windows Update round ${round}: agent busy ($errorCode), retrying" -Notes $batteryNotes -Data (Get-WuResultData -Data $data)
   }
   if ($isRebootPending) {

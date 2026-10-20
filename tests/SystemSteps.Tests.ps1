@@ -585,6 +585,13 @@ Describe 'Wait-BitLockerDecrypted' {
     $param = (Get-Command Wait-BitLockerDecrypted).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PollSeconds' }
     $param.DefaultValue.Extent.Text | Should -Be '30'
   }
+  It 'shows its limit while it waits and removes it after' {
+    Clear-SetupNow
+    $script:limits = New-Object System.Collections.ArrayList
+    Mock Get-BitLockerState { [void]$script:limits.Add((Get-SetupNow).Wait.LimitMinutes); @{ Presence = 'Present'; Status = 0 } }
+    Wait-BitLockerDecrypted -TimeoutMinutes 45 -PollSeconds 0.01 | Should -BeTrue
+    @($script:limits) | Should -Be @(45); (Get-SetupNow).Wait | Should -BeNullOrEmpty
+  }
 }
 
 Describe 'Suspend-BitLockerOnce' {
