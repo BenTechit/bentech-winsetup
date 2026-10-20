@@ -24,6 +24,7 @@ Describe 'config.json' {
   }
   It 'pins spec values' {
     $cfg.caps.maxReboots | Should -Be 12; $cfg.caps.maxWuRounds | Should -Be 6
+    $cfg.defaults.office | Should -Be 'CRAFT'; $cfg.defaults.sevenZip | Should -BeTrue
     $cfg.apps.office.products.BUSINESS | Should -Be 'O365BusinessRetail'
     $cfg.apps.office.products.HOME | Should -Be 'O365HomePremRetail'
     $cfg.apps.office.languages[0] | Should -Be 'he-il'

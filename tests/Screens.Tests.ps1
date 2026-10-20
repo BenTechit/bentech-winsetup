@@ -128,7 +128,10 @@ Describe 'ConvertTo-ScreenText' {
 
 Describe 'Update-StartChoices' {
   BeforeEach { $script:c = @{ Mode='LAPTOP'; SevenZip=$true; Office='OFF' } }
-  It 'O cycles OFF -> BUSINESS -> HOME -> OFF' { $r = Update-StartChoices -Choices $c -Key 'O'; $r.Choices.Office | Should -Be 'BUSINESS'; $r = Update-StartChoices -Choices $r.Choices -Key 'o'; $r.Choices.Office | Should -Be 'HOME'; (Update-StartChoices -Choices $r.Choices -Key 'O').Choices.Office | Should -Be 'OFF' }
+  It 'O cycles CRAFT -> BUSINESS -> HOME -> OFF -> CRAFT' {
+    $r = Update-StartChoices -Choices @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT' } -Key 'O'
+    $seen = @($r.Choices.Office); foreach ($i in 1..3) { $r = Update-StartChoices -Choices $r.Choices -Key 'o'; $seen += $r.Choices.Office }
+    $seen | Should -Be @('BUSINESS', 'HOME', 'OFF', 'CRAFT'); $r.ResetCountdown | Should -BeTrue }
   It 'Z toggles and resets the countdown' { $r = Update-StartChoices -Choices $c -Key 'Z'; $r.Choices.SevenZip | Should -BeFalse; $r.ResetCountdown | Should -BeTrue }
   It 'D switches to desktop' { (Update-StartChoices -Choices $c -Key 'D').Choices.Mode | Should -Be 'DESKTOP' }
   It 'Enter starts, Esc cancels, and any other key resets the countdown (Q1)' {
@@ -161,8 +164,11 @@ Describe 'Update-StartChoices' {
 Describe 'New-DefaultChoices' {
   It 'picks LAPTOP for a laptop and takes 7-Zip and Office from the config defaults' {
     $r = New-DefaultChoices -Machine $m -Config $cfg
-    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'BUSINESS'
+    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'CRAFT'
   }
+  It 'opens on CRAFT, and a lower-case craft default is CRAFT' {
+    (New-DefaultChoices -Machine $m -Config $cfg).Office | Should -Be 'CRAFT'
+    (New-DefaultChoices -Machine $m -Config ([pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'craft' } })).Office | Should -Be 'CRAFT' }
   It 'picks DESKTOP for a desktop' {
     (New-DefaultChoices -Machine @{ IsLaptop = $false; IsVM = $false } -Config $cfg).Mode | Should -Be 'DESKTOP'
   }
@@ -190,15 +196,19 @@ Describe 'Format-StartScreen (v2)' {
     $l | Should -Contain ('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop')
     $l | Should -Contain '   Chrome + AnyDesk   always'
     $l | Should -Contain ('   7-Zip    YES'.PadRight(53) + 'Z = yes / no')
-    $l | Should -Contain ('   Office   BUSINESS (Hebrew + English)'.PadRight(53) + 'O = off / business / home')
+    $l | Should -Contain ('   Office   BUSINESS (Hebrew + English)'.PadRight(53) + 'O = craft / 365 / off')
     $l | Should -Contain ('   Starts by itself in 25 s   ' + ('#' * 17) + ('.' * 3))
     $l | Should -Contain '   ENTER = start now           ESC = cancel, change nothing'
     @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0
   }
+  It 'shows the CRAFT line and still fits 79 columns' {
+    $l = F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT' }
+    $l | Should -Contain ('   Office   CRAFT (free Word/Excel/PowerPoint/PDF)'.PadRight(53) + 'O = craft / 365 / off')
+    @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0 }
   It 'says what the mode means, also for a brand without a driver tool' {
     (F @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }) | Should -Contain ('   Type     DESKTOP (no laptop app)'.PadRight(53) + 'L = laptop   D = desktop')
     (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'HOME' } -tool $false) | Should -Contain ('   Type     LAPTOP (no driver tool for this brand)'.PadRight(53) + 'L = laptop   D = desktop')
-    (F @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }) | Should -Contain ('   Office   OFF'.PadRight(53) + 'O = off / business / home')
+    (F @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }) | Should -Contain ('   Office   OFF'.PadRight(53) + 'O = craft / 365 / off')
   }
   It 'a full and an empty countdown bar' {
     (F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -s 30) | Should -Contain ('   Starts by itself in 30 s   ' + ('#' * 20))
@@ -240,9 +250,12 @@ Describe 'Format-StartScreen (v2)' {
 Describe 'start screen colours' {
   It 'the chosen value is green when on, dark grey when off; warnings are yellow' {
     $on = @(Get-StartScreenSegments -Line ('   7-Zip    YES'.PadRight(53) + 'Z = yes / no')); $on[1].Text | Should -Be 'YES'; $on[1].Color | Should -Be 'Green'
-    $off = @(Get-StartScreenSegments -Line ('   Office   OFF'.PadRight(53) + 'O = off / business / home')); $off[1].Text | Should -Be 'OFF'; $off[1].Color | Should -Be 'DarkGray'
+    $off = @(Get-StartScreenSegments -Line ('   Office   OFF'.PadRight(53) + 'O = craft / 365 / off')); $off[1].Text | Should -Be 'OFF'; $off[1].Color | Should -Be 'DarkGray'
     @(Get-StartScreenSegments -Line '   press ENTER to run anyway')[0].Color | Should -Be 'Yellow'
   }
+  It 'CRAFT is shown green' {
+    $s = @(Get-StartScreenSegments -Line ('   Office   CRAFT (free Word/Excel/PowerPoint/PDF)'.PadRight(53) + 'O = craft / 365 / off'))
+    $s[1].Text | Should -Be 'CRAFT'; $s[1].Color | Should -Be 'Green' }
   It 'the segments of a line add up to the line, and the labels stay uncoloured' {
     foreach ($line in @(('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop'), ('   7-Zip    NO'.PadRight(53) + 'Z = yes / no'), '   Chrome + AnyDesk   always', '')) {
       (@(Get-StartScreenSegments -Line $line) | ForEach-Object { $_.Text }) -join '' | Should -Be $line
@@ -279,7 +292,7 @@ Describe 'Show-StartScreen' {
   }
   It 'counts down from 30 and starts at 0 with the default choices (Q1)' {
     $r = Invoke-StartScreen
-    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'BUSINESS'
+    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'CRAFT'
     Get-ElapsedSeconds | Should -Be 30
     # One redraw per second: the first screen and then 29 ticks (30 s down to 1 s), nothing at 0.
     $screens.Count | Should -Be 30
@@ -320,7 +333,7 @@ Describe 'Show-StartScreen' {
     Get-ElapsedSeconds | Should -BeGreaterOrEqual 34
     Get-ElapsedSeconds | Should -BeLessThan 34.5
     # An unknown key changes nothing but the clock.
-    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'BUSINESS'
+    $r.Mode | Should -Be 'LAPTOP'; $r.SevenZip | Should -BeTrue; $r.Office | Should -Be 'CRAFT'
     $screens[4] | Should -Match 'Starts by itself in 26 s'
     $screens[5] | Should -Match 'Starts by itself in 30 s'   # redrawn at once, not a second later
   }
@@ -341,7 +354,7 @@ Describe 'Show-StartScreen' {
     $script:sent = New-Object System.Collections.Queue
     foreach ($k in 'D','O','O','L') { $script:sent.Enqueue($k) }
     $r = Invoke-StartScreen -KeyAt { param($s) if ($script:sent.Count -gt 0) { $script:sent.Dequeue() } }
-    $r.Mode | Should -Be 'LAPTOP'; $r.Office | Should -Be 'OFF'   # BUSINESS -> HOME -> OFF
+    $r.Mode | Should -Be 'LAPTOP'; $r.Office | Should -Be 'HOME'   # CRAFT -> BUSINESS -> HOME
   }
   It 'never starts by itself when the machine is not fresh' {
     $r = Invoke-StartScreen -IsFresh $false -KeyAt { param($s) if ($s -ge 30) { 'Escape' } }

@@ -17,7 +17,8 @@ $script:StartCountdownSeconds = 30
 # The column where the right-hand "TO CHANGE IT, PRESS" help starts, and the width of the countdown bar.
 $script:StartHelpColumn = 53
 $script:StartBarWidth = 20
-$script:OfficeChoices = @('OFF', 'BUSINESS', 'HOME')
+# The Office choices in the order the O key cycles them (CRAFT is the default).
+$script:OfficeChoices = @('CRAFT', 'BUSINESS', 'HOME', 'OFF')
 # The direction and format marks Hebrew Windows adds around some values (spec 9.5): U+200E, U+200F,
 # U+202A-U+202E and U+2066-U+2069, as a regex character class built from the code points so that this
 # file stays ASCII.
@@ -86,8 +87,9 @@ function New-DefaultChoices {
     The choices the start screen opens with: mode from the detected machine, 7-Zip and Office from
     config.defaults.
   .DESCRIPTION
-    LAPTOP only for a laptop that is not a virtual machine. An Office default that is not OFF,
-    BUSINESS or HOME becomes OFF (nothing gets installed that nobody asked for).
+    LAPTOP only for a laptop that is not a virtual machine. An Office default that is not CRAFT,
+    BUSINESS, HOME or OFF becomes OFF (nothing gets installed that nobody asked for). The default
+    in config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -109,8 +111,8 @@ function Update-StartChoices {
     Applies one key press to the choices. Returns @{ Choices; Action; ResetCountdown }.
   .DESCRIPTION
     Key names are [ConsoleKey] names ('L', 'Enter', 'Escape'), matched case-insensitively.
-    L / D set the mode, Z toggles 7-Zip, O cycles Office OFF -> BUSINESS -> HOME -> OFF; each of them
-    resets the countdown. Enter returns Action 'Start', Escape returns 'Cancel'. Any other key (Q1: an
+    L / D set the mode, Z toggles 7-Zip, O cycles Office CRAFT -> BUSINESS -> HOME -> OFF -> CRAFT; each
+    of them resets the countdown. Enter returns Action 'Start', Escape returns 'Cancel'. Any other key (Q1: an
     unknown key too) changes nothing but resets the countdown, so a technician who is still reading
     does not get the run started under them. An empty or null key is no key at all. The input table is
     never changed: Choices is a copy.
@@ -186,6 +188,7 @@ function Format-StartScreen {
   $sevenZipText = if ($Choices['SevenZip']) { 'YES' } else { 'NO' }
   $officeText = switch ([string]$Choices['Office']) {
     'OFF'      { 'OFF' }
+    'CRAFT'    { 'CRAFT (free Word/Excel/PowerPoint/PDF)' }
     'BUSINESS' { 'BUSINESS (Hebrew + English)' }
     'HOME'     { 'HOME (Hebrew + English)' }
     default    { ConvertTo-ScreenText $Choices['Office'] }
@@ -202,7 +205,7 @@ function Format-StartScreen {
   $lines.Add(('   Type     ' + $typeText).PadRight($helpAt) + 'L = laptop   D = desktop')
   $lines.Add('   Chrome + AnyDesk   always')
   $lines.Add(('   7-Zip    ' + $sevenZipText).PadRight($helpAt) + 'Z = yes / no')
-  $lines.Add(('   Office   ' + $officeText).PadRight($helpAt) + 'O = off / business / home')
+  $lines.Add(('   Office   ' + $officeText).PadRight($helpAt) + 'O = craft / 365 / off')
   $lines.Add('')
 
   # This line is 85 characters (the v1 wording, kept): the frame cuts it in an 80-column console.

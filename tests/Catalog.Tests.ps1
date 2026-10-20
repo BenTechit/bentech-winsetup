@@ -2,6 +2,7 @@
 BeforeAll {
   . "$PSScriptRoot\..\src\Common\Config.ps1"; . "$PSScriptRoot\..\src\State\State.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # New-DefaultChoices, for the default-plan test
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   function P($brand, $mode, $z = $true, $o = 'BUSINESS') { Get-StepPlan -Machine @{Brand=$brand} -Choices @{Mode=$mode;SevenZip=$z;Office=$o} -Config $cfg }
 }
@@ -100,6 +101,10 @@ Describe 'Get-StepPlan' {
     (P DELL LAPTOP $true 'CRAFT') -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,craft-apps,default-browser,vendor-pass1,windows-update,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
   It 'CRAFT without 7-Zip: craft-apps right after anydesk' { $p = @(P ASUS DESKTOP $false 'CRAFT'); $p.IndexOf('craft-apps') | Should -Be ($p.IndexOf('anydesk') + 1) }
   It 'BUSINESS, HOME and OFF never get craft-apps' { foreach ($o in 'BUSINESS', 'HOME', 'OFF') { (P DELL LAPTOP $true $o) | Should -Not -Contain 'craft-apps' } }
+  It 'the default choices plan craft-apps, not Microsoft 365' {
+    $o = (New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg).Office
+    $p = P DELL LAPTOP $true $o
+    $p | Should -Contain 'craft-apps'; $p | Should -Not -Contain 'office'; $p | Should -Not -Contain 'office-finish' }
 }
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'
