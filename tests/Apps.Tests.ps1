@@ -957,6 +957,24 @@ Describe 'office: background start' {
     $r.Data.StartedAt | Should -Match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$'
     @($script:activity.Text) | Should -Contain 'Microsoft 365 started installing in the background (he-il, en-us)'
   }
+  It 'a start time that cannot be read is stored as nothing; the process is still recorded and later never mistaken for a stranger' {
+    $script:existing = @($script:odt)
+    Mock Start-BackgroundExternal {
+      $p = [pscustomobject]@{ Id = 4242; HasExited = $false }
+      $p | Add-Member -MemberType ScriptProperty -Name StartTime -Value { throw 'Access is denied' }
+      $p
+    }
+    $r = Invoke-StepOffice -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Data.Background | Should -BeTrue; $r.Data.ProcessId | Should -Be 4242
+    $r.Data.ContainsKey('ProcessStartUtc') | Should -BeTrue; $r.Data.ProcessStartUtc | Should -BeNullOrEmpty
+    $r.Data.DeadlineAt | Should -Match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$'
+    $script:OfficeBackgroundProcess.Id | Should -Be 4242
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like '*start time*' }).Count | Should -Be 1
+    # After a restart the process in memory is gone: without the start time it cannot be proven to be Office.
+    $script:OfficeBackgroundProcess = $null
+    Mock Get-Process { [pscustomobject]@{ Id = 4242; StartTime = [datetime]'2026-10-20T10:00:00'; HasExited = $false; Handle = 1 } }
+    Get-OfficeBackgroundProcess -Data $r.Data | Should -BeNullOrEmpty
+  }
   It 'starts nothing in the background when the preparation fails' {
     $script:existing = @($script:odt); $script:sigBad = @('setup.exe')
     (Invoke-StepOffice -Context $script:ctx).Status | Should -Be 'Failed'
@@ -1074,6 +1092,58 @@ Describe 'Wait-OfficeBackground' {
     $r = Wait-OfficeBackground -Context $script:ctx -Purpose Finish -Clock { $script:t }
     $r.Outcome | Should -Be 'Exited'; $script:ctx.State.Steps.office.Data.ExitCode | Should -Be 0
   }
+
+  # --- V2-R12: branches Task 13 reported as tested -----------------------------------------------
+  It 'a DeadlineAt that is <Why> is rebuilt as StartedAt plus the Office limit' -ForEach @(
+    @{ Why = 'missing'; Fix = { param($d) $d.Remove('DeadlineAt') } }
+    @{ Why = 'unparseable'; Fix = { param($d) $d['DeadlineAt'] = 'not a date' } }
+  ) {
+    & $Fix $script:ctx.State.Steps.office.Data
+    $script:t = [datetime]'2026-10-20T10:59:58'      # StartedAt 10:00 + 60 min = 11:00
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }
+    $r.Outcome | Should -Be 'Killed'; $script:polls | Should -Be 2; $script:killed | Should -Be 4242
+  }
+  It 'a DeadlineAt that is missing does not end the wait early' {
+    $script:ctx.State.Steps.office.Data.Remove('DeadlineAt'); $script:exitAfter = 3
+    (Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }).Outcome | Should -Be 'Exited'
+    $script:killed | Should -BeNullOrEmpty
+  }
+  It 'with neither DeadlineAt nor StartedAt the deadline is the Office limit from now' {
+    $data = $script:ctx.State.Steps.office.Data; $data.Remove('DeadlineAt'); $data.Remove('StartedAt')
+    Mock Wait-SetupDelay { $script:t = $script:t.AddMinutes(10); $script:polls++ }
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }   # now 10:30, limit 60
+    $r.Outcome | Should -Be 'Killed'; $script:polls | Should -Be 6; $script:t | Should -Be ([datetime]'2026-10-20T11:30:00')
+  }
+  It 'an unexpected error inside the wait is not thrown: nothing is decided, and the NOW title and wait stack are put back' {
+    Set-SetupNow -SubTitle 'Windows updates'
+    Enter-SetupWait -LimitMinutes 5     # a wait that belongs to someone else stays
+    Mock Wait-SetupDelay { $script:during = Get-SetupNow; throw 'boom' }
+    $script:r = $null
+    { $script:r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t } } | Should -Not -Throw
+    $script:r.Outcome | Should -Be 'None'
+    $script:during.Title | Should -Be 'Waiting for Microsoft 365 to finish before restarting'
+    $script:during.Wait.LimitMinutes | Should -Be 60
+    $after = Get-SetupNow
+    $after.Title | Should -BeNullOrEmpty; $after.SubTitle | Should -Be 'Windows updates'; $after.Wait.LimitMinutes | Should -Be 5
+    $script:ctx.State.Steps.office.Data.Contains('Finished') | Should -BeFalse
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like 'Waiting for the background Office setup failed*' }).Count | Should -Be 1
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
+  }
+  It 'a process that ends as the deadline is reached is Exited, not killed' {
+    $script:reads = 0
+    $ended = [pscustomobject]@{ Id = 4242; ExitCode = 0 }
+    $ended | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $script:reads++; $script:reads -ge 2 }   # running at the loop check, ended at the re-read
+    $script:OfficeBackgroundProcess = $ended
+    $script:t = [datetime]'2026-10-20T11:00:00'      # exactly the deadline
+    $r = Wait-OfficeBackground -Context $script:ctx -Purpose Restart -Clock { $script:t }
+    $r.Outcome | Should -Be 'Exited'; $r.ExitCode | Should -Be 0
+    $data = $script:ctx.State.Steps.office.Data
+    $data.ExitCode | Should -Be 0; $data.Finished | Should -BeTrue; $data.Contains('KilledAtDeadline') | Should -BeFalse
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
+    $script:polls | Should -Be 0
+    @($script:activity.Text) | Should -Contain 'Microsoft 365 setup ended (exit 0)'
+    @($script:activity.Text | Where-Object { $_ -like '*stopped at its*' }).Count | Should -Be 0
+  }
 }
 
 Describe 'office-finish' {
@@ -1086,7 +1156,11 @@ Describe 'office-finish' {
     Mock Wait-SetupDelay { $script:polls++; if ($script:exitAfter -and $script:polls -ge $script:exitAfter) { $script:OfficeBackgroundProcess.HasExited = $true } }
     Mock Save-RunState { }
     Mock Get-Process { }
-    Mock Stop-ProcessTree { throw 'must not kill' }
+    # No kill is expected here. The mock does nothing: a throw inside it would be swallowed by the wait's
+    # catch-all and could never fail a test. The tests that run the wait assert Should -Invoke ... -Times 0.
+    Mock Stop-ProcessTree { }
+    # The real shortcuts would be written to the public desktop; they have their own Describe.
+    Mock Add-OfficeDesktopShortcuts { @{ Created = @(); Failed = $false } }
     $script:officeData = $script:ctx.State.Steps.office.Data
   }
   It 'a killed-at-deadline marker is Failed, with no foreground retry' {
@@ -1103,12 +1177,14 @@ Describe 'office-finish' {
     $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 3010 }; $script:exitAfter = 1
     $r = Invoke-StepOfficeFinish -Context $script:ctx
     $r.Message | Should -Be 'Office installed (restart pending)'; $r.Reboot | Should -Be 'Now'
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
   }
   It 'exit 0 seen by its own wait is Office installed, with no restart' {
     $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }; $script:exitAfter = 1
     $r = Invoke-StepOfficeFinish -Context $script:ctx
     $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Office installed'; $r.Reboot | Should -Be 'None'
     $script:ext.Count | Should -Be 0
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
   }
   It 'another stored code is Failed with the code, no retry' {
     $script:officeData.Finished = $true; $script:officeData.ExitCode = 17002
@@ -1146,6 +1222,168 @@ Describe 'office-finish' {
     $script:ctx.State.Steps.office.Data = @{}
     (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office already installed'; Should -Invoke Get-Process -Times 0
     $script:polls | Should -Be 0
+  }
+
+  # --- V2-R12: never a second install beside a setup.exe that may still be alive -----------------
+  It 'a wait that ended without a result is Failed: no foreground install, no lookups, no marker' {
+    Mock Wait-OfficeBackground { @{ Outcome = 'None'; ExitCode = $null } }
+    $script:existing = @($script:odt)
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Office setup did not complete'
+    $script:ext.Count | Should -Be 0; $script:wingetCalls.Count | Should -Be 0; $script:bg.Count | Should -Be 0
+    $script:ctx.State.Steps['office-finish'].Data.ForegroundTried | Should -BeNullOrEmpty
+    Should -Invoke Add-OfficeDesktopShortcuts -Times 0 -Exactly
+  }
+  It 'an unexpected error inside the wait leaves the live setup alone: Failed, no kill, no foreground install' {
+    $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }
+    Mock Wait-SetupDelay { throw 'boom' }
+    $script:existing = @($script:odt)
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Office setup did not complete'
+    $script:ext.Count | Should -Be 0
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
+  }
+  It 'a process that is gone (a restart took it) is still followed by the one foreground install' {
+    $script:existing = @($script:odt)   # the process is not found: the wait stores Finished and no code
+    $r = Invoke-StepOfficeFinish -Context $script:ctx
+    $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Office installed'
+    Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter { $ArgumentList -like '/configure*' }
+    Should -Invoke Stop-ProcessTree -Times 0 -Exactly
+  }
+
+  Context 'desktop shortcuts' {
+    It 'are created after a Done and the activity feed says so' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @('Word', 'Excel'); Failed = $false } }
+      $script:officeData.Finished = $true; $script:officeData.ExitCode = 0
+      $r = Invoke-StepOfficeFinish -Context $script:ctx
+      $r.Status | Should -Be 'Done'
+      @($script:activity.Text) | Should -Contain 'Desktop shortcuts: Word, Excel'
+      @($r.Notes).Count | Should -Be 0
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 1 -Exactly
+    }
+    It 'a failure is a yellow Note and the step stays Done' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @(); Failed = $true } }
+      $script:officeData.Finished = $true; $script:officeData.ExitCode = 0
+      $r = Invoke-StepOfficeFinish -Context $script:ctx
+      $r.Status | Should -Be 'Done'; $r.Notes | Should -Contain 'Office desktop shortcuts could not be created'
+      @($script:activity.Text | Where-Object { $_ -like 'Desktop shortcuts*' }).Count | Should -Be 0
+    }
+    It 'some made and some failed says both' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @('Word'); Failed = $true } }
+      $script:officeData.Finished = $true; $script:officeData.ExitCode = 0
+      $r = Invoke-StepOfficeFinish -Context $script:ctx
+      @($script:activity.Text) | Should -Contain 'Desktop shortcuts: Word'
+      $r.Notes | Should -Contain 'Office desktop shortcuts could not be created'
+    }
+    It 'also for Office that was already installed' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @('Word'); Failed = $false } }
+      $script:ctx.State.Steps.office.Data = @{}
+      $r = Invoke-StepOfficeFinish -Context $script:ctx
+      $r.Message | Should -Be 'Office already installed'
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 1 -Exactly
+      @($script:activity.Text) | Should -Contain 'Desktop shortcuts: Word'
+    }
+    It 'keep the restart that a 3010 asks for' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @('Word'); Failed = $true } }
+      $script:OfficeBackgroundProcess = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 3010 }; $script:exitAfter = 1
+      $r = Invoke-StepOfficeFinish -Context $script:ctx
+      $r.Message | Should -Be 'Office installed (restart pending)'; $r.Reboot | Should -Be 'Now'
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 1 -Exactly
+    }
+    It 'are made after the one foreground install too' {
+      Mock Add-OfficeDesktopShortcuts { @{ Created = @('Word'); Failed = $false } }
+      $script:officeData.Finished = $true; $script:existing = @($script:odt)
+      (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Office installed'
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 1 -Exactly
+    }
+    It 'never after a failure' {
+      Mock Add-OfficeDesktopShortcuts { }
+      $script:officeData.Finished = $true; $script:officeData.KilledAtDeadline = $true
+      (Invoke-StepOfficeFinish -Context $script:ctx).Status | Should -Be 'Failed'
+      $script:officeData.Remove('KilledAtDeadline'); $script:officeData.ExitCode = 17002
+      (Invoke-StepOfficeFinish -Context $script:ctx).Status | Should -Be 'Failed'
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 0 -Exactly
+    }
+    It 'never when there was no Office to finish (not chosen, or its own step failed)' {
+      Mock Add-OfficeDesktopShortcuts { }
+      $script:ctx.State.Steps.office.Status = 'Failed'; $script:ctx.State.Steps.office.Data = @{}
+      (Invoke-StepOfficeFinish -Context $script:ctx).Message | Should -Be 'Nothing to finish: Microsoft 365 was not started'
+      Should -Invoke Add-OfficeDesktopShortcuts -Times 0 -Exactly
+    }
+  }
+}
+
+Describe 'Get-OfficeExeFolder' {
+  BeforeEach { Initialize-AppMocks; $script:releaseKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' }
+  It 'is the Click-to-Run InstallationPath plus root\Office16' {
+    $script:regRead[$script:releaseKey] = @{ InstallationPath = 'C:\Program Files\Microsoft Office' }
+    Get-OfficeExeFolder | Should -Be 'C:\Program Files\Microsoft Office\root\Office16'
+  }
+  It 'is $null when the key is missing' { Get-OfficeExeFolder | Should -BeNullOrEmpty }
+  It 'is $null when the key has no InstallationPath, or an empty one' {
+    $script:regRead[$script:releaseKey] = @{ ProductReleaseIds = 'O365BusinessRetail' }
+    Get-OfficeExeFolder | Should -BeNullOrEmpty
+    $script:regRead[$script:releaseKey] = @{ InstallationPath = '  ' }
+    Get-OfficeExeFolder | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Add-OfficeDesktopShortcuts' {
+  BeforeEach {
+    # No Initialize-AppMocks here: its Test-Path mock would hide the real files this Describe makes in
+    # $TestDrive. New-DesktopShortcut (the only WScript.Shell touchpoint) is always mocked: no shortcut is
+    # ever written. Get-OfficeExeFolder is mocked so that no test reads the registry of the PC it runs on.
+    $script:made = New-Object System.Collections.ArrayList
+    $script:logs = New-Object System.Collections.ArrayList
+    $root = New-TestDir
+    $script:desk = Join-Path $root 'Desktop'; $script:exe = Join-Path $root 'root\Office16'
+    [void][IO.Directory]::CreateDirectory($script:desk); [void][IO.Directory]::CreateDirectory($script:exe)
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Get-OfficeExeFolder { $null }
+    Mock New-DesktopShortcut { [void]$script:made.Add(@{ Path = $Path; Target = $TargetPath }) }
+  }
+  It 'creates Word, Excel, PowerPoint and Outlook on the public desktop, pointing at root\Office16' {
+    foreach ($e in 'WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE', 'OUTLOOK.EXE') { 'x' | Set-Content (Join-Path $exe $e) }
+    $r = Add-OfficeDesktopShortcuts -DesktopFolder $desk -ExeFolder $exe
+    @($r.Created) | Should -Be @('Word', 'Excel', 'PowerPoint', 'Outlook'); $r.Failed | Should -BeFalse
+    $made[0].Path | Should -Be (Join-Path $desk 'Word.lnk'); $made[0].Target | Should -Be (Join-Path $exe 'WINWORD.EXE')
+    @($made | ForEach-Object { Split-Path -Leaf $_.Target }) | Should -Be @('WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE', 'OUTLOOK.EXE')
+    @($made | ForEach-Object { Split-Path -Leaf $_.Path }) | Should -Be @('Word.lnk', 'Excel.lnk', 'PowerPoint.lnk', 'Outlook.lnk')
+  }
+  It 'leaves an existing shortcut alone and skips a missing executable' {
+    'x' | Set-Content (Join-Path $exe 'WINWORD.EXE'); 'x' | Set-Content (Join-Path $exe 'EXCEL.EXE'); 'old' | Set-Content (Join-Path $desk 'Word.lnk')
+    $r = Add-OfficeDesktopShortcuts -DesktopFolder $desk -ExeFolder $exe
+    @($r.Created) | Should -Be @('Excel'); $r.Failed | Should -BeFalse
+    @($made).Count | Should -Be 1
+    Get-Content -LiteralPath (Join-Path $desk 'Word.lnk') | Should -Be 'old'
+  }
+  It 'a failing shortcut is reported and the others are still made' {
+    foreach ($e in 'WINWORD.EXE', 'EXCEL.EXE') { 'x' | Set-Content (Join-Path $exe $e) }
+    Mock New-DesktopShortcut { if ($Path -like '*Word.lnk') { throw 'access denied' }; [void]$script:made.Add(@{ Path = $Path }) }
+    $r = Add-OfficeDesktopShortcuts -DesktopFolder $desk -ExeFolder $exe
+    $r.Failed | Should -BeTrue; @($r.Created) | Should -Be @('Excel')
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+  }
+  It 'no Office folder is a failure' {
+    Mock Get-OfficeExeFolder { $null }
+    $r = Add-OfficeDesktopShortcuts -DesktopFolder $desk
+    $r.Failed | Should -BeTrue; @($r.Created).Count | Should -Be 0; $made.Count | Should -Be 0
+  }
+  It 'without folders given it uses the public desktop of all users and the registry Office folder' {
+    foreach ($e in 'WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE', 'OUTLOOK.EXE') { 'x' | Set-Content (Join-Path $exe $e) }
+    Mock Get-OfficeExeFolder { $script:exe }
+    # Whatever is on this PC's real public desktop must not change the result: only the Office programs exist.
+    Mock Test-Path { ([string]$LiteralPath).StartsWith($script:exe) }
+    $r = Add-OfficeDesktopShortcuts
+    $r.Failed | Should -BeFalse; @($r.Created).Count | Should -Be 4
+    $made[0].Path | Should -Be (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Word.lnk')
+    $made[0].Target | Should -Be (Join-Path $exe 'WINWORD.EXE')
+  }
+  It 'never throws: an error while looking up the Office folder is a failure' {
+    Mock Get-OfficeExeFolder { throw 'registry unreadable' }
+    $script:r = $null
+    { $script:r = Add-OfficeDesktopShortcuts -DesktopFolder $desk } | Should -Not -Throw
+    $script:r.Failed | Should -BeTrue; @($script:r.Created).Count | Should -Be 0
   }
 }
 

@@ -2,8 +2,9 @@
 # Microsoft 365 through the Office Deployment Tool (ODT), in two catalog steps (v2 spec 4.6):
 #   office         (after vendor-pass1) prepares as v1 did, then STARTS setup.exe /configure in the
 #                  background and records the process in its Data;
-#   office-finish  (after windows-update) waits for it, reports its result, and installs once in the
-#                  foreground when the background run left nothing behind.
+#   office-finish  (after windows-update) waits for it, reports its result, installs once in the
+#                  foreground when the background run left nothing behind, and puts the Word, Excel,
+#                  PowerPoint and Outlook shortcuts on the public desktop (v2 spec 4.7).
 # Every controlled restart, and Finalize, first waits for a background setup that is still running
 # (Wait-OfficeBackground), up to its deadline (start + timeoutsMinutes.office).
 # Needs StepResult.ps1, Logging.ps1, Activity.ps1, Process.ps1, Download.ps1, State.ps1 (Save-RunState),
@@ -19,6 +20,9 @@
 # KilledAtDeadline = $true (or neither: ended, code unknown). office-finish Data: ForegroundTried.
 
 $script:OfficeReleaseKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+
+# The desktop shortcuts office-finish makes: shortcut name -> executable under <InstallationPath>\root\Office16.
+$script:OfficeShortcutApps = [ordered]@{ Word = 'WINWORD.EXE'; Excel = 'EXCEL.EXE'; PowerPoint = 'POWERPNT.EXE'; Outlook = 'OUTLOOK.EXE' }
 
 # The setup.exe the office step started, kept for this process's lifetime: its ExitCode is readable after
 # it ends. After a restart it is $null and Get-OfficeBackgroundProcess finds the process by id + start time.
@@ -374,6 +378,8 @@ function Wait-OfficeBackground {
         'Waiting for Microsoft 365 to finish' (Finish), with the wait timer (timeoutsMinutes.office since
         Data.StartedAt). It polls (Wait-SetupDelay, which ticks) until the process ends or the Clock
         reaches Data.DeadlineAt, then puts the NOW title back (the step's subtitle and provider stay).
+        At the deadline HasExited is read once more: a setup that ended during the last poll is Ended,
+        never killed.
         Ended: Data.ExitCode (when readable), Data.Finished, activity 'Microsoft 365 setup ended (exit
         <code>)', Outcome Exited. Deadline: Stop-ProcessTree, Data.KilledAtDeadline, Data.Finished,
         activity 'Microsoft 365 setup stopped at its <N> min limit', Outcome Killed.
@@ -423,7 +429,11 @@ function Wait-OfficeBackground {
 
     $timedOut = $false
     while (-not $process.HasExited) {
-      if ((& $Clock) -ge $deadline) { $timedOut = $true; break }
+      if ((& $Clock) -ge $deadline) {
+        # It may have ended during the last poll: look once more, and never kill a setup that is done.
+        $timedOut = -not $process.HasExited
+        break
+      }
       Wait-SetupDelay -Milliseconds $PollMilliseconds
     }
 
@@ -465,21 +475,50 @@ function Wait-OfficeBackground {
 function Invoke-StepOfficeFinish {
   <#
   .SYNOPSIS
-    The office-finish step (after windows-update): reports the background Office setup's result.
+    The office-finish step (after windows-update): reports the background Office setup's result, then
+    puts the Office desktop shortcuts on the public desktop.
   .DESCRIPTION
+    Resolve-OfficeFinish decides the result:
     1. office not Done -> Done('Nothing to finish: Microsoft 365 was not started') (office's own result
        carries any failure).
     2. office Done without Data.Background (it was already installed) -> Done('Office already installed').
-    3. Wait-OfficeBackground -Purpose Finish, then from the office Data: KilledAtDeadline ->
-       Failed('Office setup timed out'); ExitCode 0 -> Done('Office installed'); 3010/1641 ->
-       Done('Office installed (restart pending)'), with Reboot 'Now' only when this wait saw the process
-       end (a code stored by a restart wait was followed by that restart: no extra one, R17a); any other
-       code -> Failed('Office setup exit <code>'), no retry.
+    3. Wait-OfficeBackground -Purpose Finish. Its Data.Finished must then be set (every ending the wait
+       decides sets it); when it is not, the wait failed unexpectedly and the setup.exe may still be
+       alive: Failed('Office setup did not complete'), and nothing is installed beside it. Otherwise,
+       from the office Data: KilledAtDeadline -> Failed('Office setup timed out'); ExitCode 0 ->
+       Done('Office installed'); 3010/1641 -> Done('Office installed (restart pending)'), with Reboot
+       'Now' only when this wait saw the process end (a code stored by a restart wait was followed by that
+       restart: no extra one, R17a); any other code -> Failed('Office setup exit <code>'), no retry.
     4. No code and no marker: the product in ProductReleaseIds -> Done('Office installed'). Otherwise ONE
        foreground install (Initialize-OfficeInstall + Invoke-OfficeForegroundInstall), recorded first as
        Data.ForegroundTried (saved), so a crash during it is never retried; with ForegroundTried already
        set -> Failed('Office setup did not complete').
+    On every Done where Office is there (paths 2, 3 and 4, including 'Office already installed'; not path 1
+    and not a Failed) Add-OfficeDesktopShortcuts runs: the names it made go to the activity feed
+    ('Desktop shortcuts: Word, Excel'), a failure adds the Note 'Office desktop shortcuts could not be
+    created'. The step stays Done either way.
   #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param([Parameter(Mandatory)][hashtable]$Context)
+
+  $result = Resolve-OfficeFinish -Context $Context
+
+  $office = $Context.State.Steps['office']
+  if ($result.Status -eq 'Done' -and $null -ne $office -and [string]$office['Status'] -eq 'Done') {
+    $shortcuts = Add-OfficeDesktopShortcuts
+    if (@($shortcuts.Created).Count -gt 0) {
+      Add-SetupActivity -Text ('Desktop shortcuts: ' + (@($shortcuts.Created) -join ', '))
+    }
+    if ($shortcuts.Failed) {
+      $result.Notes = [string[]](@($result.Notes) + 'Office desktop shortcuts could not be created')
+    }
+  }
+  return $result
+}
+
+function Resolve-OfficeFinish {
+  # Private. The result of the office-finish step, paths 1-4 of Invoke-StepOfficeFinish (no shortcuts).
   [CmdletBinding()]
   [OutputType([pscustomobject])]
   param([Parameter(Mandatory)][hashtable]$Context)
@@ -496,6 +535,14 @@ function Invoke-StepOfficeFinish {
 
   $wait = Wait-OfficeBackground -Context $Context -Purpose Finish
 
+  # Each ending the wait decides (Exited, Killed, Gone) sets Finished, and a result a restart wait stored
+  # earlier has it set already. Without it the wait decided nothing (an unexpected error inside it, or a
+  # lookup that failed): the background setup.exe may still be running, so no foreground install may
+  # start beside it, and the result cannot be read from the Data.
+  if ($data['Finished'] -ne $true) {
+    Write-SetupLog -Message 'The background Office setup result is unknown and the setup may still be running; not installing again' -Level WARN -Data @{ outcome = [string]$wait.Outcome }
+    return New-StepResult -Status Failed -Message 'Office setup did not complete'
+  }
   if ($data['KilledAtDeadline'] -eq $true) { return New-StepResult -Status Failed -Message 'Office setup timed out' }
   if ($null -ne $data['ExitCode']) {
     $code = [int]$data['ExitCode']
@@ -525,4 +572,103 @@ function Invoke-StepOfficeFinish {
   $prepared = Initialize-OfficeInstall -Context $Context
   if ($null -ne $prepared.Result) { return $prepared.Result }
   return Invoke-OfficeForegroundInstall -Context $Context -Prepared $prepared
+}
+
+# --- desktop shortcuts (v2 spec 4.7) -------------------------------------------------------------------
+
+function Get-OfficeExeFolder {
+  <#
+  .SYNOPSIS
+    Private. The folder of the Click-to-Run Office programs: InstallationPath from the Click-to-Run
+    registry key plus root\Office16, or $null when the key or the value is missing.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $configuration = Get-ItemProperty -LiteralPath $script:OfficeReleaseKey -Name InstallationPath -ErrorAction SilentlyContinue
+  $installPath = if ($configuration) { [string]$configuration.InstallationPath } else { '' }
+  if ([string]::IsNullOrWhiteSpace($installPath)) { return $null }
+  return (Join-Path $installPath.Trim() 'root\Office16')
+}
+
+function New-DesktopShortcut {
+  <#
+  .SYNOPSIS
+    Private. Writes one .lnk file: Path -> TargetPath, with the target's folder as the working folder.
+    Throws when the shortcut cannot be saved.
+  .DESCRIPTION
+    The only WScript.Shell touchpoint in the project. Tests always mock it, so no test ever writes a
+    shortcut (the real one is checked by hand, docs\testing.md).
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$TargetPath
+  )
+
+  $shell = $null
+  $link = $null
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($Path)
+    $link.TargetPath = $TargetPath
+    $link.WorkingDirectory = Split-Path -Parent $TargetPath
+    $link.Save()
+  } finally {
+    if ($null -ne $link) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($link) }
+    if ($null -ne $shell) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+  }
+}
+
+function Add-OfficeDesktopShortcuts {
+  <#
+  .SYNOPSIS
+    Puts Word, Excel, PowerPoint and Outlook shortcuts on the public desktop. Returns
+    @{ Created = <names of the shortcuts made>; Failed = <bool> }. Never throws.
+  .DESCRIPTION
+    DesktopFolder defaults to the public desktop of all users (CommonDesktopDirectory) and ExeFolder to
+    Get-OfficeExeFolder, both resolved here. Per app in $script:OfficeShortcutApps: a <Desktop>\<Name>.lnk
+    that exists is left alone (idempotent); an executable missing from ExeFolder is skipped (logged:
+    Outlook may be excluded); otherwise New-DesktopShortcut. A shortcut that cannot be made is a WARN and
+    Failed = $true, and the others are still tried. No Office folder, or no desktop folder, is Failed.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [string]$DesktopFolder,
+    [string]$ExeFolder
+  )
+
+  $created = New-Object 'System.Collections.Generic.List[string]'
+  $failed = $false
+  try {
+    if ([string]::IsNullOrWhiteSpace($DesktopFolder)) { $DesktopFolder = [Environment]::GetFolderPath('CommonDesktopDirectory') }
+    if ([string]::IsNullOrWhiteSpace($ExeFolder)) { $ExeFolder = Get-OfficeExeFolder }
+    if ([string]::IsNullOrWhiteSpace($DesktopFolder) -or [string]::IsNullOrWhiteSpace($ExeFolder)) {
+      Write-SetupLog -Message 'The Office desktop shortcuts need the public desktop and the Office folder; one is unknown' -Level WARN -Data @{ desktop = $DesktopFolder; office = $ExeFolder }
+      return @{ Created = $created.ToArray(); Failed = $true }
+    }
+
+    foreach ($name in $script:OfficeShortcutApps.Keys) {
+      $link = Join-Path $DesktopFolder "$name.lnk"
+      $exe = Join-Path $ExeFolder ([string]$script:OfficeShortcutApps[$name])
+      if (Test-Path -LiteralPath $link) { continue }
+      if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        Write-SetupLog -Message "No $name shortcut: its program is not installed" -Data @{ expected = $exe }
+        continue
+      }
+      try {
+        New-DesktopShortcut -Path $link -TargetPath $exe
+        $created.Add([string]$name)
+      } catch {
+        $failed = $true
+        Write-SetupLog -Message "The $name desktop shortcut could not be created" -Level WARN -Data @{ path = $link; error = $_.Exception.Message }
+      }
+    }
+  } catch {
+    $failed = $true
+    Write-SetupLog -Message 'The Office desktop shortcuts could not be created' -Level WARN -Data @{ error = $_.Exception.Message }
+  }
+  return @{ Created = $created.ToArray(); Failed = $failed }
 }
