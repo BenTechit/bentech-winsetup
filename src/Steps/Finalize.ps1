@@ -4,9 +4,9 @@
 #     value removed, FinalRebootDone saved, one attempt to activate Windows (spec 9.5), then ONE
 #     final restart when something needs it (Test-FinalRebootNeeded) and a restart is possible.
 #   Phase B (after that restart, or at once when none is needed or possible): the default-browser
-#     check (waiting up to 120 s for Chrome when the policy was set, spec 9.4), the temporary
-#     policies and files removed, activation and BitLocker checked, the resume task removed, the
-#     downloads and the pinned script deleted, EndedAt, and the report. This is
+#     check (waiting up to 120 s for Chrome when someone has signed in since its policy was set,
+#     spec 9.4), the temporary policies and files removed, activation and BitLocker checked, the
+#     resume task removed, the downloads and the pinned script deleted, EndedAt, and the report. This is
 #     Complete-SetupFinalization, which the entry point (Task 17) also calls on its own when a run
 #     ends with finalize not Done (the final restart failed), so no run is left without a report or
 #     with the resume task still registered (ruling R26). The entry point then shows the final screen.
@@ -93,6 +93,53 @@ function Get-LastBootUtc {
   }
 }
 
+function Get-BrowserPolicySignIn {
+  <#
+  .SYNOPSIS
+    Private. Whether anyone has signed in since the default-browser step set its policy. Returns
+    @{ Result; SetAtUtc; LastBootUtc } (both UTC [datetime], or $null when not read). Never throws.
+  .DESCRIPTION
+    The DefaultAssociationsConfiguration policy only applies at a sign-in (ruling R16), and a boot
+    after the set time means one happened (RebootCount cannot tell: interruptions also raise it).
+    Result:
+      NotSet   - the default-browser step is not Done, or has no readable Data.SetAtUtc (a WARN when
+                 it is there but unreadable): there is no policy to apply.
+      Pending  - SetAtUtc is at or after the last boot: nobody has signed in since.
+      SignedIn - the last boot came after SetAtUtc.
+      Unknown  - the last boot time could not be read.
+    LastBootUtc defaults to Get-LastBootUtc, read only for a Done step with a readable SetAtUtc. Used
+    by Test-FinalRebootNeeded (restart for it) and Complete-SetupFinalization (wait for it, spec 9.4).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$State,
+    [datetime]$LastBootUtc
+  )
+
+  $answer = @{ Result = 'NotSet'; SetAtUtc = $null; LastBootUtc = $null }
+  $step = $null
+  if ($State['Steps'] -is [System.Collections.IDictionary]) { $step = $State['Steps']['default-browser'] }
+  if ($step -isnot [System.Collections.IDictionary] -or [string]$step['Status'] -ne 'Done') { return $answer }
+  $data = $step['Data']
+  if ($data -isnot [System.Collections.IDictionary] -or $null -eq $data['SetAtUtc']) { return $answer }
+  $setAt = ConvertTo-UtcDateTime $data['SetAtUtc']
+  if ($null -eq $setAt) {
+    Write-SetupLog -Message 'The default-browser set time is unreadable; treated as no policy set' -Level WARN -Data @{ setAtUtc = [string]$data['SetAtUtc'] }
+    return $answer
+  }
+  $answer.SetAtUtc = $setAt
+
+  $boot = if ($PSBoundParameters.ContainsKey('LastBootUtc')) { ConvertTo-UtcDateTime $LastBootUtc } else { Get-LastBootUtc }
+  if ($null -eq $boot) {
+    $answer.Result = 'Unknown'
+    return $answer
+  }
+  $answer.LastBootUtc = $boot
+  $answer.Result = if ($setAt -ge $boot) { 'Pending' } else { 'SignedIn' }
+  return $answer
+}
+
 function Test-FinalRebootNeeded {
   <#
   .SYNOPSIS
@@ -103,7 +150,7 @@ function Test-FinalRebootNeeded {
         pending computer rename), or
       - the default-browser step is Done and its Data.SetAtUtc is at or after the last boot: nobody
         has signed in since the DefaultAssociationsConfiguration policy was set, and it only applies
-        at a sign-in (ruling R16; RebootCount cannot tell, because interruptions also raise it).
+        at a sign-in (Get-BrowserPolicySignIn says Pending).
     A default-browser step that is not Done, or has no readable SetAtUtc, needs no restart. LastBootUtc
     defaults to Get-LastBootUtc (read only when needed); when that cannot be read, a Done step is
     assumed to need the restart.
@@ -121,30 +168,18 @@ function Test-FinalRebootNeeded {
     return $true
   }
 
-  $step = $null
-  if ($State['Steps'] -is [System.Collections.IDictionary]) { $step = $State['Steps']['default-browser'] }
-  if ($step -isnot [System.Collections.IDictionary] -or [string]$step['Status'] -ne 'Done') { return $false }
-  $data = $step['Data']
-  if ($data -isnot [System.Collections.IDictionary] -or $null -eq $data['SetAtUtc']) { return $false }
-  $setAt = ConvertTo-UtcDateTime $data['SetAtUtc']
-  if ($null -eq $setAt) {
-    Write-SetupLog -Message 'The default-browser set time is unreadable; no restart for it' -Level WARN -Data @{ setAtUtc = [string]$data['SetAtUtc'] }
-    return $false
+  $check = @{ State = $State }
+  if ($PSBoundParameters.ContainsKey('LastBootUtc')) { $check['LastBootUtc'] = $LastBootUtc }
+  $signIn = Get-BrowserPolicySignIn @check
+  if ($signIn.Result -eq 'NotSet') { return $false }
+  if ($signIn.Result -eq 'Unknown') {
+    Write-SetupLog -Message 'Final restart needed: the last boot time is unknown, so the browser policy may not have applied'
+    return $true
   }
 
-  if ($PSBoundParameters.ContainsKey('LastBootUtc')) {
-    $boot = ConvertTo-UtcDateTime $LastBootUtc
-  } else {
-    $boot = Get-LastBootUtc
-    if ($null -eq $boot) {
-      Write-SetupLog -Message 'Final restart needed: the last boot time is unknown, so the browser policy may not have applied'
-      return $true
-    }
-  }
-
-  $needed = ($setAt -ge $boot)
+  $needed = ($signIn.Result -eq 'Pending')
   Write-SetupLog -Message 'Final restart check for the browser policy' -Data @{
-    setAtUtc = $setAt.ToString('o'); lastBootUtc = $boot.ToString('o'); needed = $needed
+    setAtUtc = $signIn.SetAtUtc.ToString('o'); lastBootUtc = $signIn.LastBootUtc.ToString('o'); needed = $needed
   }
   return $needed
 }
@@ -421,9 +456,11 @@ function Complete-SetupFinalization {
       - the state is saved at the end (a failed save is a WARN; the runner saves again anyway).
     Then, in order:
       1. Chrome installed but not the default browser -> Note 'Chrome is not the default browser'
-         (checked before its policy is removed). When the default-browser step is Done (it set the
-         policy), Wait-ChromeDefault gives Windows up to 120 s to apply it (spec 9.4: right after the
-         final restart's sign-in it may not have yet); otherwise it is read once.
+         (checked before its policy is removed). Spec 9.4: when the default-browser step set the
+         policy and a sign-in has happened since (Get-BrowserPolicySignIn: SignedIn, i.e. after the
+         final restart), Wait-ChromeDefault gives Windows up to 120 s to apply it. Otherwise (no
+         policy, nobody signed in since: a refused or failed restart, or the boot time unknown) it is
+         read once: without a sign-in the policy cannot apply, so waiting would be dead time.
       2. The DefaultAssociationsConfiguration policy value removed (the key stays), the XML deleted,
          and its folder too when it is empty.
       3. LENOVO: the AdminCommandLine policy values removed (a forced BIOS restart can skip the
@@ -462,11 +499,13 @@ function Complete-SetupFinalization {
   }
 
   if (Test-ChromeInstalled) {
-    $browserStep = $null
-    if ($runState.Steps -is [System.Collections.IDictionary]) { $browserStep = $runState.Steps['default-browser'] }
-    if ($browserStep -is [System.Collections.IDictionary] -and [string]$browserStep['Status'] -eq 'Done') {
+    $signIn = Get-BrowserPolicySignIn -State $runState
+    if ($signIn.Result -eq 'SignedIn') {
       $chromeIsDefault = Wait-ChromeDefault
     } else {
+      if ($signIn.Result -ne 'NotSet') {
+        Write-SetupLog -Message 'No wait for Chrome as default: no sign-in is known since the browser policy was set' -Data @{ signIn = $signIn.Result }
+      }
       $chromeIsDefault = ((Get-DefaultBrowserProgId) -eq 'ChromeHTML')
     }
     if (-not $chromeIsDefault) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Chrome is not the default browser' }

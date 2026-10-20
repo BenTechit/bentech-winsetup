@@ -1022,6 +1022,18 @@ Describe 'Invoke-StepFinalize through the runner' {
 }
 
 Describe 'Chrome as default: wait before the policy goes (spec 9.4)' {
+  BeforeAll {
+    # A run whose default-browser step is Done and set its policy SetMinutes after the last boot
+    # ($script:lastBoot): negative = a boot (and so a sign-in) since, positive = nobody signed in since.
+    # -NoSetAt leaves the step without SetAtUtc.
+    function New-BrowserPolicyContext {
+      param([int]$SetMinutes = -30, [switch]$NoSetAt, [switch]$PhaseB, [int]$RebootCount = 0)
+      $ctx = New-FinalizeContext -PhaseB:$PhaseB -Plan @('default-browser', 'finalize') -RebootCount $RebootCount
+      $ctx.State.Steps['default-browser'].Data = @{ RebootCountAtSet = 0 }
+      if (-not $NoSetAt) { $ctx.State.Steps['default-browser'].Data['SetAtUtc'] = $script:lastBoot.AddMinutes($SetMinutes).ToString('o') }
+      $ctx
+    }
+  }
   BeforeEach { Initialize-FinalizeMocks }
   AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
 
@@ -1034,7 +1046,7 @@ Describe 'Chrome as default: wait before the policy goes (spec 9.4)' {
       [void]$script:policyAtReads.Add($script:regPresent[$script:SystemPolicyKey].ContainsKey('DefaultAssociationsConfiguration'))
       if ($script:reads -ge 4) { 'ChromeHTML' } else { 'MSEdgeHTM' }
     }
-    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $ctx = New-BrowserPolicyContext -PhaseB -SetMinutes -30   # the final restart came after the policy
     $null = Complete-SetupFinalization -Context $ctx
     $script:reads | Should -Be 4
     Should -Invoke Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 5 }
@@ -1046,7 +1058,7 @@ Describe 'Chrome as default: wait before the policy goes (spec 9.4)' {
   }
   It 'gives up after 120 s with the yellow Note' {
     Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
-    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $ctx = New-BrowserPolicyContext -PhaseB -SetMinutes -30
     $null = Complete-SetupFinalization -Context $ctx
     Should -Invoke Get-DefaultBrowserProgId -Times 25 -Exactly
     Should -Invoke Start-Sleep -Times 24 -Exactly
@@ -1071,10 +1083,53 @@ Describe 'Chrome as default: wait before the policy goes (spec 9.4)' {
   }
   It 'never waits when Chrome is not installed' {
     $script:chromeInstalled = $false
-    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $ctx = New-BrowserPolicyContext -PhaseB -SetMinutes -30
     $null = Complete-SetupFinalization -Context $ctx
     Should -Invoke Get-DefaultBrowserProgId -Times 0 -Exactly
     $script:sleeps.Count | Should -Be 0
+  }
+  # Spec 9.4: the wait is only for the time right after the final restart's sign-in. Without a sign-in
+  # since the policy was set, Windows cannot have applied it, so 120 s would be dead time.
+  It 'reads once when nobody can be known to have signed in since the policy was set: <Case>' -ForEach @(
+    @{ Case = 'policy set after the last boot'; SetMinutes = 30; NoSetAt = $false; BootUnknown = $false }
+    @{ Case = 'no SetAtUtc';                    SetMinutes = 0;  NoSetAt = $true;  BootUnknown = $false }
+    @{ Case = 'last boot time unknown';         SetMinutes = -30; NoSetAt = $false; BootUnknown = $true }
+  ) {
+    if ($BootUnknown) { Mock Get-LastBootUtc { $null } }
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-BrowserPolicyContext -PhaseB -SetMinutes $SetMinutes -NoSetAt:$NoSetAt
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+    $ctx.State.Notes | Should -Contain 'Chrome is not the default browser'
+  }
+  It 'reads once when the final restart was refused: <Case>' -ForEach @(
+    @{ Case = 'no resume task'; ResumeTaskMissing = $true;  RebootCount = 0 }
+    @{ Case = 'reboot cap';     ResumeTaskMissing = $false; RebootCount = 12 }
+  ) {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    # Phase A: the policy was set after the last boot, so the final restart is needed, and refused.
+    $ctx = New-BrowserPolicyContext -SetMinutes 10 -RebootCount $RebootCount
+    $ctx.State.ResumeTaskMissing = $ResumeTaskMissing
+    $r = Invoke-StepFinalize -Context $ctx
+    $r.Reboot | Should -Be 'None'
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+    $ctx.State.Notes | Should -Contain 'Chrome is not the default browser'
+  }
+  It 'reads once on the R26 path (the final restart failed, nobody signed in since)' {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-BrowserPolicyContext -SetMinutes 10
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+  }
+  It 'waits in the same call when Phase A needed no restart because a boot came after the policy' {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-BrowserPolicyContext -SetMinutes -30
+    $null = Invoke-StepFinalize -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 25 -Exactly
   }
 }
 
@@ -1133,7 +1188,7 @@ Describe 'Windows activation attempt (spec 9.5)' {
     Should -Invoke Write-SetupLog -Times 3 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Windows activation attempt failed' }
   }
   It 'a product-key query that fails is a WARN and Failed, without a child' {
-    Mock Get-CimInstance { throw 'RPC server unavailable' } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
+    Mock Get-CimInstance { Write-Error -Message 'RPC server unavailable' -Category ResourceUnavailable } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
     Invoke-WindowsActivation | Should -Be 'Failed'
     Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly
     @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
