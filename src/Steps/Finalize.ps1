@@ -1,16 +1,18 @@
 ﻿# src/Steps/Finalize.ps1
 # Step 17, "Finalize" (spec 8.3 step 17, 8.4, 8.7 and 12): the last step. It runs in two phases.
 #   Phase A (State.FinalRebootDone is $false): the final power settings, the no-auto-reboot policy
-#     value removed, FinalRebootDone saved, then ONE final restart when something needs it
-#     (Test-FinalRebootNeeded) and a restart is possible.
+#     value removed, FinalRebootDone saved, one attempt to activate Windows (spec 9.5), then ONE
+#     final restart when something needs it (Test-FinalRebootNeeded) and a restart is possible.
 #   Phase B (after that restart, or at once when none is needed or possible): the default-browser
-#     check, the temporary policies and files removed, activation and BitLocker checked, the resume
-#     task removed, the downloads and the pinned script deleted, EndedAt, and the report. This is
+#     check (waiting up to 120 s for Chrome when the policy was set, spec 9.4), the temporary
+#     policies and files removed, activation and BitLocker checked, the resume task removed, the
+#     downloads and the pinned script deleted, EndedAt, and the report. This is
 #     Complete-SetupFinalization, which the entry point (Task 17) also calls on its own when a run
 #     ends with finalize not Done (the final restart failed), so no run is left without a report or
 #     with the resume task still registered (ruling R26). The entry point then shows the final screen.
 # Needs StepResult.ps1, Logging.ps1, State.ps1, Catalog.ps1 + Verdict.ps1, Reboot.ps1, Prepare.ps1,
-# Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1 and Report.ps1; the bundle holds every file.
+# Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild) and
+# Report.ps1; the bundle holds every file.
 #
 # Notes and errors: Finalize writes its own straight into State.Notes / State.Errors
 # (Add-FinalizeMessage), and its results never carry any. Phase B must have them in the State before
@@ -22,6 +24,16 @@ $script:FinalizeStepId = 'finalize'
 $script:WindowsUpdatePolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 $script:NoAutoRebootValueName = 'NoAutoRebootWithLoggedOnUsers'
 $script:SetupReportFileName = 'Setup-Report.txt'
+
+# Spec 9.5: the child that asks Windows to activate. Each Windows licensing product with a product key
+# that is not licensed gets Activate(); a ReturnValue other than 0 is exit 2, and an error (Activate
+# throws on a refusal, Stop makes it end the child) is exit 1. Same ApplicationID as Report.ps1's
+# $script:WindowsLicensingApplicationId.
+$script:WindowsActivationCommand = @'
+$ErrorActionPreference = 'Stop'; $f = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL AND LicenseStatus <> 1"
+foreach ($p in @(Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $f)) { $r = Invoke-CimMethod -InputObject $p -MethodName Activate; if ($r.ReturnValue -ne 0) { exit 2 } }
+'@
+$script:WindowsActivationTimeoutMinutes = 3
 
 function Add-FinalizeMessage {
   # Private. Appends Text to State.Notes or State.Errors (kept an array), unless it is already there:
@@ -235,6 +247,88 @@ function Write-SetupReport {
   [IO.File]::WriteAllText($Path, (($Lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $true))
 }
 
+function Wait-ChromeDefault {
+  <#
+  .SYNOPSIS
+    $true as soon as Chrome (ChromeHTML) is the default browser; $false when it still is not after the
+    last read. Spec 9.4: right after the final restart, Windows may not have applied the policy yet.
+  .DESCRIPTION
+    Reads Get-DefaultBrowserProgId at once and again after each wait of PollSeconds: Attempts reads
+    and Attempts - 1 waits (the defaults: 25 reads, 24 waits of 5 s = 120 s). It counts reads, not
+    clock time, so it always ends. Never throws (Get-DefaultBrowserProgId never does).
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [ValidateRange(1, 1000)][int]$Attempts = 25,
+    [ValidateRange(0, 3600)][int]$PollSeconds = 5
+  )
+
+  for ($read = 1; $read -le $Attempts; $read++) {
+    if ((Get-DefaultBrowserProgId) -eq 'ChromeHTML') {
+      Write-SetupLog -Message 'Chrome is the default browser' -Data @{ reads = $read; waitedSeconds = ($read - 1) * $PollSeconds }
+      return $true
+    }
+    if ($read -lt $Attempts) { Start-Sleep -Seconds $PollSeconds }
+  }
+  Write-SetupLog -Message 'Chrome is still not the default browser after the wait' -Level WARN -Data @{ reads = $Attempts; waitedSeconds = ($Attempts - 1) * $PollSeconds }
+  return $false
+}
+
+function Invoke-WindowsActivation {
+  <#
+  .SYNOPSIS
+    One attempt to activate Windows (spec 9.5). Returns 'NotNeeded', 'Activated' or 'Failed'. Never
+    throws.
+  .DESCRIPTION
+    - Get-ActivationStatus other than 'Not activated' (Activated, or Unknown: it could not be read)
+      -> NotNeeded.
+    - No Windows SoftwareLicensingProduct row with a product key (a read-only CIM query, the filter
+      Get-ActivationStatus uses) -> NotNeeded: there is nothing to activate with.
+    - Otherwise $script:WindowsActivationCommand in a child PowerShell (Invoke-PowerShellChild,
+      through Invoke-External) limited to 3 minutes: exit 0 -> Activated (INFO). A timeout, another
+      exit code or a child that cannot start -> WARN 'Windows activation attempt failed' -> Failed.
+      A product-key query that fails is a WARN too, and Failed.
+    Nothing reads the answer to decide anything: Phase B reads the status again for the report, so a
+    failed attempt keeps the Note 'Windows not activated'.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  $status = Get-ActivationStatus
+  if ($status -ne 'Not activated') {
+    Write-SetupLog -Message 'No Windows activation attempt needed' -Data @{ activation = [string]$status }
+    return 'NotNeeded'
+  }
+
+  try {
+    $filter = "ApplicationID='{0}' AND PartialProductKey IS NOT NULL" -f $script:WindowsLicensingApplicationId
+    $keyed = @(Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $filter -ErrorAction Stop | Where-Object { $null -ne $_ })
+  } catch {
+    Write-SetupLog -Message 'Windows product keys could not be read; no activation attempt' -Level WARN -Data @{ error = $_.Exception.Message }
+    return 'Failed'
+  }
+  if ($keyed.Count -eq 0) {
+    Write-SetupLog -Message 'No Windows activation attempt: no product key is installed'
+    return 'NotNeeded'
+  }
+
+  Write-SetupLog -Message 'Trying to activate Windows' -Data @{ timeoutMinutes = $script:WindowsActivationTimeoutMinutes }
+  try {
+    $run = Invoke-PowerShellChild -Command $script:WindowsActivationCommand -TimeoutMinutes $script:WindowsActivationTimeoutMinutes
+  } catch {
+    Write-SetupLog -Message 'Windows activation attempt failed' -Level WARN -Data @{ error = $_.Exception.Message }
+    return 'Failed'
+  }
+  if ($run.TimedOut -or $null -eq $run.ExitCode -or $run.ExitCode -ne 0) {
+    Write-SetupLog -Message 'Windows activation attempt failed' -Level WARN -Data @{ exitCode = $run.ExitCode; timedOut = [bool]$run.TimedOut; tail = (Get-OutputTail -Output $run.Output) }
+    return 'Failed'
+  }
+  Write-SetupLog -Message 'Windows activated'
+  return 'Activated'
+}
+
 function Restore-PostSetupSettings {
   <#
   .SYNOPSIS
@@ -271,6 +365,8 @@ function Invoke-FinalizePhaseA {
     1-3. Restore-PostSetupSettings: final power settings, the NoAutoRebootWithLoggedOnUsers value
        removed, FinalRebootDone = $true. Then the state is saved (a failed save throws: the restart
        must not happen without it), so the call after the restart goes straight to Phase B.
+    3b. Invoke-WindowsActivation (spec 9.5): one attempt, before the final restart. Phase B, after
+       that restart, does not try again.
     4. A restart is asked for only when Test-FinalRebootNeeded says so AND it can happen. A restart the
        runner then refuses would mark this step Failed and leave Phase B (and the report) unrun, so
        the refusals are decided here, recorded the way Invoke-ControlledReboot records them, and
@@ -286,6 +382,7 @@ function Invoke-FinalizePhaseA {
   $runState = $Context.State
   Restore-PostSetupSettings -Context $Context
   Save-RunState -State $runState -Root $Context.Root
+  $null = Invoke-WindowsActivation
 
   if (-not (Test-FinalRebootNeeded -Signals (Get-PendingRebootSignals) -State $runState)) {
     Write-SetupLog -Message 'No final restart needed'
@@ -315,7 +412,8 @@ function Complete-SetupFinalization {
     when a run returns 'Completed' with the finalize step not Done (the final restart failed, or
     finalize ended Failed or stuck), so the resume task is still removed and the report still
     written. For that case:
-      - FinalRebootDone not $true: Restore-PostSetupSettings first (final power settings, the
+      - FinalRebootDone not $true (Phase A never ran): Invoke-WindowsActivation (the one attempt
+        Phase A would have made, spec 9.5), then Restore-PostSetupSettings (final power settings, the
         no-auto-reboot value), but never a restart.
       - finalize found Failed: Note 'Finalize completed after an earlier failure: <its message>', so
         the run can never look green after a failure. A failed restart also keeps its 'Restart
@@ -323,7 +421,9 @@ function Complete-SetupFinalization {
       - the state is saved at the end (a failed save is a WARN; the runner saves again anyway).
     Then, in order:
       1. Chrome installed but not the default browser -> Note 'Chrome is not the default browser'
-         (checked before its policy is removed).
+         (checked before its policy is removed). When the default-browser step is Done (it set the
+         policy), Wait-ChromeDefault gives Windows up to 120 s to apply it (spec 9.4: right after the
+         final restart's sign-in it may not have yet); otherwise it is read once.
       2. The DefaultAssociationsConfiguration policy value removed (the key stays), the XML deleted,
          and its folder too when it is empty.
       3. LENOVO: the AdminCommandLine policy values removed (a forced BIOS restart can skip the
@@ -351,15 +451,25 @@ function Complete-SetupFinalization {
   $earlierStatus = if ($hasFinalizeStep) { [string]$runState.Steps[$script:FinalizeStepId].Status } else { '' }
   Write-SetupLog -Message 'Completing the setup' -Data @{ finalizeStatus = $earlierStatus; finalRebootDone = ($runState.FinalRebootDone -eq $true) }
 
-  if ($runState.FinalRebootDone -ne $true) { Restore-PostSetupSettings -Context $Context }
+  if ($runState.FinalRebootDone -ne $true) {
+    $null = Invoke-WindowsActivation
+    Restore-PostSetupSettings -Context $Context
+  }
   if ($earlierStatus -eq 'Failed') {
     $earlierMessage = [string]$runState.Steps[$script:FinalizeStepId].Message
     if ([string]::IsNullOrWhiteSpace($earlierMessage)) { $earlierMessage = '(no details)' }
     Add-FinalizeMessage -State $runState -Field Notes -Text "Finalize completed after an earlier failure: $earlierMessage"
   }
 
-  if ((Test-ChromeInstalled) -and ((Get-DefaultBrowserProgId) -ne 'ChromeHTML')) {
-    Add-FinalizeMessage -State $runState -Field Notes -Text 'Chrome is not the default browser'
+  if (Test-ChromeInstalled) {
+    $browserStep = $null
+    if ($runState.Steps -is [System.Collections.IDictionary]) { $browserStep = $runState.Steps['default-browser'] }
+    if ($browserStep -is [System.Collections.IDictionary] -and [string]$browserStep['Status'] -eq 'Done') {
+      $chromeIsDefault = Wait-ChromeDefault
+    } else {
+      $chromeIsDefault = ((Get-DefaultBrowserProgId) -eq 'ChromeHTML')
+    }
+    if (-not $chromeIsDefault) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Chrome is not the default browser' }
   }
 
   Remove-RegistryValueIfPresent -Path $script:DefaultAssociationsPolicyKey -Name $script:DefaultAssociationsPolicyName

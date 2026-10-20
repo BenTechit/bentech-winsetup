@@ -27,6 +27,13 @@ Describe 'config.json' {
   It 'Get-Signers throws on an unknown signer key instead of returning an empty list' {
     { Get-Signers -Config $cfg -Key 'nope' } | Should -Throw '*config missing signer: nope*'
   }
+  It 'every consumerApp verify entry, when present, lists paths and/or services as strings' {
+    foreach ($v in $cfg.vendors.PSObject.Properties.Value) {
+      $ver = $v.consumerApp.verify; if ($null -eq $ver) { continue }
+      (@($ver.paths) + @($ver.services) | Where-Object { $_ }).Count | Should -BeGreaterThan 0
+      foreach ($s in @($ver.paths) + @($ver.services)) { if ($null -ne $s) { $s | Should -BeOfType [string] } }
+    }
+  }
   It 'throws on a missing key' {
     '{"defaults":{}}' | Set-Content "$TestDrive\c.json"; { Read-SetupConfig -Path "$TestDrive\c.json" } | Should -Throw '*config missing key*'
   }

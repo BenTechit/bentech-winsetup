@@ -1351,6 +1351,79 @@ Describe 'Invoke-StepConsumerApp' {
     $r.Status | Should -Be 'Skipped'
     $r.Message | Should -Be 'No vendor app for DELL'
   }
+
+  # Spec 9.3: after winget's Done, the app must really be there (consumerApp.verify).
+  It 'without verify keeps v1' {
+    $ctx = New-VendorContext -Brand DELL
+    (Invoke-StepConsumerApp -Context $ctx).Message | Should -Be 'Dell SupportAssist installed'
+    $script:svcNames.Count | Should -Be 0
+  }
+  It 'a service that exists makes it Done and names the check' {
+    $ctx = New-VendorContext -Brand DELL
+    $ctx.Config.vendors.DELL.consumerApp | Add-Member -NotePropertyName verify -NotePropertyValue ([pscustomobject]@{ services = @('SupportAssistAgent') })
+    Mock Get-Service { [pscustomobject]@{ Name = 'SupportAssistAgent' } } -ParameterFilter { $Name -eq 'SupportAssistAgent' }
+    $r = Invoke-StepConsumerApp -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Dell SupportAssist installed (found service SupportAssistAgent)'
+    @($script:logs | Where-Object { $_.Level -notin 'WARN', 'ERROR' -and $_.Message -eq 'Vendor app found after install' -and $_.Data.check -eq 'service SupportAssistAgent' }).Count | Should -Be 1
+  }
+  It 'a file that exists makes it Done and names the path as configured' {
+    $ctx = New-VendorContext -Brand DELL
+    $ctx.Config.vendors.DELL.consumerApp | Add-Member -NotePropertyName verify -NotePropertyValue ([pscustomobject]@{ paths = @('%ProgramFiles%\Dell\SupportAssistAgent\bin\SupportAssistAgent.exe'); services = @('SupportAssistAgent') })
+    $script:expanded = [Environment]::ExpandEnvironmentVariables('%ProgramFiles%\Dell\SupportAssistAgent\bin\SupportAssistAgent.exe')
+    Mock Test-Path { $true } -ParameterFilter { $Path -eq $script:expanded }
+    $r = Invoke-StepConsumerApp -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Dell SupportAssist installed (found file %ProgramFiles%\Dell\SupportAssistAgent\bin\SupportAssistAgent.exe)'
+    $script:svcNames.Count | Should -Be 0   # the first hit wins: no service probe after it
+  }
+  It 'nothing found after a successful install is Failed' {
+    $ctx = New-VendorContext -Brand DELL
+    $ctx.Config.vendors.DELL.consumerApp | Add-Member -NotePropertyName verify -NotePropertyValue ([pscustomobject]@{ paths = @('C:\NoSuch\SupportAssist.exe', '%ProgramFiles%\NoSuch\*.exe'); services = @('NoSuchService') })
+    Mock Get-Service { } -ParameterFilter { $Name -eq 'NoSuchService' }
+    $r = Invoke-StepConsumerApp -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -Be 'Dell SupportAssist was not found after install'
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -like '*was not found after install*' }).Count | Should -Be 1
+  }
+  It 'never checks when winget did not install it' {
+    $ctx = New-VendorContext -Brand DELL
+    $ctx.Config.vendors.DELL.consumerApp | Add-Member -NotePropertyName verify -NotePropertyValue ([pscustomobject]@{ services = @('SupportAssistAgent') })
+    $script:wingetResult = New-StepResult -Status Failed -Message 'XPDCCXDN26VNBT: winget 0x8A15001E'
+    (Invoke-StepConsumerApp -Context $ctx).Status | Should -Be 'Skipped'
+    Should -Invoke Get-Service -Times 0 -Exactly
+  }
+}
+
+# --- Test-ConsumerAppPresent, against the real Test-Path ----------------------------------------
+# No Initialize-VendorMocks here: its Test-Path mock only knows -LiteralPath. Only $TestDrive is read,
+# and Get-Service is mocked where a test needs it, so no real service is ever queried.
+Describe 'Test-ConsumerAppPresent' {
+  BeforeEach { Mock Write-SetupLog { }; Mock Get-Service { } }
+  It 'Test-ConsumerAppPresent expands environment variables and wildcards' {
+    $d = "$TestDrive\SA\App-1.2"; [void][IO.Directory]::CreateDirectory($d); 'x' | Set-Content "$d\SupportAssist.exe"; $env:BT_TEST_SA = "$TestDrive\SA"
+    try {
+      $r = Test-ConsumerAppPresent -Verify ([pscustomobject]@{ paths = @('%BT_TEST_SA%\App-*\SupportAssist.exe') })
+      $r.Found | Should -BeTrue
+      $r.Check | Should -Match '^file '
+    } finally { Remove-Item Env:\BT_TEST_SA }
+  }
+  It 'is not found when no path exists and no service answers' {
+    $r = Test-ConsumerAppPresent -Verify ([pscustomobject]@{ paths = @("$TestDrive\nothing\*.exe", '', $null); services = @('NoSuchService') })
+    $r.Found | Should -BeFalse
+    $r.Check | Should -BeNullOrEmpty
+    Should -Invoke Get-Service -Times 1 -Exactly -ParameterFilter { $Name -eq 'NoSuchService' }
+  }
+  It 'a probe that throws is a miss, and the next probe still counts' {
+    Mock Get-Service { throw 'service control manager unavailable' } -ParameterFilter { $Name -eq 'Broken' }
+    Mock Get-Service { [pscustomobject]@{ Name = 'Good' } } -ParameterFilter { $Name -eq 'Good' }
+    $r = Test-ConsumerAppPresent -Verify ([pscustomobject]@{ services = @('Broken', 'Good') })
+    $r.Found | Should -BeTrue
+    $r.Check | Should -Be 'service Good'
+  }
+  It 'never throws on an empty verify entry' {
+    (Test-ConsumerAppPresent -Verify ([pscustomobject]@{})).Found | Should -BeFalse
+  }
 }
 
 # --- Invoke-StepVendorCleanup -----------------------------------------------------------------

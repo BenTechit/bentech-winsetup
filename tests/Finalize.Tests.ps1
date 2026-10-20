@@ -8,9 +8,10 @@
 # recorder: Restore-FinalPowerSettings, Get-PendingRebootSignals, Get-LastBootUtc, Test-ChromeInstalled,
 # Get-DefaultBrowserProgId, Get-DefaultAssociationsPath (pointed into $TestDrive),
 # Remove-LenovoAdminCommandLine, Get-ActivationStatus, Get-SmartAppControlState, Get-BitLockerState, Unregister-ResumeTask,
-# Get-InstalledAppVersions, Get-ItemProperty, Remove-ItemProperty and Write-SetupLog. As a safety net,
-# New-Item, New-ItemProperty, Set-ItemProperty, Invoke-External, Register-ScheduledTask,
-# Unregister-ScheduledTask, Restart-Computer, Get-CimInstance and Invoke-CimMethod throw (and are
+# Get-InstalledAppVersions, Get-ItemProperty, Remove-ItemProperty, Start-Sleep, the read-only
+# SoftwareLicensingProduct query and Write-SetupLog. As a safety net, New-Item, New-ItemProperty,
+# Set-ItemProperty, Invoke-External, Invoke-PowerShellChild (the activation attempt), Register-ScheduledTask,
+# Unregister-ScheduledTask, Restart-Computer, any other Get-CimInstance and Invoke-CimMethod throw (and are
 # recorded), and so does Remove-Item for any path outside $TestDrive; AfterEach asserts that nothing
 # was blocked. The only real file I/O is inside $TestDrive: the fake working folder (Downloads,
 # setup.ps1, config.json, state.json, Logs), the fake ProgramData XML and the report.
@@ -18,7 +19,7 @@
 # Get-CimInstance / Get-ItemProperty themselves, so they read nothing real either.
 BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','Engine\Verdict','Engine\Reboot','Report\Report','Steps\Finalize') { . "$PSScriptRoot\..\src\$f.ps1" }
   # The helpers Finalize and the report reuse (the bundle holds every file), and the runner for the end-to-end tests.
-  foreach ($f in 'Common\Logging','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Logging','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:st = New-RunState -Machine @{ Manufacturer='Dell Inc.'; FriendlyModel='Latitude 5440'; Serial='7HX2K93'; ComputerName='DESKTOP-AB12'; NewName='DELL-7HX2K93'; OsCaption='Windows 11 Pro'; OsDisplayVersion='25H2'; OsBuild=26200; Arch='x64'; IsLaptop=$true; IsVM=$false } -Choices @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'} -Plan @('chrome') -Version '2026.10.18.1'
   $st.StartedAt = '2026-10-18T09:05:00'; $st.EndedAt = '2026-10-18T10:17:00'; $st.AnyDeskId = '123456789'; $st.Steps.chrome.Status = 'Done'
 
@@ -101,6 +102,9 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
   #   $script:apps            what Get-InstalledAppVersions answers
   #   $script:regPresent      registry path -> hashtable of values, for Get-ItemProperty
   #   $script:regRemoved      one @{ Path; Name } per Remove-ItemProperty call ($script:regRemoveThrows: it throws)
+  #   $script:sleeps          one Seconds value per Start-Sleep call (nothing here ever waits)
+  #   $script:licensingProducts what the read-only SoftwareLicensingProduct query answers (default: no
+  #                           product key, so the activation attempt has nothing to do)
   #   $script:blocked         every call the safety net refused (must stay empty)
   function Initialize-FinalizeMocks {
     $script:logs = New-Object System.Collections.ArrayList
@@ -123,9 +127,12 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     $script:regPresent = @{}
     $script:regRemoved = New-Object System.Collections.ArrayList
     $script:regRemoveThrows = $false
+    $script:sleeps = New-Object System.Collections.ArrayList
+    $script:licensingProducts = @()
     $script:blocked = New-Object System.Collections.ArrayList
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Start-Sleep { [void]$script:sleeps.Add($Seconds) }
     Mock Restore-FinalPowerSettings {
       $script:restoreCalls++
       if ($script:restoreThrows) { throw 'powercfg exploded' }
@@ -174,7 +181,10 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     Mock Unregister-ScheduledTask { [void]$script:blocked.Add('Unregister-ScheduledTask'); throw 'blocked by the test' }
     Mock Restart-Computer { [void]$script:blocked.Add('Restart-Computer'); throw 'blocked by the test' }
     Mock Get-CimInstance { [void]$script:blocked.Add("Get-CimInstance $ClassName"); throw 'blocked by the test' }
+    # Read-only: whether a Windows product key is installed (the activation attempt asks before it runs).
+    Mock Get-CimInstance { return $script:licensingProducts } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
     Mock Invoke-CimMethod { [void]$script:blocked.Add("Invoke-CimMethod $MethodName"); throw 'blocked by the test' }
+    Mock Invoke-PowerShellChild { [void]$script:blocked.Add('Invoke-PowerShellChild'); throw 'blocked by the test' }
   }
 }
 
@@ -1008,5 +1018,151 @@ Describe 'Invoke-StepFinalize through the runner' {
     $lines = Get-ReportLines -Context $ctx
     $lines | Should -Contain 'Result       : COMPLETED WITH ERRORS'
     $lines | Should -Contain '  Restart failed: Access denied (fallback: shutdown.exe exited with code 5)'
+  }
+}
+
+Describe 'Chrome as default: wait before the policy goes (spec 9.4)' {
+  BeforeEach { Initialize-FinalizeMocks }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+
+  It 'waits until Chrome is the default, then removes the policy' {
+    $script:regPresent[$script:SystemPolicyKey] = @{ DefaultAssociationsConfiguration = $script:assocPath }
+    $script:reads = 0
+    $script:policyAtReads = New-Object System.Collections.ArrayList
+    Mock Get-DefaultBrowserProgId {
+      $script:reads++
+      [void]$script:policyAtReads.Add($script:regPresent[$script:SystemPolicyKey].ContainsKey('DefaultAssociationsConfiguration'))
+      if ($script:reads -ge 4) { 'ChromeHTML' } else { 'MSEdgeHTM' }
+    }
+    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $null = Complete-SetupFinalization -Context $ctx
+    $script:reads | Should -Be 4
+    Should -Invoke Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 5 }
+    $script:sleeps.Count | Should -Be 3
+    (@($ctx.State.Notes) -contains 'Chrome is not the default browser') | Should -BeFalse
+    # The policy was still there at every read, the 4th included, and was removed after it.
+    @($script:policyAtReads) | Should -Be @($true, $true, $true, $true)
+    @($script:regRemoved | Where-Object { $_.Path -eq $script:SystemPolicyKey -and $_.Name -eq 'DefaultAssociationsConfiguration' }).Count | Should -Be 1
+  }
+  It 'gives up after 120 s with the yellow Note' {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 25 -Exactly
+    Should -Invoke Start-Sleep -Times 24 -Exactly
+    ($script:sleeps | Measure-Object -Sum).Sum | Should -Be 120
+    $ctx.State.Notes | Should -Contain 'Chrome is not the default browser'
+  }
+  It 'reads once when the default-browser step did not set the policy' {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $ctx.State.Steps['default-browser'].Status = 'Skipped'
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+    $ctx.State.Notes | Should -Contain 'Chrome is not the default browser'
+  }
+  It 'reads once when the plan has no default-browser step' {
+    Mock Get-DefaultBrowserProgId { 'MSEdgeHTM' }
+    $ctx = New-FinalizeContext -PhaseB
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+  }
+  It 'never waits when Chrome is not installed' {
+    $script:chromeInstalled = $false
+    $ctx = New-FinalizeContext -PhaseB -Plan @('default-browser', 'finalize')
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Get-DefaultBrowserProgId -Times 0 -Exactly
+    $script:sleeps.Count | Should -Be 0
+  }
+}
+
+Describe 'Wait-ChromeDefault' {
+  BeforeEach { Initialize-FinalizeMocks }
+  It 'is $true at once, without a wait, when Chrome already is the default' {
+    Mock Get-DefaultBrowserProgId { 'ChromeHTML' }
+    Wait-ChromeDefault | Should -BeTrue
+    Should -Invoke Get-DefaultBrowserProgId -Times 1 -Exactly
+    $script:sleeps.Count | Should -Be 0
+  }
+  It 'counts reads, not clock time: Attempts reads and one wait fewer' {
+    Mock Get-DefaultBrowserProgId { $null }
+    Wait-ChromeDefault -Attempts 3 -PollSeconds 2 | Should -BeFalse
+    Should -Invoke Get-DefaultBrowserProgId -Times 3 -Exactly
+    @($script:sleeps) | Should -Be @(2, 2)
+  }
+}
+
+Describe 'Windows activation attempt (spec 9.5)' {
+  BeforeEach {
+    Initialize-FinalizeMocks
+    Mock Get-ActivationStatus { 'Not activated' }
+    Mock Get-CimInstance { [pscustomobject]@{ LicenseStatus = 5 } } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
+    Mock Invoke-PowerShellChild { @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+  }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+
+  It 'activates in a 3-minute child when a key is installed but not activated' {
+    Invoke-WindowsActivation | Should -Be 'Activated'
+    Should -Invoke Invoke-PowerShellChild -Times 1 -Exactly -ParameterFilter { $TimeoutMinutes -eq 3 -and $Command -match "MethodName Activate" -and $Command -match '55c92734-d682-4d71-983e-d6ec3f16059f' }
+  }
+  It 'sends exactly the activation command of the brief' {
+    $script:expectedCommand = (@(
+        '$ErrorActionPreference = ''Stop''; $f = "ApplicationID=''55c92734-d682-4d71-983e-d6ec3f16059f'' AND PartialProductKey IS NOT NULL AND LicenseStatus <> 1"'
+        'foreach ($p in @(Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $f)) { $r = Invoke-CimMethod -InputObject $p -MethodName Activate; if ($r.ReturnValue -ne 0) { exit 2 } }'
+      ) -join "`n")
+    $null = Invoke-WindowsActivation
+    Should -Invoke Invoke-PowerShellChild -Times 1 -Exactly -ParameterFilter { ($Command -replace "`r`n", "`n") -ceq $script:expectedCommand }
+  }
+  It 'asks only for Windows product keys, read-only, with the filter Get-ActivationStatus uses' {
+    $null = Invoke-WindowsActivation
+    Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' -and $Filter -eq "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" }
+    Should -Invoke Invoke-CimMethod -Times 0 -Exactly
+  }
+  It 'does nothing when activated, unknown, or without a product key' {
+    Mock Get-ActivationStatus { 'Activated' }; Invoke-WindowsActivation | Should -Be 'NotNeeded'
+    Mock Get-ActivationStatus { 'Unknown' }; Invoke-WindowsActivation | Should -Be 'NotNeeded'
+    Mock Get-ActivationStatus { 'Not activated' }; Mock Get-CimInstance { } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }; Invoke-WindowsActivation | Should -Be 'NotNeeded'
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly
+  }
+  It 'a timeout or a failure is a WARN and never throws' {
+    Mock Invoke-PowerShellChild { @{ ExitCode = $null; TimedOut = $true; Output = '' } }; Invoke-WindowsActivation | Should -Be 'Failed'
+    Mock Invoke-PowerShellChild { @{ ExitCode = 2; TimedOut = $false; Output = '' } }; Invoke-WindowsActivation | Should -Be 'Failed'
+    Mock Invoke-PowerShellChild { throw 'cannot start' }; Invoke-WindowsActivation | Should -Be 'Failed'
+    Should -Invoke Write-SetupLog -Times 3 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Windows activation attempt failed' }
+  }
+  It 'a product-key query that fails is a WARN and Failed, without a child' {
+    Mock Get-CimInstance { throw 'RPC server unavailable' } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
+    Invoke-WindowsActivation | Should -Be 'Failed'
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+  }
+  It 'Phase A tries it before deciding the final restart; Phase B after the restart does not' {
+    $script:order = New-Object System.Collections.ArrayList
+    $ctx = New-FinalizeContext
+    $script:activationRoot = $ctx.Root
+    Mock Invoke-WindowsActivation {
+      # Right after Restore-PostSetupSettings and its save.
+      [void]$script:order.Add('activate'); $script:savedAtActivation = (Read-RunState -Root $script:activationRoot).FinalRebootDone; 'Activated'
+    }
+    Mock Test-FinalRebootNeeded { [void]$script:order.Add('restart?'); $true }
+    $r = Invoke-StepFinalize -Context $ctx
+    $r.Reboot | Should -Be 'Now'
+    @($order) | Should -Be @('activate', 'restart?')
+    $script:savedAtActivation | Should -BeTrue
+    $script:restoreCalls | Should -Be 1
+    $null = Invoke-StepFinalize -Context $ctx   # the call after the final restart = Phase B
+    Should -Invoke Invoke-WindowsActivation -Times 1 -Exactly
+  }
+  It 'the R26 path without Phase A tries it once, before it restores the settings' {
+    Mock Invoke-WindowsActivation { $script:restoreAtActivation = $script:restoreCalls; 'Failed' }
+    $ctx = New-FinalizeContext
+    $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-WindowsActivation -Times 1 -Exactly
+    $script:restoreAtActivation | Should -Be 0
+    $script:restoreCalls | Should -Be 1
+    $ctx.State.Notes | Should -Contain 'Windows not activated'
   }
 }

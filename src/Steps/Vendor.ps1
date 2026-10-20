@@ -974,16 +974,64 @@ function Invoke-StepVendorPass2 {
 
 # --- step 15: consumer app --------------------------------------------------------------------
 
+function Test-ConsumerAppPresent {
+  <#
+  .SYNOPSIS
+    Whether the vendor app is really on the machine (spec 9.3). Returns @{ Found = <bool>; Check =
+    <string> }. Read-only; never throws.
+  .DESCRIPTION
+    Verify is a consumerApp.verify entry of config.json: `paths` and/or `services`, each a string or
+    a list of strings. Each path goes through [Environment]::ExpandEnvironmentVariables (%ProgramFiles%
+    and the like) and then Test-Path -Path, so wildcards are allowed; each service name is looked up
+    with Get-Service. The paths come first, in order, then the services. The first hit wins: Check is
+    'file <path>' (the path as configured, before expansion) or 'service <name>'. A probe that throws
+    is a miss (a WARN). Nothing found: Found $false and Check $null. Empty entries are ignored.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([AllowNull()]$Verify)
+
+  if ($null -ne $Verify) {
+    foreach ($path in @($Verify.paths)) {
+      if ([string]::IsNullOrWhiteSpace([string]$path)) { continue }
+      try {
+        if (Test-Path -Path ([Environment]::ExpandEnvironmentVariables([string]$path)) -ErrorAction Stop) {
+          return @{ Found = $true; Check = "file $path" }
+        }
+      } catch {
+        Write-SetupLog -Message 'A vendor app path could not be checked' -Level WARN -Data @{ path = [string]$path; error = $_.Exception.Message }
+      }
+    }
+    foreach ($service in @($Verify.services)) {
+      if ([string]::IsNullOrWhiteSpace([string]$service)) { continue }
+      try {
+        if (@(Get-Service -Name ([string]$service) -ErrorAction SilentlyContinue).Count -gt 0) {
+          return @{ Found = $true; Check = "service $service" }
+        }
+      } catch {
+        Write-SetupLog -Message 'A vendor app service could not be checked' -Level WARN -Data @{ service = [string]$service; error = $_.Exception.Message }
+      }
+    }
+  }
+  return @{ Found = $false; Check = $null }
+}
+
 function Invoke-StepConsumerApp {
   <#
   .SYNOPSIS
     Step 15: installs the brand's consumer app (Config.vendors.<Brand>.consumerApp) with winget.
   .DESCRIPTION
-    No consumerApp -> Skipped('No vendor app for <Brand>'). Done -> Done('<name> installed').
+    No consumerApp -> Skipped('No vendor app for <Brand>').
+    winget Done (spec 9.3: winget reported success for an app that was not there):
+      - no consumerApp.verify entry (its values are not known yet) -> Done('<name> installed') (v1);
+      - Test-ConsumerAppPresent finds it -> Done('<name> installed (found <check>)'), with an INFO log;
+      - it does not -> Failed('<name> was not found after install'), so step 16 keeps the business
+        updater.
     SPIKE#3 default: a Microsoft Store app (source msstore) whose install Failed is
     Skipped('<name>: Store install failed (<0x code>), install it from the Store'), because a Store
     install may need a Microsoft account sign-in; a failure without a code carries winget's reason
-    instead. Any other result (a Skipped, a winget-source failure) is winget's own StepResult.
+    instead. Any other result (a Skipped, a winget-source failure) is winget's own StepResult. Only a
+    Done is ever checked.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -998,7 +1046,17 @@ function Invoke-StepConsumerApp {
   $name = if ([string]::IsNullOrWhiteSpace([string]$app.name)) { $id } else { [string]$app.name }
 
   $result = Invoke-WingetInstall -Id $id -Source $source -Context $Context
-  if ($result.Status -eq 'Done') { return New-StepResult -Status Done -Message "$name installed" }
+  if ($result.Status -eq 'Done') {
+    $verify = $app.PSObject.Properties['verify']
+    if ($null -eq $verify -or $null -eq $verify.Value) { return New-StepResult -Status Done -Message "$name installed" }
+    $presence = Test-ConsumerAppPresent -Verify $verify.Value
+    if ($presence.Found) {
+      Write-SetupLog -Message 'Vendor app found after install' -Data @{ app = $name; check = $presence.Check }
+      return New-StepResult -Status Done -Message "$name installed (found $($presence.Check))"
+    }
+    Write-SetupLog -Message "$name was not found after install" -Level ERROR -Data @{ app = $name; id = $id; paths = @($verify.Value.paths); services = @($verify.Value.services) }
+    return New-StepResult -Status Failed -Message "$name was not found after install"
+  }
   if ($source -eq 'msstore' -and $result.Status -eq 'Failed') {
     $message = [string]$result.Message
     $code = [regex]::Match($message, '0x[0-9A-Fa-f]{8}')
