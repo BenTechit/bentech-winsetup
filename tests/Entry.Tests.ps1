@@ -26,9 +26,11 @@ BeforeAll {
       [bool]$WuRound = $false,
       [bool]$SearchOnly = $false,
       [string]$ResultPath = '',
+      [bool]$WuUnhide = $false,
+      [string]$UpdateIds = '',
       [scriptblock]$CrashScreen = { param($text) $null = $script:crashes.Add($text) }
     )
-    Start-BenTechSetup -Resume $Resume -WuRound $WuRound -SearchOnly $SearchOnly -ResultPath $ResultPath -Root $TestDrive -NoWait -CrashScreen $CrashScreen
+    Start-BenTechSetup -Resume $Resume -WuRound $WuRound -SearchOnly $SearchOnly -ResultPath $ResultPath -WuUnhide $WuUnhide -UpdateIds $UpdateIds -Root $TestDrive -NoWait -CrashScreen $CrashScreen
   }
 
   # A run state as Read-RunState returns it (only the fields the entry point reads).
@@ -419,6 +421,49 @@ Describe 'Start-BenTechSetup' {
       Mock Read-SetupConfig { $script:batchCfg }
       Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
       Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $InstallMode -eq 'Batch' }
+    }
+  }
+
+  # Final review C1: the end-of-run un-hide child (WUA COM mocked: New-WuSession and Invoke-WuUnhide).
+  Context '-WuUnhide' {
+    BeforeAll {
+      $script:u1 = '11111111-aaaa-4bbb-8ccc-000000000001'; $script:u2 = '22222222-aaaa-4bbb-8ccc-000000000002'
+    }
+    BeforeEach {
+      Mock New-WuSession { [pscustomobject]@{ Name = 'fake session' } }
+      Mock Invoke-WuUnhide { @{ Unhidden = @($script:u1); UnhideFailed = @($script:u2) } }
+      Mock Register-SetupTick { }
+    }
+    It 'dispatches to Invoke-WuUnhide with the ids exactly and writes { Unhidden; UnhideFailed } (UTF-8, no BOM)' {
+      $resultPath = Join-Path $TestDrive 'Logs\wu-unhide.json'
+      Invoke-Entry -WuUnhide $true -ResultPath $resultPath -UpdateIds ('{0},{1}' -f $script:u1, $script:u2) | Should -Be 0
+      Should -Invoke Invoke-WuUnhide -Times 1 -Exactly -ParameterFilter { ($Ids -join '|') -eq ('{0}|{1}' -f $script:u1, $script:u2) -and $Session.Name -eq 'fake session' }
+      $bytes = [IO.File]::ReadAllBytes($resultPath); ($bytes[0] -eq 0xEF) | Should -BeFalse
+      $r = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+      @($r.Unhidden) | Should -Be @($script:u1); @($r.UnhideFailed) | Should -Be @($script:u2)
+      Should -Invoke Initialize-SetupLog -Times 1 -Exactly -ParameterFilter { $LogDirectory -eq (Join-Path $TestDrive 'Logs') }
+    }
+    It 'runs with no lock, no screen, no tick, no activity feed and no state' {
+      Invoke-Entry -WuUnhide $true -ResultPath "$TestDrive\u.json" -UpdateIds $script:u1 | Should -Be 0
+      foreach ($c in 'Enter-RunLock', 'Start-Transcript', 'Show-StartScreen', 'Invoke-SetupRun', 'Register-SetupTick', 'Initialize-SetupActivity',
+                     'Disable-ConsoleQuickEdit', 'Resize-SetupConsole', 'Read-RunState', 'Save-RunState', 'Invoke-WuRound', 'Invoke-SetupCleanup') {
+        Should -Invoke $c -Times 0 -Exactly -Because $c
+      }
+    }
+    It 'a failing search lists every id as UnhideFailed, still writes the result and returns 0' {
+      Mock Invoke-WuUnhide { throw 'Windows Update search failed' }
+      Invoke-Entry -WuUnhide $true -ResultPath "$TestDrive\u.json" -UpdateIds ('{0},{1}' -f $script:u1, $script:u2) | Should -Be 0
+      $r = Get-Content "$TestDrive\u.json" -Raw | ConvertFrom-Json
+      @($r.Unhidden).Count | Should -Be 0; @($r.UnhideFailed) | Should -Be @($script:u1, $script:u2)
+      Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'ERROR' -and $Data.error -eq 'Windows Update search failed' }
+    }
+    It 'passes only GUID-shaped ids on; anything else is UnhideFailed without a search for it' {
+      Invoke-Entry -WuUnhide $true -ResultPath "$TestDrive\u.json" -UpdateIds (' {0} ,,not-a-guid' -f $script:u1) | Should -Be 0
+      Should -Invoke Invoke-WuUnhide -Times 1 -Exactly -ParameterFilter { ($Ids -join '|') -eq $script:u1 }
+      @((Get-Content "$TestDrive\u.json" -Raw | ConvertFrom-Json).UnhideFailed) | Should -Contain 'not-a-guid'
+    }
+    It 'returns 1 when the result cannot be written' {
+      Invoke-Entry -WuUnhide $true -ResultPath '' -UpdateIds $script:u1 | Should -Be 1
     }
   }
 

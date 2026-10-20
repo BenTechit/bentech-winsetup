@@ -3,7 +3,9 @@
 #   - from the launcher (first run): the start screen, then the run;
 #   - from the logon resume task (-Resume): straight back into the saved run;
 #   - as the Windows Update child process the windows-update step starts (-WuRound -ResultPath <p>):
-#     one round, no lock, no screen.
+#     one round, no lock, no screen;
+#   - as the un-hide child Finalize starts at the end of the run (-WuUnhide -ResultPath <p> -UpdateIds <ids>):
+#     no lock, no screen.
 #
 # The call itself, `exit (Start-BenTechSetup ...)`, is not in this file: it is src/Entry/Run.ps1, which
 # only tools\Build-Bundle.ps1 appends, as the bundle's last statement. That keeps this file safe to
@@ -164,6 +166,44 @@ function Invoke-SetupWuRoundProcess {
   }
 }
 
+function Invoke-SetupWuUnhideProcess {
+  # Private. The -WuUnhide child process (final review C1): at the end of a run, un-hides the Windows updates
+  # whose ids the parent passes in -UpdateIds (comma-separated; Restore-WuHiddenUpdates). Like -WuRound it
+  # takes no lock and shows nothing: no tick, no screen, no activity feed, no state. Only GUID-shaped ids
+  # are searched for; any other is listed as UnhideFailed. A failed search (or session) is logged and lists
+  # every id as UnhideFailed. It always writes { Unhidden; UnhideFailed } to -ResultPath (UTF-8, no BOM)
+  # and returns 0; 1 when that file cannot be written (the parent then counts every id as still hidden).
+  [CmdletBinding()]
+  [OutputType([int])]
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [AllowNull()][AllowEmptyString()][string]$ResultPath,
+    [AllowNull()][AllowEmptyString()][string]$UpdateIds
+  )
+
+  try {
+    $null = Initialize-SetupLog -LogDirectory (Join-Path $Root 'Logs')
+    $all = @(([string]$UpdateIds) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $ids = [string[]]@($all | Where-Object { $_ -match $script:WuUpdateIdPattern })
+    $odd = @($all | Where-Object { $_ -notmatch $script:WuUpdateIdPattern })
+    $result = [ordered]@{ Unhidden = @(); UnhideFailed = [string[]]@($ids + $odd) }
+    try {
+      if ($ids.Count -gt 0) {
+        $unhide = Invoke-WuUnhide -Session (New-WuSession) -Ids $ids
+        $result = [ordered]@{ Unhidden = [string[]]@($unhide.Unhidden); UnhideFailed = [string[]]@(@($unhide.UnhideFailed) + $odd) }
+      }
+    } catch {
+      Write-SetupLog -Level ERROR -Message 'Windows Update un-hide failed' -Data @{ error = $_.Exception.Message; ids = $ids }
+    }
+    Write-WuRoundResult -Path $ResultPath -Result $result
+    Write-SetupLog -Message 'Windows Update un-hide result written' -Data @{ path = $ResultPath; unhidden = @($result.Unhidden).Count; failed = @($result.UnhideFailed).Count }
+    return 0
+  } catch {
+    Write-SetupLog -Level ERROR -Message 'Windows Update un-hide process failed' -Data @{ error = $_.Exception.Message; resultPath = $ResultPath }
+    return 1
+  }
+}
+
 function Complete-SetupRun {
   # Private. After a 'Completed' run: finishes the finalization when the finalize step is not Done
   # (ruling R26: a failed final restart, or a finalize that failed or never finished, would otherwise
@@ -289,14 +329,18 @@ function Invoke-SetupMainFlow {
 function Start-BenTechSetup {
   <#
   .SYNOPSIS
-    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound
-    child) or 2 (another run holds the lock).
+    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound or
+    -WuUnhide child) or 2 (another run holds the lock).
   .DESCRIPTION
     -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide and
     windowsUpdate.installMode, the state's Machine.IsWindows10 and the power status read now (-OnAC; a
     failed read is battery); no lock,
     no transcript, no screen: no activity feed, no tick, no console resize. 0 when the round ran, 1 when
     it could not (logged).
+
+    -WuUnhide (final review C1): the end-of-run un-hide child that Restore-WuHiddenUpdates starts with
+    -ResultPath and -UpdateIds (Invoke-SetupWuUnhideProcess): the same rules as -WuRound (no lock, no
+    transcript, no screen, no state); 0 when its result JSON was written, 1 when not.
 
     Otherwise:
       1. Logging: Initialize-SetupLog <Root>\Logs; the activity feed (Initialize-SetupActivity, its
@@ -344,6 +388,8 @@ function Start-BenTechSetup {
     [bool]$WuRound,
     [bool]$SearchOnly,
     [AllowNull()][AllowEmptyString()][string]$ResultPath,
+    [bool]$WuUnhide,
+    [AllowNull()][AllowEmptyString()][string]$UpdateIds,
     [ValidateNotNullOrEmpty()][string]$Root = 'C:\BenTech\Setup',
     [AllowNull()][AllowEmptyString()][string]$ScriptPath,
     [scriptblock]$CrashScreen = {
@@ -361,6 +407,7 @@ function Start-BenTechSetup {
   )
 
   if ($WuRound) { return (Invoke-SetupWuRoundProcess -Root $Root -ResultPath $ResultPath -SearchOnly $SearchOnly) }
+  if ($WuUnhide) { return (Invoke-SetupWuUnhideProcess -Root $Root -ResultPath $ResultPath -UpdateIds $UpdateIds) }
 
   if ([string]::IsNullOrEmpty($ScriptPath)) { $ScriptPath = Join-Path $Root 'setup.ps1' }
   $version = if ([string]::IsNullOrEmpty([string]$script:SetupVersion)) { 'dev' } else { [string]$script:SetupVersion }

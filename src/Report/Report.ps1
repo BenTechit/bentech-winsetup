@@ -168,7 +168,8 @@ function Format-SetupReport {
       given) / AnyDesk ID ('not available' when there is none)
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
-      Windows Update: <rounds> rounds, <installed> installed, hidden: <titles, or ids, or 'none'>
+      Windows Update: <rounds> rounds, <installed> installed, failed repeatedly (left to Windows Update):
+             <titles, or ids, or 'none'> (the updates the run hid, un-hidden again at its end)
       Windows updates installed: '  <Round N: KB title>' per Data.InstalledLines of the windows-update
              step, in the order they were installed ('  none' when there are none)
       Steps: '  <Status padded to 8> <Title> - <Message> (<time>)' per plan step. ' - <Message>' is
@@ -228,7 +229,8 @@ function Format-SetupReport {
     $lines.Add(('  {0} {1}' -f (ConvertTo-ScreenText $name), (ConvertTo-ScreenText $AppVersions[$name])))
   }
 
-  # Hidden updates are listed by the title the Windows Update step recorded, else by their id.
+  # The updates the run hid after repeated failures (Finalize un-hides them again, final review C1) are
+  # listed by the title the Windows Update step recorded, else by their id.
   $wuStep = $steps['windows-update']
   $wuData = if ($wuStep -is [System.Collections.IDictionary] -and $wuStep['Data'] -is [System.Collections.IDictionary]) { $wuStep['Data'] } else { @{} }
   $titles = if ($wuData['FailedTitles'] -is [System.Collections.IDictionary]) { $wuData['FailedTitles'] } else { @{} }
@@ -241,7 +243,7 @@ function Format-SetupReport {
   }
   $hiddenText = if ($hidden.Count -gt 0) { $hidden.ToArray() -join ', ' } else { 'none' }
   $lines.Add('')
-  $lines.Add(('Windows Update: {0} rounds, {1} installed, hidden: {2}' -f [int]$wuData['Rounds'], [int]$wuData['Installed'], $hiddenText))
+  $lines.Add(('Windows Update: {0} rounds, {1} installed, failed repeatedly (left to Windows Update): {2}' -f [int]$wuData['Rounds'], [int]$wuData['Installed'], $hiddenText))
 
   # The updates each round installed, one line per update (Data.InstalledLines, written by the Windows
   # Update step); the text is made ASCII here, like every free-text value of the report.

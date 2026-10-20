@@ -96,12 +96,13 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # A state.json inside $TestDrive for the child to read. Returns its path.
     function New-WuStateFile {
-      param([int]$Rounds = 2, [hashtable]$FailureCounts = @{}, [string[]]$PreviousHidden = @())
+      param([int]$Rounds = 2, [hashtable]$FailureCounts = @{}, [string[]]$PreviousHidden = @(), [switch]$PreviousRestored)
       $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
       $state = New-RunState -Machine @{ IsWindows10 = $false } -Choices @{} -Plan @('windows-update') -Version 'test'
       $state.Steps['windows-update'].Data = @{ Rounds = $Rounds }
       $state.WuFailureCounts = $FailureCounts
       $state.PreviousHiddenUpdateIds = [string[]]@($PreviousHidden)
+      $state.PreviousHiddenRestored = [bool]$PreviousRestored
       Save-RunState -State $state -Root $root
       return (Join-Path $root 'state.json')
     }
@@ -283,17 +284,62 @@ Describe 'Windows Update round and step (mocked COM)' {
     }
     It 'un-hides the previous run''s hidden updates in round 1' {
       $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'p1'), (New-FakeUpdate -Id 'p9'))
-      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1 -PreviousHidden @('p1'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1 -PreviousHidden @('p1'))
       $script:searches[0] | Should -Be 'IsHidden=1'
       $script:hideCalls.Count | Should -Be 1
       $script:hideCalls[0].Id | Should -Be 'p1'
       $script:hideCalls[0].Hidden | Should -BeFalse
+      $r.PreviousUnhideDone | Should -BeTrue
     }
-    It 'does not un-hide anything after round 1' {
+    # Final review C1: once per run by a state flag, not "round 1 only", so a round 1 that failed before
+    # the un-hide does not lose it for the whole run.
+    It 'does not un-hide again once the state says it was done' {
       $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'p1'))
-      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 2 -PreviousHidden @('p1'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 2 -PreviousHidden @('p1') -PreviousRestored)
       $script:searches -contains 'IsHidden=1' | Should -BeFalse
       $script:hideCalls.Count | Should -Be 0
+      $r.PreviousUnhideDone | Should -BeFalse
+    }
+    It 'un-hides in a later round when round 1 never got to it (no flag in the state)' {
+      $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'p1'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 2 -PreviousHidden @('p1'))
+      $script:searches[0] | Should -Be 'IsHidden=1'
+      @($script:hideCalls | ForEach-Object { '{0}={1}' -f $_.Id, $_.Hidden }) | Should -Be @('p1=False')
+      $r.PreviousUnhideDone | Should -BeTrue
+    }
+    It 'a round that fails before the un-hide does not report it done' {
+      Mock Register-MicrosoftUpdateService { throw 'Microsoft Update registration failed' }
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1 -PreviousHidden @('p1'))
+      $r.Error | Should -Be 'Microsoft Update registration failed'
+      $r.PreviousUnhideDone | Should -BeFalse
+      $script:hideCalls.Count | Should -Be 0
+    }
+    It 'an update that cannot be un-hidden is a WARN; the round goes on and the un-hide counts as done' {
+      $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'p1'), (New-FakeUpdate -Id 'p2'))
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+      $script:hideThrowFor = @{ p1 = 'cannot un-hide' }
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1 -PreviousHidden @('p1', 'p2'))
+      $r.Error | Should -BeNullOrEmpty; @($r.Installed.Id) | Should -Be @('a'); $r.PreviousUnhideDone | Should -BeTrue
+      @($script:hideCalls | ForEach-Object { $_.Id }) | Should -Be @('p1', 'p2')
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Windows update could not be un-hidden' -and $_.Data.id -eq 'p1' }).Count | Should -Be 1
+    }
+    It 'Invoke-WuUnhide un-hides only the given ids that are hidden (any letter case), each once, and lists them' {
+      $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'A1'), (New-FakeUpdate -Id 'b2'), (New-FakeUpdate -Id 'c3'), (New-FakeUpdate -Id 'A1'))
+      $r = Invoke-WuUnhide -Session ([pscustomobject]@{ Name = 'fake session' }) -Ids @('a1', 'c3', 'd4', 'c3')
+      @($script:searches) | Should -Be @('IsHidden=1')
+      @($script:hideCalls | ForEach-Object { '{0}={1}' -f $_.Id, $_.Hidden }) | Should -Be @('A1=False', 'c3=False')
+      @($r.Unhidden) | Should -Be @('A1', 'c3'); @($r.UnhideFailed).Count | Should -Be 0
+    }
+    It 'Invoke-WuUnhide lists an update that refuses in UnhideFailed and goes on with the rest' {
+      $script:searchResults['IsHidden=1'] = @((New-FakeUpdate -Id 'x1'), (New-FakeUpdate -Id 'x2'))
+      $script:hideThrowFor = @{ x1 = (New-Object Runtime.InteropServices.COMException('refused', 0x80248016)) }
+      $r = Invoke-WuUnhide -Session ([pscustomobject]@{ Name = 'fake session' }) -Ids @('x1', 'x2')
+      @($r.Unhidden) | Should -Be @('x2'); @($r.UnhideFailed) | Should -Be @('x1')
+      ($script:logs | Where-Object { $_.Message -eq 'Windows update could not be un-hidden' }).Data.errorCode | Should -Be '0x80248016'
+    }
+    It 'Invoke-WuUnhide with no ids searches nothing' {
+      $r = Invoke-WuUnhide -Session ([pscustomobject]@{ Name = 'fake session' }) -Ids @()
+      $script:searches.Count | Should -Be 0; @($r.Unhidden).Count | Should -Be 0; @($r.UnhideFailed).Count | Should -Be 0
     }
     It 'hides updates that failed too often and installs the rest' {
       $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'h'), (New-FakeUpdate -Id 'i'))
@@ -1159,6 +1205,113 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r.Status | Should -Be 'Continue'; @($r.Notes).Count | Should -Be 0
     }
     It 'uses the vendor pass''s exact battery text' { . "$PSScriptRoot\..\src\Steps\Vendor.ps1"; $script:WuBatteryNote | Should -BeExactly $script:BatteryNote }
+
+    # Final review C1: the child says when it un-hid the previous run's updates; the state remembers it for the run.
+    It 'books PreviousUnhideDone into State.PreviousHiddenRestored, also from a round with an error' {
+      $script:ctx = New-WuContext
+      $res = New-ChildResult -ErrorText 'search failed'; $res['PreviousUnhideDone'] = $true; $script:childResult = $res
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.PreviousHiddenRestored | Should -BeTrue
+    }
+    It 'leaves State.PreviousHiddenRestored alone when the child did not un-hide' {
+      $script:ctx = New-WuContext
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.PreviousHiddenRestored | Should -Not -BeTrue
+      $script:ctx.State.PreviousHiddenRestored = $true
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx.State.PreviousHiddenRestored | Should -BeTrue
+    }
+  }
+
+  # Final review C1 (v1 spec 8.8): at the end of every run the updates this run (or the previous one) hid are
+  # un-hidden again, in a -WuUnhide child (mocked here: it only writes its result JSON inside $TestDrive).
+  Context 'Restore-WuHiddenUpdates (end of the run, child mocked)' {
+    BeforeAll {
+      $script:g1 = '11111111-aaaa-4bbb-8ccc-000000000001'; $script:g2 = '22222222-aaaa-4bbb-8ccc-000000000002'; $script:g3 = '33333333-aaaa-4bbb-8ccc-000000000003'
+    }
+    BeforeEach {
+      $script:ext = New-Object System.Collections.ArrayList
+      $script:unhideResult = [ordered]@{ Unhidden = @(); UnhideFailed = @() }
+      $script:unhideJson = $null
+      $script:unhideTimedOut = $false
+      $script:unhideThrows = $false
+      $script:logs = New-Object System.Collections.ArrayList
+      Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+      Mock Invoke-External {
+        [void]$script:ext.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes })
+        if ($script:unhideThrows) { throw 'The system cannot find the file specified' }
+        if ($script:unhideTimedOut) { return @{ ExitCode = $null; TimedOut = $true; Output = '' } }
+        $path = [regex]::Match($ArgumentList, '-ResultPath "([^"]+)"').Groups[1].Value
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+        if ($null -ne $script:unhideJson) { [IO.File]::WriteAllText($path, $script:unhideJson, (New-Object Text.UTF8Encoding $false)) }
+        elseif ($null -ne $script:unhideResult) { Write-WuRoundResult -Path $path -Result $script:unhideResult }
+        return @{ ExitCode = 0; TimedOut = $false; Output = '' }
+      }
+      # A run that hid g1 (title known) and inherited g2 from the previous run (no title).
+      $script:ctx = New-WuContext -Hidden @($script:g1) -Data @{ FailedTitles = @{ $script:g1 = 'Cumulative Update KB5050001' } }
+      $script:ctx.State.PreviousHiddenUpdateIds = @($script:g2, $script:g1.ToUpperInvariant())
+    }
+
+    It 'starts no child when nothing was hidden' {
+      $c = New-WuContext
+      @(Restore-WuHiddenUpdates -Context $c).Count | Should -Be 0
+      $script:ext.Count | Should -Be 0
+      $c.State.HiddenUpdatesRestored | Should -Not -BeTrue
+    }
+    It 'passes this run''s and the previous run''s ids exactly, once each, to a -WuUnhide child with a 15-minute timeout' {
+      $null = Restore-WuHiddenUpdates -Context $script:ctx
+      $script:ext.Count | Should -Be 1
+      $script:ext[0].FilePath | Should -Be $script:PowerShellExe
+      $expected = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -WuUnhide -ResultPath "{1}" -UpdateIds "{2},{3}"' -f $script:ctx.ScriptPath, (Join-Path $script:ctx.LogDir 'wu-unhide.json'), $script:g1, $script:g2
+      $script:ext[0].ArgumentList | Should -Be $expected
+      $script:ext[0].TimeoutMinutes | Should -Be 15
+    }
+    It 'success sets HiddenUpdatesRestored, saves it, and a second call starts nothing' {
+      $script:unhideResult = [ordered]@{ Unhidden = @($script:g1); UnhideFailed = @() }
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 0
+      $script:ctx.State.HiddenUpdatesRestored | Should -BeTrue
+      (Read-RunState -Root $script:ctx.Root).HiddenUpdatesRestored | Should -BeTrue
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 0
+      $script:ext.Count | Should -Be 1
+    }
+    It 'an id left in UnhideFailed is red, by its title where known, else by its id; the flag stays unset' {
+      $script:unhideResult = [ordered]@{ Unhidden = @(); UnhideFailed = @($script:g1, $script:g2) }
+      $errors = @(Restore-WuHiddenUpdates -Context $script:ctx)
+      $errors | Should -Be @(
+        'Windows update still hidden: Cumulative Update KB5050001 - un-hide it in Windows Update',
+        "Windows update still hidden: $($script:g2) - un-hide it in Windows Update")
+      $script:ctx.State.HiddenUpdatesRestored | Should -Not -BeTrue
+    }
+    It 'a timeout is red for every id' {
+      $script:unhideTimedOut = $true
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 2
+      $script:ctx.State.HiddenUpdatesRestored | Should -Not -BeTrue
+    }
+    It 'a child that cannot start, writes nothing, or writes an unreadable result is red for every id' {
+      $script:unhideThrows = $true
+      @(Restore-WuHiddenUpdates -Context $script:ctx) | Should -Contain 'Windows update still hidden: Cumulative Update KB5050001 - un-hide it in Windows Update'
+      $script:unhideThrows = $false; $script:unhideResult = $null
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 2
+      $script:unhideJson = '{"Unhidden": ['
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 2
+      $script:unhideJson = '{"Unhidden": []}'
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 2
+      $script:ctx.State.HiddenUpdatesRestored | Should -Not -BeTrue
+    }
+    It 'never reads a stale result file left by an earlier call' {
+      [void][IO.Directory]::CreateDirectory($script:ctx.LogDir)
+      Write-WuRoundResult -Path (Join-Path $script:ctx.LogDir 'wu-unhide.json') -Result ([ordered]@{ Unhidden = @($script:g1, $script:g2); UnhideFailed = @() })
+      $script:unhideResult = $null
+      @(Restore-WuHiddenUpdates -Context $script:ctx).Count | Should -Be 2
+    }
+    It 'never puts an id that is not a GUID on the command line; it counts as still hidden' {
+      $script:ctx.State.HiddenUpdateIds = @($script:g3, 'x" -Resume "')
+      $script:ctx.State.PreviousHiddenUpdateIds = @()
+      $script:unhideResult = [ordered]@{ Unhidden = @($script:g3); UnhideFailed = @() }
+      $errors = @(Restore-WuHiddenUpdates -Context $script:ctx)
+      $script:ext[0].ArgumentList | Should -Match ('-UpdateIds "{0}"$' -f $script:g3)
+      $errors | Should -Be @('Windows update still hidden: x" -Resume " - un-hide it in Windows Update')
+    }
   }
 }
 

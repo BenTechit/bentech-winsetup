@@ -19,7 +19,7 @@
 # Get-CimInstance / Get-ItemProperty themselves, so they read nothing real either.
 BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','Engine\Verdict','Engine\Reboot','Report\Report','Steps\Finalize') { . "$PSScriptRoot\..\src\$f.ps1" }
   # The helpers Finalize and the report reuse (the bundle holds every file), and the runner for the end-to-end tests.
-  foreach ($f in 'Common\Logging','Common\Activity','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Logging','Common\Activity','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget','Steps\WindowsUpdate') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:st = New-RunState -Machine @{ Manufacturer='Dell Inc.'; FriendlyModel='Latitude 5440'; Serial='7HX2K93'; ComputerName='DESKTOP-AB12'; NewName='DELL-7HX2K93'; OsCaption='Windows 11 Pro'; OsDisplayVersion='25H2'; OsBuild=26200; Arch='x64'; IsLaptop=$true; IsVM=$false } -Choices @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'} -Plan @('chrome') -Version '2026.10.18.1'
   $st.StartedAt = '2026-10-18T09:05:00'; $st.EndedAt = '2026-10-18T10:17:00'; $st.AnyDeskId = '123456789'; $st.Steps.chrome.Status = 'Done'
 
@@ -256,8 +256,8 @@ Describe 'Format-SetupReport content' {
     $lines[[array]::IndexOf($lines, 'Apps:') + 1] | Should -Be '  none'
   }
   It 'summarises Windows Update with hidden updates by title, else by id' {
-    $red | Should -Contain 'Windows Update: 3 rounds, 7 installed, hidden: Cumulative Update KB5050001 ????, id-2'
-    $green | Should -Contain 'Windows Update: 0 rounds, 0 installed, hidden: none'
+    $red | Should -Contain 'Windows Update: 3 rounds, 7 installed, failed repeatedly (left to Windows Update): Cumulative Update KB5050001 ????, id-2'
+    $green | Should -Contain 'Windows Update: 0 rounds, 0 installed, failed repeatedly (left to Windows Update): none'
   }
   It 'lists Windows updates installed per round, and none when there are none' {
     $red | Should -Contain 'Windows updates installed:'
@@ -307,7 +307,7 @@ Describe 'Format-SetupReport content' {
   It 'adds Failures and Notes sections only when there are some' {
     $red | Should -Contain 'Failures:'
     $red | Should -Contain '  Vendor drivers + BIOS (pass 1): DCU exited 3001 ????'
-    $red | Should -Contain '  Windows update hidden after repeated failures: id-2'
+    $red | Should -Contain '  Windows update failed repeatedly (left to Windows Update): id-2'
     $red | Should -Contain 'Notes:'
     $red | Should -Contain '  Windows not activated'
     $green | Should -Not -Contain 'Failures:'
@@ -997,6 +997,40 @@ Describe 'Finalize waits for a background Microsoft 365 (Task 13)' {
     Mock Wait-SetupDelay { throw 'must not wait' }; Mock Get-Process { throw 'must not look' }
     $ctx = New-FinalizeContext -PhaseB
     (Invoke-StepFinalize -Context $ctx).Status | Should -Be 'Done'
+  }
+}
+
+# Final review C1 (v1 spec 8.8): Phase B un-hides what the run hid, right after the Office wait, so the report and
+# the verdict say what is true on the machine afterwards.
+Describe 'Finalize un-hides the hidden Windows updates (final review C1)' {
+  BeforeEach { Initialize-FinalizeMocks; $script:order = New-Object System.Collections.ArrayList }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+
+  It 'runs the un-hide right after the Office wait, on every Phase B path' {
+    Mock Wait-OfficeBackground { [void]$script:order.Add('office'); @{ Outcome = 'None' } }
+    Mock Restore-WuHiddenUpdates { [void]$script:order.Add('unhide'); @() }
+    Mock Invoke-WindowsActivation { [void]$script:order.Add('activate'); 'NotNeeded' }
+    Mock Test-ChromeInstalled { [void]$script:order.Add('chrome'); $true }
+    $null = Complete-SetupFinalization -Context (New-FinalizeContext -PhaseB)
+    @($script:order)[0..2] | Should -Be @('office', 'unhide', 'chrome')
+    $script:order.Clear()   # the R26 path: Phase A never ran
+    $ctx = New-FinalizeContext; $ctx.State.Steps['finalize'].Status = 'Failed'; $ctx.State.Steps['finalize'].Message = 'restart failed'
+    $null = Complete-SetupFinalization -Context $ctx
+    @($script:order)[0..2] | Should -Be @('office', 'unhide', 'activate')
+    Should -Invoke Restore-WuHiddenUpdates -Times 2 -Exactly
+  }
+  It 'an update still hidden is a red error in the verdict and the report' {
+    Mock Restore-WuHiddenUpdates { @('Windows update still hidden: Cumulative Update KB5050001 - un-hide it in Windows Update') }
+    $ctx = New-FinalizeContext -PhaseB
+    $null = Complete-SetupFinalization -Context $ctx
+    $ctx.State.Errors | Should -Contain 'Windows update still hidden: Cumulative Update KB5050001 - un-hide it in Windows Update'
+    (Get-RunVerdict -State $ctx.State).Color | Should -Be 'RED'
+    Get-ReportLines -Context $ctx | Should -Contain '  Windows update still hidden: Cumulative Update KB5050001 - un-hide it in Windows Update'
+  }
+  It 'with nothing hidden the real un-hide starts no child (the safety net would block it)' {
+    $ctx = New-FinalizeContext -PhaseB
+    (Complete-SetupFinalization -Context $ctx).Status | Should -Be 'Done'
+    (Get-RunVerdict -State $ctx.State).Color | Should -Be 'GREEN'
   }
 }
 

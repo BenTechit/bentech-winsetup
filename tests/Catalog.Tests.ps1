@@ -117,8 +117,8 @@ Describe 'Get-RunVerdict' {
   }
   It 'names the hidden update id' {
     $s.HiddenUpdateIds = @('abc', 'def'); $f = (Get-RunVerdict -State $s).Failures
-    $f | Should -Contain 'Windows update hidden after repeated failures: abc'
-    $f | Should -Contain 'Windows update hidden after repeated failures: def'
+    $f | Should -Contain 'Windows update failed repeatedly (left to Windows Update): abc'
+    $f | Should -Contain 'Windows update failed repeatedly (left to Windows Update): def'
   }
   It 'passes state notes and errors through' {
     $s.Notes = @('n1'); $s.Errors = @('e1'); $v = Get-RunVerdict -State $s
@@ -156,16 +156,16 @@ Describe 'Get-RunVerdict' {
     $s.Plan = @('chrome', 'windows-update'); $s.Steps['windows-update'] = @{ Status = 'Done'; Message = ''; Data = @{ FailedTitles = @{ 'abc' = 'Cumulative Update KB5050001'; 'xyz' = 'not hidden' } } }
     $s.HiddenUpdateIds = @('abc', 'def')
     $f = (Get-RunVerdict -State $s).Failures
-    $f | Should -Contain 'Windows update hidden after repeated failures: Cumulative Update KB5050001'
-    $f | Should -Contain 'Windows update hidden after repeated failures: def'
+    $f | Should -Contain 'Windows update failed repeatedly (left to Windows Update): Cumulative Update KB5050001'
+    $f | Should -Contain 'Windows update failed repeatedly (left to Windows Update): def'
     ($f -join "`n") | Should -Not -Match 'xyz|not hidden'
   }
   It 'falls back to the id when the title is empty or the step Data is missing' {
     $s.Plan = @('chrome', 'windows-update'); $s.Steps['windows-update'] = @{ Status = 'Done'; Message = ''; Data = @{ FailedTitles = @{ 'abc' = '  ' } } }
     $s.HiddenUpdateIds = @('abc')
-    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update hidden after repeated failures: abc'
+    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update failed repeatedly (left to Windows Update): abc'
     $s.Steps['windows-update'] = @{ Status = 'Done'; Message = '' }
-    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update hidden after repeated failures: abc'
+    (Get-RunVerdict -State $s).Failures | Should -Contain 'Windows update failed repeatedly (left to Windows Update): abc'
   }
   It 'lists an exact duplicate failure or note once, keeping the first (M1)' {
     $s.Steps.chrome.Status = 'Failed'; $s.Steps.chrome.Message = 'x'

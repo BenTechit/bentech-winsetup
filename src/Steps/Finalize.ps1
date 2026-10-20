@@ -2,7 +2,8 @@
 # Step 17, "Finalize" (spec 8.3 step 17, 8.4, 8.7 and 12): the last step. It runs in two phases.
 #   Both start by waiting for a Microsoft 365 setup still running in the background (Wait-OfficeBackground,
 #     v2 spec 4.6; a no-op without one): Phase A restores power settings and Phase B deletes Downloads\
-#     (the ODT and office.xml), so neither may race a live install.
+#     (the ODT and office.xml), so neither may race a live install. Phase B then un-hides the Windows
+#     updates the run hid (Restore-WuHiddenUpdates, final review C1).
 #   Phase A (State.FinalRebootDone is $false): the final power settings, the no-auto-reboot policy
 #     value removed, FinalRebootDone saved, one attempt to activate Windows (spec 9.5), then ONE
 #     final restart when something needs it (Test-FinalRebootNeeded) and a restart is possible.
@@ -15,7 +16,8 @@
 #     with the resume task still registered (ruling R26). The entry point then shows the final screen.
 # Needs StepResult.ps1, Logging.ps1, State.ps1, Catalog.ps1 + Verdict.ps1, Reboot.ps1, Prepare.ps1,
 # Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild), Office.ps1
-# (Wait-OfficeBackground) and Report.ps1; the bundle holds every file.
+# (Wait-OfficeBackground), WindowsUpdate.ps1 (Restore-WuHiddenUpdates) and Report.ps1; the bundle holds
+# every file.
 #
 # Notes and errors: Finalize writes its own straight into State.Notes / State.Errors
 # (Add-FinalizeMessage), and its results never carry any. Phase B must have them in the State before
@@ -464,6 +466,10 @@ function Complete-SetupFinalization {
       - the state is saved at the end (a failed save is a WARN; the runner saves again anyway).
     Before anything else it waits for a background Microsoft 365 setup that is still running
     (Wait-OfficeBackground -Purpose Finish): step 8 deletes the ODT and office.xml.
+    Right after that (final review C1, v1 spec 8.8), Restore-WuHiddenUpdates un-hides the Windows updates
+    this run (or the previous one) hid, in a -WuUnhide child, before step 8 deletes setup.ps1; each update
+    still hidden afterwards is an Error 'Windows update still hidden: <title> - un-hide it in Windows
+    Update'. It runs once per run (State.HiddenUpdatesRestored).
     Then, in order:
       1. Chrome installed but not the default browser -> Note 'Chrome is not the default browser'
          (checked before its policy is removed). Spec 9.4: when the default-browser step set the
@@ -498,6 +504,9 @@ function Complete-SetupFinalization {
   $hasFinalizeStep = ($runState.Steps -is [hashtable] -and $runState.Steps.ContainsKey($script:FinalizeStepId))
   $earlierStatus = if ($hasFinalizeStep) { [string]$runState.Steps[$script:FinalizeStepId].Status } else { '' }
   Write-SetupLog -Message 'Completing the setup' -Data @{ finalizeStatus = $earlierStatus; finalRebootDone = ($runState.FinalRebootDone -eq $true) }
+
+  # Final review C1 (v1 spec 8.8): what the run hid is un-hidden again; whatever stays hidden is red.
+  foreach ($text in @(Restore-WuHiddenUpdates -Context $Context)) { Add-FinalizeMessage -State $runState -Field Errors -Text $text }
 
   if ($runState.FinalRebootDone -ne $true) {
     $null = Invoke-WindowsActivation

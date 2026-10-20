@@ -23,9 +23,10 @@ function Get-RunVerdict {
     "<Title>: <Message>". A step that is still pending or running (or has no state entry at all)
     when the verdict is taken never finished, so it is a failure ("<Title>: did not finish"): the
     final screen must never be green when steps never ran. Done steps are fine.
-    Then 'Reboot limit reached', each hidden update ("Windows update hidden after repeated failures:
-    <title>", the title the Windows Update step recorded in Data.FailedTitles, else the id; M7), and
-    State.Errors are failures; State.Notes are notes. A string already in its list is not added again
+    Then 'Reboot limit reached', each update the run hid after repeated failures ("Windows update failed
+    repeatedly (left to Windows Update): <title>", the title the Windows Update step recorded in
+    Data.FailedTitles, else the id; M7; Finalize un-hides it again at the end, final review C1, and one
+    that stays hidden is in State.Errors too), and State.Errors are failures; State.Notes are notes. A string already in its list is not added again
     (exact match; M1), so one root cause reported by two steps takes one line on the final screen.
     RED if any failure, otherwise YELLOW if any note, otherwise GREEN.
   #>
@@ -59,7 +60,8 @@ function Get-RunVerdict {
 
   if ($State['RebootCapHit'] -eq $true) { & $addFailure 'Reboot limit reached' }
 
-  # Hidden updates by title (as the report lists them), else by id.
+  # Updates the run hid, by title (as the report lists them), else by id. They are un-hidden at the end of
+  # the run (final review C1), so the line says what is true afterwards.
   $titles = @{}
   $wuStep = if ($State['Steps'] -is [System.Collections.IDictionary]) { $State['Steps']['windows-update'] } else { $null }
   if ($wuStep -is [System.Collections.IDictionary] -and $wuStep['Data'] -is [System.Collections.IDictionary] -and
@@ -71,7 +73,7 @@ function Get-RunVerdict {
     if ([string]::IsNullOrEmpty($key)) { continue }
     $title = if ($titles.Contains($key)) { [string]$titles[$key] } else { '' }
     $name = if ([string]::IsNullOrWhiteSpace($title)) { $key } else { $title }
-    & $addFailure ('Windows update hidden after repeated failures: {0}' -f $name)
+    & $addFailure ('Windows update failed repeatedly (left to Windows Update): {0}' -f $name)
   }
   foreach ($e in @($State['Errors'])) { if (-not [string]::IsNullOrEmpty($e)) { & $addFailure ([string]$e) } }
   foreach ($n in @($State['Notes']))  { if (-not [string]::IsNullOrEmpty($n)) { & $addNote ([string]$n) } }

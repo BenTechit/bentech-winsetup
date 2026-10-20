@@ -54,6 +54,8 @@ function New-RunState {
     Builds a fresh State hashtable (see "Shared shapes" in the plan). Every plan step is pending.
   .DESCRIPTION
     PreviousRun stays $null: the entry point (Task 17) fills it from the previous run's verdict.
+    PreviousHiddenRestored ($true once a Windows Update round un-hid PreviousHiddenUpdateIds) and
+    HiddenUpdatesRestored ($true once Finalize un-hid what the run hid) start $false (final review C1).
     From -Previous (the earlier run's state, if any):
       - PreviousHiddenUpdateIds = the union of its HiddenUpdateIds and its own PreviousHiddenUpdateIds,
         without duplicates (compared without regard to case, first spelling kept), so Windows Update
@@ -114,6 +116,8 @@ function New-RunState {
     WuFailureCounts         = @{}
     HiddenUpdateIds         = @()
     PreviousHiddenUpdateIds = $previousHidden
+    PreviousHiddenRestored  = $false
+    HiddenUpdatesRestored   = $false
     Notes                   = @()
     Errors                  = @()
     AnyDeskId               = $null
