@@ -6,12 +6,15 @@
 # Finding the stick: a new run records the launcher's path ($env:BT_SELF, set by the launcher) and that
 # drive's volume serial number in the state (Get-LauncherInfo). At the end the stick is the drive with that
 # serial, else any other drive holding BenTechSetup.cmd in its root (Find-SetupStick). The system drive is
-# never the stick: a launcher run from the Desktop recorded the system drive's serial.
+# never the stick, and neither is the drive of a Desktop launcher.
 #
-# Deleting C:\BenTech: only Remove-SetupFolder does it, with `cmd.exe /d /c rd /s /q` through Invoke-External.
-# rd removes a junction without following it; Remove-Item -Recurse on Windows PowerShell 5.1 would follow it
-# and delete whatever it points to. It refuses any path whose leaf is not BenTech, a drive root, and a
-# reparse point. Needs Logging.ps1, Activity.ps1 (Wait-SetupDelay) and Process.ps1 (Invoke-External).
+# Nothing here follows a link. Deleting C:\BenTech: only Remove-SetupFolder does it, with
+# `cmd.exe /d /c rd /s /q` through Invoke-External. rd removes a junction without following it;
+# Remove-Item -Recurse on Windows PowerShell 5.1 would follow it and delete whatever it points to. It refuses
+# a path that is not fully qualified, whose leaf is not BenTech, a drive root, and a reparse point, and
+# Invoke-SetupCleanup calls it only for %SystemDrive%\BenTech. The old logs on the stick are replaced with rd
+# too, and a BenTech-Logs that is a link is left alone. Needs Logging.ps1, Activity.ps1 (Wait-SetupDelay) and
+# Process.ps1 (Invoke-External).
 #
 # None of these functions throws.
 
@@ -48,11 +51,13 @@ function Find-SetupStick {
     The BenTech USB stick: @{ Root = 'E:\'; Drive = 'E:' }, or @{ Root = $null; Drive = $null }. Never throws.
   .DESCRIPTION
     One Win32_LogicalDisk read. The disk whose VolumeSerialNumber equals Launcher.VolumeSerial
-    (case-insensitive) wins, so the stick is found under another letter too. Otherwise the first disk with
-    <DeviceID>\BenTechSetup.cmd. The system drive (-SystemDrive) is never the stick, by serial or by file:
-    a launcher started from the Desktop recorded the system drive. Network drives are never looked at (a
-    share that does not answer would hold up the final screen, which calls this every second). A failed
-    query is no stick, logged once per process (not once a second).
+    (case-insensitive) wins, so the stick is found under another letter too; but not when the launcher ran
+    from a Desktop (Test-DesktopLauncher): its serial is then the Desktop's drive, which may be an internal
+    disk. Otherwise the first removable or local fixed disk (DriveType 2 or 3; never an optical drive)
+    with <DeviceID>\BenTechSetup.cmd. The system drive (-SystemDrive) is never the stick, by serial or by
+    file. Network drives are never looked at (a share that does not answer would hold up the final screen,
+    which calls this every second). A failed query is no stick, logged once per process (not once a
+    second).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -69,7 +74,7 @@ function Find-SetupStick {
       $id -ne '' -and $id -ne $system -and [int]$_.DriveType -ne 4
     })
     $serial = if ($null -ne $Launcher) { [string]$Launcher['VolumeSerial'] } else { '' }
-    if ($serial -ne '') {
+    if ($serial -ne '' -and -not (Test-DesktopLauncher -Path ([string]$Launcher['Path']))) {
       foreach ($disk in $disks) {
         if ([string]::Equals([string]$disk.VolumeSerialNumber, $serial, [StringComparison]::OrdinalIgnoreCase)) {
           $id = ([string]$disk.DeviceID).ToUpperInvariant()
@@ -78,6 +83,7 @@ function Find-SetupStick {
       }
     }
     foreach ($disk in $disks) {
+      if ([int]$disk.DriveType -notin 2, 3) { continue }
       $id = ([string]$disk.DeviceID).ToUpperInvariant()
       if (Test-Path -LiteralPath ($id + '\BenTechSetup.cmd') -PathType Leaf) { return @{ Root = $id + '\'; Drive = $id } }
     }
@@ -120,14 +126,32 @@ function Get-StickLogTarget {
   return [IO.Path]::Combine($StickRoot, 'BenTech-Logs', $name)
 }
 
+function Test-StickReparsePoint {
+  # Private. $true when something exists at -Path and it is a reparse point (a junction or a symbolic link,
+  # also one whose target is gone). Nothing there is $false. Any other error (access denied) propagates.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    return (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+  } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+    return $false
+  }
+}
+
 function Copy-SetupLogsToStick {
   <#
   .SYNOPSIS
     Copies -LogDir to <StickRoot>BenTech-Logs\<PcName>, replacing what is there. Returns
     @{ Ok; Target; Error }. Never throws.
   .DESCRIPTION
-    An existing target is removed first (Remove-Item -Recurse: FAT/exFAT holds no junctions), so a re-run of
-    the same PC replaces its logs; then the folder is copied. A failure is Ok = $false with the message.
+    Never follows a link (V2-R13 I1): a stick formatted NTFS that once sat in an infected PC can hold a
+    junction, and this runs as admin. When <StickRoot>BenTech-Logs or the target is a reparse point, nothing
+    is copied or deleted: Ok = $false, Error 'BenTech-Logs on the USB stick is a link; logs not saved'.
+    An existing target is replaced: `cmd.exe /d /c rd /s /q` through Invoke-External (rd removes a junction
+    inside it without following it; never Remove-Item -Recurse), then the folder is copied. A target that is
+    still there after rd, or any other failure, is Ok = $false with the message.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -137,10 +161,19 @@ function Copy-SetupLogsToStick {
     [AllowNull()][AllowEmptyString()][string]$PcName
   )
 
+  $logsRoot = [IO.Path]::Combine($StickRoot, 'BenTech-Logs')
   $target = Get-StickLogTarget -StickRoot $StickRoot -PcName $PcName
   try {
-    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }
-    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+    if ((Test-StickReparsePoint -Path $logsRoot) -or (Test-StickReparsePoint -Path $target)) {
+      return @{ Ok = $false; Target = $target; Error = 'BenTech-Logs on the USB stick is a link; logs not saved' }
+    }
+    if ([IO.Directory]::Exists($target)) {
+      $null = Invoke-External -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList ('/d /c rd /s /q "{0}"' -f $target) -TimeoutMinutes 5 -WorkingDirectory $env:SystemRoot
+      if ([IO.Directory]::Exists($target)) {
+        return @{ Ok = $false; Target = $target; Error = "The old logs in $target could not be removed" }
+      }
+    }
+    [void][IO.Directory]::CreateDirectory($logsRoot)
     Copy-Item -LiteralPath $LogDir -Destination $target -Recurse -Force -ErrorAction Stop
     return @{ Ok = $true; Target = $target; Error = $null }
   } catch {
@@ -188,9 +221,10 @@ function Remove-SetupFolder {
   .SYNOPSIS
     Deletes the BenTech folder at -Path with `rd /s /q`. $true when it no longer exists. Never throws.
   .DESCRIPTION
-    Refuses (ERROR log, $false, nothing run) unless [IO.Path]::GetFullPath(-Path) is a folder whose leaf is
-    BenTech, is not a drive root and is not a reparse point (a junction named BenTech would point the
-    deletion somewhere else). A path that does not exist (already gone) is $true.
+    Refuses (ERROR log, $false, nothing run) a -Path that is not fully qualified, and unless
+    [IO.Path]::GetFullPath(-Path) is a folder whose leaf is BenTech, is not a drive root and is not a
+    reparse point (a junction named BenTech would point the deletion somewhere else). A path that does not
+    exist (already gone) is $true.
     Then `cmd.exe /d /c rd /s /q "<full>"` through Invoke-External (5-minute timeout), up to 1 + -Retries
     tries, Wait-SetupDelay -RetrySeconds between them. rd's exit code is not trusted: success is the folder
     being gone afterwards.
@@ -208,6 +242,13 @@ function Remove-SetupFolder {
     Write-SetupLog -Level ERROR -Message 'Refusing to delete the setup folder' -Data @{ path = $Path; reason = $reason; error = $detail }
   }
 
+  # V2-R13 M1: only a fully qualified path (X:\... or \\server\share\...). A relative or drive-relative one
+  # ('BenTech', '.\BenTech', 'C:', 'C:BenTech', '\BenTech') would resolve against whatever the current
+  # directory happens to be.
+  if ([string]$Path -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])') {
+    & $refuse 'the path is not fully qualified' $null
+    return $false
+  }
   try {
     $full = [IO.Path]::GetFullPath($Path)
   } catch {
@@ -272,15 +313,18 @@ function Invoke-SetupCleanup {
     2. Finish only: the logs go to the stick (Find-SetupStick, Copy-SetupLogsToStick with the new PC name,
        else the computer name). A failed copy is shown and waits for Enter (other keys are ignored), so the
        technician can still save the logs by hand. No stick: one line, no wait.
-    3. Finish only: a launcher that ran from the Desktop (Test-DesktopLauncher) is deleted. A launcher
-       anywhere else is never touched.
+    3. Finish only: a launcher that ran from the Desktop (Test-DesktopLauncher) is deleted, and only when it
+       is a file with the extension .cmd. A launcher anywhere else is never touched.
     4. The process (PowerShell and .NET) moves out of the folder, to %SystemRoot%.
-    5. Remove-SetupFolder on the parent of -Root (C:\BenTech). A failure is shown and waits for any key.
+    5. Remove-SetupFolder on the parent of -Root, but only when that is %SystemDrive%\BenTech (full paths,
+       case-insensitive; otherwise one line 'Not deleting <path>: not C:\BenTech'). A failure is shown and
+       waits for any key.
     6. -ProgramDataFolder is removed when it exists and is empty.
     Cancel (Esc on the start screen, no earlier run) runs 1 and 4-6 only.
+    Both waits empty the key buffer first (-FlushInput), so a key pressed earlier cannot skip them.
 
     The seams (production defaults shown): -ReadKey waits for a key and returns its [ConsoleKey] name;
-    -Write writes one line of text.
+    -Write writes one line of text; -FlushInput throws away waiting key presses.
   #>
   [CmdletBinding()]
   param(
@@ -289,17 +333,20 @@ function Invoke-SetupCleanup {
     [AllowNull()][hashtable]$State,
     [scriptblock]$ReadKey = { [Console]::ReadKey($true).Key.ToString() },
     [scriptblock]$Write = { param($t) Write-Host $t -ForegroundColor White -BackgroundColor Black },
-    [string]$ProgramDataFolder = (Join-Path $env:ProgramData 'BenTech')
+    [string]$ProgramDataFolder = (Join-Path $env:ProgramData 'BenTech'),
+    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } }
   )
 
   $say = {
     param($text)
     try { $null = & $Write $text } catch { }
   }
-  # Waits for Enter (-EnterOnly) or any key. A key read that fails (no console) ends the wait: nothing may
-  # hold the machine forever, and the folder is still deleted.
+  # Waits for Enter (-EnterOnly) or any key, after emptying the key buffer (an Enter typed ahead must not
+  # skip the stop). A key read that fails (no console) ends the wait: nothing may hold the machine forever,
+  # and the folder is still deleted. A flush that fails only loses that guard.
   $waitKey = {
     param([bool]$EnterOnly)
+    try { $null = & $FlushInput } catch { }
     while ($true) {
       try { $key = [string](& $ReadKey) } catch { return }
       if (-not $EnterOnly -or $key -eq 'Enter') { return }
@@ -337,7 +384,8 @@ function Invoke-SetupCleanup {
     }
 
     $launcherPath = if ($null -ne $launcher) { [string]$launcher['Path'] } else { '' }
-    if ($launcherPath -ne '' -and (Test-DesktopLauncher -Path $launcherPath)) {
+    if ($launcherPath -ne '' -and (Test-DesktopLauncher -Path $launcherPath) -and
+        [IO.Path]::GetExtension($launcherPath) -eq '.cmd' -and (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
       try {
         Remove-Item -LiteralPath $launcherPath -Force -ErrorAction Stop
       } catch {
@@ -350,7 +398,18 @@ function Invoke-SetupCleanup {
   try { Set-Location -LiteralPath $env:SystemRoot -ErrorAction Stop } catch { }
   try { [Environment]::CurrentDirectory = $env:SystemRoot } catch { }
 
-  if (-not (Remove-SetupFolder -Path $folder)) {
+  # V2-R13 M1, defence in depth: whatever -Root says, only %SystemDrive%\BenTech is ever deleted.
+  $expected = ([string]$env:SystemDrive).TrimEnd('\') + '\BenTech'
+  $isSetupFolder = $false
+  try {
+    $isSetupFolder = ([string]$env:SystemDrive -match '^[A-Za-z]:\\?$') -and [string]::Equals(
+      [IO.Path]::GetFullPath($folder).TrimEnd('\'), [IO.Path]::GetFullPath($expected).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    $isSetupFolder = $false
+  }
+  if (-not $isSetupFolder) {
+    & $say ('Not deleting {0}: not {1}' -f $folder, $expected)
+  } elseif (-not (Remove-SetupFolder -Path $folder)) {
     & $say ('Could not delete {0} - delete it by hand' -f $folder)
     & $waitKey $false
   }

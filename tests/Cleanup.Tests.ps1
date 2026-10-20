@@ -47,6 +47,21 @@ Describe 'Find-SetupStick (Review Focus 1)' {
     $s = Find-SetupStick -Launcher @{ Path = 'C:\Users\ben\Desktop\BenTechSetup.cmd'; Drive = 'C:'; VolumeSerial = 'AAAA0001' } -SystemDrive 'c:'
     $s.Root | Should -BeNullOrEmpty
   }
+  It 'skips the serial match for a launcher that ran from a Desktop (V2-R13 M2: a Desktop redirected to an internal drive)' {
+    Mock Test-DesktopLauncher { $true }
+    Mock Test-Path { $LiteralPath -eq 'G:\BenTechSetup.cmd' }
+    $s = Find-SetupStick -Launcher @{ Path = 'F:\Users\ben\Desktop\BenTechSetup.cmd'; Drive = 'F:'; VolumeSerial = '1A2B3C4D' } -SystemDrive 'C:'
+    $s.Drive | Should -Be 'G:'                          # F: has the recorded serial, but it is the Desktop's drive
+    Should -Invoke Test-DesktopLauncher -Times 1 -Exactly -ParameterFilter { $Path -eq 'F:\Users\ben\Desktop\BenTechSetup.cmd' }
+    Mock Test-Path { $false }
+    (Find-SetupStick -Launcher @{ Path = 'F:\Users\ben\Desktop\BenTechSetup.cmd'; VolumeSerial = '1A2B3C4D' } -SystemDrive 'C:').Root | Should -BeNullOrEmpty
+  }
+  It 'the fallback probes only removable and fixed disks (DriveType 2 or 3), never an optical drive (V2-R13 M3)' {
+    Mock Get-CimInstance { New-Disk 'C:' 'AAAA0001' 3; New-Disk 'D:' 'CDCD0001' 5; New-Disk 'X:' 'XXXX0001' 0; New-Disk 'H:' 'DDDD0001' 3 } -ParameterFilter { $ClassName -eq 'Win32_LogicalDisk' }
+    Mock Test-Path { $true }
+    (Find-SetupStick -Launcher $null -SystemDrive 'C:').Drive | Should -Be 'H:'
+    Should -Invoke Test-Path -Times 0 -Exactly -ParameterFilter { $LiteralPath -in 'D:\BenTechSetup.cmd', 'X:\BenTechSetup.cmd' }
+  }
   It 'never looks at a network drive (an unreachable share would freeze the screen)' {
     Mock Get-CimInstance { New-Disk 'C:' 'AAAA0001' 3; New-Disk 'N:' '1A2B3C4D' 4 } -ParameterFilter { $ClassName -eq 'Win32_LogicalDisk' }
     Mock Test-Path { $true }
@@ -75,12 +90,62 @@ Describe 'Copy-SetupLogsToStick' {
     $r = Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot "$TestDrive\s2\" -PcName 'PC'; $r.Ok | Should -BeFalse; $r.Error | Should -Match 'not ready'
   }
   It 'turns invalid characters into _ and an empty or dots-only name into UNKNOWN-PC (never the BenTech-Logs folder itself)' {
-    Mock Copy-Item { }; Mock Remove-Item { }
+    Mock Copy-Item { }; Mock Invoke-External { throw 'must not run' }
     $s = "$TestDrive\s3\"
     (Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot $s -PcName 'A:B*C').Target | Should -Be "$($s)BenTech-Logs\A_B_C"
     foreach ($name in '', '..', ' . ') { (Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot $s -PcName $name).Target | Should -Be "$($s)BenTech-Logs\UNKNOWN-PC" }
-    Should -Invoke Remove-Item -Times 0 -Exactly
+    Should -Invoke Invoke-External -Times 0 -Exactly
     Get-StickLogTarget -StickRoot 'E:\' -PcName 'DELL-J0C7QK4' | Should -Be 'E:\BenTech-Logs\DELL-J0C7QK4'   # pure, no file access
+  }
+  It 'replaces the old logs with rd through Invoke-External, never Remove-Item -Recurse' {
+    $logs = "$TestDrive\Logs4"; [void][IO.Directory]::CreateDirectory($logs); 'r' | Set-Content "$logs\setup.log"
+    $script:s4old = "$TestDrive\s4\BenTech-Logs\PC"; $old = $s4old; [void][IO.Directory]::CreateDirectory($old)
+    Mock Remove-Item { throw 'must not run' }
+    Mock Invoke-External { [IO.Directory]::Delete($script:s4old); @{ ExitCode = 0; TimedOut = $false; Output = '' } }   # empty folder, no recursion
+    (Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\s4\" -PcName 'PC').Ok | Should -BeTrue
+    Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter { $FilePath -like '*\System32\cmd.exe' -and $ArgumentList -eq ('/d /c rd /s /q "{0}"' -f $old) -and $TimeoutMinutes -eq 5 }
+    Should -Invoke Remove-Item -Times 0 -Exactly
+  }
+  It 'old logs that rd cannot remove: not saved, nothing copied' {
+    $old = "$TestDrive\s5\BenTech-Logs\PC"; [void][IO.Directory]::CreateDirectory($old)
+    Mock Invoke-External { @{ ExitCode = 5; TimedOut = $false; Output = '' } }; Mock Copy-Item { throw 'must not run' }
+    $r = Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot "$TestDrive\s5\" -PcName 'PC'
+    $r.Ok | Should -BeFalse; $r.Error | Should -Match 'could not be removed'
+    Should -Invoke Copy-Item -Times 0 -Exactly
+  }
+  It 'a junction at BenTech-Logs is refused: nothing copied, nothing deleted, its target untouched (V2-R13 I1, real junction)' {
+    $t = "$TestDrive\jt1"; [void][IO.Directory]::CreateDirectory("$t\PC"); 'keep' | Set-Content "$t\PC\keep.txt"
+    [void][IO.Directory]::CreateDirectory("$TestDrive\js1")
+    & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /J "$TestDrive\js1\BenTech-Logs" "$t" | Out-Null
+    Mock Invoke-External { throw 'must not run' }; Mock Copy-Item { throw 'must not run' }
+    try {
+      $r = Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot "$TestDrive\js1\" -PcName 'PC'
+      $r.Ok | Should -BeFalse; $r.Error | Should -Be 'BenTech-Logs on the USB stick is a link; logs not saved'
+      Should -Invoke Invoke-External -Times 0 -Exactly; Should -Invoke Copy-Item -Times 0 -Exactly
+      "$t\PC\keep.txt" | Should -Exist
+      @(Get-ChildItem -LiteralPath $t -Recurse -Force).Count | Should -Be 2
+    } finally { [IO.Directory]::Delete("$TestDrive\js1\BenTech-Logs") }   # the junction only, never its target
+  }
+  It 'a junction at BenTech-Logs\(PC name) is refused the same way (real junction)' {
+    $t = "$TestDrive\jt2"; [void][IO.Directory]::CreateDirectory($t); 'keep' | Set-Content "$t\keep.txt"
+    [void][IO.Directory]::CreateDirectory("$TestDrive\js2\BenTech-Logs")
+    & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /J "$TestDrive\js2\BenTech-Logs\PC" "$t" | Out-Null
+    Mock Invoke-External { throw 'must not run' }; Mock Copy-Item { throw 'must not run' }
+    try {
+      $r = Copy-SetupLogsToStick -LogDir "$TestDrive\Logs" -StickRoot "$TestDrive\js2\" -PcName 'PC'
+      $r.Ok | Should -BeFalse; $r.Error | Should -Be 'BenTech-Logs on the USB stick is a link; logs not saved'
+      Should -Invoke Invoke-External -Times 0 -Exactly; Should -Invoke Copy-Item -Times 0 -Exactly
+      "$t\keep.txt" | Should -Exist
+    } finally { [IO.Directory]::Delete("$TestDrive\js2\BenTech-Logs\PC") }
+  }
+  It 'a junction inside BenTech-Logs\(PC name) is removed by the replace, and its target survives (real rd, inside $TestDrive only)' {
+    $logs = "$TestDrive\Logs6"; [void][IO.Directory]::CreateDirectory($logs); 'new' | Set-Content "$logs\setup.log"
+    $t = "$TestDrive\jt3"; [void][IO.Directory]::CreateDirectory($t); 'keep' | Set-Content "$t\keep.txt"
+    $old = "$TestDrive\js3\BenTech-Logs\PC"; [void][IO.Directory]::CreateDirectory($old); 'old' | Set-Content "$old\stale.txt"
+    & "$env:SystemRoot\System32\cmd.exe" /d /c mklink /J "$old\link" "$t" | Out-Null
+    (Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\js3\" -PcName 'PC').Ok | Should -BeTrue
+    "$t\keep.txt" | Should -Exist
+    "$old\link" | Should -Not -Exist; "$old\stale.txt" | Should -Not -Exist; "$old\setup.log" | Should -Exist
   }
 }
 Describe 'Remove-SetupFolder (Review Focus 2)' {
@@ -111,6 +176,12 @@ Describe 'Remove-SetupFolder (Review Focus 2)' {
     Remove-SetupFolder -Path "C:\bad|name\BenTech" | Should -BeFalse
     Should -Invoke Invoke-External -Times 0 -Exactly
     "$TestDrive\BenTech" | Should -Exist
+  }
+  It 'refuses a path that is not fully qualified, before resolving it (V2-R13 M1)' {
+    Mock Invoke-External { throw 'must not run' }; Mock Write-SetupLog { }
+    foreach ($p in 'C:', 'BenTech', '.\BenTech', 'C:BenTech', '\BenTech', '', $null) { Remove-SetupFolder -Path $p | Should -BeFalse }
+    Should -Invoke Invoke-External -Times 0 -Exactly
+    Should -Invoke Write-SetupLog -Times 7 -Exactly -ParameterFilter { $Level -eq 'ERROR' -and $Data.reason -eq 'the path is not fully qualified' }
   }
   It 'a BenTech folder that is already gone is $true, with nothing run' {
     Mock Invoke-External { throw 'must not run' }
@@ -162,8 +233,11 @@ Describe 'Invoke-SetupCleanup' {
     Mock Copy-SetupLogsToStick { [void]$script:order.Add("copy $PcName logging=$([bool]$script:SetupLogPath)"); @{ Ok = $true; Target = 'E:\BenTech-Logs\DELL-J0C7QK4' } }
     Mock Test-DesktopLauncher { $true }; Mock Remove-Item { [void]$script:order.Add("del $LiteralPath") }; Mock Set-Location { }
     Mock Remove-SetupFolder { [void]$script:order.Add("rd $Path"); $true }
+    # The fake Desktop launcher "is a file" (V2-R13 M4); every other Test-Path is the real one.
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq 'C:\Users\ben\Desktop\BenTechSetup.cmd' -and $PathType -eq 'Leaf' }
     $script:st = @{ Machine = @{ NewName = 'DELL-J0C7QK4' }; Launcher = @{ Path = 'C:\Users\ben\Desktop\BenTechSetup.cmd'; VolumeSerial = '1A2B3C4D' } }
-    $script:run = @{ Root = 'C:\BenTech\Setup'; State = $st; Write = { param($t) [void]$script:lines.Add($t) }; ProgramDataFolder = "$TestDrive\pd" }
+    # -FlushInput is always a seam here: the default would read the real console's key buffer.
+    $script:run = @{ Root = 'C:\BenTech\Setup'; State = $st; Write = { param($t) [void]$script:lines.Add($t) }; ProgramDataFolder = "$TestDrive\pd"; FlushInput = { } }
   }
   It 'Finish: stops logging, copies the logs, deletes the Desktop launcher, then removes C:\BenTech' {
     Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no key expected' }
@@ -214,8 +288,54 @@ Describe 'Invoke-SetupCleanup' {
     $script:SetupLogPath | Should -BeNullOrEmpty
   }
   It 'Cancel without a state' {
-    Invoke-SetupCleanup -Root 'C:\BenTech\Setup' -Mode Cancel -Write $run.Write -ProgramDataFolder $run.ProgramDataFolder -ReadKey { throw 'no key' }
+    Invoke-SetupCleanup -Root 'C:\BenTech\Setup' -Mode Cancel -Write $run.Write -ProgramDataFolder $run.ProgramDataFolder -FlushInput { } -ReadKey { throw 'no key' }
     @($order) | Should -Be @('rd C:\BenTech')
+  }
+  It 'empties the key buffer right before each wait, so a key pressed earlier cannot skip it (V2-R13 I2)' {
+    $script:events = New-Object System.Collections.ArrayList
+    Mock Copy-SetupLogsToStick { [void]$script:events.Add('copy'); @{ Ok = $false; Error = 'disk full' } }; Mock Remove-SetupFolder { [void]$script:events.Add('rd'); $false }
+    $script:keys = New-Object Collections.Queue; 'Enter', 'Q' | ForEach-Object { $script:keys.Enqueue($_) }
+    $r = $run.Clone(); $r.FlushInput = { [void]$script:events.Add('flush') }
+    Invoke-SetupCleanup @r -Mode Finish -ReadKey { [void]$script:events.Add('read'); $script:keys.Dequeue() }
+    @($events) | Should -Be @('copy', 'flush', 'read', 'rd', 'flush', 'read')
+  }
+  It 'a flush that fails still waits for the key' {
+    Mock Remove-SetupFolder { $false }; $script:keys = New-Object Collections.Queue; $script:keys.Enqueue('Q')
+    $r = $run.Clone(); $r.FlushInput = { throw 'no console input' }
+    Invoke-SetupCleanup @r -Mode Cancel -ReadKey { $script:keys.Dequeue() }
+    $script:keys.Count | Should -Be 0
+  }
+  It 'the production flush only reads keys that are already waiting' {
+    $param = (Get-Command Invoke-SetupCleanup).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'FlushInput' }
+    $param.DefaultValue.Extent.Text | Should -Match 'while \(\[Console\]::KeyAvailable\) \{ \[void\]\[Console\]::ReadKey\(\$true\) \}'
+  }
+  It 'deletes nothing unless the folder is C:\BenTech (V2-R13 M1)' {
+    $r = $run.Clone(); $r.Root = "$TestDrive\x\Setup"
+    Invoke-SetupCleanup @r -Mode Finish -ReadKey { throw 'no key expected' }
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+    $lines | Should -Contain ('Not deleting {0}\x: not {1}' -f $TestDrive, (Join-Path $env:SystemDrive 'BenTech'))
+    $order[0] | Should -Be 'copy DELL-J0C7QK4 logging=False'   # the logs are still saved
+    Invoke-SetupCleanup @r -Mode Cancel -ReadKey { throw 'no key expected' }
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+  }
+  It 'the C:\BenTech check ignores case and a trailing backslash' {
+    $r = $run.Clone(); $r.Root = ('{0}\bentech\SETUP\' -f $env:SystemDrive.ToLowerInvariant())
+    Invoke-SetupCleanup @r -Mode Cancel -ReadKey { throw 'no key expected' }
+    Should -Invoke Remove-SetupFolder -Times 1 -Exactly
+  }
+  It 'deletes the Desktop launcher only when it is a .cmd file (V2-R13 M4)' {
+    $dir = "$TestDrive\desk1\BenTechSetup.cmd"; [void][IO.Directory]::CreateDirectory($dir)
+    $txt = "$TestDrive\desk2\BenTechSetup.txt"; [void][IO.Directory]::CreateDirectory("$TestDrive\desk2"); 'x' | Set-Content $txt
+    # Pester 6 has no fall-through to the real command when no filter matches: answer as -PathType Leaf does.
+    Mock Test-Path { [IO.File]::Exists($LiteralPath) }
+    foreach ($p in $dir, $txt, "$TestDrive\desk3\BenTechSetup.cmd") {
+      $st.Launcher.Path = $p
+      Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no key expected' }
+    }
+    @($order | Where-Object { $_ -like 'del *' }).Count | Should -Be 0
+    $dir | Should -Exist; $txt | Should -Exist
+    Should -Invoke Test-Path -Times 1 -Exactly -ParameterFilter { $LiteralPath -eq $dir -and $PathType -eq 'Leaf' }
+    Should -Invoke Test-Path -Times 0 -Exactly -ParameterFilter { $LiteralPath -eq $txt }   # not .cmd: never even looked at
   }
   It 'removes an empty ProgramData\BenTech and keeps one that has files' {
     [void][IO.Directory]::CreateDirectory("$TestDrive\pd"); Invoke-SetupCleanup @run -Mode Cancel -ReadKey { }; "$TestDrive\pd" | Should -Not -Exist
