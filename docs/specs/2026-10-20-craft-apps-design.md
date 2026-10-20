@@ -1,6 +1,6 @@
 # bentech-winsetup: Craft apps as the default office suite
 
-**Status:** DRAFT. Ben agreed the behaviour in chat on 20/10/2026; the plan approval is pending.
+**Status:** Approved. Ben agreed the behaviour in chat and approved the plan on 20/10/2026. The final review's fixes (ledger ruling C-R4) sharpen 3.3: the signer must be the certificate's one CN exactly, only the MSI's own `<App>.lnk` is renamed and only in place, the other items fail at once after `GitHub busy - try again later`, download links must be the repo's own release downloads, and msiexec writes a log to `Logs\craft-<assetPrefix>.log`.
 **Amends:** [2026-10-20-progress-visibility-design.md](2026-10-20-progress-visibility-design.md) and the v1 spec. Both stay binding wherever this document does not change them.
 
 ## 1. Why
