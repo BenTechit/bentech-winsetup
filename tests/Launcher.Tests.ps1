@@ -721,14 +721,14 @@ Describe 'Publish.ps1' {
     (Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw) | Should -Not -Match 'Start-Process[^\r\n]*\bgh\b'
   }
 
-  It 'uploads exactly the four signed files, never the launcher (R29), and targets HEAD' {
+  It 'uploads the four signed files and the ScreenConnect installer, never the launcher (R29), and targets HEAD' {
     $tok = $null; $err = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
     $assign = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$releaseNames' }, $true))
     $assign.Count | Should -Be 1
     $names = @($assign[0].Right.FindAll({ $args[0] -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
-    $names | Should -Be @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig')
-    $ghArgs = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$ghArgs' }, $true))
+    $names | Should -Be @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig', 'ScreenConnect.ClientSetup.exe')
+    $ghArgs =@($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$ghArgs' }, $true))
     $ghArgs.Count | Should -Be 1
     $ghArgs[0].Right.Extent.Text | Should -Match '\$releaseAssets'
     $ghArgs[0].Right.Extent.Text | Should -Match "'--target', \`$source\.Head"
@@ -738,6 +738,41 @@ Describe 'Publish.ps1' {
   It 'refuses a dirty or unpushed tree unless -DryRun, which only warns' {
     $text = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw
     $text | Should -Match 'if \(\$source\.Problems\.Count -gt 0 -and -not \$DryRun\) \{\s*throw'
+  }
+
+  It 'a real publish refuses a failed installer check' {
+    $text = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw
+    $text | Should -Match 'if \(\$installerCheck\.Problems\.Count -gt 0 -and -not \$DryRun\) \{\s*throw'
+  }
+
+  Context 'the ScreenConnect installer check (Review Focus 5)' {
+    BeforeAll {
+      # Dot-source Get-ScreenConnectInstallerCheck and Get-CertificateEndWarning from the AST of tools\Publish.ps1.
+      $tok = $null; $err = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+      foreach ($name in 'Get-ScreenConnectInstallerCheck', 'Get-CertificateEndWarning') {
+        $fn = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $name }, $true))
+        $fn.Count | Should -Be 1
+        . ([ScriptBlock]::Create($fn[0].Extent.Text))
+      }
+      $script:fakeExe = Join-Path $TestDrive 'sc\ScreenConnect.ClientSetup.exe'; New-Item -ItemType Directory (Split-Path $fakeExe) -Force | Out-Null
+      [IO.File]::WriteAllText($fakeExe, 'installer'); $script:fakeHash = (Get-FileHash -LiteralPath $fakeExe -Algorithm SHA256).Hash
+      $script:scSubject = 'CN="ConnectWise, LLC", O="ConnectWise, LLC", L=Tampa, S=Florida, C=US'
+      function Use-Sig([string]$Status, [string]$Subject) {
+        $script:sig = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]$Status; SignerCertificate = [pscustomobject]@{ Subject = $Subject; NotAfter = [datetime]'2027-02-19T13:59:59' } }
+        Mock Get-AuthenticodeSignature { $script:sig } }
+      function C([string]$Sha = $script:fakeHash, [string]$Path = $script:fakeExe) { Get-ScreenConnectInstallerCheck -Path $Path -Sha256 $Sha -Signers @('"ConnectWise, LLC"') }
+    }
+    It 'passes Ben''s file and returns the certificate end date' { Use-Sig 'Valid' $scSubject; $r = C; @($r.Problems).Count | Should -Be 0; $r.NotAfter | Should -Be ([datetime]'2027-02-19T13:59:59') }
+    It 'compares the SHA-256 without regard to case' { Use-Sig 'Valid' $scSubject; @((C $fakeHash.ToLowerInvariant()).Problems).Count | Should -Be 0 }
+    It 'names each failed check' {
+      Use-Sig 'Valid' $scSubject; (@((C ('0' * 64)).Problems) -join "`n") | Should -Match 'SHA-256 is'
+      Use-Sig 'UnknownError' $scSubject; (@((C).Problems) -join "`n") | Should -Match 'Authenticode status is UnknownError, not Valid'
+      Use-Sig 'Valid' 'CN="Other Remote Ltd", O="Other Remote Ltd", C=US'; (@((C).Problems) -join "`n") | Should -Match 'not signed by'
+      (@((C -Path "$TestDrive\nope.exe").Problems) -join "`n") | Should -Match 'not found' }
+    It 'warns inside 60 days of the end date, not before' {
+      Get-CertificateEndWarning -NotAfter ([datetime]'2027-02-19T13:59:59') -Now ([datetime]'2026-10-20T10:00:00') | Should -BeNullOrEmpty
+      Get-CertificateEndWarning -NotAfter ([datetime]'2027-02-19T13:59:59') -Now ([datetime]'2026-12-22T10:00:00') | Should -Match '^WARNING: .*19/02/2027' }
   }
 
   Context 'Get-PublishSource (git mocked)' {
@@ -790,8 +825,9 @@ Describe 'Publish.ps1' {
     BeforeAll {
       $script:pr = Join-Path $TestDrive 'pubrepo'
       $root = Split-Path -Parent $PSScriptRoot
-      foreach ($dir in 'tools', 'keys', 'launcher', 'src\Common') { New-Item -ItemType Directory (Join-Path $pr $dir) -Force | Out-Null }
+      foreach ($dir in 'tools', 'keys', 'launcher', 'config', 'src\Common') { New-Item -ItemType Directory (Join-Path $pr $dir) -Force | Out-Null }
       Copy-Item "$root\tools\Publish.ps1", "$root\tools\Build-Launcher.ps1", "$root\tools\Signing.ps1" "$pr\tools"
+      Copy-Item "$root\config\config.json" "$pr\config"
       Copy-Item "$root\launcher\BenTechSetup.template.cmd" "$pr\launcher"
       Copy-Item "$root\src\Common\Signature.ps1" "$pr\src\Common"
       $rsa.ToXmlString($false) | Set-Content "$pr\keys\public-key.xml" -Encoding ASCII
@@ -809,12 +845,14 @@ Describe 'Publish.ps1' {
       $script:ghDir = Join-Path $TestDrive 'ghstub'; New-Item -ItemType Directory $ghDir | Out-Null
       "@echo off`r`necho %*> `"%~dp0gh-called.txt`"`r`nexit /b 0`r`n" | Set-Content "$ghDir\gh.cmd" -Encoding ASCII -NoNewline
       function RunPublish {
+        # The installer path is always a parameter into $TestDrive: a test never reads Ben's real file.
+        param([string]$Installer = (Join-Path $TestDrive 'no-installer\ScreenConnect.ClientSetup.exe'))
         Remove-Item -LiteralPath "$pr\dist" -Recurse -Force -ErrorAction SilentlyContinue
         $oldPath = $env:PATH; $oldToken = $env:GH_TOKEN; $oldCeiling = $env:GIT_CEILING_DIRECTORIES
         try {
           # The stub repo is not a git repository; the ceiling stops git from finding one above $TestDrive.
           $env:PATH = "$ghDir;$oldPath"; $env:GH_TOKEN = 'invalid-test-token'; $env:GIT_CEILING_DIRECTORIES = $TestDrive
-          $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pr\tools\Publish.ps1" -Version 2026.10.18.7 -DryRun 2>&1 | Out-String
+          $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pr\tools\Publish.ps1" -Version 2026.10.18.7 -DryRun -ScreenConnectInstaller $Installer 2>&1 | Out-String
           @{ Code = $LASTEXITCODE; Out = $out }
         } finally { $env:PATH = $oldPath; $env:GH_TOKEN = $oldToken; $env:GIT_CEILING_DIRECTORIES = $oldCeiling }
       }
@@ -822,9 +860,10 @@ Describe 'Publish.ps1' {
     }
     AfterEach { "$ghDir\gh-called.txt" | Should -Not -Exist }
 
-    It 'builds the four signed files plus the launcher, never calls gh, and would upload only the four' {
+    It 'builds the four signed files plus the launcher, never calls gh, and would upload only the four (no installer on the stick)' {
       $r = RunPublish
       $r.Code | Should -Be 0
+      $r.Out | Should -Match 'WARNING: ScreenConnect installer not found'
       @(Get-ChildItem -LiteralPath "$pr\dist" -File | ForEach-Object { $_.Name } | Sort-Object) |
         Should -Be @('BenTechSetup.cmd', 'config.json', 'config.json.sig', 'setup.ps1', 'setup.ps1.sig')
       [IO.File]::ReadAllText("$pr\dist\BenTechSetup.cmd") | Should -Match ([regex]::Escape("'https://github.com/example-invalid/not-a-real-repo/releases/latest/download'"))
@@ -837,6 +876,15 @@ Describe 'Publish.ps1' {
       $line[0] | Should -Match ' --target \S+ '
       $line[0] | Should -Not -Match 'BenTechSetup\.cmd'
     }
+    It 'copies an installer to dist and lists it as the fifth file; a failed check is only a warning under -DryRun' {
+      $fake = Join-Path $TestDrive 'fake-sc\ScreenConnect.ClientSetup.exe'; New-Item -ItemType Directory (Split-Path $fake) -Force | Out-Null
+      [IO.File]::WriteAllText($fake, 'not the real installer')
+      $r = RunPublish -Installer $fake
+      $r.Code | Should -Be 0; $r.Out | Should -Match 'WARNING: ScreenConnect installer SHA-256 is'
+      "$pr\dist\ScreenConnect.ClientSetup.exe" | Should -Exist
+      $line = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^DRY RUN - not run: gh ' })[0]
+      $tokens = @(($line -replace '^DRY RUN - not run: gh ', '') -split ' ')
+      $tokens[7] | Should -Be "$pr\dist\ScreenConnect.ClientSetup.exe"; $tokens[8] | Should -Be '--repo' }
     It 'warns, but goes on, when the source cannot be verified under -DryRun (no git repository here)' {
       $r = RunPublish
       $r.Code | Should -Be 0

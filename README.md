@@ -1,10 +1,10 @@
 # bentech-winsetup
 
-Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool`, only after Microsoft 365, and a few empty policy keys).
+Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits when AnyDesk was chosen. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool`, only after Microsoft 365, and a few empty policy keys).
 
 The launcher (`BenTechSetup.cmd`) is tiny and rarely changes. It downloads the newest signed `setup.ps1` and `config.json` from this repo's latest GitHub Release, verifies the signatures against the public key built into the launcher, and only then runs them. Updating the tool means publishing a release, never re-copying a file to the USB stick (usually; see [Publishing](#publishing-a-new-version)).
 
-Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first) and, for the free Craft office suite that is now the default, [docs/specs/2026-10-20-craft-apps-design.md](docs/specs/2026-10-20-craft-apps-design.md) (it amends both). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md), [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md) and [docs/superpowers/plans/2026-10-20-craft-apps.md](docs/superpowers/plans/2026-10-20-craft-apps.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
+Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first) and, for the free Craft office suite that is now the default, [docs/specs/2026-10-20-craft-apps-design.md](docs/specs/2026-10-20-craft-apps-design.md) (it amends both) and, for ScreenConnect as a remote-access choice next to AnyDesk, [docs/specs/2026-10-20-screenconnect-design.md](docs/specs/2026-10-20-screenconnect-design.md) (it amends all three). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md), [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md), [docs/superpowers/plans/2026-10-20-craft-apps.md](docs/superpowers/plans/2026-10-20-craft-apps.md) and [docs/superpowers/plans/2026-10-20-screenconnect.md](docs/superpowers/plans/2026-10-20-screenconnect.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
 
 ## What it does
 
@@ -17,7 +17,9 @@ In this order (steps that don't apply to the machine are left out):
 5. **Remove bloatware**: a conservative list from `config.json`.
 6. **Rename the PC** to `<BRAND>-<SERIAL>` (max 15 characters).
 7. **winget** ready (installs App Installer if missing).
-8. **Google Chrome** and **AnyDesk** (always; no unattended password, the customer accepts every connection).
+8. **Google Chrome** (always), then the **remote tool** that **R** picked on the start screen: **AnyDesk** (the default; no unattended password, the customer accepts every connection), **ScreenConnect**, or both.
+    - ScreenConnect is **unattended on purpose**: it connects without the customer clicking Accept, so get the customer's OK at the counter (for example on the repair form). It enrols the PC in Ben's ScreenConnect list (name, IP, user name). That is the one exception to "the tool collects nothing off-machine".
+    - The installer is Ben's own `ScreenConnect.ClientSetup.exe`, taken from the run's own release. It runs only after its SHA-256 matches the one in the signed `config.json` and it carries a `ConnectWise, LLC` signature. The step then waits for the `ScreenConnect Client (b58e7c32699a96bf)` service. How Ben builds a new installer: [A new ScreenConnect installer](#a-new-screenconnect-installer).
 9. **7-Zip**, optional.
 10. **Craft apps** (Office CRAFT, the default): the free **WordCraft, GridCraft, DeckCraft and PdfCraft** (Word, Excel, PowerPoint and a PDF reader), then the **ArtCraft Launcher**, meant to keep them up to date (checked on the first laptop, [docs/testing.md](docs/testing.md) 1.17).
     - Each is the MSI for the PC's processor (x64 or arm64) from the latest GitHub release of its project. It runs only after its `SHA256SUMS.txt` line and its `Learning Machines Inc` signature check out, and an app already at that version is skipped.
@@ -47,7 +49,8 @@ In this order (steps that don't apply to the machine are left out):
 
       WHAT WILL HAPPEN                                  TO CHANGE IT, PRESS
       Type     LAPTOP (driver tool + laptop app)        L = laptop   D = desktop
-      Chrome + AnyDesk   always
+      Chrome   always
+      Remote   ANYDESK                                  R = anydesk / sc / both
       7-Zip    YES                                      Z = yes / no
       Office   CRAFT (free Word/Excel/PowerPoint/PDF)   O = craft / 365 / off
 
@@ -57,7 +60,8 @@ In this order (steps that don't apply to the machine are left out):
    ```
 
    - **Top block:** the PC (make, model, serial number `SN`), whether it is on its charger or on battery, and the name it will get.
-   - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app; a brand-name desktop gets the driver tool but no laptop app; a brand with no driver tool (ASUS, a VM) gets no driver tool and the line says `no driver tool for this brand` (an ASUS laptop still gets its laptop app, MyASUS; a VM gets neither). Chrome and AnyDesk always get installed.
+   - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app; a brand-name desktop gets the driver tool but no laptop app; a brand with no driver tool (ASUS, a VM) gets no driver tool and the line says `no driver tool for this brand` (an ASUS laptop still gets its laptop app, MyASUS; a VM gets neither). Chrome always gets installed.
+   - **Remote:** the default is **ANYDESK**, as before. **R** goes to SCREENCONNECT, then BOTH (the line reads `ANYDESK + SCREENCONNECT`), then back to ANYDESK. While ScreenConnect is chosen a yellow line follows: `ScreenConnect = unattended access: get the customer's OK first`. It is only a reminder: nothing waits for it and the countdown runs as usual.
    - **Office:** the default is **CRAFT**, the free Craft apps (WordCraft, GridCraft, DeckCraft, PdfCraft and the ArtCraft Launcher; see "What it does", item 10). They are alpha, so Microsoft 365 is one key press away: **O** goes to BUSINESS, then HOME (both install Microsoft 365), then OFF, then back to CRAFT. The tool installs one suite or the other, never both.
    - **Colours:** on a black screen, the value of each choice is green (yes / on) or dark grey (`NO` / `OFF`); a yellow line is a warning.
    - **The countdown:** `Starts by itself in N s` and a bar that empties. **Every key you press restarts it at 30 s**, also a key that does nothing (Space, F5, ...), so the run starts by itself only when nobody touches the keyboard.
@@ -67,6 +71,7 @@ In this order (steps that don't apply to the machine are left out):
    | `L` / `D` | Laptop / Desktop mode (auto-detected; a VM defaults to Desktop) |
    | `Z` | 7-Zip on/off |
    | `O` | Office cycles CRAFT (the default), BUSINESS, HOME, OFF. CRAFT is the free Craft apps; BUSINESS and HOME are Microsoft 365 (Hebrew + English) |
+   | `R` | Remote tool cycles ANYDESK (the default), SCREENCONNECT, BOTH. ScreenConnect is unattended access: get the customer's OK first |
    | `Enter` | Start now |
    | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing of setup's own is left. If an earlier run left its state, Esc deletes nothing: its logs stay for diagnosis |
    | any other key | Nothing changes, but the countdown goes back to 30 s |
@@ -81,6 +86,8 @@ In this order (steps that don't apply to the machine are left out):
    | `B` | Open Default Apps for Chrome (the screen suggests it when Chrome is not the default) |
    | `R` | Open the report in Notepad |
    | any other key | Nothing: a stray key does not throw the logs away |
+
+   **The remote tools on this screen:** the AnyDesk ID in big digits shows only when AnyDesk was chosen (ANYDESK or BOTH). With ScreenConnect chosen the `New name` line ends in `ScreenConnect: installed` or `ScreenConnect: NOT installed`, so the name to look for sits beside the status; with SCREENCONNECT alone there is no AnyDesk ID at all. The PC should appear in Ben's ScreenConnect list under that name after the final restart (unproven until [docs/testing.md](docs/testing.md) 1.18).
 
    **The USB-stick line** above the report line says whether the stick is there, and is checked again every second: `USB stick found (E:) - logs will be saved there`, or `No BenTech USB stick - plug it in now to keep the logs`. Plug the stick in while the screen is up. **With no stick, Enter deletes the logs without asking again.** To keep them anyway, copy `C:\BenTech\Setup\Logs` from an elevated prompt before you press Enter.
 
@@ -199,7 +206,10 @@ Pushing to `main` does not reach any customer. Only a published GitHub Release d
    ```
 
    The version is `yyyy.MM.dd.N`; `N` counts releases on that day. Add `-DryRun` to do everything except the upload (it still builds and signs `dist\` locally and prints the `gh` command).
-3. It stops at the first failure and runs: clean/pushed check, the full test suite, bundle, sign `setup.ps1` and `config.json` with your private key, verify both signatures against `keys\public-key.xml`, build the launcher, then `gh release create v<Version> --target <HEAD>` with exactly four files: `setup.ps1`, `setup.ps1.sig`, `config.json`, `config.json.sig`.
+3. It stops at the first failure and runs: clean/pushed check and the ScreenConnect installer check, the full test suite, bundle (and a copy of the installer into `dist\`), sign `setup.ps1` and `config.json` with your private key, verify both signatures against `keys\public-key.xml`, build the launcher, then `gh release create v<Version> --target <HEAD>` with five files: `setup.ps1`, `setup.ps1.sig`, `config.json`, `config.json.sig` and `ScreenConnect.ClientSetup.exe`.
+   - **The fifth file is Ben's own installer**, read from `%USERPROFILE%\.bentech-winsetup\ScreenConnect.ClientSetup.exe` (beside the signing key; `-ScreenConnectInstaller <path>` names another file). It has no `.sig`: the signed `config.json` pins its SHA-256. The release is public, so anyone can download the installer (spec section 7).
+   - **It is checked first**, before the slow test run: the file exists, its SHA-256 equals `apps.screenconnect.sha256` in `config.json`, and its Authenticode status is `Valid` with a `ConnectWise, LLC` signer. Any failure stops a real publish. With `-DryRun` it is only a `WARNING: ScreenConnect installer ...` line, and a missing installer is left out of the printed `gh` command.
+   - **The end date:** Publish prints `ScreenConnect installer certificate ends dd/MM/yyyy`, and a yellow warning when that is less than 60 days away (a warning only, also on a real publish). See [A new ScreenConnect installer](#a-new-screenconnect-installer).
 4. **Check the launcher hash it prints.** The launcher is the trust anchor (it holds the public key), so it is never uploaded to GitHub. Publish prints `Launcher SHA-256: ...` and records it in `keys\launcher.sha256`.
    - **Hash unchanged:** the USB sticks are still current.
    - **Hash changed** (a `WARNING: the launcher changed` line): copy the new `dist\BenTechSetup.cmd` to every USB stick. The launcher only changes when the public key, the repo URL or `launcher\BenTechSetup.template.cmd` changes. A normal release (code or config) does not change it.
@@ -231,7 +241,24 @@ Make the previous release the "latest" one (from the repo folder):
 gh release edit v<old> --latest
 ```
 
-The next launcher run downloads that release. Machines already running keep their pinned copy. Then fix forward with a new release (`N+1`).
+The next launcher run downloads that release. Machines already running keep their pinned copy. Then fix forward with a new release (`N+1`). A rollback brings back that release's own ScreenConnect installer too: each run downloads the installer from its own release (`releases/download/v<its version>/`), never from `latest`.
+
+### A new ScreenConnect installer
+
+Needed when Ben builds a new installer (a new ScreenConnect version, or another instance), and in any case **before 19/02/2027**. The installer is signed with no timestamp, so from 20/02/2027 Windows stops reporting its signature as `Valid`. Publish warns 60 days ahead; until a new release is out, the ScreenConnect step refuses the old installer with a red `ScreenConnect installer check failed`. (PCs that already have the client are not affected: they update themselves from Ben's server.)
+
+1. **Save the new file** as `%USERPROFILE%\.bentech-winsetup\ScreenConnect.ClientSetup.exe`, beside the signing key. It never goes into the repo or a synced folder (OneDrive, a cloud-backed Desktop or Downloads). **Never run it on the dev PC:** it would enrol that PC in the list. Read what it is:
+
+   ```
+   $exe = "$env:USERPROFILE\.bentech-winsetup\ScreenConnect.ClientSetup.exe"
+   Get-FileHash $exe -Algorithm SHA256
+   $sig = Get-AuthenticodeSignature $exe
+   $sig.Status                       # must be Valid
+   $sig.SignerCertificate.Subject    # must hold CN="ConnectWise, LLC" (Windows puts the quotes there)
+   $sig.SignerCertificate.NotAfter   # the end date: build the next installer before it
+   ```
+2. **Update `config\config.json`:** `apps.screenconnect.sha256` becomes the new hash. `serviceName` changes only if a test install shows another suffix. Run the tests, commit, push.
+3. **Publish a new release** ([Publishing](#publishing-a-new-version)). A real publish refuses an installer whose hash is not the one in `config.json`, so a stale `config.json` or the wrong file cannot go out.
 
 ## Signing key
 
@@ -285,7 +312,7 @@ If the plain-text file was ever in a synced folder (OneDrive, a cloud-backed Des
 
 ## Changing apps and lists
 
-Everything Ben may want to change without touching code is in `config\config.json`: the 7-Zip and Office defaults, the Chrome and AnyDesk download URLs, winget IDs, the Office products and languages, the vendor tool matrix and consumer app IDs, expected Authenticode signers, the bloatware remove/protect lists, caps and timeouts.
+Everything Ben may want to change without touching code is in `config\config.json`: the 7-Zip and Office defaults, the Chrome and AnyDesk download URLs, the ScreenConnect installer's pin, winget IDs, the Office products and languages, the vendor tool matrix and consumer app IDs, expected Authenticode signers, the bloatware remove/protect lists, caps and timeouts.
 
 Edit it, run the tests (they check that the remove and protect lists don't overlap, that every signer reference exists and that every `verify` entry is well formed), commit, push, publish. No launcher update is needed. Keep it UTF-8 and valid JSON.
 
@@ -304,6 +331,13 @@ Settings worth knowing:
   **`displayName` and `startMenuName` are best guesses** (`^WordCraft` and so on) until [docs/testing.md](docs/testing.md) section 1.17 confirms the real names on a laptop: if the report lacks a Craft app's version, or a desktop shortcut is missing, correct the regex there. `signers.craft` is the company name the MSIs' Authenticode signature must carry (`Learning Machines Inc`): the signer certificate's one CN must be exactly that, letter for letter. It is matched by name and never by thumbprint, because their certificates live 3 days.
 
   **GitHub limits:** GitHub allows 60 lookups an hour per IP, and a laptop needs 5. A rate-limit answer (HTTP 403 or 429) gets one retry after 60 s; a second one fails that item with `GitHub busy - try again later`, and the items after it fail the same way at once, without asking GitHub again. A network blip is asked again after 5 s and 10 s. The MSI and `SHA256SUMS.txt` links must point into the project's own `https://github.com/<repo>/releases/download/`; any other link fails the item with `release lookup failed`. msiexec logs each install to `Logs\craft-<assetPrefix>.log`.
+- **`apps.screenconnect`** (with **`signers.connectwise`**, **`defaults.remote`** and two timeouts): Ben's ScreenConnect installer. Its fields:
+  - `signer`: `connectwise`, the key in `signers`;
+  - `url`: the installer in this repo's release. `{version}` becomes the run's own bundle version, **never `latest`**: a run then never mixes a newer installer with its own `config.json`, and a rollback brings back its own installer. A development run that was not bundled has no version, and the step fails with `ScreenConnect: release version unknown`;
+  - `sha256`: the SHA-256 of Ben's installer. This pin, in the signed `config.json`, is what proves the file is Ben's: every ScreenConnect installer carries a valid ConnectWise signature, including one built for somebody else's instance. The downloaded file must match it (case does not matter) **and** carry the signature, else it is deleted and the step fails with `ScreenConnect installer check failed`;
+  - `serviceName`: the exact Windows service name (`ScreenConnect Client (b58e7c32699a96bf)`; the suffix is fixed for Ben's instance). A PC that has the service counts as already installed, the service's state decides the result, and the same text is the `DisplayName` the report looks for.
+
+  `signers.connectwise` is `"ConnectWise, LLC"` **with the quotes**: Windows quotes a name that holds a comma, and the check looks for the text `CN=<signer>` in the signer subject (`CN="ConnectWise, LLC", O=...`), so without the quotes the real file would be refused. The step does **not** use the exact-CN rule of the Craft apps (`-ExactCN`): it refuses quoted subjects by design, and the hash already pins the exact file. `defaults.remote` is the start screen's default (`ANYDESK`, `SCREENCONNECT` or `BOTH`); a missing or invalid value counts as `ANYDESK`. `timeoutsMinutes.screenconnect` (10) is how long the installer may run (it has no documented silent switch), and `timeoutsMinutes.screenconnectService` (3) how long the step then waits for the service to run.
 - **`apps.office.excludeApps`**: the Office apps left out of the install. The default leaves exactly Word, Excel, PowerPoint, Outlook (classic) and OneNote. An id the Office Deployment Tool rejects must be removed from the list. `timeoutsMinutes.office` (60) is how long a background install and a restart waiting for it may take.
 - **`vendors.<BRAND>.consumerApp.verify`** (optional): how the vendor-app step recognises the app after winget reports success.
 
@@ -343,7 +377,7 @@ Pass means the last line reads `Failed: 0`. Pass a single file to `-Path` to run
 - Every `.ps1` is **UTF-8 with BOM** (PowerShell 5.1 reads BOM-less files as ANSI). `tests\Encoding.Tests.ps1` enforces it. `.gitattributes` marks `*.ps1`, `*.json`, `*.cmd` and `*.xml` as `-text` so Git never rewrites line endings. The launcher is ASCII-only with CRLF.
 - **Never parse localized output.** Machines may run Hebrew Windows: use exit codes, CIM, registry values, GUIDs and SIDs.
 - Downloads use `System.Net.WebClient` with TLS 1.2, never `Invoke-WebRequest`.
-- Never run setup steps or the launcher on the dev PC. Tests mock everything.
+- Never run setup steps, the launcher or `ScreenConnect.ClientSetup.exe` on the dev PC (the installer would enrol it in the ScreenConnect list). Tests mock everything, and none reads the real installer.
 
 **Build the bundle by hand:**
 

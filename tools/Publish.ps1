@@ -4,24 +4,33 @@
 #
 # Steps, stopping at the first failure (non-zero exit):
 #   0. the source: the working tree is clean (dist\ is ignored) and HEAD is pushed (equals its upstream),
-#      so the release tag points at exactly the code that was built. -DryRun only warns.
+#      so the release tag points at exactly the code that was built; and Ben's ScreenConnect installer
+#      (%USERPROFILE%\.bentech-winsetup\ScreenConnect.ClientSetup.exe, or -ScreenConnectInstaller) exists, has
+#      the SHA-256 pinned in config\config.json apps.screenconnect and a Valid ConnectWise signature. Its
+#      certificate end date is printed, with a warning inside 60 days. -DryRun only warns.
 #   1. tools\Invoke-Tests.ps1 on tests\ (in a child Windows PowerShell 5.1)
-#   2. tools\Build-Bundle.ps1 -> dist\setup.ps1, dist\config.json
+#   2. tools\Build-Bundle.ps1 -> dist\setup.ps1, dist\config.json; the installer is copied to dist\
 #   3. tools\Sign-File.ps1 on both (the DPAPI-protected private key; never leaves this PC)
 #   4. both signatures verified against keys\public-key.xml with Test-DetachedSignature
 #   5. tools\Build-Launcher.ps1 -> dist\BenTechSetup.cmd, pointing at <repo>'s latest release. Its SHA-256
 #      is printed and recorded in keys\launcher.sha256, with a warning when it changed (copies already
 #      handed out are then the old launcher). Commit that file: a real publish needs a clean tree.
-#   6. unless -DryRun: gh release create v<Version> --target <HEAD> with the FOUR signed files only.
+#   6. unless -DryRun: gh release create v<Version> --target <HEAD> with FIVE files: the four signed ones
+#      (setup.ps1, config.json and their .sig) plus ScreenConnect.ClientSetup.exe. The installer has no .sig:
+#      the signed config.json pins its SHA-256. Under -DryRun a missing installer is left out (it was warned
+#      about in step 0).
 #      The launcher is the trust anchor (it holds the public key), so it never ships on the channel it
 #      protects (R29): Ben hands out dist\BenTechSetup.cmd himself.
-# -DryRun does steps 1-5 for real (including signing dist\ locally) and only prints the gh command.
+# -DryRun does steps 0-5 for real (including signing dist\ locally) and only prints the gh command.
 # The repo comes from tools\publish.settings.json: { "repo": "<owner>/<name>" }.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$Version,
   [string]$Notes,
-  [switch]$DryRun
+  [switch]$DryRun,
+  # Ben's installer; empty means %USERPROFILE%\.bentech-winsetup\ScreenConnect.ClientSetup.exe (resolved in the body).
+  # A parameter so the tests point it into $TestDrive and never read the real file.
+  [string]$ScreenConnectInstaller
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,8 +44,12 @@ $publicKeyPath = Join-Path $repoRoot 'keys\public-key.xml'
 $launcherHashPath = Join-Path $repoRoot 'keys\launcher.sha256'
 $windowsPowerShell = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $signedNames = @('setup.ps1', 'config.json')
-$releaseNames = @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig')
+$releaseNames = @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig', 'ScreenConnect.ClientSetup.exe')
+$installerName = 'ScreenConnect.ClientSetup.exe'
 $launcherName = 'BenTechSetup.cmd'
+if ([string]::IsNullOrWhiteSpace($ScreenConnectInstaller)) {
+  $ScreenConnectInstaller = Join-Path $env:USERPROFILE ('.bentech-winsetup\' + $installerName)
+}
 
 $step = 'checks'
 $started = Get-Date
@@ -77,6 +90,69 @@ function Get-PublishSource {
   return @{ Head = $head; Problems = $problems.ToArray() }
 }
 
+function Get-ScreenConnectInstallerCheck {
+  # Returns @{ Problems = <string[]>; NotAfter = <datetime or $null> } for Ben's ScreenConnect installer. It
+  # never throws. A problem is anything that would make the run's step refuse the file, or that would mean
+  # the wrong file is about to be published: the file is missing, its SHA-256 is not the one pinned in
+  # config.json (that pin is what proves it is Ben's file; every ScreenConnect installer carries a valid
+  # ConnectWise signature), its Authenticode status is not Valid (an expired certificate shows as another
+  # status: the installer has no timestamp), or its signer is not on the list. The signer rule is the one
+  # Test-FileSignature applies without -ExactCN: the subject holds CN=<signer> as literal text.
+  # NotAfter is the signer certificate's end date whenever it could be read.
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Sha256,
+    [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Signers
+  )
+
+  $problems = New-Object System.Collections.Generic.List[string]
+  $notAfter = $null
+  try {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+      # Nothing else can be checked without the file.
+      $problems.Add("not found: $Path")
+      return @{ Problems = $problems.ToArray(); NotAfter = $null }
+    }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if (-not [string]::Equals($actual, $Sha256, [StringComparison]::OrdinalIgnoreCase)) {
+      $problems.Add("SHA-256 is $actual, config.json apps.screenconnect.sha256 is $Sha256")
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+    $subject = ''
+    if ($signature.SignerCertificate) {
+      $subject = [string]$signature.SignerCertificate.Subject
+      $notAfter = $signature.SignerCertificate.NotAfter
+    }
+    if ([string]$signature.Status -ne 'Valid') {
+      $problems.Add("Authenticode status is $($signature.Status), not Valid")
+    } else {
+      $allowed = @($Signers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+      $match = $false
+      foreach ($signer in $allowed) {
+        if ($subject -like ('*CN=' + [Management.Automation.WildcardPattern]::Escape($signer) + '*')) { $match = $true; break }
+      }
+      if (-not $match) { $problems.Add("not signed by $($allowed -join ' or ') (subject: $subject)") }
+    }
+  } catch {
+    $problems.Add("could not be read: $($_.Exception.Message)")
+  }
+  return @{ Problems = $problems.ToArray(); NotAfter = $notAfter }
+}
+
+function Get-CertificateEndWarning {
+  # A warning text when the certificate ends in less than 60 days, else $null. The installer carries no
+  # timestamp, so from the end date on Windows stops reporting its signature as Valid and the run refuses it.
+  param(
+    [Parameter(Mandatory)][datetime]$NotAfter,
+    [Parameter(Mandatory)][datetime]$Now
+  )
+
+  $days = ($NotAfter - $Now).TotalDays
+  if ($days -ge 60) { return $null }
+  $end = $NotAfter.ToString('dd/MM/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+  return "WARNING: the ScreenConnect installer's certificate ends $end ($([int][Math]::Floor($days)) days from now): build a new installer before then (README `"A new ScreenConnect installer`")"
+}
+
 try {
   # Same rule as Build-Bundle.ps1, checked up front so a typo fails before the slow test run.
   if ($Version -cnotmatch '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+\z') {
@@ -96,11 +172,25 @@ try {
   }
 
   $step = '0/6 source'
-  Write-PublishStep '0/6 Checking the source (clean tree, HEAD pushed)'
+  Write-PublishStep '0/6 Checking the source and the ScreenConnect installer'
   $source = Get-PublishSource -RepoRoot $repoRoot
   foreach ($problem in $source.Problems) { Write-Host "WARNING: $problem" -ForegroundColor Yellow }
   if ($source.Problems.Count -gt 0 -and -not $DryRun) { throw "refusing to publish: $($source.Problems -join '; ')" }
   if ($source.Problems.Count -eq 0) { Write-Host "Clean and pushed at $($source.Head)" }
+
+  # Ben's installer, checked here, before the slow test run: it must be the file config.json pins.
+  $appConfig = Get-Content -LiteralPath (Join-Path $repoRoot 'config\config.json') -Raw | ConvertFrom-Json
+  $installerCheck = Get-ScreenConnectInstallerCheck -Path $ScreenConnectInstaller -Sha256 ([string]$appConfig.apps.screenconnect.sha256) -Signers @($appConfig.signers.connectwise)
+  foreach ($problem in $installerCheck.Problems) { Write-Host "WARNING: ScreenConnect installer $problem" -ForegroundColor Yellow }
+  if ($installerCheck.Problems.Count -gt 0 -and -not $DryRun) {
+    throw "refusing to publish: the ScreenConnect installer $($installerCheck.Problems -join '; ')"
+  }
+  if ($installerCheck.Problems.Count -eq 0) { Write-Host "ScreenConnect installer checked: $ScreenConnectInstaller" }
+  if ($installerCheck.NotAfter) {
+    Write-Host "ScreenConnect installer certificate ends $(([datetime]$installerCheck.NotAfter).ToString('dd/MM/yyyy', [Globalization.CultureInfo]::InvariantCulture))"
+    $endWarning = Get-CertificateEndWarning -NotAfter ([datetime]$installerCheck.NotAfter) -Now (Get-Date)
+    if ($endWarning) { Write-Host $endWarning -ForegroundColor Yellow }
+  }
 
   $step = '1/6 tests'
   Write-PublishStep "1/6 Running the test suite"
@@ -110,12 +200,17 @@ try {
   $step = '2/6 bundle'
   Write-PublishStep "2/6 Building the bundle $Version"
   # Old outputs go first, so a failure further on can never leave a new file next to a stale signature
-  # or launcher. Only these five files are removed, never the folder.
+  # or launcher. Only these six files are removed, never the folder.
   foreach ($name in @($releaseNames) + $launcherName) {
     $path = Join-Path $dist $name
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
   }
   & (Join-Path $toolsDir 'Build-Bundle.ps1') -Version $Version -OutDir $dist
+  # Ben's installer goes to dist\ as it is. A real publish only gets here after step 0 passed its checks;
+  # under -DryRun a file that failed them is still copied, so the dry run shows the full upload.
+  if (Test-Path -LiteralPath $ScreenConnectInstaller -PathType Leaf) {
+    Copy-Item -LiteralPath $ScreenConnectInstaller -Destination (Join-Path $dist $installerName) -Force
+  }
 
   $step = '3/6 sign'
   Write-PublishStep '3/6 Signing'
@@ -149,7 +244,12 @@ try {
   [IO.File]::WriteAllText($launcherHashPath, "$launcherHash  $launcherName`r`n", (New-Object Text.ASCIIEncoding))
 
   $step = '6/6 release'
-  $releaseAssets = @(foreach ($name in $releaseNames) { Join-Path $dist $name })
+  # Under -DryRun a missing installer (already warned about in step 0) is left out; every other file must exist.
+  $releaseAssets = @(foreach ($name in $releaseNames) {
+    $asset = Join-Path $dist $name
+    if ($DryRun -and $name -eq $installerName -and -not (Test-Path -LiteralPath $asset -PathType Leaf)) { continue }
+    $asset
+  })
   foreach ($asset in $releaseAssets) { if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "missing release file: $asset" } }
   $ghArgs = @('release', 'create', $tag) + $releaseAssets + @('--repo', $repo, '--target', $source.Head, '--title', $tag, '--notes', $Notes)
   if ($DryRun) {
@@ -180,8 +280,8 @@ Write-Host "  Repo:     $repo"
 Write-Host "  Commit:   $(if ($source.Head) { $source.Head } else { '(unknown)' })"
 Write-Host "  Base URL: $baseUrl"
 Write-Host '  Release files (uploaded):'
-foreach ($asset in $releaseAssets) { Write-Host ("    {0,-17} {1,9:N0} bytes" -f (Split-Path -Leaf $asset), (Get-Item -LiteralPath $asset).Length) }
+foreach ($asset in $releaseAssets) { Write-Host ("    {0,-29} {1,10:N0} bytes" -f (Split-Path -Leaf $asset), (Get-Item -LiteralPath $asset).Length) }
 Write-Host '  Launcher (NOT uploaded; hand it out yourself):'
-Write-Host ("    {0,-17} {1,9:N0} bytes  SHA-256 {2}" -f $launcherName, (Get-Item -LiteralPath $launcherPath).Length, $launcherHash)
+Write-Host ("    {0,-29} {1,10:N0} bytes  SHA-256 {2}" -f $launcherName, (Get-Item -LiteralPath $launcherPath).Length, $launcherHash)
 if ($DryRun) { Write-Host '  DRY RUN: nothing was published.' -ForegroundColor Yellow } else { Write-Host "  Published: https://github.com/$repo/releases/tag/$tag" -ForegroundColor Green }
 exit 0
