@@ -62,6 +62,7 @@ Describe 'config.json' {
 '@ | ConvertFrom-Json
     @(Get-BadVerifyVendors -Config $synthetic) | Should -Be @('EMPTY', 'EMPTYLIST', 'NUMBER')
   }
+  It 'installs Windows updates one at a time by default' { $cfg.windowsUpdate.installMode | Should -Be 'OneAtATime' }
   It 'throws on a missing key' {
     '{"defaults":{}}' | Set-Content "$TestDrive\c.json"; { Read-SetupConfig -Path "$TestDrive\c.json" } | Should -Throw '*config missing key*'
   }

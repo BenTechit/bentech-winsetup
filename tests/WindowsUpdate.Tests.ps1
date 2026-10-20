@@ -107,9 +107,9 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # Runs the child round against a state file and returns its parsed result JSON.
     function Invoke-TestRound {
-      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly, [bool]$OnAC = $true)
+      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly, [bool]$OnAC = $true, [string]$InstallMode = 'Batch')
       $script:roundResultPath = Join-Path (Split-Path -Parent $StatePath) 'Logs\wu-round.json'
-      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly -OnAC $OnAC
+      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly -OnAC $OnAC -InstallMode $InstallMode
       return ([IO.File]::ReadAllText($script:roundResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
     }
 
@@ -544,6 +544,175 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r = Invoke-TestRound -StatePath (New-WuStateFile) -OnAC $false
       @($r.Installed.Id) | Should -Be @('sw'); $r.FirmwareDeferred | Should -Be 0
     }
+
+    # Spec 4.5: one update at a time, so the parent can show "Installing 3 of 7". Inherits every COM mock
+    # above; the download and install mocks are replaced by per-id ones.
+    Context 'one at a time' {
+      BeforeEach {
+        $script:installHResultFor = @{}
+        $script:downloadHResultFor = @{}
+        $script:installRebootFor = @{}
+        $script:installThrowFor = @{}
+        Mock Invoke-WuDownload {
+          $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID })
+          [void]$script:downloadCalls.Add($ids)
+          $codes = @(foreach ($id in $ids) { if ($script:downloadCodes.Contains($id)) { $script:downloadCodes[$id] } else { 2 } })
+          $hr = 0
+          foreach ($id in $ids) { if ($script:downloadHResultFor.Contains($id)) { $hr = $script:downloadHResultFor[$id] } }
+          return @{ ResultCodes = $codes; HResult = $hr }
+        }
+        Mock Invoke-WuInstall {
+          $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID })
+          [void]$script:installCalls.Add($ids)
+          foreach ($id in $ids) { if ($script:installThrowFor.Contains($id)) { throw $script:installThrowFor[$id] } }
+          $codes = @(foreach ($id in $ids) { if ($script:installCodes.Contains($id)) { $script:installCodes[$id] } else { 2 } })
+          $hr = 0
+          $reboot = $false
+          foreach ($id in $ids) {
+            if ($script:installHResultFor.Contains($id)) { $hr = $script:installHResultFor[$id] }
+            if ($script:installRebootFor.Contains($id)) { $reboot = [bool]$script:installRebootFor[$id] }
+          }
+          return @{ ResultCodes = $codes; RebootRequired = $reboot; HResult = $hr }
+        }
+      }
+
+      It 'downloads and installs each update on its own, in search order' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 's1')); $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:downloadCalls.Count | Should -Be 2; $script:downloadCalls[0] | Should -Be @('s1'); $script:downloadCalls[1] | Should -Be @('d1')
+        $script:installCalls.Count | Should -Be 2; $script:installCalls[0] | Should -Be @('s1'); $script:installCalls[1] | Should -Be @('d1')
+        @($r.Installed.Id) | Should -Be @('s1', 'd1'); $r.Found | Should -Be 2; $r.Installed[0].Kb | Should -Be 'KB5000001'
+      }
+      It 'maps per-update codes the v1 way: 2 and 3 installed, 4 and 5 failed' {
+        $script:searchResults[$script:SoftwareCriteria] = @('a','b','c','d' | ForEach-Object { New-FakeUpdate -Id $_ }); $script:installCodes = @{ a = 2; b = 3; c = 4; d = 5 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        @($r.Installed.Id) | Should -Be @('a', 'b'); @($r.Failed.Id) | Should -Be @('c', 'd'); @($r.Failed.ResultCode) | Should -Be @(4, 5)
+      }
+      It 'a failed download is Failed with its code, is not installed, and the next update still runs' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'x'), (New-FakeUpdate -Id 'y')); $script:downloadCodes = @{ x = 4 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:installCalls.Count | Should -Be 1; $script:installCalls[0] | Should -Be @('y'); @($r.Failed.ResultCode) | Should -Be @(4)
+      }
+      It 'skips the download of an update that is already downloaded' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'dl' -Downloaded $true))
+        $null = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime; $script:downloadCalls.Count | Should -Be 0; $script:installCalls.Count | Should -Be 1
+      }
+      It 'ORs RebootRequired over the updates' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installRebootFor = @{ a = $true }
+        (Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime).RebootRequired | Should -BeTrue
+      }
+      It 'ErrorCode is the first non-zero install HResult; a code that does not end the round lets the loop go on' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installHResultFor = @{ a = 0x80070643; b = 0x80070005 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:installCalls.Count | Should -Be 2; $r.ErrorCode | Should -Be '0x80070643'; $r.Error | Should -BeNullOrEmpty
+      }
+      It 'stops at a round-ending install code (<_>): the rest are not attempted' -ForEach @(0x80240016, 0x8024A000, 0x80242014) {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installHResultFor = @{ a = $_ }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:installCalls.Count | Should -Be 1; $r.ErrorCode | Should -Be (Format-WuHResult -HResult $_)
+        @($r.Installed.Id) + @($r.Failed.Id) | Should -Not -Contain 'b'
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        $p.Updates[1].Status | Should -Be 'skipped'
+      }
+      It 'a round-ending download code stops the loop and is ErrorCode when no install ran after it' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:downloadHResultFor = @{ b = 0x80240016 }; $script:downloadCodes = @{ b = 4 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:installCalls.Count | Should -Be 1; $r.ErrorCode | Should -Be '0x80240016'
+      }
+      It 'keeps what was done when the second install throws; Error and ErrorCode are set' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installThrowFor = @{ b = (New-Object Runtime.InteropServices.COMException('busy', 0x80240016)) }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        @($r.Installed.Id) | Should -Be @('a'); $r.Error | Should -Be 'busy'; $r.ErrorCode | Should -Be '0x80240016'
+      }
+      It 'writes the progress file: total, statuses, KB, size and phase done' {
+        $u = New-FakeUpdate -Id 'a'; $u | Add-Member NoteProperty MaxDownloadSize ([decimal]52428800)
+        $script:searchResults[$script:SoftwareCriteria] = @($u, (New-FakeUpdate -Id 'b')); $script:installCodes = @{ b = 4 }
+        $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 2) -InstallMode OneAtATime
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        $p.Round | Should -Be 2; $p.Mode | Should -Be 'OneAtATime'; $p.Phase | Should -Be 'done'; $p.Total | Should -Be 2
+        @($p.Updates.Status) | Should -Be @('installed', 'failed'); $p.Updates[0].Kb | Should -Be 'KB5000001'; $p.Updates[0].SizeMB | Should -Be 50
+      }
+      It 'a progress file that cannot be written never breaks the round' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+        Mock Get-WuProgressPath { Join-Path $TestDrive 'no\such\folder\p.json' }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $r.Error | Should -BeNullOrEmpty; @($r.Installed.Id) | Should -Be @('a')
+      }
+
+      # Beyond the brief's list: the details the parent's NOW and the result rules depend on.
+      It 'logs at most one WARN per round when the progress file cannot be written' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+        Mock Get-WuProgressPath { Join-Path $TestDrive 'no\such\folder\p.json' }
+        $null = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'progress' }).Count | Should -Be 1
+        Test-Path (Join-Path $TestDrive 'no') | Should -BeFalse
+      }
+      It 'shows the update being installed: phase installing, its 1-based number, status installing' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+        $script:seenAtInstall = New-Object System.Collections.ArrayList
+        Mock Invoke-WuInstall {
+          $p = [IO.File]::ReadAllText((Get-WuProgressPath -ResultPath $script:roundResultPath)) | ConvertFrom-Json
+          [void]$script:seenAtInstall.Add(('{0} {1} of {2}: {3}' -f $p.Phase, $p.Current, $p.Total, (@($p.Updates.Status) -join ',')))
+          return @{ ResultCodes = @(2); RebootRequired = $false; HResult = 0 }
+        }
+        $null = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        @($script:seenAtInstall) | Should -Be @('installing 1 of 2: installing,pending', 'installing 2 of 2: installed,installing')
+      }
+      It 'writes phase done after an exception, and leaves no temporary file' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'))
+        $script:installThrowFor = @{ a = (New-Object Runtime.InteropServices.COMException('busy', 0x80240016)) }
+        $null = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $path = Get-WuProgressPath -ResultPath $script:roundResultPath
+        ([IO.File]::ReadAllText($path) | ConvertFrom-Json).Phase | Should -Be 'done'
+        Test-Path -LiteralPath "$path.tmp" | Should -BeFalse
+      }
+      It 'never attempts or lists firmware left for later on battery' {
+        $fw = New-FakeUpdate -Id 'fw'; $fw | Add-Member NoteProperty DriverClass 'Firmware'
+        $script:searchResults[$script:DriverCriteria] = @($fw, (New-FakeUpdate -Id 'net'))
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime -OnAC $false
+        @($script:installCalls | ForEach-Object { $_ }) | Should -Be @('net'); $r.FirmwareDeferred | Should -Be 1; $r.Found | Should -Be 2
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        $p.Total | Should -Be 1; @($p.Updates.Title) | Should -Be @('Update net')
+      }
+      It 'an earlier non-zero install HResult stays ErrorCode when a later download ends the round' {
+        $script:searchResults[$script:SoftwareCriteria] = @('a', 'b', 'c' | ForEach-Object { New-FakeUpdate -Id $_ })
+        $script:installHResultFor = @{ a = 0x80070643 }; $script:downloadHResultFor = @{ b = 0x80240016 }; $script:downloadCodes = @{ b = 4 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $r.ErrorCode | Should -Be '0x80070643'; @($script:downloadCalls | ForEach-Object { $_ }) | Should -Be @('a', 'b')
+        @($r.Failed.Id) | Should -Be @('b'); @($r.Installed.Id) | Should -Be @('a')
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        @($p.Updates.Status) | Should -Be @('installed', 'failed', 'skipped')
+      }
+      It 'when no install ran at all, ErrorCode is the first non-zero download HResult (v1 rule)' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+        $script:downloadCodes = @{ a = 4; b = 4 }; $script:downloadHResultFor = @{ a = 0x80240022; b = 0x80070005 }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $script:downloadCalls.Count | Should -Be 2; $script:installCalls.Count | Should -Be 0; $r.ErrorCode | Should -Be '0x80240022'
+      }
+      It 'has no ErrorCode when every update went well' {
+        $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b'))
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        $r.ErrorCode | Should -BeNullOrEmpty; @($r.Installed.Id) | Should -Be @('a', 'b')
+      }
+    }
+    It 'batch mode writes the phases and final statuses too' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installCodes = @{ b = 4 }
+      $null = Invoke-TestRound -StatePath (New-WuStateFile)
+      $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+      $p.Mode | Should -Be 'Batch'; $p.Phase | Should -Be 'done'; @($p.Updates.Status) | Should -Be @('installed', 'failed')
+    }
+    It 'batch mode marks a failed download failed and shows the install phase during the install' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'x'), (New-FakeUpdate -Id 'y')); $script:downloadCodes = @{ x = 4 }
+      $script:seenAtInstall = $null
+      Mock Invoke-WuInstall {
+        $script:seenAtInstall = [IO.File]::ReadAllText((Get-WuProgressPath -ResultPath $script:roundResultPath)) | ConvertFrom-Json
+        return @{ ResultCodes = @(2); RebootRequired = $false; HResult = 0 }
+      }
+      $null = Invoke-TestRound -StatePath (New-WuStateFile)
+      $script:seenAtInstall.Phase | Should -Be 'installing'; @($script:seenAtInstall.Updates.Status) | Should -Be @('failed', 'pending')
+      $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+      @($p.Updates.Status) | Should -Be @('failed', 'installed')
+    }
   }
 
   Context 'Invoke-StepWindowsUpdate (parent step, child process mocked)' {
@@ -929,5 +1098,107 @@ Describe 'Invoke-WuInstall (COM wrapper, fake session)' {
     $script:installer.SeenAtInstall.AllowSourcePrompts | Should -BeFalse
     $r.ResultCodes | Should -Be @(2)
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'ForceQuiet' }).Count | Should -Be 1
+  }
+}
+
+# Spec 4.5: English titles where Windows allows it. New-Object -ComObject is mocked; no WUA object is created.
+Describe 'New-WuSession' {
+  BeforeAll {
+    . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\Activity.ps1"
+  }
+  It 'asks for English titles (UserLocale 1033)' {
+    Mock New-Object { [pscustomobject]@{ ClientApplicationID = $null; UserLocale = 0 } } -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' }
+    $s = New-WuSession; $s.UserLocale | Should -Be 1033; $s.ClientApplicationID | Should -Be 'BenTech Setup'
+  }
+  It 'still returns the session when the locale is refused, with a WARN' {
+    Mock Write-SetupLog { }
+    Mock New-Object { $o = [pscustomobject]@{ ClientApplicationID = $null }; $o | Add-Member ScriptProperty UserLocale { 0 } { throw 'E_INVALIDARG' }; $o } -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' }
+    New-WuSession | Should -Not -BeNullOrEmpty; Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -match 'en-US' }
+  }
+}
+Describe 'Get-WuInstallMode and Get-WuProgressPath' {
+  BeforeAll {
+    . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\Activity.ps1"
+  }
+  BeforeEach { Mock Write-SetupLog { } }
+  It 'defaults to OneAtATime, honours Batch, ignores nonsense' {
+    Get-WuInstallMode -Config ([pscustomobject]@{}) | Should -Be 'OneAtATime'
+    Get-WuInstallMode -Config ([pscustomobject]@{ windowsUpdate = [pscustomobject]@{ installMode = 'Batch' } }) | Should -Be 'Batch'
+    Get-WuInstallMode -Config ([pscustomobject]@{ windowsUpdate = [pscustomobject]@{ installMode = 'Fast' } }) | Should -Be 'OneAtATime'
+  }
+  It 'derives the progress path from the result path' { Get-WuProgressPath -ResultPath 'C:\BenTech\Setup\Logs\wu-round2.json' | Should -Be 'C:\BenTech\Setup\Logs\wu-round2.progress.json' }
+  It 'warns about an unknown mode only, and uses the canonical spelling' {
+    Get-WuInstallMode -Config ([pscustomobject]@{ windowsUpdate = [pscustomobject]@{ installMode = 'batch' } }) | Should -BeExactly 'Batch'
+    Get-WuInstallMode -Config ([pscustomobject]@{ windowsUpdate = [pscustomobject]@{} }) | Should -Be 'OneAtATime'
+    Should -Invoke Write-SetupLog -Times 0 -Exactly
+    Get-WuInstallMode -Config ([pscustomobject]@{ windowsUpdate = [pscustomobject]@{ installMode = 'Fast' } }) | Should -Be 'OneAtATime'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.installMode -eq 'Fast' }
+  }
+}
+# The progress file the parent's NOW reads (spec 4.5). Real file I/O inside $TestDrive only.
+Describe 'Update-WuProgress' {
+  BeforeAll {
+    . "$PSScriptRoot\..\src\Common\Logging.ps1"
+    . "$PSScriptRoot\..\src\Common\Activity.ps1"
+    function New-TestProgress {
+      [ordered]@{ Round = 1; Mode = 'OneAtATime'; Phase = 'searching'; Current = 0; Total = 2
+                  Updates = @([ordered]@{ Kb = 'KB1'; Title = 'One'; SizeMB = 1.5; Status = 'pending' }, [ordered]@{ Kb = ''; Title = 'Two'; SizeMB = 0; Status = 'pending' })
+                  UpdatedAt = $null }
+    }
+  }
+  BeforeEach {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    $script:WuProgressWarned = $false
+  }
+  It 'sets the phase, the current number and one status, and writes UTF-8 JSON without a BOM' {
+    $path = Join-Path $TestDrive 'p1.progress.json'; $progress = New-TestProgress
+    Update-WuProgress -Path $path -Progress $progress -Phase 'installing' -Current 2 -Index 1 -Status 'installing'
+    $bytes = [IO.File]::ReadAllBytes($path); ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB) | Should -BeFalse
+    $p = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+    $p.Phase | Should -Be 'installing'; $p.Current | Should -Be 2; @($p.Updates.Status) | Should -Be @('pending', 'installing')
+    $p.UpdatedAt | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+  }
+  It 'replaces an existing file and leaves no temporary file' {
+    $path = Join-Path $TestDrive 'p2.progress.json'; $progress = New-TestProgress
+    Update-WuProgress -Path $path -Progress $progress -Phase 'downloading'
+    Update-WuProgress -Path $path -Progress $progress -Phase 'done'
+    ([IO.File]::ReadAllText($path) | ConvertFrom-Json).Phase | Should -Be 'done'
+    Test-Path -LiteralPath "$path.tmp" | Should -BeFalse
+  }
+  It 'keeps a one-update list a JSON array' {
+    $path = Join-Path $TestDrive 'p3.progress.json'; $progress = New-TestProgress; $progress.Updates = @($progress.Updates[0]); $progress.Total = 1
+    Update-WuProgress -Path $path -Progress $progress
+    ([IO.File]::ReadAllText($path) | ConvertFrom-Json).Updates -is [array] | Should -BeTrue
+  }
+  It 'never throws: an unwritable path is one WARN, however often it is tried' {
+    $path = Join-Path $TestDrive 'missing\folder\p.progress.json'; $progress = New-TestProgress
+    { Update-WuProgress -Path $path -Progress $progress -Phase 'downloading' } | Should -Not -Throw
+    { Update-WuProgress -Path $path -Progress $progress -Phase 'installing' -Index 0 -Status 'installing' } | Should -Not -Throw
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+    $progress.Phase | Should -Be 'installing'
+  }
+  It 'ignores an index outside the list' {
+    $path = Join-Path $TestDrive 'p4.progress.json'; $progress = New-TestProgress
+    { Update-WuProgress -Path $path -Progress $progress -Index 5 -Status 'failed' } | Should -Not -Throw
+    @(([IO.File]::ReadAllText($path) | ConvertFrom-Json).Updates.Status) | Should -Be @('pending', 'pending')
+  }
+}
+# Spec 4.5: the size and KB the progress file shows, and the KB on each Installed entry.
+Describe 'ConvertTo-WuUpdateInfo SizeBytes and New-WuInstalledEntry Kb' {
+  It 'reads MaxDownloadSize as SizeBytes; missing or unreadable is 0' {
+    $u =[pscustomobject]@{ Identity = [pscustomobject]@{ UpdateID = 'a' }; Title = 'A'; KBArticleIDs = $null; Categories = $null; MaxDownloadSize = [decimal]1048576 }
+    (ConvertTo-WuUpdateInfo -Update $u).SizeBytes | Should -Be 1048576
+    $u2 = [pscustomobject]@{ Identity = [pscustomobject]@{ UpdateID = 'b' }; Title = 'B'; KBArticleIDs = $null; Categories = $null }
+    (ConvertTo-WuUpdateInfo -Update $u2).SizeBytes | Should -Be 0
+    $u3 = [pscustomobject]@{ Identity = [pscustomobject]@{ UpdateID = 'c' }; Title = 'C'; KBArticleIDs = $null; Categories = $null }
+    $u3 | Add-Member ScriptProperty MaxDownloadSize { throw 'E_FAIL' }
+    (ConvertTo-WuUpdateInfo -Update $u3).SizeBytes | Should -Be 0
+  }
+  It 'Kb is KB plus the first KB article, or empty' {
+    (New-WuInstalledEntry -Info ([pscustomobject]@{ Id = 'a'; Title = 'A'; KBs = @('5070001', '5070002'); CategoryIds = @() })).Kb | Should -Be 'KB5070001'
+    (New-WuInstalledEntry -Info ([pscustomobject]@{ Id = 'b'; Title = 'B'; KBs = @(); CategoryIds = @() })).Kb | Should -Be ''
   }
 }

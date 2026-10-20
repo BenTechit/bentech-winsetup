@@ -127,7 +127,8 @@ function Invoke-SetupWuRoundProcess {
   # error is logged; the parent treats a missing result JSON as a failed round).
   # Spec 9.2: the power status is read at the start of every round (each round is its own process) and
   # passed as -OnAC, so firmware is flashed only on mains power. A failed read counts as battery (WARN):
-  # firmware is never flashed on a guess.
+  # firmware is never flashed on a guess. Spec 4.5: -InstallMode comes from config windowsUpdate.installMode
+  # (Get-WuInstallMode: one update at a time unless the config says Batch).
   [CmdletBinding()]
   [OutputType([int])]
   param(
@@ -154,7 +155,8 @@ function Invoke-SetupWuRoundProcess {
     }
     # A missing state is not checked here: Invoke-WuRound reports it in the result JSON.
     $null = Invoke-WuRound -StatePath (Join-Path $Root 'state.json') -ResultPath $ResultPath `
-      -FailuresBeforeHide ([int]$config.caps.wuFailuresBeforeHide) -IsWindows10 $isWindows10 -SearchOnly:$SearchOnly -OnAC $onAC
+      -FailuresBeforeHide ([int]$config.caps.wuFailuresBeforeHide) -IsWindows10 $isWindows10 -SearchOnly:$SearchOnly -OnAC $onAC `
+      -InstallMode (Get-WuInstallMode -Config $config)
     return 0
   } catch {
     Write-SetupLog -Level ERROR -Message 'Windows Update round process failed' -Data @{ error = $_.Exception.Message; resultPath = $ResultPath }
@@ -282,8 +284,9 @@ function Start-BenTechSetup {
     The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound
     child) or 2 (another run holds the lock).
   .DESCRIPTION
-    -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide, the
-    state's Machine.IsWindows10 and the power status read now (-OnAC; a failed read is battery); no lock,
+    -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide and
+    windowsUpdate.installMode, the state's Machine.IsWindows10 and the power status read now (-OnAC; a
+    failed read is battery); no lock,
     no transcript, no screen: no activity feed, no tick, no console resize. 0 when the round ran, 1 when
     it could not (logged).
 

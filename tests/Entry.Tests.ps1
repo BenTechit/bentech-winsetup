@@ -407,6 +407,15 @@ Describe 'Start-BenTechSetup' {
       Mock Test-OnACPower { throw 'no power status' }; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
       Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.error -eq 'no power status' }
     }
+    # Spec 4.5: the config switch between one update at a time (default) and v1's batch install.
+    It '-WuRound passes the configured install mode' { Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null; Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $InstallMode -eq 'OneAtATime' } }
+    It '-WuRound passes Batch when the config asks for it' {
+      $script:batchCfg = $script:cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+      $script:batchCfg.windowsUpdate.installMode = 'Batch'
+      Mock Read-SetupConfig { $script:batchCfg }
+      Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $InstallMode -eq 'Batch' }
+    }
   }
 
   # Final review I3: in the classic console host one click into the window starts a QuickEdit selection,

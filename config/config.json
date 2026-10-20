@@ -5,6 +5,7 @@
   "timeoutsMinutes": { "default": 30, "msi": 20, "office": 60, "vendor": 60, "wuRound": 90,
                        "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2 },
   "power": { "finalAcMonitorMinutes": 15 },
+  "windowsUpdate": { "installMode": "OneAtATime" },
   "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },
   "signers": {
     "google": ["Google LLC"], "anydesk": ["AnyDesk Software GmbH"], "microsoft": ["Microsoft Corporation"],

@@ -10,7 +10,9 @@
 #   child's result JSON, and books it into the state. It returns Continue (with Reboot 'Now' when
 #   needed) until a round finds nothing to do, then Done.
 # - The child round, Invoke-WuRound, does the COM work in that separate process: search, hide, accept
-#   EULAs, download, install. It ALWAYS writes its result JSON; any exception becomes its Error.
+#   EULAs, download, install (one update at a time by default, or v1's batch: config
+#   windowsUpdate.installMode, spec 4.5). It ALWAYS writes its result JSON; any exception becomes its
+#   Error. While it runs it keeps Logs\wu-round<N>.progress.json up to date for the parent's screen.
 #
 # Why it cannot loop forever: the round cap; a per-update failure counter in state.json
 # (WuFailureCounts) that hides an update after caps.wuFailuresBeforeHide failures; Defender
@@ -40,6 +42,10 @@ $script:WuBatteryNote = 'On battery: BIOS/firmware updates skipped'
 #   0x80242014 WU_E_UH_POSTREBOOTSTILLPENDING (earlier updates need a restart to finish)
 $script:WuBusyErrorCodes = @('0x80240016', '0x8024A000')
 $script:WuRebootPendingErrorCode = '0x80242014'
+
+# Spec 4.5: Update-WuProgress logs its first failed write of a round and stays quiet after that.
+# Invoke-WuRound resets it at the start of every round.
+$script:WuProgressWarned = $false
 
 # --- pure helpers -----------------------------------------------------------------------------
 
@@ -132,7 +138,7 @@ function ConvertTo-WuUpdateInfo {
   <#
   .SYNOPSIS
     Turns a WUA IUpdate into [pscustomobject]@{ Id; Title; KBs; CategoryIds; CanRequestUserInput;
-    IsDriver; DriverClass }.
+    IsDriver; DriverClass; SizeBytes }.
   .DESCRIPTION
     Id is Identity.UpdateID. KBs and CategoryIds are string arrays (possibly empty), read from the COM
     collections with Count/Item(i). Only the category GUIDs (CategoryID) are kept: names are localized.
@@ -140,6 +146,8 @@ function ConvertTo-WuUpdateInfo {
     -Type is the search that found the update (spec 9.2): IsDriver is $true for 'Driver'. DriverClass
     (IWindowsDriverUpdate.DriverClass, the INF setup class such as 'Firmware'; not localized) is read
     only for drivers, in a try; it is '' for software or when it cannot be read.
+    SizeBytes (spec 4.5, display only) is IUpdate.MaxDownloadSize as a [double]; 0 when it is missing or
+    cannot be read.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -172,6 +180,12 @@ function ConvertTo-WuUpdateInfo {
       $driverClass = ''
     }
   }
+  $sizeBytes = [double]0
+  try {
+    $sizeBytes = [double]$Update.MaxDownloadSize
+  } catch {
+    $sizeBytes = [double]0
+  }
 
   [pscustomobject]@{
     Id                  = [string]$Update.Identity.UpdateID
@@ -181,7 +195,62 @@ function ConvertTo-WuUpdateInfo {
     CanRequestUserInput = $userInput
     IsDriver            = $isDriver
     DriverClass         = $driverClass
+    SizeBytes           = $sizeBytes
   }
+}
+
+function Get-WuKb {
+  # Private. 'KB' + the update info's first KB article id (WUA lists the bare number), or '' when it has
+  # none.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)]$Info)
+
+  $first = @(ConvertTo-WuList -Value $Info.KBs) | Select-Object -First 1
+  if ([string]::IsNullOrWhiteSpace([string]$first)) { return '' }
+  return ('KB' + ([string]$first).Trim())
+}
+
+function Test-WuRoundEndingCode {
+  # Private. $true for an HRESULT (Format-WuHResult text) that v1 treats as round-ending (ruling R23): the
+  # agent is busy, or earlier updates need a restart. The one-at-a-time loop stops at such a code.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()][AllowEmptyString()][string]$Code)
+
+  if ([string]::IsNullOrWhiteSpace($Code)) { return $false }
+  return (($script:WuBusyErrorCodes -contains $Code) -or ($Code -eq $script:WuRebootPendingErrorCode))
+}
+
+function Get-WuInstallMode {
+  <#
+  .SYNOPSIS
+    The configured Windows Update install mode (spec 4.5): 'OneAtATime' or 'Batch'.
+  .DESCRIPTION
+    config.windowsUpdate.installMode, matched ignoring case and returned in its canonical spelling. A
+    missing section or value is 'OneAtATime' (the default); an unknown value is 'OneAtATime' and a WARN.
+    'Batch' brings back v1's one-batch download and install.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)]$Config)
+
+  $value = [string]$Config.windowsUpdate.installMode
+  if ([string]::IsNullOrWhiteSpace($value)) { return 'OneAtATime' }
+  foreach ($mode in 'OneAtATime', 'Batch') {
+    if ($value.Trim() -eq $mode) { return $mode }
+  }
+  Write-SetupLog -Level WARN -Message 'Unknown Windows Update install mode in config.json; installing one update at a time' -Data @{ installMode = $value }
+  return 'OneAtATime'
+}
+
+function Get-WuProgressPath {
+  # Private. The progress file next to a round's result file: ...\wu-round2.json -> ...\wu-round2.progress.json.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$ResultPath)
+
+  return [IO.Path]::ChangeExtension($ResultPath, '.progress.json')
 }
 
 function Select-WuUpdates {
@@ -279,12 +348,19 @@ function Get-WuRoundOutcome {
 # --- COM touchpoints (each replaced by the tests) ---------------------------------------------
 
 function New-WuSession {
-  # Private. A new Microsoft.Update.Session.
+  # Private. A new Microsoft.Update.Session. Spec 4.5: it asks for English titles (UserLocale 1033,
+  # en-US), display only. A session that refuses the locale is a WARN and is still returned: the titles
+  # then stay localized and the screen's ASCII filter handles them.
   [CmdletBinding()]
   param()
 
   $session = New-Object -ComObject 'Microsoft.Update.Session'
   $session.ClientApplicationID = 'BenTech Setup'
+  try {
+    $session.UserLocale = 1033
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Windows Update session refused the en-US locale; titles stay localized' -Data @{ error = $_.Exception.Message }
+  }
   return $session
 }
 
@@ -445,9 +521,10 @@ function Write-WuRoundResult {
 }
 
 function New-WuInstalledEntry {
-  # Private. One Installed entry of the round result: @{ Id; Title; IsDefinition }. IsDefinition (the
+  # Private. One Installed entry of the round result: @{ Id; Title; IsDefinition; Kb }. IsDefinition (the
   # Defender definition-updates category GUID) lets the parent leave those out of re-offer counting:
   # definition updates keep their UpdateID and only get a new revision, so they come back legitimately.
+  # Kb (spec 4.5, for the report) is 'KB' + the first KB article id, or ''.
   [CmdletBinding()]
   param([Parameter(Mandatory)]$Info)
 
@@ -455,7 +532,188 @@ function New-WuInstalledEntry {
     Id           = [string]$Info.Id
     Title        = [string]$Info.Title
     IsDefinition = (@(ConvertTo-WuList -Value $Info.CategoryIds) -contains $script:DefinitionUpdatesCategoryId)
+    Kb           = (Get-WuKb -Info $Info)
   }
+}
+
+function New-WuProgressEntry {
+  # Private. One entry of the progress file's Updates list (spec 4.5): @{ Kb; Title; SizeMB; Status }, with
+  # Status 'pending'. SizeMB is SizeBytes in MB, rounded to one decimal.
+  [CmdletBinding()]
+  param([Parameter(Mandatory)]$Info)
+
+  return [ordered]@{
+    Kb     = (Get-WuKb -Info $Info)
+    Title  = [string]$Info.Title
+    SizeMB = [math]::Round(([double]$Info.SizeBytes / 1MB), 1)
+    Status = 'pending'
+  }
+}
+
+function Update-WuProgress {
+  <#
+  .SYNOPSIS
+    Private. Updates the round's progress (spec 4.5) and writes it to Path. Never throws.
+  .DESCRIPTION
+    Progress is the ordered dictionary Invoke-WuRound keeps:
+      { Round; Mode 'OneAtATime'|'Batch'; Phase 'searching'|'downloading'|'installing'|'done';
+        Current (1-based, 0 = none); Total; Updates [ { Kb; Title; SizeMB; Status } ]; UpdatedAt }
+    Status is 'pending', 'downloading', 'installing', 'installed', 'failed' or 'skipped' (not attempted:
+    the loop stopped at a round-ending code). -Phase and -Current are set when given; -Index (0-based,
+    into Updates) with -Status sets that update's Status (an index outside the list is ignored). UpdatedAt
+    is now (ISO 's'). The JSON (depth 4, UTF-8 without a BOM) goes to <Path>.tmp first, which then
+    replaces Path ([IO.File]::Replace, or a Move when Path does not exist yet), so the parent never reads
+    a half-written file. Folders are not created. A failed write is logged as a WARN once per round
+    ($script:WuProgressWarned, reset by Invoke-WuRound) and the round goes on: the file is display only.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][System.Collections.IDictionary]$Progress,
+    [string]$Phase,
+    [int]$Current,
+    [int]$Index = -1,
+    [string]$Status
+  )
+
+  try {
+    if ($PSBoundParameters.ContainsKey('Phase')) { $Progress['Phase'] = $Phase }
+    if ($PSBoundParameters.ContainsKey('Current')) { $Progress['Current'] = $Current }
+    if ($PSBoundParameters.ContainsKey('Status')) {
+      $updates = @(ConvertTo-WuList -Value $Progress['Updates'])
+      if ($Index -ge 0 -and $Index -lt $updates.Count) { $updates[$Index]['Status'] = $Status }
+    }
+    $Progress['UpdatedAt'] = (Get-Date).ToString('s', [Globalization.CultureInfo]::InvariantCulture)
+    $json = ConvertTo-Json -InputObject $Progress -Depth 4
+    $temporary = $Path + '.tmp'
+    [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding $false))
+    if ([IO.File]::Exists($Path)) {
+      # [NullString]::Value, not $null: PowerShell would pass '' for $null, which File.Replace rejects.
+      [IO.File]::Replace($temporary, $Path, [NullString]::Value)
+    } else {
+      [IO.File]::Move($temporary, $Path)
+    }
+  } catch {
+    if (-not $script:WuProgressWarned) {
+      $script:WuProgressWarned = $true
+      Write-SetupLog -Level WARN -Message 'Windows Update progress file could not be written; the round goes on' -Data @{ path = $Path; error = $_.Exception.Message }
+    }
+  }
+}
+
+function Invoke-WuInstallEach {
+  <#
+  .SYNOPSIS
+    Private. Downloads and installs the updates one at a time, in search order (spec 4.5), so the parent
+    can show "Installing 3 of 7". Returns @{ RebootRequired = <bool>; ErrorCode = <string|$null> }.
+  .DESCRIPTION
+    Infos is the round's Install selection, in the same order as Progress.Updates. For each update
+    (Current = its 1-based number):
+    1. Phase and status 'downloading'. When it is not downloaded yet: Invoke-WuDownload with it alone.
+       A ResultCode other than 2/3 makes it Failed (@{ Id; Title; ResultCode = <download code> }) with
+       status 'failed', and it is not installed.
+    2. Phase and status 'installing'; Invoke-WuInstall with it alone. ResultCode 2/3 -> Installed
+       (New-WuInstalledEntry), status 'installed'; anything else -> Failed with its code, status
+       'failed'. RebootRequired is OR-ed over the installs.
+    3. Stop rule: when this update's download or install HResult is round-ending (Test-WuRoundEndingCode:
+       busy or restart pending), the loop stops after it. The rest get status 'skipped' and appear in
+       neither list: they were not attempted, and the parent's v1 handling of the code applies. Any
+       other non-zero HResult does not stop the loop.
+    4. ErrorCode: the first non-zero install HResult; when there is none, the round-ending download
+       HResult that stopped the loop; when no install ran at all, the first non-zero download HResult
+       (v1's rule); otherwise $null.
+    Installed and Failed are the round's own lists, filled in place. An exception propagates:
+    Invoke-WuRound's catch keeps what is already listed (v1 behaviour).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)]$Session,
+    [Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$ById,
+    [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Infos,
+    [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Installed,
+    [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Failed,
+    [Parameter(Mandatory)][System.Collections.IDictionary]$Progress,
+    [Parameter(Mandatory)][string]$ProgressPath
+  )
+
+  $rebootRequired = $false
+  $installRan = $false
+  $firstInstallCode = $null
+  $firstDownloadCode = $null
+  $stoppingDownloadCode = $null
+
+  for ($i = 0; $i -lt $Infos.Count; $i++) {
+    $info = $Infos[$i]
+    $update = $ById[$info.Id]
+    $endCode = $null
+    $logData = @{ number = $i + 1; total = $Infos.Count; id = $info.Id; title = $info.Title }
+
+    Update-WuProgress -Path $ProgressPath -Progress $Progress -Phase 'downloading' -Current ($i + 1) -Index $i -Status 'downloading'
+    $downloadOk = $true
+    if (-not [bool]$update.IsDownloaded) {
+      $download = Invoke-WuDownload -Session $Session -Updates @($update)
+      $codes = @(ConvertTo-WuList -Value $download.ResultCodes)
+      $code = if ($codes.Count -gt 0) { [int]$codes[0] } else { 0 }
+      if ($null -ne $download.HResult -and [int64]$download.HResult -ne 0) {
+        $hresult = Format-WuHResult -HResult $download.HResult
+        Write-SetupLog -Message 'Windows Update download reported an error code' -Level WARN -Data @{ id = $info.Id; title = $info.Title; errorCode = $hresult }
+        if ($null -eq $firstDownloadCode) { $firstDownloadCode = $hresult }
+        if (Test-WuRoundEndingCode -Code $hresult) {
+          $endCode = $hresult
+          $stoppingDownloadCode = $hresult
+        }
+      }
+      if ($code -ne 2 -and $code -ne 3) {
+        $downloadOk = $false
+        $Failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
+        Write-SetupLog -Message 'Windows update download failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
+        Update-WuProgress -Path $ProgressPath -Progress $Progress -Index $i -Status 'failed'
+      }
+    }
+
+    if ($downloadOk) {
+      Write-SetupLog -Message 'Installing a Windows update (one at a time)' -Data $logData
+      Update-WuProgress -Path $ProgressPath -Progress $Progress -Phase 'installing' -Index $i -Status 'installing'
+      $install = Invoke-WuInstall -Session $Session -Updates @($update)
+      $installRan = $true
+      if ([bool]$install.RebootRequired) { $rebootRequired = $true }
+      $codes = @(ConvertTo-WuList -Value $install.ResultCodes)
+      $code = if ($codes.Count -gt 0) { [int]$codes[0] } else { 0 }
+      if ($null -ne $install.HResult -and [int64]$install.HResult -ne 0) {
+        $hresult = Format-WuHResult -HResult $install.HResult
+        Write-SetupLog -Message 'Windows Update installation reported an error code' -Level WARN -Data @{ id = $info.Id; title = $info.Title; errorCode = $hresult }
+        if ($null -eq $firstInstallCode) { $firstInstallCode = $hresult }
+        if (Test-WuRoundEndingCode -Code $hresult) { $endCode = $hresult }
+      }
+      if ($code -eq 2 -or $code -eq 3) {
+        $Installed.Add((New-WuInstalledEntry -Info $info))
+        Update-WuProgress -Path $ProgressPath -Progress $Progress -Index $i -Status 'installed'
+      } else {
+        $Failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
+        Write-SetupLog -Message 'Windows update install failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
+        Update-WuProgress -Path $ProgressPath -Progress $Progress -Index $i -Status 'failed'
+      }
+    }
+
+    if ($null -ne $endCode) {
+      $updates = @(ConvertTo-WuList -Value $Progress['Updates'])
+      for ($j = $i + 1; $j -lt $updates.Count; $j++) { $updates[$j]['Status'] = 'skipped' }
+      Update-WuProgress -Path $ProgressPath -Progress $Progress
+      Write-SetupLog -Message 'Windows Update round stopped early; the remaining updates were not attempted' -Level WARN -Data @{ errorCode = $endCode; notAttempted = $Infos.Count - $i - 1 }
+      break
+    }
+  }
+
+  $errorCode = $null
+  if ($null -ne $firstInstallCode) {
+    $errorCode = $firstInstallCode
+  } elseif ($null -ne $stoppingDownloadCode) {
+    $errorCode = $stoppingDownloadCode
+  } elseif (-not $installRan) {
+    $errorCode = $firstDownloadCode
+  }
+  return @{ RebootRequired = $rebootRequired; ErrorCode = $errorCode }
 }
 
 function Get-WuRoundNumber {
@@ -478,8 +736,9 @@ function Invoke-WuRound {
   .SYNOPSIS
     One Windows Update round, run in the child process the parent step starts with -WuRound. Always
     writes ResultPath:
-      { Installed: [{Id,Title,IsDefinition}], Failed: [{Id,Title,ResultCode}], Hidden: [Id],
-        HideFailed: [Id], OnlyDefinitions, RebootRequired, Error, ErrorCode, FirmwareDeferred }
+      { Installed: [{Id,Title,IsDefinition,Kb}], Failed: [{Id,Title,ResultCode}], Hidden: [Id],
+        HideFailed: [Id], OnlyDefinitions, RebootRequired, Error, ErrorCode, FirmwareDeferred, Found }
+    Found is the number of updates the searches found (whatever was then done with them).
   .DESCRIPTION
     1. Reads state.json (Read-RunState on StatePath's folder; read-only use): WuFailureCounts,
        PreviousHiddenUpdateIds and Steps['windows-update'].Data.Rounds (the parent saved the new
@@ -515,6 +774,21 @@ function Invoke-WuRound {
 
     -OnAC (spec 9.2): whether the machine is on mains power; the -WuRound entry reads it at the start
     of the round. On battery, firmware driver updates are deferred.
+
+    -InstallMode (spec 4.5, config windowsUpdate.installMode): 'OneAtATime' (the default) replaces
+    steps 7 and 8 with Invoke-WuInstallEach: each update is downloaded and installed on its own, in
+    search order, and the loop stops at the first round-ending HRESULT (the rest are not attempted);
+    ErrorCode then follows Invoke-WuInstallEach's rule. 'Batch' is v1's one download and one install.
+    The hide, EULA and SearchOnly paths are the same in both modes.
+
+    Progress (spec 4.5): <ResultPath without .json>.progress.json (Get-WuProgressPath), written by
+    Update-WuProgress and read by the parent's NOW on every tick: Phase 'searching' once the state is
+    read; after the selection, Total and Updates (the Install set, all 'pending'; deferred firmware is
+    never listed); Batch: Phase 'downloading' / 'installing' around the two batch calls and each
+    update's final status from its code; OneAtATime: Invoke-WuInstallEach keeps Phase, Current and the
+    statuses; Phase 'done' in a finally, also after an exception. The result's folder is created first,
+    so the progress file can be written from the start. A progress file that cannot be written never
+    breaks the round.
   #>
   [CmdletBinding()]
   param(
@@ -523,13 +797,16 @@ function Invoke-WuRound {
     [Parameter(Mandatory)][ValidateRange(1, 1000)][int]$FailuresBeforeHide,
     [Parameter(Mandatory)][bool]$IsWindows10,
     [switch]$SearchOnly,
-    [bool]$OnAC = $true
+    [bool]$OnAC = $true,
+    [ValidateSet('OneAtATime', 'Batch')][string]$InstallMode = 'OneAtATime'
   )
 
   $installed = New-Object 'System.Collections.Generic.List[object]'
   $failed = New-Object 'System.Collections.Generic.List[object]'
   $hidden = New-Object 'System.Collections.Generic.List[string]'
   $hideFailed = New-Object 'System.Collections.Generic.List[string]'
+  # Every update the searches found, as update infos (Found in the result).
+  $infos = New-Object 'System.Collections.Generic.List[object]'
   $onlyDefinitions = $false
   $rebootRequired = $false
   $errorText = $null
@@ -537,14 +814,22 @@ function Invoke-WuRound {
   # Set once the selection exists; a round that fails before it deferred nothing.
   $firmwareDeferred = 0
 
+  $progressPath = Get-WuProgressPath -ResultPath $ResultPath
+  $progress = [ordered]@{ Round = 0; Mode = $InstallMode; Phase = 'searching'; Current = 0; Total = 0; Updates = @(); UpdatedAt = $null }
+  $script:WuProgressWarned = $false
+
   try {
+    $resultFolder = Split-Path -Parent $ResultPath
+    if ($resultFolder) { [void][IO.Directory]::CreateDirectory($resultFolder) }
     $state = Read-RunState -Root (Split-Path -Parent $StatePath)
     if ($null -eq $state) { throw "Run state not found or unreadable: $StatePath" }
     $failureCounts = $state['WuFailureCounts']
     if ($failureCounts -isnot [System.Collections.IDictionary]) { $failureCounts = @{} }
     $previousHidden = @(ConvertTo-WuList -Value $state['PreviousHiddenUpdateIds'] | ForEach-Object { [string]$_ } | Where-Object { $_ })
     $round = Get-WuRoundNumber -State $state
-    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10; onAC = $OnAC }
+    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10; onAC = $OnAC; installMode = $InstallMode }
+    $progress['Round'] = $round
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'searching'
 
     $session = New-WuSession
     if ($SearchOnly) {
@@ -566,7 +851,6 @@ function Invoke-WuRound {
 
     # Id -> IUpdate, so the selection (info objects) can be mapped back to the COM objects.
     $byId = @{}
-    $infos = New-Object 'System.Collections.Generic.List[object]'
     foreach ($type in 'Software', 'Driver') {
       foreach ($update in @(Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type $type))) {
         if ($null -eq $update) { continue }
@@ -592,6 +876,9 @@ function Invoke-WuRound {
       Write-SetupLog -Message 'Firmware update left for later: on battery' -Data @{ id = $info.Id; title = $info.Title; driverClass = $info.DriverClass }
     }
     Write-SetupLog -Message 'Windows Update search finished' -Data @{ found = $infos.Count; install = @($selection.Install).Count; hide = @($selection.Hide).Count; skip = @($selection.Skip).Count; deferred = $firmwareDeferred; onlyDefinitions = $onlyDefinitions }
+    $progress['Total'] = @($selection.Install).Count
+    $progress['Updates'] = [object[]]@(foreach ($info in $selection.Install) { New-WuProgressEntry -Info $info })
+    Update-WuProgress -Path $progressPath -Progress $progress
 
     if ($SearchOnly) {
       foreach ($info in $selection.Install) { $installed.Add((New-WuInstalledEntry -Info $info)) }
@@ -614,54 +901,70 @@ function Invoke-WuRound {
         if (-not [bool]$update.EulaAccepted) { Approve-WuEula -Update $update }
       }
 
-      # Download what is not there yet; an update whose download did not succeed is not installed.
-      # The download's own HResult only becomes ErrorCode when no install runs afterwards: a leftover
-      # download code must not trigger the busy / restart handling of a round whose installs worked.
-      $downloadErrorCode = $null
-      $downloadCodes = @{}
-      $toDownload = @(foreach ($info in $selection.Install) { if (-not [bool]$byId[$info.Id].IsDownloaded) { $info } })
-      if ($toDownload.Count -gt 0) {
-        $download = Invoke-WuDownload -Session $session -Updates @(foreach ($info in $toDownload) { $byId[$info.Id] })
-        $codes = @(ConvertTo-WuList -Value $download.ResultCodes)
-        if ($null -ne $download.HResult -and [int64]$download.HResult -ne 0) {
-          $downloadErrorCode = Format-WuHResult -HResult $download.HResult
-          Write-SetupLog -Message 'Windows Update download reported an error code' -Level WARN -Data @{ errorCode = $downloadErrorCode }
-        }
-        for ($i = 0; $i -lt $toDownload.Count; $i++) {
-          $downloadCodes[$toDownload[$i].Id] = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
-        }
-      }
-      $ready = New-Object 'System.Collections.Generic.List[object]'
-      foreach ($info in $selection.Install) {
-        $code = if ($downloadCodes.ContainsKey($info.Id)) { $downloadCodes[$info.Id] } else { 2 }
-        if ($code -eq 2 -or $code -eq 3) {
-          $ready.Add($info)
-        } else {
-          $failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
-          Write-SetupLog -Message 'Windows update download failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
-        }
-      }
+      if ($InstallMode -eq 'OneAtATime') {
+        $each = Invoke-WuInstallEach -Session $session -ById $byId -Infos $selection.Install -Installed $installed -Failed $failed -Progress $progress -ProgressPath $progressPath
+        $rebootRequired = [bool]$each.RebootRequired
+        $errorCode = $each.ErrorCode
+      } else {
+        # Batch (v1). Progress: each update's place in the progress list, for its final status.
+        $progressIndex = @{}
+        $installList = @($selection.Install)
+        for ($i = 0; $i -lt $installList.Count; $i++) { $progressIndex[[string]$installList[$i].Id] = $i }
 
-      if ($ready.Count -gt 0) {
-        $install = Invoke-WuInstall -Session $session -Updates @(foreach ($info in $ready) { $byId[$info.Id] })
-        $codes = @(ConvertTo-WuList -Value $install.ResultCodes)
-        $rebootRequired = [bool]$install.RebootRequired
-        if ($null -ne $install.HResult -and [int64]$install.HResult -ne 0) {
-          $errorCode = Format-WuHResult -HResult $install.HResult
-          Write-SetupLog -Message 'Windows Update installation reported an error code' -Level WARN -Data @{ errorCode = $errorCode }
-        }
-        for ($i = 0; $i -lt $ready.Count; $i++) {
-          $info = $ready[$i]
-          $code = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
-          if ($code -eq 2 -or $code -eq 3) {
-            $installed.Add((New-WuInstalledEntry -Info $info))
-          } else {
-            $failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
-            Write-SetupLog -Message 'Windows update install failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
+        # Download what is not there yet; an update whose download did not succeed is not installed.
+        # The download's own HResult only becomes ErrorCode when no install runs afterwards: a leftover
+        # download code must not trigger the busy / restart handling of a round whose installs worked.
+        $downloadErrorCode = $null
+        $downloadCodes = @{}
+        $toDownload = @(foreach ($info in $selection.Install) { if (-not [bool]$byId[$info.Id].IsDownloaded) { $info } })
+        if ($toDownload.Count -gt 0) {
+          Update-WuProgress -Path $progressPath -Progress $progress -Phase 'downloading'
+          $download = Invoke-WuDownload -Session $session -Updates @(foreach ($info in $toDownload) { $byId[$info.Id] })
+          $codes = @(ConvertTo-WuList -Value $download.ResultCodes)
+          if ($null -ne $download.HResult -and [int64]$download.HResult -ne 0) {
+            $downloadErrorCode = Format-WuHResult -HResult $download.HResult
+            Write-SetupLog -Message 'Windows Update download reported an error code' -Level WARN -Data @{ errorCode = $downloadErrorCode }
+          }
+          for ($i = 0; $i -lt $toDownload.Count; $i++) {
+            $downloadCodes[$toDownload[$i].Id] = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
           }
         }
-      } else {
-        $errorCode = $downloadErrorCode
+        $ready = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($info in $selection.Install) {
+          $code = if ($downloadCodes.ContainsKey($info.Id)) { $downloadCodes[$info.Id] } else { 2 }
+          if ($code -eq 2 -or $code -eq 3) {
+            $ready.Add($info)
+          } else {
+            $failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
+            Write-SetupLog -Message 'Windows update download failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
+            Update-WuProgress -Path $progressPath -Progress $progress -Index $progressIndex[[string]$info.Id] -Status 'failed'
+          }
+        }
+
+        if ($ready.Count -gt 0) {
+          Update-WuProgress -Path $progressPath -Progress $progress -Phase 'installing'
+          $install = Invoke-WuInstall -Session $session -Updates @(foreach ($info in $ready) { $byId[$info.Id] })
+          $codes = @(ConvertTo-WuList -Value $install.ResultCodes)
+          $rebootRequired = [bool]$install.RebootRequired
+          if ($null -ne $install.HResult -and [int64]$install.HResult -ne 0) {
+            $errorCode = Format-WuHResult -HResult $install.HResult
+            Write-SetupLog -Message 'Windows Update installation reported an error code' -Level WARN -Data @{ errorCode = $errorCode }
+          }
+          for ($i = 0; $i -lt $ready.Count; $i++) {
+            $info = $ready[$i]
+            $code = if ($i -lt $codes.Count) { [int]$codes[$i] } else { 0 }
+            if ($code -eq 2 -or $code -eq 3) {
+              $installed.Add((New-WuInstalledEntry -Info $info))
+              Update-WuProgress -Path $progressPath -Progress $progress -Index $progressIndex[[string]$info.Id] -Status 'installed'
+            } else {
+              $failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
+              Write-SetupLog -Message 'Windows update install failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
+              Update-WuProgress -Path $progressPath -Progress $progress -Index $progressIndex[[string]$info.Id] -Status 'failed'
+            }
+          }
+        } else {
+          $errorCode = $downloadErrorCode
+        }
       }
     }
   } catch {
@@ -669,6 +972,9 @@ function Invoke-WuRound {
     if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = [string]$_ }
     $errorCode = Get-WuExceptionErrorCode -Exception $_.Exception
     Write-SetupLog -Message 'Windows Update round failed' -Level ERROR -Data @{ error = $errorText; errorCode = $errorCode }
+  } finally {
+    # Spec 4.5: the round's downloads and installs are over, whatever happened.
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'done'
   }
 
   # Always read SystemInfo, on the exception path too (ruling R24a): 0x80240016 also means "a
@@ -690,6 +996,7 @@ function Invoke-WuRound {
     Error            = $errorText
     ErrorCode        = $errorCode
     FirmwareDeferred = $firmwareDeferred
+    Found            = $infos.Count
   }
   Write-WuRoundResult -Path $ResultPath -Result $result
   Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; hideFailed = $hideFailed.Count; firmwareDeferred = $firmwareDeferred; rebootRequired = $rebootRequired; error = $errorText; errorCode = $errorCode }
