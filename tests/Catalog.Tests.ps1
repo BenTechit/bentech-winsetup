@@ -4,10 +4,13 @@ BeforeAll {
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
   . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # New-DefaultChoices, for the default-plan test
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
-  function P($brand, $mode, $z = $true, $o = 'BUSINESS') { Get-StepPlan -Machine @{Brand=$brand} -Choices @{Mode=$mode;SevenZip=$z;Office=$o} -Config $cfg }
+  # The fifth parameter adds Choices.Remote only when given: the plans built without it prove "exactly as today".
+  function P($brand, $mode, $z = $true, $o = 'BUSINESS', $r = $null) {
+    $c = @{Mode=$mode;SevenZip=$z;Office=$o}; if ($null -ne $r) { $c.Remote = $r }
+    Get-StepPlan -Machine @{Brand=$brand} -Choices $c -Config $cfg }
 }
 Describe 'StepCatalog' {
-  It 'lists the 20 steps in spec order with their titles and functions' {
+  It 'lists the 21 steps in spec order with their titles and functions' {
     $rows = @($script:StepCatalog | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Title, $_.Function })
     $rows | Should -Be @(
       'prepare|Prepare machine|Invoke-StepPrepare'
@@ -19,6 +22,7 @@ Describe 'StepCatalog' {
       'winget|Prepare winget|Invoke-StepWinget'
       'chrome|Google Chrome|Invoke-StepChrome'
       'anydesk|AnyDesk|Invoke-StepAnyDesk'
+      'screenconnect|ScreenConnect|Invoke-StepScreenConnect'
       '7zip|7-Zip|Invoke-StepSevenZip'
       'craft-apps|Craft apps|Invoke-StepCraftApps'
       'default-browser|Chrome as default browser|Invoke-StepDefaultBrowser'
@@ -37,7 +41,7 @@ Describe 'StepCatalog' {
   It 'has the progress screen''s Short titles (v2 spec 4.2)' {
     @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
       'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons'
-      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', '7zip|7-Zip', 'craft-apps|Craft apps'
+      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', 'screenconnect|ScreenConnect', '7zip|7-Zip', 'craft-apps|Craft apps'
       'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'office|Microsoft 365', 'windows-update|Windows Update'
       'office-finish|Microsoft 365', 'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
     )
@@ -121,6 +125,17 @@ Describe 'Get-StepPlan' {
     $o = (New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg).Office
     $p = P DELL LAPTOP $true $o
     $p | Should -Contain 'craft-apps'; $p | Should -Not -Contain 'office'; $p | Should -Not -Contain 'office-finish' }
+  It 'BOTH: screenconnect right after anydesk' {
+    (P DELL LAPTOP $true 'BUSINESS' 'BOTH') -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,screenconnect,7zip,default-browser,vendor-pass1,office,windows-update,office-finish,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
+  It 'SCREENCONNECT: no anydesk, screenconnect right after chrome' {
+    $p = @(P ASUS DESKTOP $false 'CRAFT' 'SCREENCONNECT'); $p | Should -Not -Contain 'anydesk'; $p.IndexOf('screenconnect') | Should -Be ($p.IndexOf('chrome') + 1) }
+  It 'ANYDESK, an empty or unknown Remote and a lower-case value plan as their Get-RemoteChoice says (Review Focus 1)' {
+    $today = (P DELL LAPTOP) -join ','
+    foreach ($r in 'ANYDESK', '', 'TEAMVIEWER') { (P DELL LAPTOP $true 'BUSINESS' $r) -join ',' | Should -Be $today -Because $r }
+    (P DELL LAPTOP $true 'BUSINESS' 'both') | Should -Contain 'screenconnect' }
+  It 'the default choices plan AnyDesk only' {
+    $d = New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg; $p = Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $d -Config $cfg
+    $p | Should -Contain 'anydesk'; $p | Should -Not -Contain 'screenconnect' }
 }
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'

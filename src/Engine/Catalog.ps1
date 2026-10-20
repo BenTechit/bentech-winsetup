@@ -18,6 +18,9 @@
 #
 # Craft apps (craft spec 3.2): the free office suite runs right after 7zip, so its MSI installs come before
 # the vendor tools. It replaces office and office-finish: no plan holds both.
+#
+# Remote access (screenconnect spec 4.2): screenconnect runs right after anydesk. Choices.Remote, read through
+# Get-RemoteChoice, picks anydesk (ANYDESK or BOTH), screenconnect (SCREENCONNECT or BOTH) or both.
 $script:StepCatalog = @(
   @{ Id = 'prepare';         Title = 'Prepare machine';                 Short = 'Prepare';              Function = 'Invoke-StepPrepare' }
   @{ Id = 'bitlocker';       Title = 'Turn off BitLocker';              Short = 'BitLocker off';        Function = 'Invoke-StepBitLocker' }
@@ -28,6 +31,7 @@ $script:StepCatalog = @(
   @{ Id = 'winget';          Title = 'Prepare winget';                  Short = 'winget';               Function = 'Invoke-StepWinget' }
   @{ Id = 'chrome';          Title = 'Google Chrome';                   Short = 'Chrome';               Function = 'Invoke-StepChrome' }
   @{ Id = 'anydesk';         Title = 'AnyDesk';                         Short = 'AnyDesk';              Function = 'Invoke-StepAnyDesk' }
+  @{ Id = 'screenconnect';   Title = 'ScreenConnect';                   Short = 'ScreenConnect';        Function = 'Invoke-StepScreenConnect' }
   @{ Id = '7zip';            Title = '7-Zip';                           Short = '7-Zip';                Function = 'Invoke-StepSevenZip' }
   @{ Id = 'craft-apps';      Title = 'Craft apps';                      Short = 'Craft apps';           Function = 'Invoke-StepCraftApps' }
   @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Short = 'Default browser';      Function = 'Invoke-StepDefaultBrowser' }
@@ -115,6 +119,9 @@ function Get-StepPlan {
     Choices.Office picks the office suite: CRAFT gives craft-apps and neither office nor office-finish;
     OFF gives none of the three; any other value (BUSINESS, HOME) gives office and office-finish and no
     craft-apps.
+    Choices.Remote picks the remote-access tools, read through Get-RemoteChoice (screenconnect spec 4.1):
+    anydesk unless it is SCREENCONNECT, screenconnect unless it is ANYDESK. A missing, empty or unknown
+    Remote (a run started by an older version) is ANYDESK, which plans exactly what that version did.
     The mode comes from Choices (what the technician picked), never from Machine.IsLaptop.
     The ids are emitted one by one, the normal PowerShell way, so `foreach`, the pipeline, `@(...)` and
     a `[string[]]` parameter such as New-RunState -Plan all see every id. A real plan always has at
@@ -146,6 +153,8 @@ function Get-StepPlan {
       'craft-apps'     { $Choices['Office'] -eq 'CRAFT' }
       'office'         { $Choices['Office'] -notin 'OFF', 'CRAFT' }
       'office-finish'  { $Choices['Office'] -notin 'OFF', 'CRAFT' }
+      'anydesk'        { (Get-RemoteChoice -Choices $Choices) -ne 'SCREENCONNECT' }
+      'screenconnect'  { (Get-RemoteChoice -Choices $Choices) -ne 'ANYDESK' }
       default          { $true }
     }
     if ($include) { $plan.Add($step.Id) }
