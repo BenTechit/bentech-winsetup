@@ -153,13 +153,18 @@ function Copy-SetupLogsToStick {
     An existing target is replaced: `cmd.exe /d /c rd /s /q` through Invoke-External (rd removes a junction
     inside it without following it; never Remove-Item -Recurse), then the folder is copied. A target that is
     still there after rd, or any other failure, is Ok = $false with the message.
+    Final review M3: after the logs, -StatePath (the run's state.json), when that file exists, is copied to
+    <target>\state-final.json, unless that name is a link there (never written through: StateError 'state-
+    final.json on the USB stick is a link; state not saved'). A state copy that fails only sets StateError
+    (@{ Ok; Target; Error; StateError }): the logs are saved all the same.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][string]$LogDir,
     [Parameter(Mandatory)][string]$StickRoot,
-    [AllowNull()][AllowEmptyString()][string]$PcName
+    [AllowNull()][AllowEmptyString()][string]$PcName,
+    [AllowNull()][AllowEmptyString()][string]$StatePath
   )
 
   $logsRoot = [IO.Path]::Combine($StickRoot, 'BenTech-Logs')
@@ -176,10 +181,24 @@ function Copy-SetupLogsToStick {
     }
     [void][IO.Directory]::CreateDirectory($logsRoot)
     Copy-Item -LiteralPath $LogDir -Destination $target -Recurse -Force -ErrorAction Stop
-    return @{ Ok = $true; Target = $target; Error = $null }
   } catch {
-    return @{ Ok = $false; Target = $target; Error = $_.Exception.Message }
+    return @{ Ok = $false; Target = $target; Error = $_.Exception.Message; StateError = $null }
   }
+
+  $stateError = $null
+  if (-not [string]::IsNullOrEmpty($StatePath) -and [IO.File]::Exists($StatePath)) {
+    $stateTarget = [IO.Path]::Combine($target, 'state-final.json')
+    try {
+      if (Test-StickReparsePoint -Path $stateTarget) {
+        $stateError = 'state-final.json on the USB stick is a link; state not saved'
+      } else {
+        Copy-Item -LiteralPath $StatePath -Destination $stateTarget -Force -ErrorAction Stop
+      }
+    } catch {
+      $stateError = $_.Exception.Message
+    }
+  }
+  return @{ Ok = $true; Target = $target; Error = $null; StateError = $stateError }
 }
 
 function Test-DesktopLauncher {
@@ -312,8 +331,10 @@ function Invoke-SetupCleanup {
     1. Logs 'Cleanup: ...', then stops logging (setup.log and activity.txt are about to be copied and
        deleted).
     2. Finish only: the logs go to the stick (Find-SetupStick, Copy-SetupLogsToStick with the new PC name,
-       else the computer name). A failed copy is shown and waits for Enter (other keys are ignored), so the
-       technician can still save the logs by hand. No stick: one line, no wait.
+       else the computer name, and <Root>\state.json as state-final.json). A failed copy is shown and waits
+       for Enter (other keys are ignored), so the technician can still save the logs by hand. A copy that
+       worked shows 'Logs saved to <target>' for 3 seconds (Wait-SetupDelay), after one line when only
+       state.json could not be saved. No stick: one line, no wait.
     3. Finish only: a launcher that ran from the Desktop (Test-DesktopLauncher) is deleted, and only when it
        is a file with the extension .cmd. A launcher anywhere else is never touched.
     4. The process (PowerShell and .NET) moves out of the folder, to %SystemRoot%.
@@ -375,11 +396,16 @@ function Invoke-SetupCleanup {
         if ([string]::IsNullOrWhiteSpace($pcName)) { $pcName = [string]$machine['ComputerName'] }
         if ([string]::IsNullOrWhiteSpace($pcName)) { $pcName = [string]$env:COMPUTERNAME }
         & $say ('Saving the logs to {0} ...' -f (Get-StickLogTarget -StickRoot ([string]$stick['Root']) -PcName $pcName))
-        $copy = Copy-SetupLogsToStick -LogDir (Join-Path $Root 'Logs') -StickRoot ([string]$stick['Root']) -PcName $pcName
+        $copy = Copy-SetupLogsToStick -LogDir (Join-Path $Root 'Logs') -StickRoot ([string]$stick['Root']) -PcName $pcName -StatePath (Join-Path $Root 'state.json')
         if (-not $copy['Ok']) {
           & $say ('Logs could not be saved to the USB stick: {0}' -f $copy['Error'])
           & $say ('Press ENTER to delete {0} anyway' -f $folder)
           & $waitKey $true
+        } else {
+          if (-not [string]::IsNullOrEmpty([string]$copy['StateError'])) { & $say ('state.json could not be saved to the USB stick: {0}' -f $copy['StateError']) }
+          # Final review M4: the window closes right after the cleanup, so the success stays up for a moment.
+          & $say ('Logs saved to {0}' -f $copy['Target'])
+          Wait-SetupDelay -Seconds 3
         }
       } else {
         & $say 'No USB stick found: the logs are not saved'

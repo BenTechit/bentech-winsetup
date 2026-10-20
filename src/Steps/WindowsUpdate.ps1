@@ -668,14 +668,15 @@ function Invoke-WuInstallEach {
     (Current = its 1-based number):
     1. Phase and status 'downloading'. When it is not downloaded yet: Invoke-WuDownload with it alone.
        A ResultCode other than 2/3 makes it Failed (@{ Id; Title; ResultCode = <download code> }) with
-       status 'failed', and it is not installed.
+       status 'failed', and it is not installed. A download that succeeded but whose HResult is
+       round-ending (step 3) is not installed either: status 'skipped', in neither list (final review M1).
     2. Phase and status 'installing'; Invoke-WuInstall with it alone. ResultCode 2/3 -> Installed
        (New-WuInstalledEntry), status 'installed'; anything else -> Failed with its code, status
        'failed'. RebootRequired is OR-ed over the installs.
     3. Stop rule: when this update's download or install HResult is round-ending (Test-WuRoundEndingCode:
-       busy or restart pending), the loop stops after it. The rest get status 'skipped' and appear in
-       neither list: they were not attempted, and the parent's v1 handling of the code applies. Any
-       other non-zero HResult does not stop the loop.
+       busy or restart pending), the loop stops there (a download code: before this update's install).
+       The rest get status 'skipped' and appear in neither list: they were not attempted, and the
+       parent's v1 handling of the code applies. Any other non-zero HResult does not stop the loop.
     4. ErrorCode (ruling V2-R11): the HResult that stopped the loop (download or install), so the parent
        gives the round the same meaning as v1 (R23 busy wait or restart, R23b no failure counts);
        otherwise the first non-zero install HResult; otherwise, when no install ran at all, the first
@@ -726,6 +727,12 @@ function Invoke-WuInstallEach {
         $Failed.Add([ordered]@{ Id = $info.Id; Title = $info.Title; ResultCode = $code })
         Write-SetupLog -Message 'Windows update download failed' -Level WARN -Data @{ id = $info.Id; title = $info.Title; resultCode = $code }
         Update-WuProgress -Path $ProgressPath -Progress $Progress -Index $i -Status 'failed'
+      } elseif ($null -ne $endCode) {
+        # Final review M1 (spec 4.5): the loop stops at the first round-ending code, before this update's
+        # install too. Not attempted: 'skipped', in neither list, so it gets no failure count.
+        $downloadOk = $false
+        Write-SetupLog -Message 'Windows update not installed: its download ended the round' -Level WARN -Data @{ id = $info.Id; title = $info.Title; errorCode = $endCode }
+        Update-WuProgress -Path $ProgressPath -Progress $Progress -Index $i -Status 'skipped'
       }
     }
 

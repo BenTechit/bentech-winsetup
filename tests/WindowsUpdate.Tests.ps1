@@ -666,6 +666,17 @@ Describe 'Windows Update round and step (mocked COM)' {
         $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
         $script:installCalls.Count | Should -Be 1; $r.ErrorCode | Should -Be '0x80240016'
       }
+      # Final review M1 (spec 4.5): the loop stops at the first round-ending code, also before the install of
+      # the update whose download reported it. Not attempted is 'skipped', in neither list (no failure count).
+      It 'a round-ending download code (<_>) stops before that update''s install, even when its download succeeded' -ForEach @(0x80240016, 0x80242014) {
+        $script:searchResults[$script:SoftwareCriteria] = @('a', 'b', 'c' | ForEach-Object { New-FakeUpdate -Id $_ }); $script:downloadHResultFor = @{ b = $_ }
+        $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime
+        @($script:installCalls | ForEach-Object { $_ }) | Should -Be @('a'); @($script:downloadCalls | ForEach-Object { $_ }) | Should -Be @('a', 'b')
+        $r.ErrorCode | Should -Be (Format-WuHResult -HResult $_); $r.Error | Should -BeNullOrEmpty
+        @($r.Installed.Id) | Should -Be @('a'); @($r.Failed).Count | Should -Be 0
+        $p = Get-Content (Get-WuProgressPath -ResultPath $script:roundResultPath) -Raw | ConvertFrom-Json
+        @($p.Updates.Status) | Should -Be @('installed', 'skipped', 'skipped')
+      }
       It 'keeps what was done when the second install throws; Error and ErrorCode are set' {
         $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 'a'), (New-FakeUpdate -Id 'b')); $script:installThrowFor = @{ b = (New-Object Runtime.InteropServices.COMException('busy', 0x80240016)) }
         $r = Invoke-TestRound -StatePath (New-WuStateFile) -InstallMode OneAtATime

@@ -177,6 +177,46 @@ function Find-FirstExisting {
   return $null
 }
 
+# winget.exe from the App Installer package folder, never through PATH: in an elevated session PATH also
+# reaches the per-user WindowsApps alias folder, which the user can write to (final review M6). The folder
+# pattern is the setup tool's (Get-WingetPath, its package-folder step): the newest
+# Microsoft.DesktopAppInstaller_<version>_(x64|arm64)__8wekyb3d8bbwe directly under %ProgramFiles%\WindowsApps
+# that holds a winget.exe. When WindowsApps cannot be listed, the same folders come from Get-AppxPackage
+# -AllUsers (read-only). $null when there is none.
+function Get-WingetPackagePath {
+  $pattern = '^Microsoft\.DesktopAppInstaller_(?<v>\d+(?:\.\d+){1,3})_(?:x64|arm64)__8wekyb3d8bbwe$'
+  $apps = (Join-Path $env:ProgramFiles 'WindowsApps').TrimEnd('\')
+  $folders = @()
+  try {
+    $folders = @(Get-ChildItem -LiteralPath $apps -Directory -Filter 'Microsoft.DesktopAppInstaller_*' -ErrorAction Stop | ForEach-Object { $_.FullName })
+  } catch {
+    $folders = @()
+  }
+  if ($folders.Count -eq 0) {
+    try {
+      $folders = @(Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction Stop | ForEach-Object { [string]$_.InstallLocation } | Where-Object { $_ })
+    } catch {
+      $folders = @()
+    }
+  }
+  $best = $null
+  $bestVersion = $null
+  foreach ($folder in $folders) {
+    $parent = [string](Split-Path -Parent $folder)
+    if (-not [string]::Equals($parent.TrimEnd('\'), $apps, [StringComparison]::OrdinalIgnoreCase)) { continue }
+    $m = [regex]::Match((Split-Path -Leaf $folder), $pattern)
+    $version = $null
+    if (-not $m.Success -or -not [version]::TryParse($m.Groups['v'].Value, [ref]$version)) { continue }
+    $exe = Join-Path $folder 'winget.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { continue }
+    if ($null -eq $bestVersion -or $version -gt $bestVersion) {
+      $best = $exe
+      $bestVersion = $version
+    }
+  }
+  return $best
+}
+
 # $true on AC power or when there is no battery at all, $false on battery, $null when it cannot be read.
 function Get-OnAcPower {
   try {
@@ -326,14 +366,14 @@ function Invoke-DellCapture {
   $dcu = Find-FirstExisting -Candidates $DcuCandidates
   if (-not $dcu) {
     if ($InstallTool) {
-      $wingetCmd = Get-Command -Name 'winget.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-      if (-not $wingetCmd) { throw 'winget.exe was not found on this PC, so Dell Command Update cannot be installed. Install or repair App Installer, then run this again.' }
+      $winget = Get-WingetPackagePath
+      if (-not $winget) { throw 'winget.exe was not found in the App Installer package on this PC, so Dell Command Update cannot be installed. Install or repair App Installer, then run this again.' }
       $outFile = Join-Path $LogDir 'winget-install.out.txt'
       $errFile = Join-Path $LogDir 'winget-install.err.txt'
       Write-Host 'Installing Dell Command Update with winget (this can take several minutes)...'
       $wingetArgs = 'install --id Dell.CommandUpdate.Universal -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
-      $r = Invoke-Proc -FilePath $wingetCmd.Source -ArgumentList $wingetArgs -TimeoutMinutes $TimeoutMinutes -StdOutFile $outFile -StdErrFile $errFile
-      $record = New-RunRecord -CommandLine ('"' + $wingetCmd.Source + '" ' + $wingetArgs) -Result $r
+      $r = Invoke-Proc -FilePath $winget -ArgumentList $wingetArgs -TimeoutMinutes $TimeoutMinutes -StdOutFile $outFile -StdErrFile $errFile
+      $record = New-RunRecord -CommandLine ('"' + $winget + '" ' + $wingetArgs) -Result $r
       $record.OutputTail = Get-FileTail -Path $outFile
       $record.ErrorTail = Get-FileTail -Path $errFile
       $tool.Install = $record
@@ -421,11 +461,16 @@ function Invoke-HpCapture {
     $hpia = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter 'HPImageAssistant.exe' -File | Select-Object -First 1
   }
   if (-not $hpia) { throw ('HPImageAssistant.exe was not found under ' + $extractDir + ' after the extraction (exit code ' + $tool.Extract.ExitCodeHex + ').') }
+  # The extracted tool runs elevated from the user-writable %TEMP%, so its own signature is checked too,
+  # right before the launch (final review, Task 1 SECURITY). capture.json keeps what was found.
   $hpiaSig = Get-SignatureInfo -Path $hpia.FullName
   $tool.Path = $hpia.FullName
   $tool.FileVersion = Get-FileVersionText -Path $hpia.FullName
   $tool.SignatureStatus = $hpiaSig.Status
   $tool.SignerSubject = $hpiaSig.Subject
+  if ($hpiaSig.Status -ne 'Valid' -or [string]$hpiaSig.Subject -notmatch 'HP Inc') {
+    throw ('HPImageAssistant.exe was not run: its Authenticode signature is "' + $hpiaSig.Status + '" with signer "' + $hpiaSig.Subject + '" (it must be Valid and signed by HP Inc).')
+  }
 
   $analyzeArgs = '/Operation:Analyze /Category:All /Selection:All /Action:List /Silent /ReportFolder:"' + $ReportDir + '"'
   Write-Host ('Running HP Image Assistant (list only, up to ' + $TimeoutMinutes + ' minutes)...')

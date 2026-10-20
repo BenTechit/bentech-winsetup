@@ -148,6 +148,39 @@ Describe 'Copy-SetupLogsToStick' {
     "$t\keep.txt" | Should -Exist
     "$old\link" | Should -Not -Exist; "$old\stale.txt" | Should -Not -Exist; "$old\setup.log" | Should -Exist
   }
+  # Final review M3: the run state goes along, machine-readable (WuFailureCounts, HiddenUpdateIds, step Data).
+  It 'copies state.json into the stick folder as state-final.json when there is one' {
+    $logs = "$TestDrive\Logs7"; [void][IO.Directory]::CreateDirectory($logs); 'r' | Set-Content "$logs\setup.log"
+    '{"RunId":"r7"}' | Set-Content "$TestDrive\state7.json"
+    $r = Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\s7\" -PcName 'PC' -StatePath "$TestDrive\state7.json"
+    $r.Ok | Should -BeTrue; $r.StateError | Should -BeNullOrEmpty
+    "$TestDrive\s7\BenTech-Logs\PC\state-final.json" | Should -FileContentMatchExactly '"RunId":"r7"'
+    "$TestDrive\s7\BenTech-Logs\PC\setup.log" | Should -Exist
+  }
+  It 'no state.json: only the logs, still Ok' {
+    $logs = "$TestDrive\Logs8"; [void][IO.Directory]::CreateDirectory($logs); 'r' | Set-Content "$logs\setup.log"
+    $r = Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\s8\" -PcName 'PC' -StatePath "$TestDrive\none\state.json"
+    $r.Ok | Should -BeTrue; $r.StateError | Should -BeNullOrEmpty
+    "$TestDrive\s8\BenTech-Logs\PC\state-final.json" | Should -Not -Exist
+  }
+  It 'a state-final.json that is a link is never written through; the logs still count as saved' {
+    $logs = "$TestDrive\Logs9"; [void][IO.Directory]::CreateDirectory($logs); 'r' | Set-Content "$logs\setup.log"
+    '{}' | Set-Content "$TestDrive\state9.json"
+    Mock Test-StickReparsePoint { $Path -like '*\state-final.json' }
+    $r = Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\s9\" -PcName 'PC' -StatePath "$TestDrive\state9.json"
+    $r.Ok | Should -BeTrue; $r.StateError | Should -Be 'state-final.json on the USB stick is a link; state not saved'
+    "$TestDrive\s9\BenTech-Logs\PC\state-final.json" | Should -Not -Exist
+    Should -Invoke Test-StickReparsePoint -Times 1 -Exactly -ParameterFilter { $Path -eq "$TestDrive\s9\BenTech-Logs\PC\state-final.json" }
+  }
+  It 'a state copy that fails is reported in StateError, never thrown; the logs still count as saved' {
+    $logs = "$TestDrive\Logs10"; [void][IO.Directory]::CreateDirectory($logs); 'r' | Set-Content "$logs\setup.log"
+    '{}' | Set-Content "$TestDrive\state10.json"
+    Mock Copy-Item { Write-Error 'The disk is full' } -ParameterFilter { $Destination -like '*state-final.json' }
+    Mock Copy-Item { & (Get-Command Copy-Item -CommandType Cmdlet) @PesterBoundParameters }
+    $r = Copy-SetupLogsToStick -LogDir $logs -StickRoot "$TestDrive\s10\" -PcName 'PC' -StatePath "$TestDrive\state10.json"
+    $r.Ok | Should -BeTrue; $r.StateError | Should -Match 'disk is full'
+    "$TestDrive\s10\BenTech-Logs\PC\setup.log" | Should -Exist
+  }
 }
 Describe 'Remove-SetupFolder (Review Focus 2)' {
   It 'refuses anything that is not a folder named BenTech' {
@@ -379,5 +412,35 @@ Describe 'Invoke-SetupCleanup' {
     $r = $run.Clone(); $r.Root = "$TestDrive\x\Setup"
     Invoke-SetupCleanup @r -Mode Finish -ReadKey { throw 'no key expected' }
     Should -Invoke Unregister-ResumeTask -Times 0 -Exactly
+  }
+
+  # Final review M3 and M4.
+  It 'Finish passes Root\state.json to the stick copy' {
+    Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no key expected' }
+    Should -Invoke Copy-SetupLogsToStick -Times 1 -Exactly -ParameterFilter { $StatePath -eq 'C:\BenTech\Setup\state.json' }
+  }
+  It 'after a successful copy it shows Logs saved to (target) for 3 seconds, before C:\BenTech is deleted' {
+    $script:events = New-Object System.Collections.ArrayList
+    Mock Wait-SetupDelay { [void]$script:events.Add("wait $Seconds") }
+    Mock Remove-SetupFolder { [void]$script:events.Add('rd'); $true }
+    $r = $run.Clone(); $r.Write = { param($t) [void]$script:events.Add($t) }
+    Invoke-SetupCleanup @r -Mode Finish -ReadKey { throw 'no key expected' }
+    $i = [array]::IndexOf(@($events), 'Logs saved to E:\BenTech-Logs\DELL-J0C7QK4')
+    $i | Should -BeGreaterThan -1
+    @($events)[($i + 1)..($i + 2)] | Should -Be @('wait 3', 'rd')
+  }
+  It 'a state.json that could not be saved is one line; the logs are still reported saved' {
+    Mock Copy-SetupLogsToStick { @{ Ok = $true; Target = 'E:\BenTech-Logs\DELL-J0C7QK4'; Error = $null; StateError = 'The disk is full' } }
+    Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no key expected' }
+    $lines | Should -Contain 'state.json could not be saved to the USB stick: The disk is full'
+    $lines | Should -Contain 'Logs saved to E:\BenTech-Logs\DELL-J0C7QK4'
+  }
+  It 'no Logs saved line and no 3-second wait after a failed copy or with no stick' {
+    Mock Copy-SetupLogsToStick { @{ Ok = $false; Error = 'disk full' } }
+    Invoke-SetupCleanup @run -Mode Finish -ReadKey { 'Enter' }
+    Mock Find-SetupStick { @{ Root = $null } }
+    Invoke-SetupCleanup @run -Mode Finish -ReadKey { throw 'no key expected' }
+    @($lines | Where-Object { $_ -like 'Logs saved to*' }).Count | Should -Be 0
+    $script:waits.Count | Should -Be 0
   }
 }
