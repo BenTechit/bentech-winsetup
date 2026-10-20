@@ -1,6 +1,6 @@
 # bentech-winsetup
 
-Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing is left on the customer's PC.
+Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool` and a few empty policy keys).
 
 The launcher (`BenTechSetup.cmd`) is tiny and rarely changes. It downloads the newest signed `setup.ps1` and `config.json` from this repo's latest GitHub Release, verifies the signatures against the public key built into the launcher, and only then runs them. Updating the tool means publishing a release, never re-copying a file to the USB stick (usually; see [Publishing](#publishing-a-new-version)).
 
@@ -53,7 +53,7 @@ In this order (steps that don't apply to the machine are left out):
    ```
 
    - **Top block:** the PC (make, model, serial number `SN`), whether it is on its charger or on battery, and the name it will get.
-   - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app, a desktop does not; for a brand without a driver tool (ASUS, a VM) it says `no driver tool for this brand`. Chrome and AnyDesk always get installed.
+   - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app; a brand-name desktop gets the driver tool but no laptop app; a brand with no driver tool (ASUS, a VM) gets no driver tool and the line says `no driver tool for this brand` (an ASUS laptop still gets its laptop app, MyASUS; a VM gets neither). Chrome and AnyDesk always get installed.
    - **Colours:** on a black screen, the value of each choice is green (yes / on) or dark grey (`NO` / `OFF`); a yellow line is a warning.
    - **The countdown:** `Starts by itself in N s` and a bar that empties. **Every key you press restarts it at 30 s**, also a key that does nothing (Space, F5, ...), so the run starts by itself only when nobody touches the keyboard.
 
@@ -63,10 +63,10 @@ In this order (steps that don't apply to the machine are left out):
    | `Z` | 7-Zip on/off |
    | `O` | Office cycles OFF, BUSINESS, HOME |
    | `Enter` | Start now |
-   | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing is left. If an earlier run was left unfinished, Esc deletes nothing: its logs stay for diagnosis |
+   | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing of setup's own is left. If an earlier run left its state, Esc deletes nothing: its logs stay for diagnosis |
    | any other key | Nothing changes, but the countdown goes back to 30 s |
 
-   On battery a yellow line warns that BIOS updates are skipped unless you plug in. If the PC does not look like a fresh install (Windows older than 14 days, or more than 1 GB in Desktop/Documents/Downloads) there is no countdown and the screen says `This PC already has user files or is older than 14 days - press ENTER to run anyway`. A `Previous run: <date> - UNFINISHED` line appears only when an earlier run was left unfinished (a crash, or a run stopped half way). A run that was finished with Enter leaves nothing behind, so there is nothing to show.
+   On battery a yellow line warns that BIOS updates are skipped unless you plug in. If the PC does not look like a fresh install (Windows older than 14 days, or more than 1 GB in Desktop/Documents/Downloads) there is no countdown and the screen says `This PC already has user files or is older than 14 days - press ENTER to run anyway`. A `Previous run: <date> - <result>` line appears when an earlier run left its `state.json` behind: normally after an unfinished run (`UNFINISHED`: a crash, or a run stopped half way). A run that was finished with Enter deletes `C:\BenTech` and so shows nothing; if its folder survived (the window was closed instead of pressing Enter, `rd` could not delete it, or Windows is not on drive C:) the line shows that run's colour, for example `GREEN`.
 4. **Walk away.** The progress screen (below) shows what is happening. The machine reboots by itself (a 15 s `Restarting in N s ...` countdown on screen), logs in by itself and carries on. If Microsoft 365 is still installing in the background, the restart waits for it (the screen says so). Nothing asks for input.
 5. **Come back to the final screen.** The whole console is green, yellow or red. Press **Enter** to finish. Keys:
 
@@ -82,13 +82,13 @@ In this order (steps that don't apply to the machine are left out):
    **What Enter does**, in this order:
    1. **Saves the logs:** the whole `Logs` folder goes to `<stick>\BenTech-Logs\<PC name>\` (the new PC name). A folder of the same name from an earlier run is replaced. The stick is the drive the launcher was started from; if it is plugged in under another letter it is found by its serial number; otherwise it is any other removable or hard drive with `BenTechSetup.cmd` in its root (the only rule that works when you started the launcher from the Desktop). A stick whose `BenTech-Logs` folder is a link is refused and nothing is saved. If saving fails, the screen says why and waits for Enter before going on, so you can still save the logs by hand.
    2. **Deletes the Desktop launcher:** if you started `BenTechSetup.cmd` from the user's or the public Desktop, that copy is deleted. Only a `.cmd` file on a Desktop is ever deleted: a launcher on the stick, or anywhere else, is never touched.
-   3. **Deletes `C:\BenTech`** (and `C:\ProgramData\BenTech` when it is empty), so **no folder is left**. If it cannot be deleted the screen says `delete it by hand` and waits for a key. On a PC whose Windows is not on drive C: the folder is kept (`Not deleting ...`).
+   3. **Deletes `C:\BenTech`** (and `C:\ProgramData\BenTech` when it is empty), so **no setup folder is left**. If it cannot be deleted the screen says `delete it by hand` and waits for a key. On a PC whose Windows is not on drive C: the folder is kept (`Not deleting ...`).
 
    A **crash** is different: it leaves everything in place (the folder, the logs and the resume task) so you can see what went wrong. See [Setup crashed](#setup-crashed).
 
 ### Reading the progress screen
 
-Everything the run is doing is on one screen, redrawn at least once a second. It enlarges the console window to about 100 x 45 when it can; Windows Terminal does not let a script resize it, and the screen then fits whatever size it has (when space runs out, JUST HAPPENED gets shorter first, then the list under NOW).
+Everything the run is doing is on one screen, redrawn about once a second while the run works or waits (the timer does not redraw more often than that), and at once when a step starts or ends. It enlarges the console window to about 100 x 45 when it can; Windows Terminal does not let a script resize it, and the screen then fits whatever size it has (when space runs out, JUST HAPPENED gets shorter first, then the list under NOW).
 
 ```
   BENTECH WINDOWS SETUP - working, do not turn off   /   Total 01:12:40   Restarts 2
@@ -106,7 +106,7 @@ Everything the run is doing is on one screen, redrawn at least once a second. It
        [OK] KB5043080 .NET Framework 3.5
        [>>] KB2267602 Defender Antivirus definitions
        [..] KB5046613 Servicing Stack
-       ... 3 more
+       ... and 3 more
   ------------------------------------------------------------------------------------------------
   JUST HAPPENED
   13:05  Windows Update round 1: found 7, installed 6, failed 0
@@ -117,7 +117,7 @@ Everything the run is doing is on one screen, redrawn at least once a second. It
 
 (The names, times and counts in this example are made up.)
 
-- **Header:** the total time since the run started, how many times the PC restarted, and a **spinner** (`| / - \`) that turns on every redraw. The spinner and the timers moving is the sign of life: if they stand still for more than a couple of minutes, something is probably stuck, and `Logs\setup.log` shows the last thing it did. (A few short waits, such as starting the Dell service, can stand still for up to a minute.)
+- **Header:** the total time since the run started, how many times the PC restarted, and a **spinner** (`| / - \`) that turns on every redraw (in the example above it is the `/` in the first line, between `do not turn off` and `Total`; the `/` in the NOW line is only a separator). The spinner and the timers moving is the sign of life: if they stand still for more than a couple of minutes, something is probably stuck, and `Logs\setup.log` shows the last thing it did. (A few short waits, such as starting the Dell service, can stand still for up to a minute.)
 - **Checklist:** one line per step of this run, in order, in as many columns as fit. The whole screen is on a black background. Markers: `[OK]` done (green), `[>>]` running (cyan), `[X ]` failed (red), `[--]` skipped (dark grey), `[..]` still to do (plain). The reason of a failed or skipped step is not here; it is in JUST HAPPENED.
 - **`(bg)` after Microsoft 365** means it is installing in the background, next to the step NOW shows, with its own timer. When the background installer has ended but the finishing step has not run yet it reads `(bg ended)`; after that the line shows the result.
 - **NOW:** the step that is running, with what it is using (the tool, the Windows Update round), and its time. While the step waits for something that has a time limit, the time is shown against the limit: `14:10 (of max 90 min)` means 14 minutes 10 seconds so far and the wait ends at 90 minutes. Under it, what the step reports: for a **driver pass** the tool's own latest log line (`Log: ...`), for **Windows Update** the phase (`Installing 3 of 7`) and the list of updates with a marker each, while **Microsoft 365 holds up a restart** `Waiting for Microsoft 365 to finish before restarting`. With nothing to report it shows the newest JUST HAPPENED line.
@@ -151,7 +151,7 @@ The final screen lists at most 3 failures and 2 notes, each with a one-line reas
 
 `Downloads\`, the pinned `setup.ps1` and `config.json` are deleted when Finalize ends. `Logs\` and `state.json` stay until you press Enter on the final screen.
 
-**After a finished run** nothing is left on the PC: Enter on the final screen copied the whole `Logs\` folder to the USB stick, to `<stick>\BenTech-Logs\<PC name>\`, and deleted `C:\BenTech`. Read the report and the logs there. (With no stick, they are gone: see step 5 of [Daily use](#daily-use).)
+**After a finished run** nothing of setup's own is left in `C:\BenTech`: Enter on the final screen copied the whole `Logs\` folder to the USB stick, to `<stick>\BenTech-Logs\<PC name>\`, and deleted `C:\BenTech`. Read the report and the logs there. What setup does not remove (`C:\Program Files\OfficeDeploymentTool`, a few empty policy keys) is listed in [docs/testing.md](docs/testing.md) section 5. (With no stick, they are gone: see step 5 of [Daily use](#daily-use).)
 
 **While `C:\BenTech` exists, open the logs with R on the final screen or from an elevated prompt** (for example `notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal). Never browse to `C:\BenTech` in Explorer: its "You don't currently have permission... Continue" button adds your own account to the folder's permissions, and the next run then refuses the folder with exit code 5 (it is no longer admin-only), so you would have to delete it, logs included.
 
@@ -177,9 +177,9 @@ A red screen reads `Setup crashed: <message> - see C:\BenTech\Setup\Logs`. Press
 1. Read the tail of `Logs\setup.log` and the newest `Logs\transcript-*.txt`. The log has the stack trace.
 2. Fix it in the repo and publish a new release, or re-run if it looks transient.
 3. **Re-run:** double-click the launcher again. It downloads the newest release, archives the old state to `Logs\state-<RunId>.json` and the old activity feed to `Logs\activity-<RunId>.txt`, resets the counters, and runs every step again. Steps that were already done finish in seconds. The start screen shows `Previous run: <date> - UNFINISHED`.
-4. To stop the retries without running again: double-click the launcher and press **Esc**. That removes the leftover resume task and runs no step. Because the crashed run left its state, Esc deletes nothing: the launcher's fresh `setup.ps1`, `config.json` and the `Logs\` folder stay in `C:\BenTech\Setup`. Copy the logs out (from an elevated prompt) before you delete the folder by hand.
+4. To stop the retries without running again: double-click the launcher and press **Esc**. That removes the leftover resume task and runs no step. When the crashed run saved its state, Esc deletes nothing: the launcher's fresh `setup.ps1`, `config.json` and the `Logs\` folder stay in `C:\BenTech\Setup`. Copy the logs out (from an elevated prompt) before you delete the folder by hand. **Exception:** a crash before the run's first state save (or a corrupt `state.json`) leaves no readable state, and then Esc deletes `C:\BenTech` with its logs, so copy the logs out before you press Esc.
 
-An unreadable `state.json` (power cut mid-write) is archived as `Logs\state.corrupt-<time>.json` and a new run starts by itself. (Known gap: Esc on the start screen then counts as a fresh PC and deletes `C:\BenTech` with those logs, so copy out what you need first.)
+An unreadable `state.json` (power cut mid-write) is archived as `Logs\state.corrupt-<time>.json` and a new run starts by itself. (Known gap, in two cases: after a corrupt `state.json`, and after a crash before the first save, there is no readable state, so Esc on the start screen counts as a fresh PC and deletes `C:\BenTech` with those logs. Copy out what you need first.)
 
 ## Publishing a new version
 
