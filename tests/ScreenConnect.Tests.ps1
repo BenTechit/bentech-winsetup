@@ -123,6 +123,7 @@ Describe 'Get-ScreenConnectServiceState' {
     Mock Get-Service { [pscustomobject]@{ Name = 'ScreenConnect Client (0123456789abcdef)'; Status = 'Running' } }; Get-ScreenConnectServiceState -Name $scName | Should -Be 'Missing' }
   It 'a Get-Service that throws is Missing, logged at WARN' {
     Mock Write-SetupLog { }
+    # throw, not Write-Error (the usual rule): the step reads with -ErrorAction SilentlyContinue, so a Write-Error never reaches its catch (that failure is the test above); only a terminating error does.
     Mock Get-Service { throw 'service control manager unavailable' }
     Get-ScreenConnectServiceState -Name $scName | Should -Be 'Missing'
     Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' } }
@@ -185,6 +186,7 @@ Describe 'Invoke-StepScreenConnect' {
     $script:svc = 'Missing'; $script:extHandler = { param($c) $script:svc = 'Running'; @{ ExitCode = $null; TimedOut = $true; Output = '' } }
     (Invoke-StepScreenConnect -Context $ctx).Status | Should -Be 'Done' }
   It 'an installer that cannot be started is Failed at once, with no wait' {
+    # throw is right here: Invoke-External is our own function and it throws when a program cannot be started (Process.ps1); the step catches that.
     Mock Invoke-External { throw 'The system cannot execute the specified program' }
     (Invoke-StepScreenConnect -Context $ctx).Message | Should -BeExactly 'ScreenConnect install failed (installer could not be started)'; $script:waits.Count | Should -Be 0 }
   It 'polls every 5 s until the service runs, and shows the 3-minute limit only while it waits' {
@@ -199,6 +201,19 @@ Describe 'Invoke-StepScreenConnect' {
   It 'a blank <_> is not configured either, and nothing is read' -ForEach 'url', 'sha256', 'serviceName' {
     $ctx.Config.apps.screenconnect.$_ = ' '; (Invoke-StepScreenConnect -Context $ctx).Message | Should -BeExactly 'ScreenConnect is not configured'
     $script:downloads.Count | Should -Be 0; Should -Invoke Get-Service -Times 0 -Exactly }
+  # The ERROR line says which part of the config is missing, so Ben need not open config.json to find out.
+  It 'the not-configured log line names the missing section' {
+    $ctx.Config.apps.PSObject.Properties.Remove('screenconnect'); $null = Invoke-StepScreenConnect -Context $ctx
+    $line = @($script:logs | Where-Object { $_.Message -like 'ScreenConnect is not configured*' })
+    $line.Count | Should -Be 1; $line[0].Level | Should -Be 'ERROR'; $line[0].Data.missing | Should -BeExactly 'apps.screenconnect' }
+  It 'the not-configured log line names the blank field <_>' -ForEach 'url', 'sha256', 'serviceName' {
+    $ctx.Config.apps.screenconnect.$_ = ' '; $null = Invoke-StepScreenConnect -Context $ctx
+    $line = @($script:logs | Where-Object { $_.Message -like 'ScreenConnect is not configured*' })
+    $line.Count | Should -Be 1; $line[0].Data.missing | Should -BeExactly $_ }
+  It 'the not-configured log line names a signer key that signers does not hold, and lists every missing part in order' {
+    $ctx.Config.apps.screenconnect.signer = 'nope'; $ctx.Config.apps.screenconnect.url = ''; $ctx.Config.apps.screenconnect.sha256 = $null
+    $null = Invoke-StepScreenConnect -Context $ctx
+    @($script:logs | Where-Object { $_.Message -like 'ScreenConnect is not configured*' })[0].Data.missing | Should -BeExactly 'url, sha256, signer' }
 }
 
 Describe 'the step file' {

@@ -457,8 +457,10 @@ Describe 'Test-FileSignature' {
     }
     It 'the quoted config entry accepts the real subject' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners $scSigners | Should -BeTrue }
     It 'an entry without the quotes would refuse it' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners @('ConnectWise, LLC') | Should -BeFalse }
-    It '-ExactCN refuses the quoted subject, so the step does not use it' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners $scSigners -ExactCN | Should -BeFalse }
-    It 'refuses status <_> (an expired installer is not Valid)' -ForEach 'UnknownError', 'NotTrusted', 'HashMismatch', 'NotSigned' {
+    # The certificate object here has no SubjectName, so Get-CertificateCommonName finds no common name and -ExactCN refuses.
+    # The refusal of a quoted subject itself is pinned by the DER tests of the -ExactCN context above.
+    It '-ExactCN refuses a certificate object with no SubjectName (no common name to compare)' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners $scSigners -ExactCN | Should -BeFalse }
+    It 'refuses status <_> with the real ScreenConnect subject (any status but Valid is refused)' -ForEach 'UnknownError', 'NotTrusted', 'HashMismatch', 'NotSigned' {
       Use-ScSignature $_; Test-FileSignature -Path $ps -AllowedSigners $scSigners | Should -BeFalse }
   }
 }

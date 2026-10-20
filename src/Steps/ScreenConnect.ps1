@@ -187,7 +187,7 @@ function Invoke-StepScreenConnect {
   .DESCRIPTION
     1. The config: apps.screenconnect with a url, a sha256 and a serviceName, and a signer key that signers
        holds with at least one name (Get-Signers). Anything missing is Failed('ScreenConnect is not
-       configured'), with nothing read, downloaded or run.
+       configured'), with nothing read, downloaded or run; the ERROR line's Data.missing names the parts.
     2. The service serviceName already there, in any state (Get-ScreenConnectServiceState not Missing), skips
        the install ('ScreenConnect already installed'): go to 7.
     3. The link: Get-ScreenConnectUrl with this bundle's version ($script:SetupVersion). None (a 'dev' run) is
@@ -209,7 +209,8 @@ function Invoke-StepScreenConnect {
        Failed('ScreenConnect install timed out') when the installer timed out, else Failed('ScreenConnect
        install failed (service not found)'). Every Done writes the activity line 'ScreenConnect installed -
        this PC will appear in your ScreenConnect list'; a Failed writes none (the runner writes its line).
-    The runner clears NOW after the step. PollSeconds (5) exists so tests need not wait.
+    The runner clears NOW after the step. PollSeconds (5, from 1 to 3600) is the gap between two reads of the
+    service while it waits; the tests mock Wait-SetupDelay, so none of them passes it.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -229,9 +230,18 @@ function Invoke-StepScreenConnect {
     }
   }
   $serviceName = [string]$settings.serviceName
-  if ($null -eq $settings -or $signers.Count -eq 0 -or [string]::IsNullOrWhiteSpace($serviceName) -or
-      [string]::IsNullOrWhiteSpace([string]$settings.url) -or [string]::IsNullOrWhiteSpace([string]$settings.sha256)) {
-    Write-SetupLog -Message 'ScreenConnect is not configured (apps.screenconnect: url, sha256, serviceName, signer)' -Level ERROR
+  # Which parts are missing or blank, for the log line (the section, else url, sha256, serviceName, signer in this order).
+  $missing = New-Object System.Collections.Generic.List[string]
+  if ($null -eq $settings) {
+    $missing.Add('apps.screenconnect')
+  } else {
+    if ([string]::IsNullOrWhiteSpace([string]$settings.url)) { $missing.Add('url') }
+    if ([string]::IsNullOrWhiteSpace([string]$settings.sha256)) { $missing.Add('sha256') }
+    if ([string]::IsNullOrWhiteSpace($serviceName)) { $missing.Add('serviceName') }
+    if ($signers.Count -eq 0) { $missing.Add('signer') }
+  }
+  if ($missing.Count -gt 0) {
+    Write-SetupLog -Message 'ScreenConnect is not configured (apps.screenconnect: url, sha256, serviceName, signer)' -Level ERROR -Data @{ missing = ($missing -join ', ') }
     return New-StepResult -Status Failed -Message 'ScreenConnect is not configured'
   }
 

@@ -6,7 +6,7 @@
 # given) and reads the per-user Uninstall view, where the ArtCraft Launcher registers. With the same
 # Config it reports ScreenConnect by apps.screenconnect.serviceName, and Format-SetupReport shows the
 # remote tools (AnyDesk ID, ScreenConnect) by Choices.Remote.
-# Needs Catalog.ps1 + Verdict.ps1 (Get-StepTitle, Get-RemoteChoice), StartScreen.ps1 (ConvertTo-ScreenText,
+# Needs Catalog.ps1 (Get-RemoteChoice) + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
 # ConvertFrom-StateTime, Format-HoursMinutes), DefaultBrowser.ps1 (Read-RegistryStringValue),
 # Office.ps1 ($script:OfficeReleaseKey) and Logging.ps1; the bundle holds every file.
 #

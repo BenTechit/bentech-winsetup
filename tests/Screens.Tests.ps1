@@ -907,6 +907,18 @@ Describe 'Format-FinalScreen' {
     $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | % { "Failure $_" }) -Notes @(1..20 | % { "Note $_" })) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false -StickLine '  No BenTech USB stick - plug it in now to keep the logs')
     $l.Count | Should -BeLessOrEqual 29; $l | Should -Contain '  AnyDesk ID:'; $l | Should -Contain '  New name : DELL-7HX2K93     ScreenConnect: installed'
   }
+  It 'a 15 character new name (the longest) and ScreenConnect chosen: the New name line stays within 79 columns (<Remote>, <Status>)' -ForEach @(
+    @{ Remote = 'SCREENCONNECT'; Status = 'Failed'; Tail = 'NOT installed' }, @{ Remote = 'BOTH'; Status = 'Failed'; Tail = 'NOT installed' }
+    @{ Remote = 'SCREENCONNECT'; Status = 'Done'; Tail = 'installed' }
+  ) {
+    $st = New-FinalState; $st.Machine = @{} + $script:m; $st.Machine.NewName = 'ABCDEFGHIJKLMNO'
+    $st.Choices = @{ Remote = $Remote }; $st.Steps = @{ screenconnect = @{ Status = $Status } }
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+    $line = @($l | Where-Object { $_ -like '  New name : *' })
+    $line.Count | Should -Be 1
+    $line[0] | Should -BeExactly ('  New name : ABCDEFGHIJKLMNO     ScreenConnect: ' + $Tail)
+    $line[0].Length | Should -BeLessOrEqual 79
+  }
   It 'ANYDESK, choices without Remote and an invalid Remote: the ID and no status (Review Focus 1)' -ForEach @(@{ Choices = @{ Remote = 'ANYDESK' } }, @{ Choices = @{ Mode = 'LAPTOP' } }, @{ Choices = @{ Remote = 'TEAMVIEWER' } }) {
     $st = New-FinalState; $st.Choices = $Choices; $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
     $l | Should -Contain '  New name : DELL-7HX2K93'; $l | Should -Contain '  AnyDesk ID:'; ($l -join "`n") | Should -Not -Match 'ScreenConnect'

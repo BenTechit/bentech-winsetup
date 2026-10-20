@@ -728,7 +728,7 @@ Describe 'Publish.ps1' {
     $assign.Count | Should -Be 1
     $names = @($assign[0].Right.FindAll({ $args[0] -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
     $names | Should -Be @('setup.ps1', 'setup.ps1.sig', 'config.json', 'config.json.sig', 'ScreenConnect.ClientSetup.exe')
-    $ghArgs =@($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$ghArgs' }, $true))
+    $ghArgs = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$ghArgs' }, $true))
     $ghArgs.Count | Should -Be 1
     $ghArgs[0].Right.Extent.Text | Should -Match '\$releaseAssets'
     $ghArgs[0].Right.Extent.Text | Should -Match "'--target', \`$source\.Head"
@@ -743,6 +743,35 @@ Describe 'Publish.ps1' {
   It 'a real publish refuses a failed installer check' {
     $text = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw
     $text | Should -Match 'if \(\$installerCheck\.Problems\.Count -gt 0 -and -not \$DryRun\) \{\s*throw'
+  }
+
+  It 'a real publish checks the copy in dist\ again, with the same pin and signers as step 0 (T4-M1)' {
+    # Source text (AST), not behaviour, as for the refusal test above: the stubbed repo is not a git repository, so
+    # a real publish stops at the source check and never reaches the copy.
+    $tok = $null; $err = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+    $err | Should -BeNullOrEmpty
+    $calls = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'Get-ScreenConnectInstallerCheck' }, $true) | Sort-Object { $_.Extent.StartOffset })
+    $calls.Count | Should -Be 2
+    $argText = {
+      param($call, [string]$name)
+      $els = @($call.CommandElements)
+      for ($i = 0; $i -lt $els.Count - 1; $i++) {
+        if ($els[$i] -is [Management.Automation.Language.CommandParameterAst] -and $els[$i].ParameterName -eq $name) { return $els[$i + 1].Extent.Text }
+      }
+    }
+    & $argText $calls[1] 'Path' | Should -Be '(Join-Path $dist $installerName)'
+    & $argText $calls[1] 'Sha256' | Should -Be (& $argText $calls[0] 'Sha256')
+    & $argText $calls[1] 'Signers' | Should -Be (& $argText $calls[0] 'Signers')
+    # After the copy to dist\, inside an `if (-not $DryRun)` that throws on any problem.
+    $copy = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'Copy-Item' -and $args[0].Extent.Text -match '\$installerName' }, $true))
+    $copy.Count | Should -Be 1
+    $calls[1].Extent.StartOffset | Should -BeGreaterThan $copy[0].Extent.StartOffset
+    $node = $calls[1].Parent
+    while ($node -and $node -isnot [Management.Automation.Language.IfStatementAst]) { $node = $node.Parent }
+    $node | Should -Not -BeNullOrEmpty
+    $node.Clauses[0].Item1.Extent.Text | Should -Be '-not $DryRun'
+    $node.Extent.Text | Should -Match 'throw "ScreenConnect installer in dist failed its check: '
   }
 
   Context 'the ScreenConnect installer check (Review Focus 5)' {
@@ -773,6 +802,85 @@ Describe 'Publish.ps1' {
     It 'warns inside 60 days of the end date, not before' {
       Get-CertificateEndWarning -NotAfter ([datetime]'2027-02-19T13:59:59') -Now ([datetime]'2026-10-20T10:00:00') | Should -BeNullOrEmpty
       Get-CertificateEndWarning -NotAfter ([datetime]'2027-02-19T13:59:59') -Now ([datetime]'2026-12-22T10:00:00') | Should -Match '^WARNING: .*19/02/2027' }
+    It 'the 60-day boundary: 59.9 days warns, exactly 60 and 60.1 do not (T4-M2)' {
+      $now = [datetime]'2026-10-20T10:00:00'
+      Get-CertificateEndWarning -NotAfter $now.AddDays(59.9) -Now $now | Should -Match '^WARNING: '
+      Get-CertificateEndWarning -NotAfter $now.AddDays(60) -Now $now | Should -BeNullOrEmpty
+      Get-CertificateEndWarning -NotAfter $now.AddDays(60.1) -Now $now | Should -BeNullOrEmpty }
+    It 'a date still to come says "ends DATE (N days from now)" (T4-M2)' {
+      $w = Get-CertificateEndWarning -NotAfter ([datetime]'2027-02-19T13:59:59') -Now ([datetime]'2026-12-22T10:00:00')
+      $w | Should -Match "certificate ends 19/02/2027 \(59 days from now\)"
+      $w | Should -Not -Match 'ended|ago' }
+    It 'a date in the past says "ended DATE (N days ago)", never a negative count (T4-M2)' {
+      $w = Get-CertificateEndWarning -NotAfter ([datetime]'2026-10-17T13:59:59') -Now ([datetime]'2026-10-20T10:00:00')
+      $w | Should -Match "certificate ended 17/10/2026 \(3 days ago\)"
+      $w | Should -Not -Match 'from now|-[0-9]'
+      Get-CertificateEndWarning -NotAfter ([datetime]'2026-10-20T08:00:00') -Now ([datetime]'2026-10-20T10:00:00') | Should -Match "ended 20/10/2026 \(0 days ago\)" }
+    It 'never throws for <Why>, and reports that there is no signer (T4-M3)' -ForEach @(
+      @{ Why = 'a list holding $null';   Signers = @($null) }
+      @{ Why = 'a list holding ""';      Signers = @('') }
+      @{ Why = 'a list holding blanks';  Signers = @(' ', '') }
+      @{ Why = 'an empty list';          Signers = @() }
+      @{ Why = '$null';                  Signers = $null }
+    ) {
+      Use-Sig 'Valid' $scSubject
+      { $script:r = Get-ScreenConnectInstallerCheck -Path $fakeExe -Sha256 $fakeHash -Signers $Signers } | Should -Not -Throw
+      @($r.Problems) | Should -Be @('no ConnectWise signer in config.json signers.connectwise')
+      # Reported whatever the signature status says, so the next run after fixing the signature does not hit it.
+      Use-Sig 'UnknownError' $scSubject
+      $both = (Get-ScreenConnectInstallerCheck -Path $fakeExe -Sha256 $fakeHash -Signers $Signers).Problems -join "`n"
+      $both | Should -Match 'Authenticode status is UnknownError'; $both | Should -Match 'no ConnectWise signer in config.json signers.connectwise' }
+    It 'a blank entry beside a real signer is ignored, not fatal (T4-M3)' {
+      Use-Sig 'Valid' $scSubject
+      @((Get-ScreenConnectInstallerCheck -Path $fakeExe -Sha256 $fakeHash -Signers @($null, '', '"ConnectWise, LLC"')).Problems).Count | Should -Be 0 }
+  }
+
+  Context 'Publish and the step agree on the installer signature (F-M4)' {
+    # tools\Publish.ps1 keeps its own copy of the signer rule (it cannot dot-source src\ in a user's checkout run).
+    # The same fake signatures go to Test-FileSignature (the rule the run applies) and to Get-ScreenConnectInstallerCheck
+    # (the rule that predicts it); both must accept or refuse the same file. Neither is -ExactCN.
+    BeforeDiscovery {
+      $quoted = '"ConnectWise, LLC"'   # signers.connectwise of config.json (Config.Tests pins it)
+      $real = 'CN="ConnectWise, LLC", O="ConnectWise, LLC", L=Tampa, S=Florida, C=US'
+      $cases = @(
+        @{ Why = 'the real quoted subject and the config signer';                        Status = 'Valid';        Subject = $real; Signers = @($quoted); Accept = $true }
+        @{ Why = 'the real quoted subject and a signer typed without the quotes';        Status = 'Valid';        Subject = $real; Signers = @('ConnectWise, LLC'); Accept = $false }
+        @{ Why = 'a look-alike company name (quoted) and the config signer';             Status = 'Valid';        Subject = 'CN="ConnectWise, LLC Evil", O="ConnectWise, LLC Evil", L=Tampa, S=Florida, C=US'; Signers = @($quoted); Accept = $false }
+        @{ Why = 'a look-alike company name (unquoted) and the unquoted signer: a substring, accepted by both'; Status = 'Valid'; Subject = 'CN=ConnectWise, LLC Evil, O=ConnectWise, LLC Evil, C=US'; Signers = @('ConnectWise, LLC'); Accept = $true }
+        @{ Why = 'the signer only in O= and another CN';                                 Status = 'Valid';        Subject = 'CN="Other Ltd", O="ConnectWise, LLC", C=US'; Signers = @($quoted); Accept = $false }
+        @{ Why = 'a wildcard as the signer';                                             Status = 'Valid';        Subject = $real; Signers = @('*'); Accept = $false }
+        @{ Why = 'no signer at all';                                                     Status = 'Valid';        Subject = $real; Signers = @(); Accept = $false }
+        @{ Why = 'a blank signer';                                                       Status = 'Valid';        Subject = $real; Signers = @(''); Accept = $false }
+        @{ Why = 'a Valid signature with no signer certificate';                         Status = 'Valid';        Subject = $null; Signers = @($quoted); Accept = $false }
+        @{ Why = 'status UnknownError (an ended certificate) with the real subject';     Status = 'UnknownError'; Subject = $real; Signers = @($quoted); Accept = $false }
+        @{ Why = 'status NotTrusted with the real subject';                              Status = 'NotTrusted';   Subject = $real; Signers = @($quoted); Accept = $false }
+        @{ Why = 'status HashMismatch with the real subject';                            Status = 'HashMismatch'; Subject = $real; Signers = @($quoted); Accept = $false }
+        @{ Why = 'status NotSigned with the real subject';                               Status = 'NotSigned';    Subject = $real; Signers = @($quoted); Accept = $false }
+      )
+    }
+    BeforeAll {
+      foreach ($f in 'Logging', 'Activity', 'Process', 'Download') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
+      $tok = $null; $err = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+      $fn = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-ScreenConnectInstallerCheck' }, $true))
+      $fn.Count | Should -Be 1
+      . ([ScriptBlock]::Create($fn[0].Extent.Text))
+      $script:parityExe = Join-Path $TestDrive 'parity\ScreenConnect.ClientSetup.exe'; New-Item -ItemType Directory (Split-Path $parityExe) -Force | Out-Null
+      [IO.File]::WriteAllText($parityExe, 'installer'); $script:parityHash = (Get-FileHash -LiteralPath $parityExe -Algorithm SHA256).Hash
+      function Use-ParitySig([string]$Status, $Subject) {
+        $cert = if ($null -eq $Subject) { $null } else { [pscustomobject]@{ Subject = $Subject; NotAfter = [datetime]'2027-02-19T13:59:59' } }
+        $script:paritySig = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]$Status; SignerCertificate = $cert }
+        Mock Get-AuthenticodeSignature { $script:paritySig } }
+    }
+    It 'the config signer is the quoted one used in these cases' {
+      @((Get-Content -LiteralPath "$PSScriptRoot\..\config\config.json" -Raw | ConvertFrom-Json).signers.connectwise) | Should -Be @('"ConnectWise, LLC"') }
+    It 'both accept or both refuse: <Why> (accept: <Accept>)' -ForEach $cases {
+      Use-ParitySig $Status $Subject
+      $step = Test-FileSignature -Path $parityExe -AllowedSigners $Signers
+      $publish = Get-ScreenConnectInstallerCheck -Path $parityExe -Sha256 $parityHash -Signers $Signers
+      $step | Should -Be $Accept
+      (@($publish.Problems).Count -eq 0) | Should -Be $Accept
+      (@($publish.Problems).Count -eq 0) | Should -Be $step }
   }
 
   Context 'Get-PublishSource (git mocked)' {

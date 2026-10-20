@@ -9,7 +9,8 @@
 #      the SHA-256 pinned in config\config.json apps.screenconnect and a Valid ConnectWise signature. Its
 #      certificate end date is printed, with a warning inside 60 days. -DryRun only warns.
 #   1. tools\Invoke-Tests.ps1 on tests\ (in a child Windows PowerShell 5.1)
-#   2. tools\Build-Bundle.ps1 -> dist\setup.ps1, dist\config.json; the installer is copied to dist\
+#   2. tools\Build-Bundle.ps1 -> dist\setup.ps1, dist\config.json; the installer is copied to dist\ and, on a
+#      real publish, checked again there (same pin and signers as step 0), so the uploaded bytes are the checked ones
 #   3. tools\Sign-File.ps1 on both (the DPAPI-protected private key; never leaves this PC)
 #   4. both signatures verified against keys\public-key.xml with Test-DetachedSignature
 #   5. tools\Build-Launcher.ps1 -> dist\BenTechSetup.cmd, pointing at <repo>'s latest release. Its SHA-256
@@ -92,21 +93,24 @@ function Get-PublishSource {
 
 function Get-ScreenConnectInstallerCheck {
   # Returns @{ Problems = <string[]>; NotAfter = <datetime or $null> } for Ben's ScreenConnect installer. It
-  # never throws. A problem is anything that would make the run's step refuse the file, or that would mean
-  # the wrong file is about to be published: the file is missing, its SHA-256 is not the one pinned in
-  # config.json (that pin is what proves it is Ben's file; every ScreenConnect installer carries a valid
-  # ConnectWise signature), its Authenticode status is not Valid (an expired certificate shows as another
-  # status: the installer has no timestamp), or its signer is not on the list. The signer rule is the one
+  # never throws, whatever Signers holds (a config without signers.connectwise gives @($null), which must
+  # reach the function and be reported, not stop the run at the call). A problem is anything that would make
+  # the run's step refuse the file, or that would mean the wrong file is about to be published: the file is
+  # missing, its SHA-256 is not the one pinned in config.json (that pin is what proves it is Ben's file;
+  # every ScreenConnect installer carries a valid ConnectWise signature), there is no usable signer to check
+  # against, its Authenticode status is not Valid (an expired certificate shows as another status: the
+  # installer has no timestamp), or its signer is not on the list. The signer rule is the one
   # Test-FileSignature applies without -ExactCN: the subject holds CN=<signer> as literal text.
   # NotAfter is the signer certificate's end date whenever it could be read.
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][AllowEmptyString()][string]$Sha256,
-    [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Signers
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Signers
   )
 
   $problems = New-Object System.Collections.Generic.List[string]
   $notAfter = $null
+  $allowed = @($Signers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   try {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
       # Nothing else can be checked without the file.
@@ -117,6 +121,7 @@ function Get-ScreenConnectInstallerCheck {
     if (-not [string]::Equals($actual, $Sha256, [StringComparison]::OrdinalIgnoreCase)) {
       $problems.Add("SHA-256 is $actual, config.json apps.screenconnect.sha256 is $Sha256")
     }
+    if ($allowed.Count -eq 0) { $problems.Add('no ConnectWise signer in config.json signers.connectwise') }
     $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
     $subject = ''
     if ($signature.SignerCertificate) {
@@ -125,8 +130,7 @@ function Get-ScreenConnectInstallerCheck {
     }
     if ([string]$signature.Status -ne 'Valid') {
       $problems.Add("Authenticode status is $($signature.Status), not Valid")
-    } else {
-      $allowed = @($Signers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    } elseif ($allowed.Count -gt 0) {
       $match = $false
       foreach ($signer in $allowed) {
         if ($subject -like ('*CN=' + [Management.Automation.WildcardPattern]::Escape($signer) + '*')) { $match = $true; break }
@@ -150,6 +154,12 @@ function Get-CertificateEndWarning {
   $days = ($NotAfter - $Now).TotalDays
   if ($days -ge 60) { return $null }
   $end = $NotAfter.ToString('dd/MM/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+  if ($days -lt 0) {
+    # Already ended (a dry run only: a real publish refuses a file whose status is no longer Valid). Whole calendar
+    # days, so the count agrees with the date shown.
+    $ago = [int]($Now.Date - $NotAfter.Date).TotalDays
+    return "WARNING: the ScreenConnect installer's certificate ended $end ($ago days ago): build a new installer now (README `"A new ScreenConnect installer`")"
+  }
   return "WARNING: the ScreenConnect installer's certificate ends $end ($([int][Math]::Floor($days)) days from now): build a new installer before then (README `"A new ScreenConnect installer`")"
 }
 
@@ -210,6 +220,12 @@ try {
   # under -DryRun a file that failed them is still copied, so the dry run shows the full upload.
   if (Test-Path -LiteralPath $ScreenConnectInstaller -PathType Leaf) {
     Copy-Item -LiteralPath $ScreenConnectInstaller -Destination (Join-Path $dist $installerName) -Force
+  }
+  # The file was checked at step 0, and the test run took a while since. Check the bytes that will be uploaded,
+  # with the same pin and signers, so a file that changed in between never reaches the release.
+  if (-not $DryRun) {
+    $distCheck = Get-ScreenConnectInstallerCheck -Path (Join-Path $dist $installerName) -Sha256 ([string]$appConfig.apps.screenconnect.sha256) -Signers @($appConfig.signers.connectwise)
+    if ($distCheck.Problems.Count -gt 0) { throw "ScreenConnect installer in dist failed its check: $($distCheck.Problems -join '; ')" }
   }
 
   $step = '3/6 sign'
