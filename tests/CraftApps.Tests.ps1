@@ -45,7 +45,7 @@ BeforeAll {
   #   $script:now        each Set-SetupNow SubTitle
   #   $script:waits      each Wait-SetupDelay Seconds
   #   $script:downloads  each Get-RemoteFile call (Url, Destination); the mock writes 'placeholder' to Destination
-  #   $script:sigCalls   each Test-FileSignature call (Path, Signers); $script:sigBad lists the leaf names that fail
+  #   $script:sigCalls   each Test-FileSignature call (Path, Signers, ExactCN); $script:sigBad lists the leaf names that fail
   #   $script:ext        each Invoke-External call; $script:extHandler answers it (default: exit 0)
   #   $script:texts      URL -> text for Get-RemoteText (Set-CraftRelease fills it); an unknown URL throws
   function Initialize-CraftMocks {
@@ -73,7 +73,7 @@ BeforeAll {
       return $Destination
     }
     Mock Test-FileSignature {
-      [void]$script:sigCalls.Add(@{ Path = $Path; Signers = @($AllowedSigners) })
+      [void]$script:sigCalls.Add(@{ Path = $Path; Signers = @($AllowedSigners); ExactCN = [bool]$ExactCN })
       return (-not ($script:sigBad -contains (Split-Path -Leaf $Path)))
     }
     Mock Invoke-External {
@@ -325,6 +325,7 @@ Describe 'Install-CraftItem' {
     $r = I; $r.Status | Should -Be 'Installed'; $r.Version | Should -Be '0.8.0'; $r.Reason | Should -BeExactly ''
     $script:downloads[0].Destination | Should -Be $msi
     $script:sigCalls[0].Path | Should -Be $msi; @($script:sigCalls[0].Signers) | Should -Be @('Learning Machines Inc')
+    $script:sigCalls[0].ExactCN | Should -BeTrue   # the exact CN, not a substring (final review I1)
     $script:ext.Count | Should -Be 1; $script:ext[0].FilePath | Should -Be (Join-Path $env:windir 'System32\msiexec.exe')
     $script:ext[0].ArgumentList | Should -BeExactly "/i `"$msi`" /qn /norestart"; $script:ext[0].TimeoutMinutes | Should -Be 20
   }

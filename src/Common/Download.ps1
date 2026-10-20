@@ -221,11 +221,37 @@ function Find-LatestLink {
   return $null
 }
 
+function Get-CertificateCommonName {
+  <#
+  .SYNOPSIS
+    Private. The value of the one CN in a certificate's subject, or $null when the subject has no CN,
+    more than one, or cannot be read. Never throws.
+  .DESCRIPTION
+    Reads the subject as Windows renders it, one attribute per line (X500DistinguishedName.Decode with
+    UseNewLines); a value with a comma, a quote, a line break or an edge space comes back in quotes, so
+    it can never equal a plain company name. Not GetNameInfo(SimpleName): with no CN in the subject that
+    falls back to the OU= or O= value (seen on .NET Framework 4.8), so 'O=<company>' alone would pass.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()]$Certificate)
+
+  try {
+    if ($null -eq $Certificate -or $null -eq $Certificate.SubjectName) { return $null }
+    $lines = $Certificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseNewLines) -split "`r?`n"
+    $names = @($lines | Where-Object { $_ -clike 'CN=*' } | ForEach-Object { $_.Substring(3) })
+    if ($names.Count -ne 1) { return $null }
+    return [string]$names[0]
+  } catch {
+    return $null
+  }
+}
+
 function Test-FileSignature {
   <#
   .SYNOPSIS
     $true when the file has a valid Authenticode signature whose signer certificate subject
-    contains CN=<one of the allowed signers>.
+    contains CN=<one of the allowed signers> (with -ExactCN: whose one CN is exactly that signer).
   .DESCRIPTION
     "Valid" includes catalog-signed Windows binaries, which is how Get-AuthenticodeSignature
     reports them. A missing or unreadable file, a non-Valid status, or a signer that is not on
@@ -235,12 +261,18 @@ function Test-FileSignature {
 
     Each allowed signer is matched as literal text (wildcard characters are escaped) and an empty
     signer is ignored, so a bad config entry cannot allow everything.
+
+    -ExactCN (the Craft MSIs, final review I1): the subject must hold exactly one CN, and its value
+    must equal an allowed signer, case-sensitively (-ceq): 'CN=Learning Machines Inc.' or the name in
+    O= only is refused. Without it the match stays a substring of the subject, for the vendors, until
+    their real subjects are recorded (v1 R32).
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param(
     [Parameter(Mandatory)][string]$Path,
-    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$AllowedSigners
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$AllowedSigners,
+    [switch]$ExactCN
   )
 
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -258,14 +290,22 @@ function Test-FileSignature {
   $status = [string]$signature.Status
   $subject = ''
   if ($signature.SignerCertificate) { $subject = [string]$signature.SignerCertificate.Subject }
+  $commonName = $null
+  if ($ExactCN) { $commonName = Get-CertificateCommonName -Certificate $signature.SignerCertificate }
 
   if ($status -eq 'Valid' -and $subject) {
     foreach ($signer in $AllowedSigners) {
       if ([string]::IsNullOrWhiteSpace($signer)) { continue }
-      if ($subject -like ('*CN=' + [Management.Automation.WildcardPattern]::Escape($signer) + '*')) { return $true }
+      if ($ExactCN) {
+        if ($null -ne $commonName -and $commonName -ceq $signer) { return $true }
+      } elseif ($subject -like ('*CN=' + [Management.Automation.WildcardPattern]::Escape($signer) + '*')) {
+        return $true
+      }
     }
   }
 
-  Write-SetupLog -Message 'Signature check: rejected' -Level WARN -Data @{ path = $Path; status = $status; subject = $subject; allowedSigners = @($AllowedSigners) }
+  $detail = @{ path = $Path; status = $status; subject = $subject; allowedSigners = @($AllowedSigners) }
+  if ($ExactCN) { $detail['exactCN'] = $true; $detail['commonName'] = $commonName }
+  Write-SetupLog -Message 'Signature check: rejected' -Level WARN -Data $detail
   return $false
 }

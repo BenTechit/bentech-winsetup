@@ -305,4 +305,73 @@ Describe 'Test-FileSignature' {
     try { Test-FileSignature -Path "$TestDrive\u2.ps1" -AllowedSigners @('Microsoft') | Out-Null } finally { $script:SetupLogPath = $null }
     (Get-Content "$d\setup.log" -Raw) | Should -Match 'NotSigned'
   }
+
+  Context '-ExactCN: the signer is the certificate''s one CN, exactly (Craft, final review I1)' {
+    # Real certificates with the subject under test, made in memory: an ephemeral CNG key signs them and is
+    # not attached, so nothing reaches a key or certificate store. Get-AuthenticodeSignature is mocked to
+    # hand one back with the Status under test, because no real file is signed by these subjects.
+    BeforeAll {
+      function New-TestCertificate([string]$Subject) {
+        $rsa = New-Object Security.Cryptography.RSACng 2048
+        try {
+          $pkcs1 = [Security.Cryptography.RSASignaturePadding]::Pkcs1
+          $request = New-Object Security.Cryptography.X509Certificates.CertificateRequest ($Subject, $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, $pkcs1)
+          $generator = [Security.Cryptography.X509Certificates.X509SignatureGenerator]::CreateForRSA($rsa, $pkcs1)
+          $now = [DateTimeOffset]::UtcNow
+          $request.Create($request.SubjectName, $generator, $now.AddDays(-1), $now.AddDays(2), [byte[]](1, 2, 3, 4))
+        } finally { $rsa.Dispose() }
+      }
+      $script:craftSubject = 'CN=Learning Machines Inc, O=Learning Machines Inc, L=Atlanta, S=Georgia, C=US'
+      function Use-FakeSignature([string]$Status, [string]$Subject) {
+        $script:fake = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]$Status; SignerCertificate = (New-TestCertificate $Subject) }
+        Mock Get-AuthenticodeSignature { $script:fake }
+      }
+    }
+    It 'accepts the real Craft subject' {
+      Use-FakeSignature 'Valid' $script:craftSubject
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeTrue
+    }
+    It 'rejects <Why>' -ForEach @(
+      @{ Why = 'a trailing dot';                   Subject = 'CN=Learning Machines Inc., O=Learning Machines Inc., L=Atlanta, S=Georgia, C=US' }
+      @{ Why = 'a longer company name';            Subject = 'CN=Learning Machines Incorporated, O=Learning Machines Incorporated, C=US' }
+      @{ Why = 'more words after the name';        Subject = 'CN=Learning Machines Inc Holdings, C=US' }
+      @{ Why = 'the name only in O=';              Subject = 'CN=Other Company Ltd, O=Learning Machines Inc, C=US' }
+      @{ Why = 'the name in O= and no CN at all';  Subject = 'O=Learning Machines Inc, L=Atlanta, C=US' }
+      @{ Why = 'the name in OU= and no CN at all'; Subject = 'OU=Learning Machines Inc, O=Other Company Ltd, C=US' }
+      @{ Why = 'another letter case';              Subject = 'CN=LEARNING MACHINES INC, C=US' }
+      @{ Why = 'a second CN';                      Subject = 'CN=Other Company Ltd, CN=Learning Machines Inc, C=US' }
+    ) {
+      Use-FakeSignature 'Valid' $Subject
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
+    }
+    It 'rejects Status <_> even with the exact CN' -ForEach 'HashMismatch', 'NotTrusted', 'NotSigned', 'UnknownError' {
+      Use-FakeSignature $_ $script:craftSubject
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
+    }
+    It 'rejects a signature without a signer certificate' {
+      $script:fake = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]'Valid'; SignerCertificate = $null }
+      Mock Get-AuthenticodeSignature { $script:fake }
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Should -BeFalse
+    }
+    It 'still ignores an empty allowed signer' {
+      Use-FakeSignature 'Valid' $script:craftSubject
+      Test-FileSignature -Path $ps -AllowedSigners @('', ' ') -ExactCN | Should -BeFalse
+    }
+    It 'accepts when any one of several allowed signers is the CN' {
+      Use-FakeSignature 'Valid' $script:craftSubject
+      Test-FileSignature -Path $ps -AllowedSigners @('Other Company Ltd', 'Learning Machines Inc') -ExactCN | Should -BeTrue
+    }
+    It 'without -ExactCN the match stays a substring, as for the vendors (R32)' {
+      Use-FakeSignature 'Valid' 'CN=Learning Machines Inc., O=Learning Machines Inc., C=US'
+      Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') | Should -BeTrue
+    }
+    It 'logs the subject and the CN it read when it rejects' {
+      Use-FakeSignature 'Valid' 'CN=Learning Machines Incorporated, C=US'
+      $d = Join-Path $TestDrive 'siglog4'
+      Initialize-SetupLog -LogDirectory $d
+      try { Test-FileSignature -Path $ps -AllowedSigners @('Learning Machines Inc') -ExactCN | Out-Null } finally { $script:SetupLogPath = $null }
+      $log = Get-Content "$d\setup.log" -Raw
+      $log | Should -Match '\[WARN\]'; $log | Should -Match '"commonName":\s*"Learning Machines Incorporated"'
+    }
+  }
 }

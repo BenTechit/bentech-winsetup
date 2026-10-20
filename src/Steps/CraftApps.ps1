@@ -329,7 +329,7 @@ function Install-CraftItem {
       Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
       return (New-CraftItemFailure -Name $name -Version $version -Reason 'checksum mismatch')
     }
-    if (-not (Test-FileSignature -Path $msi -AllowedSigners $Signers)) {
+    if (-not (Test-FileSignature -Path $msi -AllowedSigners $Signers -ExactCN)) {
       Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
       return (New-CraftItemFailure -Name $name -Version $version -Reason 'signature check failed')
     }
