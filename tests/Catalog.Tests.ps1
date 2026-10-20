@@ -30,6 +30,15 @@ Describe 'StepCatalog' {
     )
   }
   It 'has unique ids' { @($script:StepCatalog.Id | Select-Object -Unique).Count | Should -Be $script:StepCatalog.Count }
+  It 'every step has a Short title of at most 20 characters' { foreach ($s in $script:StepCatalog) { $s.Short | Should -Not -BeNullOrEmpty; $s.Short.Length | Should -BeLessOrEqual 20 } }
+  It 'has the progress screen''s Short titles (v2 spec 4.2)' {
+    @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
+      'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons'
+      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', '7zip|7-Zip'
+      'office|Microsoft 365', 'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'windows-update|Windows Update'
+      'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
+    )
+  }
 }
 Describe 'Get-StepPlan' {
   It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,office,default-browser,vendor-pass1,windows-update,vendor-pass2,consumer-app,vendor-cleanup,finalize' }

@@ -7,25 +7,28 @@
 
 # Defined at file scope on purpose: dot-sourcing this file, or bundling it into one script, makes
 # $script:StepCatalog visible to Get-StepPlan, Get-RunVerdict and the runner.
+#
+# Title is what the verdict and the report print; Short (at most 20 characters) is what the progress
+# screen's checklist and NOW line print (v2 spec 4.2).
 $script:StepCatalog = @(
-  @{ Id = 'prepare';         Title = 'Prepare machine';                 Function = 'Invoke-StepPrepare' }
-  @{ Id = 'bitlocker';       Title = 'Turn off BitLocker';              Function = 'Invoke-StepBitLocker' }
-  @{ Id = 'region';          Title = 'Time zone + Hebrew keyboard';     Function = 'Invoke-StepRegion' }
-  @{ Id = 'desktop-icons';   Title = 'Desktop icons';                   Function = 'Invoke-StepDesktopIcons' }
-  @{ Id = 'bloatware';       Title = 'Remove bloatware';                Function = 'Invoke-StepBloatware' }
-  @{ Id = 'rename';          Title = 'Rename PC';                       Function = 'Invoke-StepRename' }
-  @{ Id = 'winget';          Title = 'Prepare winget';                  Function = 'Invoke-StepWinget' }
-  @{ Id = 'chrome';          Title = 'Google Chrome';                   Function = 'Invoke-StepChrome' }
-  @{ Id = 'anydesk';         Title = 'AnyDesk';                         Function = 'Invoke-StepAnyDesk' }
-  @{ Id = '7zip';            Title = '7-Zip';                           Function = 'Invoke-StepSevenZip' }
-  @{ Id = 'office';          Title = 'Microsoft 365';                   Function = 'Invoke-StepOffice' }
-  @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Function = 'Invoke-StepDefaultBrowser' }
-  @{ Id = 'vendor-pass1';    Title = 'Vendor drivers + BIOS (pass 1)';  Function = 'Invoke-StepVendorPass1' }
-  @{ Id = 'windows-update';  Title = 'Windows Update';                  Function = 'Invoke-StepWindowsUpdate' }
-  @{ Id = 'vendor-pass2';    Title = 'Vendor drivers + BIOS (pass 2)';  Function = 'Invoke-StepVendorPass2' }
-  @{ Id = 'consumer-app';    Title = 'Vendor app';                      Function = 'Invoke-StepConsumerApp' }
-  @{ Id = 'vendor-cleanup';  Title = 'Remove business updater';         Function = 'Invoke-StepVendorCleanup' }
-  @{ Id = 'finalize';        Title = 'Finalize';                        Function = 'Invoke-StepFinalize' }
+  @{ Id = 'prepare';         Title = 'Prepare machine';                 Short = 'Prepare';              Function = 'Invoke-StepPrepare' }
+  @{ Id = 'bitlocker';       Title = 'Turn off BitLocker';              Short = 'BitLocker off';        Function = 'Invoke-StepBitLocker' }
+  @{ Id = 'region';          Title = 'Time zone + Hebrew keyboard';     Short = 'Time zone + keyboard'; Function = 'Invoke-StepRegion' }
+  @{ Id = 'desktop-icons';   Title = 'Desktop icons';                   Short = 'Desktop icons';        Function = 'Invoke-StepDesktopIcons' }
+  @{ Id = 'bloatware';       Title = 'Remove bloatware';                Short = 'Remove bloatware';     Function = 'Invoke-StepBloatware' }
+  @{ Id = 'rename';          Title = 'Rename PC';                       Short = 'Rename PC';            Function = 'Invoke-StepRename' }
+  @{ Id = 'winget';          Title = 'Prepare winget';                  Short = 'winget';               Function = 'Invoke-StepWinget' }
+  @{ Id = 'chrome';          Title = 'Google Chrome';                   Short = 'Chrome';               Function = 'Invoke-StepChrome' }
+  @{ Id = 'anydesk';         Title = 'AnyDesk';                         Short = 'AnyDesk';              Function = 'Invoke-StepAnyDesk' }
+  @{ Id = '7zip';            Title = '7-Zip';                           Short = '7-Zip';                Function = 'Invoke-StepSevenZip' }
+  @{ Id = 'office';          Title = 'Microsoft 365';                   Short = 'Microsoft 365';        Function = 'Invoke-StepOffice' }
+  @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Short = 'Default browser';      Function = 'Invoke-StepDefaultBrowser' }
+  @{ Id = 'vendor-pass1';    Title = 'Vendor drivers + BIOS (pass 1)';  Short = 'Drivers (pass 1)';     Function = 'Invoke-StepVendorPass1' }
+  @{ Id = 'windows-update';  Title = 'Windows Update';                  Short = 'Windows Update';       Function = 'Invoke-StepWindowsUpdate' }
+  @{ Id = 'vendor-pass2';    Title = 'Vendor drivers + BIOS (pass 2)';  Short = 'Drivers (pass 2)';     Function = 'Invoke-StepVendorPass2' }
+  @{ Id = 'consumer-app';    Title = 'Vendor app';                      Short = 'Laptop app';           Function = 'Invoke-StepConsumerApp' }
+  @{ Id = 'vendor-cleanup';  Title = 'Remove business updater';         Short = 'Remove updater';       Function = 'Invoke-StepVendorCleanup' }
+  @{ Id = 'finalize';        Title = 'Finalize';                        Short = 'Finish';               Function = 'Invoke-StepFinalize' }
 )
 
 # Brands whose vendor tool (Dell Command | Update, Lenovo System Update, HP Image Assistant) the

@@ -3,10 +3,10 @@
 #
 # SAFETY: these are console screens. Nothing here may touch the real console, read a real key, change
 # the console colour or start a process. Every Show-* call passes all of its seams (-ReadKey, -Now,
-# -Sleep, -OnAC, -Write, -SetColor, -Launch, -FlushInput), and BeforeEach also replaces Clear-Host,
-# Write-Host and Start-Process with commands that throw, so a forgotten seam fails loudly.
+# -Sleep, -OnAC, -Write, -Writer, -SetColor, -Launch, -FlushInput), and BeforeEach also replaces
+# Clear-Host, Write-Host and Start-Process with commands that throw, so a forgotten seam fails loudly.
 BeforeAll {
-  foreach ($f in 'StartScreen','ProgressScreen','FinalScreen') { . "$PSScriptRoot\..\src\UI\$f.ps1" }
+  foreach ($f in 'ConsoleFrame','StartScreen','ProgressScreen','FinalScreen') { . "$PSScriptRoot\..\src\UI\$f.ps1" }
   # The real commands the screens call in production, so Pester can mock them.
   . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Config.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
@@ -14,6 +14,43 @@ BeforeAll {
   . "$PSScriptRoot\..\src\Steps\Apps.ps1"; . "$PSScriptRoot\..\src\Steps\DefaultBrowser.ps1"
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   $script:m = @{ Manufacturer='Dell Inc.'; FriendlyModel='Latitude 5440'; Serial='7HX2K93'; IsLaptop=$true; IsVM=$false; OsCaption='Windows 11 Pro'; OsDisplayVersion='25H2'; OsBuild=26200; Arch='x64'; NewName='DELL-7HX2K93' }
+  $script:Hebrew = -join [char[]](0x05E2, 0x05D3, 0x05DB, 0x05D5, 0x05DF)
+
+  # The v2 progress screen fixture (Task 7): a local catalog with Short titles, a run with every marker,
+  # Office in the background, and a NOW view with a 60-minute wait.
+  $script:cat = @(
+    @{ Id = 'prepare';        Title = 'Prepare machine';                Short = 'Prepare';          Function = 'Invoke-StepPrepare' }
+    @{ Id = 'bitlocker';      Title = 'Turn off BitLocker';             Short = 'BitLocker off';    Function = 'Invoke-StepBitLocker' }
+    @{ Id = 'chrome';         Title = 'Google Chrome';                  Short = 'Chrome';           Function = 'Invoke-StepChrome' }
+    @{ Id = 'anydesk';        Title = 'AnyDesk';                        Short = 'AnyDesk';          Function = 'Invoke-StepAnyDesk' }
+    @{ Id = '7zip';           Title = '7-Zip';                          Short = '7-Zip';            Function = 'Invoke-StepSevenZip' }
+    @{ Id = 'vendor-pass1';   Title = 'Vendor drivers + BIOS (pass 1)'; Short = 'Drivers (pass 1)'; Function = 'Invoke-StepVendorPass1' }
+    @{ Id = 'office';         Title = 'Microsoft 365';                  Short = 'Microsoft 365';    Function = 'Invoke-StepOffice' }
+    @{ Id = 'windows-update'; Title = 'Windows Update';                 Short = 'Windows Update';   Function = 'Invoke-StepWindowsUpdate' }
+    @{ Id = 'office-finish';  Title = 'Microsoft 365 (finish)';         Short = 'Microsoft 365';    Function = 'Invoke-StepOfficeFinish' }
+    @{ Id = 'finalize';       Title = 'Finalize';                       Short = 'Finish';           Function = 'Invoke-StepFinalize' }
+  )
+  function New-V2State {
+    @{
+      StartedAt = '2026-10-20T11:00:00'; RebootCount = 2
+      Plan = @('prepare', 'bitlocker', 'chrome', 'anydesk', '7zip', 'vendor-pass1', 'office', 'windows-update', 'office-finish', 'finalize')
+      Steps = @{
+        'prepare'        = @{ Status = 'Done' }
+        'bitlocker'      = @{ Status = 'Skipped'; Message = 'Not encrypted' }
+        'chrome'         = @{ Status = 'Failed'; Message = 'MSI exit 1603' }
+        'anydesk'        = @{ Status = 'Done' }
+        '7zip'           = @{ Status = 'Done' }
+        'vendor-pass1'   = @{ Status = 'running'; StartedAt = '2026-10-20T12:00:00' }
+        'office'         = @{ Status = 'Done'; Data = @{ Background = $true; StartedAt = '2026-10-20T11:59:00' } }
+        'windows-update' = @{ Status = 'pending' }
+        'office-finish'  = @{ Status = 'pending' }
+        'finalize'       = @{ Status = 'pending' }
+      }
+    }
+  }
+  $script:now = [datetime]'2026-10-20T12:12:40'
+  $script:view = @{ SubTitle = 'Dell Command Update'; Lines = @('Log: Installing Intel Chipset'); Wait = @{ StartedAt = [datetime]'2026-10-20T12:00:00'; LimitMinutes = 60 } }
+  $script:act = @([pscustomobject]@{ Time = [datetime]'2026-10-20T12:31:00'; Text = 'Microsoft 365 started installing in the background' })
 
   # A fake clock: Sleep moves it forward, Now reads it. Show-StartScreen never waits for real time.
   function Reset-FakeClock { $script:clock = [datetime]'2026-10-18T09:00:00'; $script:t0 = $script:clock }
@@ -365,129 +402,199 @@ Describe 'Show-StartScreen' {
   }
 }
 
-Describe 'Format-ProgressScreen' {
-  BeforeAll {
-    $script:cat = @(
-      @{ Id = 'prepare';  Title = 'Prepare machine';   Function = 'Invoke-StepPrepare' }
-      @{ Id = 'bitlocker'; Title = 'Turn off BitLocker'; Function = 'Invoke-StepBitLocker' }
-      @{ Id = 'chrome';   Title = 'Google Chrome';     Function = 'Invoke-StepChrome' }
-      @{ Id = 'anydesk';  Title = 'AnyDesk';           Function = 'Invoke-StepAnyDesk' }
-      @{ Id = '7zip';     Title = '7-Zip';             Function = 'Invoke-StepSevenZip' }
-      @{ Id = 'office';   Title = 'Microsoft 365';     Function = 'Invoke-StepOffice' }
-    )
-    function New-ProgressState {
-      @{
-        StartedAt = '2026-10-18T09:00:00'; RebootCount = 2
-        Plan = @('prepare', 'bitlocker', 'chrome', 'anydesk', '7zip', 'office')
-        Steps = @{
-          'prepare'   = @{ Status = 'Done';    Message = 'ok';                  StartedAt = '2026-10-18T09:00:01' }
-          'bitlocker' = @{ Status = 'Skipped'; Message = 'Drive not encrypted'; StartedAt = '2026-10-18T09:01:00' }
-          'chrome'    = @{ Status = 'Failed';  Message = 'MSI exit 1603';       StartedAt = '2026-10-18T09:02:00' }
-          'anydesk'   = @{ Status = 'running'; Message = '';                    StartedAt = '2026-10-18T09:14:55' }
-          '7zip'      = @{ Status = 'pending'; Message = '';                    StartedAt = $null }
-          # 'office' has no state entry at all
-        }
-      }
-    }
+Describe 'Format-ProgressScreen (v2)' {
+  It 'draws header, checklist columns, NOW and JUST HAPPENED' {
+    $l = Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -Spinner '/' -NowView $view -Activity $act
+    $l[0] | Should -Be '  BENTECH WINDOWS SETUP - working, do not turn off   /   Total 01:12:40   Restarts 2'
+    $l[1] | Should -Be ('  ' + ('-' * 96))
+    $l[2] | Should -Be ('  ' + '[OK] Prepare'.PadRight(32) + '[OK] AnyDesk'.PadRight(32) + '[>>] Microsoft 365 (bg) 13:40')
+    $l[3] | Should -Be ('  ' + '[--] BitLocker off'.PadRight(32) + '[OK] 7-Zip'.PadRight(32) + '[..] Windows Update')
+    $l[4] | Should -Be ('  ' + '[X ] Chrome'.PadRight(32) + '[>>] Drivers (pass 1)'.PadRight(32) + '[..] Finish')
+    $l[6] | Should -Be '  NOW  Drivers (pass 1) - Dell Command Update   /   12:40 (of max 60 min)'
+    $l[7] | Should -Be '       Log: Installing Intel Chipset'
+    $l[9] | Should -Be '  JUST HAPPENED'
+    $l[10] | Should -Be '  12:31  Microsoft 365 started installing in the background'
+    ($l -join "`n") | Should -Not -Match 'Microsoft 365 \(finish\)'
   }
-  It 'prints one marker line per planned step, in plan order, with catalog titles' {
-    $l = Format-ProgressScreen -State (New-ProgressState) -Catalog $cat -Now ([datetime]'2026-10-18T09:17:30')
-    $l | Should -Contain '  [OK] Prepare machine'
-    $l | Should -Contain '  [--] Turn off BitLocker - Drive not encrypted'
-    $l | Should -Contain '  [X ] Google Chrome - MSI exit 1603'
-    $l | Should -Contain '  [>>] AnyDesk  (02:35)'
-    $l | Should -Contain '  [..] 7-Zip'
-    $l | Should -Contain '  [..] Microsoft 365'
-    $order = @($l | Where-Object { $_ -match '^  \[' })
-    $order.Count | Should -Be 6
-    $order[0] | Should -Match 'Prepare machine'; $order[5] | Should -Match 'Microsoft 365'
+  It 'NOW without a wait shows the step time and no limit' {
+    (Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -NowView @{ Lines = @() } -Activity @())[6] | Should -Be '  NOW  Drivers (pass 1)   /   12:40'
   }
-  It 'has the heading first and the reboot and total line last' {
-    $l = Format-ProgressScreen -State (New-ProgressState) -Catalog $cat -Now ([datetime]'2026-10-18T10:17:30')
-    $l[0] | Should -Be '  BENTECH WINDOWS SETUP - working, do not turn off'
-    $l[$l.Count - 1] | Should -Be '  Reboots: 2    Total: 1:17'
+  It 'NOW shows an override title (the Office restart wait)' {
+    $v = @{ Title = 'Waiting for Microsoft 365 to finish before restarting'; Wait = @{ StartedAt = [datetime]'2026-10-20T11:59:00'; LimitMinutes = 60 } }
+    (Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -NowView $v)[6] | Should -Be '  NOW  Waiting for Microsoft 365 to finish before restarting   /   13:40 (of max 60 min)'
   }
-  It 'shows elapsed time past 59 minutes as minutes, and clamps a start time in the future to 00:00' {
-    $st = New-ProgressState
-    $st.Steps['anydesk'].StartedAt = '2026-10-18T09:00:00'
-    (Format-ProgressScreen -State $st -Catalog $cat -Now ([datetime]'2026-10-18T10:41:07')) | Should -Contain '  [>>] AnyDesk  (101:07)'
-    (Format-ProgressScreen -State $st -Catalog $cat -Now ([datetime]'2026-10-18T08:00:00')) | Should -Contain '  [>>] AnyDesk  (00:00)'
+  It 'falls back to the newest activity line when the step has no detail' {
+    (Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -NowView @{ Lines = @() } -Activity $act)[7] | Should -Be '       Microsoft 365 started installing in the background'
   }
-  It 'accepts a step start time that was already turned into a datetime' {
-    $st = New-ProgressState
-    $st.Steps['anydesk'].StartedAt = [datetime]'2026-10-18T09:14:55'
-    $st.StartedAt = [datetime]'2026-10-18T09:00:00'
-    $l = Format-ProgressScreen -State $st -Catalog $cat -Now ([datetime]'2026-10-18T09:17:30')
-    $l | Should -Contain '  [>>] AnyDesk  (02:35)'
-    $l | Should -Contain '  Reboots: 2    Total: 0:17'
+  It 'cuts a long NOW list with "... and N more"' {
+    $v = @{ Lines = @(1..15 | ForEach-Object { "update $_" }) }
+    $l = Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 40 -NowView $v
+    $l[7] | Should -Be '       update 1'; $l[15] | Should -Be '       update 9'; $l[16] | Should -Be '       ... and 6 more'
   }
-  It 'falls back to the step id when the catalog does not know it, and drops an empty reason' {
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('mystery'); Steps = @{ mystery = @{ Status = 'Failed'; Message = '' } } }
-    (Format-ProgressScreen -State $st -Catalog $cat -Now ([datetime]'2026-10-18T09:00:10')) | Should -Contain '  [X ] mystery'
+  It 'shrinks JUST HAPPENED first, then the NOW list, and keeps header, checklist and NOW line' {
+    $v = @{ Lines = @(1..10 | ForEach-Object { "u$_" }) }
+    $l = @(Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 12 -NowView $v -Activity $act)
+    $l.Count | Should -Be 11; $l[6] | Should -Match '^  NOW  '; $l[10] | Should -Be '       ... and 7 more'
+    $l | Should -Not -Contain '  JUST HAPPENED'
   }
-  It 'keeps a long failure reason on one ASCII line' {
-    $st = New-ProgressState
-    $st.Steps['chrome'].Message = ('Windows said ' + [char]0x05D1 + "`r`n" + ('x' * 200))
-    $l = Format-ProgressScreen -State $st -Catalog $cat -Now ([datetime]'2026-10-18T09:17:30')
-    $line = @($l | Where-Object { $_ -match '^  \[X \] Google Chrome' })
-    $line.Count | Should -Be 1
-    $line[0].Length | Should -BeLessOrEqual 79
-    $line[0] | Should -Match '^  \[X \] Google Chrome - Windows said \? x+\.\.\.$'
+  It 'fits a tiny 40x12 window (Review Focus 3)' {
+    $l = @(Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 40 -Height 12 -NowView $view -Activity $act)
+    $l.Count | Should -BeLessOrEqual 11; @($l | Where-Object { $_.Length -gt 39 }).Count | Should -Be 0
   }
-  It 'works with the real step catalog' {
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('prepare', 'finalize'); Steps = @{ prepare = @{ Status = 'Done' }; finalize = @{ Status = 'pending' } } }
-    $l = Format-ProgressScreen -State $st -Catalog $script:StepCatalog -Now ([datetime]'2026-10-18T09:00:10')
-    $l | Should -Contain '  [OK] Prepare machine'; $l | Should -Contain '  [..] Finalize'
+  It 'is ASCII only with Hebrew everywhere (Review Focus 4)' {
+    $v = @{ SubTitle = "tool $Hebrew"; Lines = @("log $Hebrew") }; $a = @([pscustomobject]@{ Time = $now; Text = "done $Hebrew" })
+    ((Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -NowView $v -Activity $a) -join "`n") -match '[^\x20-\x7E\n]' | Should -BeFalse
+  }
+  It 'in a tiny window drops the separators first, then checklist rows from the bottom; header and NOW stay' {
+    $l = @(Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 40 -Height 12 -NowView $view -Activity $act)
+    $l.Count | Should -Be 11
+    $l[0] | Should -Match '^  BENTECH WINDOWS SETUP'; $l[1] | Should -Be '  [OK] Prepare'; $l[9] | Should -Be '  [..] Finish'; $l[10] | Should -Match '^  NOW  Drivers \(pass 1\)'
+    $l = @(Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 40 -Height 8 -NowView $view -Activity $act)
+    $l.Count | Should -Be 7
+    $l[0] | Should -Match '^  BENTECH'; $l[1] | Should -Be '  [OK] Prepare'; $l[5] | Should -Be '  [OK] 7-Zip'; $l[6] | Should -Match '^  NOW  '
+  }
+  It 'shows NOW "-" with no time when nothing runs and no title is set, and leaves out an empty JUST HAPPENED' {
+    $st = New-V2State; $st.Steps['vendor-pass1'] = @{ Status = 'Done' }
+    $l = @(Format-ProgressScreen -State $st -Catalog $cat -Now $now -Width 100 -Height 30)
+    $l[6] | Should -Be '  NOW  -'
+    $l.Count | Should -Be 7
+  }
+  It 'never shows a negative wait limit or time' {
+    $v = @{ Wait = @{ StartedAt = [datetime]'2026-10-20T13:00:00'; LimitMinutes = -0.5 } }
+    (Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -NowView $v)[6] | Should -Be '  NOW  Drivers (pass 1)   /   00:00 (of max 0 min)'
+  }
+  It 'titles a step from Short, else Title, else the id' {
+    $c = @(@{ Id = 'prepare'; Title = 'Prepare machine' }, @{ Id = 'bitlocker'; Short = 'BitLocker off'; Title = 'x' })
+    $st = @{ StartedAt = '2026-10-20T11:00:00'; RebootCount = 0; Plan = @('prepare', 'bitlocker', 'mystery'); Steps = @{} }
+    $l = @(Format-ProgressScreen -State $st -Catalog $c -Now $now -Width 100 -Height 30)
+    $l[2] | Should -Be ('  ' + '[..] Prepare machine'.PadRight(23) + '[..] BitLocker off'.PadRight(23) + '[..] mystery')
   }
 }
-
-Describe 'Show-ProgressScreen' {
-  # Safety net: this must only reach the console through its seams. The production writer's colours
-  # land on a fake RawUI, never on the console running the tests.
+Describe 'Get-ChecklistEntry: the Microsoft 365 line' {
+  It 'shows the result of office-finish once it has one' { $s = New-V2State; $s.Steps['office-finish'] = @{ Status = 'Failed'; Message = 'Office setup timed out' }; Get-ChecklistEntry -State $s -Id 'office' -Short 'Microsoft 365' -Now $now | Should -Be '[X ] Microsoft 365' }
+  It 'keeps office''s own failure' { $s = New-V2State; $s.Steps.office = @{ Status = 'Failed' }; $s.Steps['office-finish'] = @{ Status = 'Done' }; Get-ChecklistEntry -State $s -Id 'office' -Short 'Microsoft 365' -Now $now | Should -Be '[X ] Microsoft 365' }
+  It 'says (bg ended) when the background process has ended' { $s = New-V2State; $s.Steps.office.Data.Finished = $true; Get-ChecklistEntry -State $s -Id 'office' -Short 'Microsoft 365' -Now $now | Should -Be '[..] Microsoft 365 (bg ended)' }
+  It 'is running while office-finish waits' { $s = New-V2State; $s.Steps['office-finish'] = @{ Status = 'running' }; Get-ChecklistEntry -State $s -Id 'office' -Short 'Microsoft 365' -Now $now | Should -Be '[>>] Microsoft 365' }
+  It 'is [OK] for a foreground Office install with office-finish not started' { $s = New-V2State; $s.Steps.office = @{ Status = 'Done' }; Get-ChecklistEntry -State $s -Id 'office' -Short 'Microsoft 365' -Now $now | Should -Be '[OK] Microsoft 365' }
+  It 'marks every other step by its own status, with no timer' {
+    $s = New-V2State
+    Get-ChecklistEntry -State $s -Id 'vendor-pass1' -Short 'Drivers (pass 1)' -Now $now | Should -Be '[>>] Drivers (pass 1)'
+    Get-ChecklistEntry -State $s -Id 'bitlocker' -Short 'BitLocker off' -Now $now | Should -Be '[--] BitLocker off'
+    Get-ChecklistEntry -State $s -Id 'not-in-state' -Short 'X' -Now $now | Should -Be '[..] X'
+  }
+}
+Describe 'Format-Checklist' {
+  It 'fills columns top to bottom, two-space indent, no trailing spaces' { Format-Checklist -Entries @('a','b','c','d','e') -Width 20 | Should -Be @('  a   c   e', '  b   d') }
+  It 'uses one column when the window is narrower than one entry' { Format-Checklist -Entries @('[OK] Prepare', '[..] Finish') -Width 10 | Should -Be @('  [OK] Prepare', '  [..] Finish') }
+}
+Describe 'Format-Elapsed and Format-MinutesSeconds' {
+  It 'do not wrap hours or minutes, and show a negative span as zero' {
+    Format-Elapsed -Span ([timespan]::FromSeconds(26 * 3600 + 65)) | Should -Be '26:01:05'
+    Format-Elapsed -Span ([timespan]::FromSeconds(-5)) | Should -Be '00:00:00'
+    Format-MinutesSeconds -Span ([timespan]::FromSeconds(101 * 60 + 7)) | Should -Be '101:07'
+    Format-MinutesSeconds -Span ([timespan]::FromSeconds(-5)) | Should -Be '00:00'
+  }
+}
+Describe 'ConsoleFrame' {
   BeforeEach {
-    Mock Clear-Host { throw 'Clear-Host must not run in tests' }
-    Mock Write-Host { throw 'Write-Host must not run in tests' }
-    Mock Start-Process { throw 'Start-Process must not run in tests' }
-    $script:fakeRawUI = [pscustomobject]@{ BackgroundColor = 'DarkBlue'; ForegroundColor = 'White' }
-    Mock Get-ConsoleRawUI { $script:fakeRawUI }
-    Mock Write-SetupLog { }
+    $script:fw = @{ Calls = New-Object System.Collections.ArrayList; Size = @{ Width = 30; Height = 5; Top = 10 } }
+    $script:writer = @{ GetSize = { [pscustomobject]$script:fw.Size }; Clear = { param($b) [void]$script:fw.Calls.Add('clear'); $script:fw.ClearBack = $b }
+      MoveTo = { param($row) [void]$script:fw.Calls.Add("row $row") }; Write = { param($t, $c, $b) [void]$script:fw.Calls.Add(@{ T = $t; C = $c; B = $b }) } }
+    Reset-ConsoleFrame
+    Mock Write-Host { throw 'Write-Host must not be used' }; Mock Clear-Host { throw 'Clear-Host must not be used' }
   }
-  It 'the production writer sets a black background and gray text right before it clears (spec 9.1)' {
-    $script:atClear = $null
-    Mock Clear-Host { $script:atClear = @{ B = [string]$script:fakeRawUI.BackgroundColor; F = [string]$script:fakeRawUI.ForegroundColor } }
-    Mock Write-Host { }
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('finalize'); Steps = @{ finalize = @{ Status = 'Done' } } }
-    Show-ProgressScreen -State $st -Now { [datetime]'2026-10-18T09:00:05' }
-    $script:atClear.B | Should -Be 'Black'
-    $script:atClear.F | Should -Be 'Gray'
+  It 'ConvertTo-ConsoleFrame pads and cuts to exactly Width x Height' {
+    $f = ConvertTo-ConsoleFrame -Lines @('abc', ('x' * 50)) -Width 10 -Height 3
+    $f.Count | Should -Be 3; @($f | Where-Object { $_.Length -ne 10 }).Count | Should -Be 0; $f[0] | Should -Be 'abc       '
   }
-  It 'draws the formatted lines through the write seam at the injected time' {
-    $script:progressDrawn = $null
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 1; Plan = @('prepare'); Steps = @{ prepare = @{ Status = 'running'; StartedAt = '2026-10-18T09:00:00' } } }
-    Show-ProgressScreen -State $st -Catalog @(@{ Id = 'prepare'; Title = 'Prepare machine'; Function = 'x' }) `
-      -Now { [datetime]'2026-10-18T09:01:05' } -Write { param($lines) $script:progressDrawn = @($lines) }
-    $script:progressDrawn | Should -Contain '  [>>] Prepare machine  (01:05)'
-    $script:progressDrawn[$script:progressDrawn.Count - 1] | Should -Be '  Reboots: 1    Total: 0:01'
+  It 'clears only when the size changes, writes Height-1 rows of Width-1 characters and parks the cursor' {
+    Write-ConsoleFrame -Lines @('a', 'b') -Writer $writer; Write-ConsoleFrame -Lines @('a', 'b') -Writer $writer
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 1
+    @($fw.Calls | Where-Object { $_ -is [hashtable] -and $_.T.Length -ne 29 }).Count | Should -Be 0
+    @($fw.Calls | Where-Object { $_ -is [hashtable] -and (-not $_.C -or $_.B -ne 'Black') }).Count | Should -Be 0   # spec 9.1: both colours, on Black
+    $fw.ClearBack | Should -Be 'Black'
+    @($fw.Calls | Where-Object { $_ -eq 'row 14' }).Count | Should -Be 2     # Top + Height - 1, once per frame
+    $fw.Calls[$fw.Calls.Count - 1] | Should -Be 'row 14'
+    $fw.Size.Width = 40; Write-ConsoleFrame -Lines @('a') -Writer $writer
+    @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 2
   }
-  It 'clears the screen and writes the lines when no -Write seam is given' {
-    $script:cleared = 0
-    $script:hostCalls = New-Object System.Collections.ArrayList
-    Mock Clear-Host { $script:cleared++ }
-    $script:hostColors = New-Object System.Collections.ArrayList
-    Mock Write-Host { $null = $script:hostCalls.Add([string]$Object); $null = $script:hostColors.Add(@{ F = $ForegroundColor; B = $BackgroundColor }) }
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('finalize'); Steps = @{ finalize = @{ Status = 'Done' } } }
-    Show-ProgressScreen -State $st -Now { [datetime]'2026-10-18T09:00:05' }
-    $cleared | Should -Be 1
-    $hostCalls | Should -Contain '  [OK] Finalize'
-    $hostCalls | Should -Contain ''
-    $hostColors.Count | Should -BeGreaterThan 0
-    @($hostColors | Where-Object { $_.F -ne 'Gray' -or $_.B -ne 'Black' }).Count | Should -Be 0
+  It 'clears again after Reset-ConsoleFrame, and blanks the rows it has no line for' {
+    Write-ConsoleFrame -Lines @('a', 'b') -Writer $writer; Reset-ConsoleFrame; $fw.Calls.Clear()
+    Write-ConsoleFrame -Lines @('a') -Writer $writer
+    $fw.Calls[0] | Should -Be 'clear'
+    @($fw.Calls | Where-Object { $_ -is [hashtable] } | ForEach-Object { $_.T }) | Should -Be @(('a'.PadRight(29)), (' ' * 29), (' ' * 29), (' ' * 29))
+    @($fw.Calls | Where-Object { $_ -is [string] -and $_ -like 'row *' }) | Should -Be @('row 10', 'row 11', 'row 12', 'row 13', 'row 14')
   }
-  It 'uses the step catalog when none is passed' {
-    $script:progressDrawn = $null
-    $st = @{ StartedAt = '2026-10-18T09:00:00'; RebootCount = 0; Plan = @('finalize'); Steps = @{ finalize = @{ Status = 'Done' } } }
-    Show-ProgressScreen -State $st -Now { [datetime]'2026-10-18T09:00:05' } -Write { param($lines) $script:progressDrawn = @($lines) }
-    $script:progressDrawn | Should -Contain '  [OK] Finalize'
+  It 'writes each Colorize segment in its colour, else the frame colours, always with a background' {
+    Write-ConsoleFrame -Lines @('  [OK] a') -Writer $writer -Foreground 'White' -Background 'Black' -Colorize { param($l) @{ Text = $l.Substring(0, 2) }; @{ Text = $l.Substring(2); Color = 'Green'; Background = 'Blue' } }
+    $w = @($fw.Calls | Where-Object { $_ -is [hashtable] })
+    $w[0].T | Should -Be '  '; $w[0].C | Should -Be 'White'; $w[0].B | Should -Be 'Black'
+    $w[1].T | Should -Be '[OK] a'.PadRight(27); $w[1].C | Should -Be 'Green'; $w[1].B | Should -Be 'Blue'
+  }
+  It 'lets a writer failure propagate (the tick catches it)' {
+    $writer.MoveTo = { param($row) throw 'window closed' }
+    { Write-ConsoleFrame -Lines @('a') -Writer $writer } | Should -Throw '*window closed*'
+  }
+  It 'Split-ProgressLine colours each marker up to the next one' {
+    $s = @(Split-ProgressLine -Line '  [OK] Prepare   [X ] Chrome')
+    $s[0].Text | Should -Be '  '; $s[0].Color | Should -BeNullOrEmpty
+    $s[1].Text | Should -Be '[OK] Prepare   '; $s[1].Color | Should -Be 'Green'
+    $s[2].Text | Should -Be '[X ] Chrome'; $s[2].Color | Should -Be 'Red'
+  }
+  It 'Split-ProgressLine knows every marker and leaves plain text whole' {
+    $s = @(Split-ProgressLine -Line '[>>] a [--] b [..] c')
+    $s.Count | Should -Be 3
+    $s[0].Text | Should -Be '[>>] a '; $s[0].Color | Should -Be 'Cyan'
+    $s[1].Text | Should -Be '[--] b '; $s[1].Color | Should -Be 'DarkGray'
+    $s[2].Text | Should -Be '[..] c'; $s[2].Color | Should -BeNullOrEmpty
+    $p = @(Split-ProgressLine -Line '  NOW  Windows Update')
+    $p.Count | Should -Be 1; $p[0].Text | Should -Be '  NOW  Windows Update'; $p[0].Color | Should -BeNullOrEmpty
+  }
+  It 'Get-ConsoleTargetSize grows to 100x45 within the screen and never shrinks' {
+    $r = Get-ConsoleTargetSize -Current @{ Width = 80; Height = 25; BufferWidth = 80; BufferHeight = 9001 } -Largest @{ Width = 160; Height = 50 }
+    $r.WindowWidth | Should -Be 100; $r.WindowHeight | Should -Be 45; $r.BufferWidth | Should -Be 100; $r.BufferHeight | Should -Be 9001
+    (Get-ConsoleTargetSize -Current @{ Width = 80; Height = 25; BufferWidth = 80; BufferHeight = 25 } -Largest @{ Width = 90; Height = 30 }).WindowHeight | Should -Be 30
+    (Get-ConsoleTargetSize -Current @{ Width = 120; Height = 50; BufferWidth = 120; BufferHeight = 9001 } -Largest @{ Width = 160; Height = 60 }).WindowWidth | Should -Be 120
+  }
+  It 'Resize-SetupConsole never throws: a refusal is logged at INFO and gives $false' {
+    # Get-ConsoleTargetSize throws before anything is set, so the console running the tests is never resized.
+    Mock Get-ConsoleTargetSize { throw 'The handle is invalid.' }; Mock Write-SetupLog { }
+    Resize-SetupConsole | Should -BeFalse
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'INFO' }
+    Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Level -ne 'INFO' }
+  }
+  It 'Show-ProgressScreen draws through the writer and the spinner moves on every call' {
+    $script:ProgressSpinnerIndex = 0; $fw.Size = @{ Width = 100; Height = 30; Top = 0 }
+    Show-ProgressScreen -State (New-V2State) -Catalog $cat -Now { $now } -Writer $writer
+    Show-ProgressScreen -State (New-V2State) -Catalog $cat -Now { $now } -Writer $writer
+    $heads = @($fw.Calls | Where-Object { $_ -is [hashtable] -and $_.T -like '  BENTECH WINDOWS SETUP*' })
+    $heads[0].T | Should -Match '   \|   Total'; $heads[1].T | Should -Match '   /   Total'
+  }
+  It 'Show-ProgressScreen colours the checklist markers and shows the NOW provider''s lines' {
+    Clear-SetupNow; Set-SetupNow -SubTitle 'Dell Command Update' -Provider { param($a) "Log: $a" } -ProviderArgument 'Installing Intel Chipset'
+    $fw.Size = @{ Width = 100; Height = 30; Top = 0 }
+    Show-ProgressScreen -State (New-V2State) -Catalog $cat -Now { $now } -Writer $writer
+    Clear-SetupNow
+    $w = @($fw.Calls | Where-Object { $_ -is [hashtable] })
+    @($w | Where-Object { $_.T -like '`[X `] Chrome*' })[0].C | Should -Be 'Red'
+    @($w | Where-Object { $_.T -like '`[OK`] Prepare*' })[0].C | Should -Be 'Green'
+    @($w | Where-Object { $_.T -like '  NOW  Drivers (pass 1) - Dell Command Update   /   12:40*' }).Count | Should -Be 1
+    @($w | Where-Object { $_.T -like '       Log: Installing Intel Chipset*' }).Count | Should -Be 1
+  }
+  It 'a provider that throws still gives a screen, with one WARN' {
+    $script:warns = 0; Mock Write-SetupLog { if ($Level -eq 'WARN') { $script:warns++ } }
+    Clear-SetupNow; Set-SetupNow -Provider { throw 'bad json' }; $fw.Size = @{ Width = 100; Height = 30; Top = 0 }
+    { Show-ProgressScreen -State (New-V2State) -Catalog $cat -Now { $now } -Writer $writer } | Should -Not -Throw
+    { Show-ProgressScreen -State (New-V2State) -Catalog $cat -Now { $now } -Writer $writer } | Should -Not -Throw
+    $warns | Should -Be 1; Clear-SetupNow
+  }
+  It 'a provider that fails again after Clear-SetupNow warns again' {
+    $script:warns = 0; Mock Write-SetupLog { if ($Level -eq 'WARN') { $script:warns++ } }
+    Clear-SetupNow; Set-SetupNow -Provider { throw 'bad json' }
+    (Get-ProgressNowView).Lines.Count | Should -Be 0; $null = Get-ProgressNowView
+    Clear-SetupNow; Set-SetupNow -Provider { throw 'still bad' }
+    $null = Get-ProgressNowView
+    $warns | Should -Be 2; Clear-SetupNow
   }
 }
 
