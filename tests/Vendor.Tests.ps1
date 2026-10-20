@@ -19,6 +19,9 @@ BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download', 'Config') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Detect\Detection.ps1"
   foreach ($f in 'Winget', 'BitLocker') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
+  # ConvertTo-ScreenText: the log line shown in NOW goes through it (Hebrew becomes '?').
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"
+  $script:Hebrew = -join [char[]](0x05E2, 0x05D3, 0x05DB, 0x05D5, 0x05DF)
 
   # The config text is read once here: the steps get a fresh object per test (New-VendorContext), so a
   # test can change a timeout or a tool entry without touching the others.
@@ -85,8 +88,11 @@ BeforeAll {
   #   $script:serviceStarts  one name per Start-Service call (must stay empty)
   #   $script:svc*           the fake Dell service behind Get-Service (see the mock)
   #   $script:removed        one path per Remove-Item call
+  #   $script:activity       the Text of each Add-SetupActivity call
   function Initialize-VendorMocks {
     $script:order = New-Object System.Collections.ArrayList
+    $script:activity = New-Object System.Collections.ArrayList
+    Clear-SetupNow
     $script:logs = New-Object System.Collections.ArrayList
     $script:sleeps = New-Object System.Collections.ArrayList
     $script:ext = New-Object System.Collections.ArrayList
@@ -139,6 +145,7 @@ BeforeAll {
     $script:removed = New-Object System.Collections.ArrayList
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Add-SetupActivity { [void]$script:activity.Add($Text) }
     Mock Start-Sleep { [void]$script:sleeps.Add(@{ Seconds = $Seconds; Milliseconds = $Milliseconds }) }
     Mock Test-Path { return ($script:existing -contains $LiteralPath) }
     Mock Invoke-External {
@@ -586,6 +593,30 @@ Describe 'Invoke-VendorPass: BitLocker and power gate' {
     $script:ext[1].ArgumentList | Should -Match '/Category:Drivers,Software '
     $r.Notes | Should -Contain 'On battery: BIOS/firmware updates skipped'
   }
+  # --- the activity feed (Task 10) ---
+  It 'a BitLocker suspension writes an activity line' {
+    $script:bitlockerDecrypted = $false
+    $script:suspendOk = $true
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    @($script:activity) | Should -Contain 'BitLocker suspended for one restart (BIOS update)'
+  }
+  It 'no suspension (decrypted, or the suspend failed) writes no BitLocker line' {
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:bitlockerDecrypted = $false
+    $script:suspendOk = $false
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    @($script:activity | Where-Object { $_ -like 'BitLocker*' }).Count | Should -Be 0
+  }
+  It 'on battery writes an activity line, and no BitLocker line' {
+    $script:onAC = $false
+    $script:bitlockerDecrypted = $false
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    @($script:activity) | Should -Be @('On battery: BIOS and firmware left out of this driver pass')
+  }
+  It 'on AC with a decrypted drive writes no gate line' {
+    $null = Invoke-VendorPass -Context $script:ctx -Pass 1
+    $script:activity.Count | Should -Be 0
+  }
   It 'HP: on battery HPIA gets /Category:Drivers,Software' {
     $script:ctx = New-VendorContext -Brand HP
     $hpia = Join-Path $script:ctx.DownloadDir 'HPIA\HPImageAssistant.exe'
@@ -629,6 +660,130 @@ Describe 'Invoke-VendorPass: brands and config' {
     @(Get-ToolRuns)[0].ArgumentList | Should -Match 'dcu-pass1\.log'
     (Invoke-StepVendorPass2 -Context $ctx).Data.Pass | Should -Be 2
     @(Get-ToolRuns)[1].ArgumentList | Should -Match 'dcu-pass2\.log'
+  }
+}
+
+# --- the driver tool's log line in NOW (Task 10) ----------------------------------------------
+Describe 'Get-VendorLogSource' {
+  It 'Dell is a file, Lenovo and HP are folders' {
+    $ctx = New-VendorContext -Brand DELL
+    (Get-VendorLogSource -Context $ctx -Kind dcu -Pass 2).Path | Should -Be (Join-Path $ctx.LogDir 'dcu-pass2.log')
+    (Get-VendorLogSource -Context $ctx -Kind dcu -Pass 2).Folder | Should -BeNullOrEmpty
+    (Get-VendorLogSource -Context $ctx -Kind lsu -Pass 1).Folder | Should -Be (Join-Path $env:ProgramData 'Lenovo\SystemUpdate\logs')
+    (Get-VendorLogSource -Context $ctx -Kind lsu -Pass 1).Path | Should -BeNullOrEmpty
+    (Get-VendorLogSource -Context $ctx -Kind hpia -Pass 1).Folder | Should -Be (Join-Path $ctx.LogDir 'HPIA-pass1')
+  }
+  It 'an unknown kind has no source' {
+    $s = Get-VendorLogSource -Context (New-VendorContext) -Kind mystery -Pass 1
+    $s.Path | Should -BeNullOrEmpty
+    $s.Folder | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Get-LastLogLine' {
+  It 'is the last non-blank line' { Get-LastLogLine -Text "first`r`nsecond`r`n`r`n   `r`n" | Should -Be 'second' }
+  It 'keeps the whole line, timestamp included' {
+    Get-LastLogLine -Text "[2026-10-20 00:16:10] : Finished installing the updates. `r`n" | Should -Be '[2026-10-20 00:16:10] : Finished installing the updates.'
+  }
+  It 'turns Hebrew into ?' { Get-LastLogLine -Text "Installing $script:Hebrew driver" | Should -Be 'Installing ????? driver' }
+  It 'is empty for nothing' {
+    Get-LastLogLine -Text '' | Should -BeExactly ''
+    Get-LastLogLine -Text $null | Should -BeExactly ''
+    Get-LastLogLine -Text "`r`n`r`n" | Should -BeExactly ''
+  }
+}
+
+Describe 'Get-VendorNowLines' {
+  It 'shows the last non-blank log line; Hebrew in a log line becomes ? (Review Focus 4)' {
+    $p = "$TestDrive\dcu.log"
+    [IO.File]::WriteAllText($p, "start`r`nInstalling $script:Hebrew driver`r`n`r`n")
+    Get-VendorNowLines -Source @{ Path = $p } | Should -Be @('Log: Installing ????? driver')
+  }
+  It 'reads a log the tool holds open, and the newest *.log of a folder' {
+    $d = "$TestDrive\lsu"
+    [void][IO.Directory]::CreateDirectory($d)
+    [IO.File]::WriteAllText("$d\old.log", 'old')
+    (Get-Item "$d\old.log").LastWriteTime = (Get-Date).AddHours(-1)
+    $w = [IO.File]::Open("$d\new.log", 'Create', 'Write', 'ReadWrite')
+    try {
+      $b = [Text.Encoding]::UTF8.GetBytes("Downloading package 3`r`n")
+      $w.Write($b, 0, $b.Length)
+      $w.Flush()
+      Get-VendorNowLines -Source @{ Folder = $d } | Should -Be @('Log: Downloading package 3')
+    } finally { $w.Dispose() }
+  }
+  It 'reads a UTF-16 log' {
+    $d = "$TestDrive\u16"
+    [void][IO.Directory]::CreateDirectory($d)
+    [IO.File]::WriteAllText("$d\tool.log", "one`r`nStep two`r`n", [Text.Encoding]::Unicode)
+    Get-VendorNowLines -Source @{ Folder = $d } | Should -Be @('Log: Step two')
+  }
+  It 'ignores files that are not *.log' {
+    $d = "$TestDrive\mixed"
+    [void][IO.Directory]::CreateDirectory($d)
+    [IO.File]::WriteAllText("$d\a.log", 'from the log')
+    [IO.File]::WriteAllText("$d\b.txt", 'from the text file')
+    [IO.File]::WriteAllText("$d\c.logx", 'from the logx file')
+    (Get-Item "$d\a.log").LastWriteTime = (Get-Date).AddHours(-1)
+    Get-VendorNowLines -Source @{ Folder = $d } | Should -Be @('Log: from the log')
+  }
+  It 'no log yet is no line' {
+    Get-VendorNowLines -Source @{ Path = "$TestDrive\none.log" } | Should -BeNullOrEmpty
+    Get-VendorNowLines -Source @{ Folder = "$TestDrive\nofolder" } | Should -BeNullOrEmpty
+    $empty = "$TestDrive\emptyfolder"
+    [void][IO.Directory]::CreateDirectory($empty)
+    Get-VendorNowLines -Source @{ Folder = $empty } | Should -BeNullOrEmpty
+  }
+  It 'an empty log, an empty source and no source are no line, and never throw' {
+    $p = "$TestDrive\empty.log"
+    [IO.File]::WriteAllText($p, '')
+    Get-VendorNowLines -Source @{ Path = $p } | Should -BeNullOrEmpty
+    Get-VendorNowLines -Source @{} | Should -BeNullOrEmpty
+    Get-VendorNowLines -Source $null | Should -BeNullOrEmpty
+  }
+  It 'a folder path that is not valid is no line, and never throws' {
+    { Get-VendorNowLines -Source @{ Folder = "$TestDrive\bad|name" } } | Should -Not -Throw
+    Get-VendorNowLines -Source @{ Folder = "$TestDrive\bad|name" } | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Invoke-VendorPass shows the tool and its log in NOW' {
+  BeforeEach {
+    Initialize-VendorMocks
+    $script:now = $null
+    Mock Invoke-DellUpdate { $script:now = Get-SetupNow; New-VendorOutcome -Outcome Done }
+    Mock Invoke-LenovoUpdate { $script:now = Get-SetupNow; New-VendorOutcome -Outcome Done }
+    Mock Invoke-HpUpdate { $script:now = Get-SetupNow; New-VendorOutcome -Outcome Done }
+  }
+  It 'Dell: the tool name and the pass log file' {
+    $ctx = New-VendorContext -Brand DELL
+    $null = Invoke-VendorPass -Context $ctx -Pass 1
+    $script:now.SubTitle | Should -Be 'Dell Command Update'
+    $script:now.ProviderArgument.Path | Should -Match 'dcu-pass1\.log$'
+    $script:now.ProviderArgument.Path | Should -Be (Join-Path $ctx.LogDir 'dcu-pass1.log')
+  }
+  It 'Lenovo: the tool name and the System Update log folder' {
+    $null = Invoke-VendorPass -Context (New-VendorContext -Brand LENOVO) -Pass 1
+    $script:now.SubTitle | Should -Be 'Lenovo System Update'
+    $script:now.ProviderArgument.Folder | Should -Be (Join-Path $env:ProgramData 'Lenovo\SystemUpdate\logs')
+  }
+  It 'HP: the tool name and the report folder of the pass' {
+    $ctx = New-VendorContext -Brand HP
+    $null = Invoke-VendorPass -Context $ctx -Pass 2
+    $script:now.SubTitle | Should -Be 'HP Image Assistant'
+    $script:now.ProviderArgument.Folder | Should -Be (Join-Path $ctx.LogDir 'HPIA-pass2')
+  }
+  It 'the provider the screen calls returns the log line' {
+    $ctx = New-VendorContext -Brand DELL
+    [void][IO.Directory]::CreateDirectory($ctx.LogDir)
+    [IO.File]::WriteAllText((Join-Path $ctx.LogDir 'dcu-pass1.log'), "[2026-10-20 00:16:10] : Downloading 3 of 6`r`n")
+    $null = Invoke-VendorPass -Context $ctx -Pass 1
+    $lines = @(& $script:now.Provider $script:now.ProviderArgument)
+    $lines | Should -Be @('Log: [2026-10-20 00:16:10] : Downloading 3 of 6')
+  }
+  It 'a brand without a vendor tool leaves NOW alone' {
+    $null = Invoke-VendorPass -Context (New-VendorContext -Brand ASUS) -Pass 1
+    (Get-SetupNow).SubTitle | Should -BeNullOrEmpty
   }
 }
 

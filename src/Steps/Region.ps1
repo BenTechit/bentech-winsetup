@@ -102,7 +102,8 @@ function Invoke-StepRegion {
   .DESCRIPTION
     Always Done. A time zone that cannot be set gives the Note 'Time zone could not be set'; a keyboard
     that cannot be added gives 'Hebrew keyboard could not be added' (or the English equivalent). The
-    language list is only written when Merge-LanguageTags adds something.
+    language list is only written when Merge-LanguageTags adds something. With no Note at all, one
+    line goes to the activity feed (a Note says it in yellow otherwise).
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -111,5 +112,6 @@ function Invoke-StepRegion {
   $notes = New-Object 'System.Collections.Generic.List[string]'
   if (-not (Set-IsraelClock)) { $notes.Add('Time zone could not be set') }
   foreach ($note in @(Add-MissingLanguage)) { if (-not [string]::IsNullOrEmpty($note) -and -not $notes.Contains($note)) { $notes.Add($note) } }
+  if ($notes.Count -eq 0) { Add-SetupActivity -Text 'Time zone set to Israel; Hebrew and English keyboards ready' }
   return New-StepResult -Status Done -Message 'Region settings applied' -Notes $notes.ToArray()
 }

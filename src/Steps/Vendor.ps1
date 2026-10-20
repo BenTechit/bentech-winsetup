@@ -2,8 +2,9 @@
 # Steps 12 and 14 (vendor silent updater, passes 1 and 2), 15 (vendor consumer app) and 16 (remove the
 # business updater), spec 8.3 and 9.2. Needs StepResult.ps1, Logging.ps1, Process.ps1, Download.ps1,
 # Config.ps1 (Get-Signers), Winget.ps1 (Invoke-WingetInstall, Invoke-WingetUninstall), BitLocker.ps1
-# (Wait-BitLockerDecrypted, Suspend-BitLockerOnce) and Detection.ps1 (Test-OnACPower); the bundle holds
-# every file.
+# (Wait-BitLockerDecrypted, Suspend-BitLockerOnce), Detection.ps1 (Test-OnACPower), Activity.ps1
+# (Add-SetupActivity, Set-SetupNow, Read-FileTail) and StartScreen.ps1 (ConvertTo-ScreenText); the bundle
+# holds every file.
 #
 # The business tools (Dell Command Update, Lenovo System Update, HP Image Assistant) apply EVERYTHING
 # they recommend for the model (Q18), BIOS and firmware included. A BIOS flash on battery, or on a drive
@@ -373,6 +374,93 @@ function ConvertTo-VendorStepResult {
   return New-StepResult -Status Failed -Message $text -Reboot $reboot -Notes $allNotes.ToArray() -Data $data
 }
 
+# --- the driver tool's log, shown in NOW ------------------------------------------------------
+# While a pass runs, the progress screen shows the tool's name and the last line of its own log (display
+# only: the text is never parsed, so a Hebrew Windows changes nothing but a '?' or two).
+
+function Get-VendorLogSource {
+  <#
+  .SYNOPSIS
+    Pure. Where a driver tool writes its log, as @{ Path = <file|$null>; Folder = <folder|$null> }.
+  .DESCRIPTION
+    dcu  -> Path   <Logs>\dcu-pass<Pass>.log (dcu-cli's -outputLog)
+    lsu  -> Folder %ProgramData%\Lenovo\SystemUpdate\logs (System Update writes there by itself)
+    hpia -> Folder <Logs>\HPIA-pass<Pass> (HPIA's /ReportFolder)
+    Any other kind has neither. The tool functions and Copy-LenovoLog take their paths from here too, so
+    the log the screen follows is always the one the tool really writes.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Context,
+    [Parameter(Mandatory)][string]$Kind,
+    [Parameter(Mandatory)][int]$Pass
+  )
+
+  $source = @{ Path = $null; Folder = $null }
+  switch ($Kind) {
+    'dcu' { $source.Path = Join-Path $Context.LogDir "dcu-pass$Pass.log" }
+    'lsu' { $source.Folder = Join-Path $env:ProgramData 'Lenovo\SystemUpdate\logs' }
+    'hpia' { $source.Folder = Join-Path $Context.LogDir "HPIA-pass$Pass" }
+  }
+  return $source
+}
+
+function Get-LastLogLine {
+  <#
+  .SYNOPSIS
+    Pure. The last non-blank line of Text, whole, as plain ASCII (ConvertTo-ScreenText); '' when there
+    is none. The timestamp the tool puts in front stays.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+
+  $lines = @([string]$Text -split "`r`n|`r|`n")
+  for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    $clean = ConvertTo-ScreenText $lines[$i]
+    if ($clean -ne '') { return $clean }
+  }
+  return ''
+}
+
+function Get-VendorNowLines {
+  <#
+  .SYNOPSIS
+    The NOW detail line of a driver pass: @('Log: <last log line>'), or @() while there is no log (or no
+    line in it) yet. The progress screen's provider; display only, it never throws.
+  .DESCRIPTION
+    Source is a Get-VendorLogSource result: its Path, else the newest *.log of its Folder. The file is
+    read with Read-FileTail (the last 64 KB; a log the tool holds open, UTF-8 or UTF-16, is fine). A
+    problem of any kind is no line: the tick calls this every second, and the run goes on without it.
+  #>
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param([AllowNull()][hashtable]$Source)
+
+  try {
+    if ($null -eq $Source) { return @() }
+    $path = [string]$Source['Path']
+    if ([string]::IsNullOrEmpty($path)) {
+      $folder = [string]$Source['Folder']
+      if ([string]::IsNullOrEmpty($folder) -or -not [IO.Directory]::Exists($folder)) { return @() }
+      # GetFiles('*.log') also returns *.logx (the three-letter extension rule), hence the Extension test.
+      $newest = $null
+      foreach ($file in (New-Object IO.DirectoryInfo $folder).GetFiles('*.log')) {
+        if ($file.Extension -ne '.log') { continue }
+        if ($null -eq $newest -or $file.LastWriteTimeUtc -gt $newest.LastWriteTimeUtc) { $newest = $file }
+      }
+      if ($null -eq $newest) { return @() }
+      $path = $newest.FullName
+    }
+    $line = Get-LastLogLine -Text (Read-FileTail -Path $path)
+    if ($line -eq '') { return @() }
+    return @("Log: $line")
+  } catch {
+    return @()
+  }
+}
+
 function Find-VendorToolExe {
   # Private. The first of Tool.exeCandidates that exists as a file, or $null.
   [CmdletBinding()]
@@ -479,7 +567,7 @@ function Invoke-DellUpdate {
     Write-SetupLog -Message 'DCU /configure could not be started; applying updates anyway' -Level WARN -Data @{ error = $_.Exception.Message }
   }
 
-  $logPath = Join-Path $Context.LogDir "dcu-pass$Pass.log"
+  $logPath = (Get-VendorLogSource -Context $Context -Kind dcu -Pass $Pass).Path
   $timeout = [double]$Context.Config.timeoutsMinutes.vendor
   $notes = New-Object 'System.Collections.Generic.List[string]'
   $maxTries = 2
@@ -616,7 +704,7 @@ function Copy-LenovoLog {
     [Parameter(Mandatory)][int]$Pass
   )
 
-  $source = Join-Path $env:ProgramData 'Lenovo\SystemUpdate\logs'
+  $source = (Get-VendorLogSource -Context $Context -Kind lsu -Pass $Pass).Folder
   $target = Join-Path $Context.LogDir "lenovo-pass$Pass"
   try {
     if (-not (Test-Path -LiteralPath $source -PathType Container)) {
@@ -852,7 +940,7 @@ function Invoke-HpUpdate {
     return New-VendorOutcome -Outcome Failed -Message "$name signature check failed"
   }
 
-  $reportFolder = Join-Path $Context.LogDir "HPIA-pass$Pass"
+  $reportFolder = (Get-VendorLogSource -Context $Context -Kind hpia -Pass $Pass).Folder
   $softpaqFolder = Join-Path $Context.DownloadDir 'HPIA-softpaqs'
   $timeout = [double]$Context.Config.timeoutsMinutes.vendor
   $notes = New-Object 'System.Collections.Generic.List[string]'
@@ -902,6 +990,9 @@ function Invoke-VendorPass {
     5. ConvertTo-VendorStepResult maps the outcome (DoneReboot -> Done + Reboot 'Now'; Skipped ->
        '<tool> does not support this model'; DoneWarning -> Done + Note) and adds the tool's own Notes.
        Data = @{ Pass; ExitCode }.
+    Two gate facts also go to the activity feed: the battery line (step 2) and the BitLocker suspension
+    (step 3). Right before the tool function runs, NOW gets the tool's name as its sub-title and a
+    provider that shows the last line of the tool's own log (Get-VendorNowLines).
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -924,12 +1015,14 @@ function Invoke-VendorPass {
   $gate = 'skipped (on battery)'
   if (-not [bool](Test-OnACPower)) {
     $notes.Add($script:BatteryNote)
+    Add-SetupActivity -Text 'On battery: BIOS and firmware left out of this driver pass'
   } else {
     $allowFirmware = [bool](Wait-BitLockerDecrypted -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.bitlockerDecrypt))
     $gate = 'decrypted'
     if (-not $allowFirmware) {
       if (Suspend-BitLockerOnce) {
         $notes.Add('BitLocker still decrypting: suspended for BIOS update')
+        Add-SetupActivity -Text 'BitLocker suspended for one restart (BIOS update)'
         $allowFirmware = $true
         $gate = 'suspended'
       } else {
@@ -939,6 +1032,10 @@ function Invoke-VendorPass {
     }
   }
   Write-SetupLog -Message 'Vendor pass starting' -Data @{ tool = $name; pass = $Pass; bitlocker = $gate; firmware = $allowFirmware }
+
+  # NOW: the tool's name and, as the screen's provider, the last line of its log (the runner clears NOW
+  # before and after the step). Set before the tool function, which may first install the tool.
+  Set-SetupNow -SubTitle $name -Provider { param($source) Get-VendorNowLines -Source $source } -ProviderArgument (Get-VendorLogSource -Context $Context -Kind $kind -Pass $Pass)
 
   if ($kind -eq 'dcu') {
     $outcome = Invoke-DellUpdate -Context $Context -Tool $tool -OnAC $allowFirmware -Pass $Pass

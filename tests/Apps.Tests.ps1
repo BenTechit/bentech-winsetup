@@ -13,6 +13,8 @@ BeforeAll {
   foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process', 'Download') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
   . "$PSScriptRoot\..\src\Steps\Winget.ps1"
   foreach ($f in 'Apps', 'Office', 'DefaultBrowser') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
+  # Report.ps1 holds Get-InstalledAppVersions, which the steps read for the activity feed (mocked below).
+  . "$PSScriptRoot\..\src\Report\Report.ps1"
   . "$PSScriptRoot\..\src\Common\Config.ps1"
   $script:ConfigFile = "$PSScriptRoot\..\config\config.json"
   $script:cfg = Read-SetupConfig -Path $script:ConfigFile
@@ -56,7 +58,9 @@ BeforeAll {
   #   $script:regRead     registry path -> hashtable of values for Get-ItemProperty ($null result when absent)
   #   $script:regKeys     the New-Item paths; $script:regValues one hashtable per New-ItemProperty call
   #   $script:fileText    path -> text for Get-Content
+  #   $script:activity    one hashtable (Text, LogText) per Add-SetupActivity call
   function Initialize-AppMocks {
+    $script:activity = New-Object System.Collections.ArrayList
     $script:logs = New-Object System.Collections.ArrayList
     $script:sleeps = New-Object System.Collections.ArrayList
     $script:ext = New-Object System.Collections.ArrayList
@@ -84,6 +88,8 @@ BeforeAll {
     $script:shellCalls = 0
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Add-SetupActivity { [void]$script:activity.Add(@{ Text = $Text; LogText = $LogText }) }
+    Mock Get-InstalledAppVersions { @{} }
     Mock Start-Sleep { [void]$script:sleeps.Add(@{ Seconds = $Seconds; Milliseconds = $Milliseconds }) }
     Mock Test-Path { return ($script:existing -contains $LiteralPath) }
     Mock Invoke-External {
@@ -367,6 +373,34 @@ Describe 'Invoke-StepChrome' {
     $r.Message | Should -Be 'Chrome download failed: download failed after 3 attempts: https://example.test/chrome.msi'
     $script:ext.Count | Should -Be 0
   }
+
+  # --- the activity feed (Task 10) ---
+  It 'writes its installed version to the activity feed' {
+    Mock Get-InstalledAppVersions { @{ 'Google Chrome' = '141.0.7390.55' } }
+    (Invoke-StepChrome -Context $script:ctx -RetrySeconds 0).Status | Should -Be 'Done'
+    @($script:activity.Text) | Should -Contain 'Google Chrome 141.0.7390.55 installed'
+  }
+  It 'an already installed Chrome writes no version line' {
+    Set-ChromeInstalled
+    Mock Get-InstalledAppVersions { @{ 'Google Chrome' = '141.0.7390.55' } }
+    $null = Invoke-StepChrome -Context $script:ctx
+    $script:activity.Count | Should -Be 0
+  }
+  It 'a version that cannot be found still writes the line, without a version' {
+    (Invoke-StepChrome -Context $script:ctx -RetrySeconds 0).Status | Should -Be 'Done'
+    @($script:activity.Text) | Should -Be @('Google Chrome installed')
+  }
+  It 'a version lookup that throws still leaves the step Done, with a WARN' {
+    Mock Get-InstalledAppVersions { throw 'registry gone' }
+    (Invoke-StepChrome -Context $script:ctx -RetrySeconds 0).Status | Should -Be 'Done'
+    @($script:activity.Text) | Should -Be @('Google Chrome installed')
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -BeGreaterOrEqual 1
+  }
+  It 'a failed install writes no version line' {
+    $script:codes = @(1603)
+    (Invoke-StepChrome -Context $script:ctx -RetrySeconds 0).Status | Should -Be 'Failed'
+    $script:activity.Count | Should -Be 0
+  }
 }
 
 # --- Invoke-StepAnyDesk -----------------------------------------------------------------------
@@ -534,6 +568,30 @@ Describe 'Invoke-StepAnyDesk' {
     $r = Invoke-StepAnyDesk -Context $script:ctx
     ($r | ConvertTo-Json -Depth 6 -Compress) | Should -Not -Match '123456789'
   }
+  It 'the ID goes to the activity feed with a log text that has no ID, so setup.log never sees it' {
+    Mock Get-InstalledAppVersions { @{ 'AnyDesk' = '9.0.4' } }
+    $null = Invoke-StepAnyDesk -Context $script:ctx -PollSeconds 0
+    $script:activity.Count | Should -Be 1
+    $script:activity[0].Text | Should -Be 'AnyDesk 9.0.4 - ID 123456789'
+    $script:activity[0].LogText | Should -Be 'AnyDesk 9.0.4 - ID recorded'
+    $script:activity[0].LogText | Should -Not -Match '123456789'
+  }
+  It 'the activity line has no stray space when the version is not known' {
+    $null = Invoke-StepAnyDesk -Context $script:ctx -PollSeconds 0
+    $script:activity[0].Text | Should -Be 'AnyDesk - ID 123456789'
+    $script:activity[0].LogText | Should -Be 'AnyDesk - ID recorded'
+  }
+  It 'no ID, no activity line' {
+    $script:existing = @($script:anyExe)
+    $script:getIdOutput = 'Service not running'
+    $null = Invoke-StepAnyDesk -Context $script:ctx
+    $script:activity.Count | Should -Be 0
+  }
+  It 'an AnyDesk that was already installed still shows its ID' {
+    $script:existing = @($script:anyExe)
+    $null = Invoke-StepAnyDesk -Context $script:ctx
+    $script:activity[0].Text | Should -Be 'AnyDesk - ID 123456789'
+  }
   It 'Find-AnyDeskId shows its limit while it polls and removes it after' {
     Clear-SetupNow
     $script:limits = New-Object System.Collections.ArrayList
@@ -559,6 +617,34 @@ Describe 'Invoke-StepSevenZip' {
     $r = Invoke-StepSevenZip -Context $script:ctx
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be 'winget unavailable'
+    $script:activity.Count | Should -Be 0
+  }
+  It 'writes its version when winget installed it' {
+    Mock Get-InstalledAppVersions { @{ '7-Zip' = '24.08' } }
+    $null = Invoke-StepSevenZip -Context $script:ctx
+    @($script:activity.Text) | Should -Be @('7-Zip 24.08 installed')
+  }
+  It 'a version that cannot be found still writes the line' {
+    $null = Invoke-StepSevenZip -Context $script:ctx
+    @($script:activity.Text) | Should -Be @('7-Zip installed')
+  }
+  It 'a skipped winget install writes no line' {
+    $script:wingetResult = New-StepResult -Status Skipped -Message '7zip.7zip: no package or installer for this system'
+    $null = Invoke-StepSevenZip -Context $script:ctx
+    $script:activity.Count | Should -Be 0
+  }
+}
+
+Describe 'Get-AppVersionText' {
+  BeforeEach { Initialize-AppMocks }
+  It 'is the version of the named app' {
+    Mock Get-InstalledAppVersions { @{ 'Google Chrome' = ' 141.0.1 '; '7-Zip' = '24.08' } }
+    Get-AppVersionText -Name 'Google Chrome' | Should -Be '141.0.1'
+  }
+  It 'is an empty string for an app that is not listed' { Get-AppVersionText -Name 'AnyDesk' | Should -BeExactly '' }
+  It 'is an empty string when the lookup throws' {
+    Mock Get-InstalledAppVersions { throw 'registry gone' }
+    Get-AppVersionText -Name 'AnyDesk' | Should -BeExactly ''
   }
 }
 

@@ -144,6 +144,8 @@ function Invoke-StepBloatware {
     DISM queue would cost the full timeout for each one) and count as failed. The result is
     Done('Removed <N> packages'), with the Note 'Bloatware: <M> packages could not be removed' when
     M > 0. A list that cannot be read is a Note too: it only means less is removed.
+
+    Every package whose removal succeeded also writes 'Removed <name>' to the activity feed.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -189,7 +191,7 @@ function Invoke-StepBloatware {
     } else {
       $packageNames = @($provisioned | Where-Object { [string]$_.DisplayName -eq $name } | ForEach-Object { [string]$_.PackageName })
       $result = Remove-BloatwarePackage -Name $name -ProvisionedPackageNames $packageNames -TimeoutMinutes $timeout
-      if (-not $result.Ok) { $failed++ }
+      if ($result.Ok) { Add-SetupActivity -Text "Removed $name" } else { $failed++ }
       if ($result.TimedOut) {
         $stopped = $true
         Write-SetupLog -Message 'An app removal timed out; the remaining packages are not tried' -Level WARN -Data @{ name = $name }

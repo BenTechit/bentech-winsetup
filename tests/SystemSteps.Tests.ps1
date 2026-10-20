@@ -85,6 +85,7 @@ BeforeAll {
   #   $script:calls        ordered, human-readable log of every mocked call
   #   $script:regValues    one hashtable per New-ItemProperty call; $script:regKeys the New-Item paths
   #   $script:logs         one hashtable per Write-SetupLog call
+  #   $script:activity     the Text of each Add-SetupActivity call
   #   $script:cimGet       the arguments of each Get-CimInstance call
   #   $script:cimCalls     one hashtable per Invoke-CimMethod call (Method, Arguments)
   #   $script:ext          one hashtable per Invoke-External call
@@ -96,6 +97,7 @@ BeforeAll {
     $script:regValues = New-Object System.Collections.ArrayList
     $script:regKeys = New-Object System.Collections.ArrayList
     $script:logs = New-Object System.Collections.ArrayList
+    $script:activity = New-Object System.Collections.ArrayList
     $script:cimGet = New-Object System.Collections.ArrayList
     $script:cimCalls = New-Object System.Collections.ArrayList
     $script:ext = New-Object System.Collections.ArrayList
@@ -149,6 +151,7 @@ BeforeAll {
     $script:renameThrows = $null
 
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Add-SetupActivity { [void]$script:activity.Add($Text) }
 
     # Registry: Set-RegistryDword uses Test-Path, New-Item and New-ItemProperty.
     Mock Test-Path { return ($script:existingKeys -contains $LiteralPath) }
@@ -788,6 +791,17 @@ Describe 'Invoke-StepRegion' {
     @($r.Notes) | Should -Be @('English keyboard could not be added')
     $script:langSets.Count | Should -Be 2
   }
+
+  # --- the activity feed (Task 10) ---
+  It 'writes one activity line when both settings worked' {
+    $null = Invoke-StepRegion -Context (New-SysContext)
+    @($script:activity) | Should -Be @('Time zone set to Israel; Hebrew and English keyboards ready')
+  }
+  It 'writes no activity line when a Note was needed (the yellow Note says it)' {
+    $script:tzThrows = $true
+    $null = Invoke-StepRegion -Context (New-SysContext)
+    $script:activity.Count | Should -Be 0
+  }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1047,6 +1061,38 @@ Describe 'Invoke-StepBloatware' {
     $null = Invoke-StepBloatware -Context (New-SysContext)
     ($script:calls -match '^(restart-computer|stop-computer|stop-process)').Count | Should -Be 0
   }
+
+  # --- the activity feed (Task 10) ---
+  It 'lists each removed app, not the failed ones' {
+    $script:installed = @('king.com.CandyCrushSaga', 'king.com.Other')
+    $script:provisioned = @('king.com.CandyCrushSaga', 'king.com.Other')
+    $script:failUserRemoval = @('king.com.Other')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    @($script:activity) | Should -Be @('Removed king.com.CandyCrushSaga')
+  }
+  It 'writes one line per removed app, in removal order' {
+    $script:installed = @('king.com.A', 'MicrosoftTeams')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    @($script:activity) | Should -Be @('Removed king.com.A', 'Removed MicrosoftTeams')
+  }
+  It 'a package that fails only its provisioned removal is not listed as removed' {
+    $script:installed = @('king.com.A', 'king.com.B')
+    $script:provisioned = @('king.com.A', 'king.com.B')
+    $script:failProvRemoval = @('king.com.A')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    @($script:activity) | Should -Be @('Removed king.com.B')
+  }
+  It 'apps that a timeout left untried are not listed' {
+    $script:installed = @('king.com.A', 'king.com.B')
+    $script:timeoutUserRemoval = @('king.com.A')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    $script:activity.Count | Should -Be 0
+  }
+  It 'nothing to remove writes no line' {
+    $script:installed = @('Microsoft.WindowsCalculator', 'Contoso.Keep')
+    $null = Invoke-StepBloatware -Context (New-SysContext)
+    $script:activity.Count | Should -Be 0
+  }
 }
 
 Describe 'Invoke-StepBloatware through the real Invoke-PowerShellChild' {
@@ -1056,6 +1102,7 @@ Describe 'Invoke-StepBloatware through the real Invoke-PowerShellChild' {
     $script:extCalls = New-Object System.Collections.ArrayList
     $script:tripwire = New-Object System.Collections.ArrayList
     Mock Write-SetupLog {}
+    Mock Add-SetupActivity {}
     Mock Get-AppxPackage { foreach ($n in 'king.com.CandyCrushSaga', 'Microsoft.WindowsCalculator') { [pscustomobject]@{ Name = $n } } }
     Mock Get-AppxProvisionedPackage { [void]$script:tripwire.Add('prov-list') }
     Mock Remove-AppxPackage { [void]$script:tripwire.Add('appx-remove') }

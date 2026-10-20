@@ -5,6 +5,10 @@
 #
 # Chrome and AnyDesk come from vendor permalinks that always serve the newest build; both are
 # Authenticode-checked against the signer in config before they run (spec 9.1). 7-Zip goes through winget.
+#
+# Each of the three also writes one fact to the activity feed (Add-SetupActivity, Activity.ps1): the version
+# that was installed, read with Get-InstalledAppVersions (Report.ps1; the bundle holds every file). That
+# line is display only, so a version that cannot be read never changes a step's result.
 
 function Write-TextFileUtf8NoBom {
   <#
@@ -26,6 +30,39 @@ function Write-TextFileUtf8NoBom {
   $folder = Split-Path -Parent $target
   if ($folder) { [void][IO.Directory]::CreateDirectory($folder) }
   [IO.File]::WriteAllText($target, $Text, (New-Object Text.UTF8Encoding $false))
+}
+
+# --- activity facts ---------------------------------------------------------------------------
+
+function Get-AppVersionText {
+  <#
+  .SYNOPSIS
+    Private. The installed version of one of the apps this tool installs, for the activity feed: the
+    value Get-InstalledAppVersions reports under Name ('Google Chrome', 'AnyDesk', '7-Zip'), or '' when
+    the app is not listed or the lookup fails (a WARN). Never throws.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$Name)
+
+  try {
+    $versions = Get-InstalledAppVersions
+    if ($versions -is [System.Collections.IDictionary] -and $versions.Contains($Name)) { return ([string]$versions[$Name]).Trim() }
+  } catch {
+    Write-SetupLog -Message 'An installed app version could not be read' -Level WARN -Data @{ app = $Name; error = $_.Exception.Message }
+  }
+  return ''
+}
+
+function Get-AppLabel {
+  # Private. '<Name> <version>' for the activity feed, or just Name when the version is not known.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$Name)
+
+  $version = Get-AppVersionText -Name $Name
+  if ($version -ne '') { return "$Name $version" }
+  return $Name
 }
 
 # --- Chrome (step 7) --------------------------------------------------------------------------
@@ -120,8 +157,14 @@ function Invoke-StepChrome {
     if ($run.TimedOut) { return New-StepResult -Status Failed -Message 'Chrome install failed (msiexec timed out)' }
 
     $outcome = Convert-MsiExitCode -ExitCode $run.ExitCode
-    if ($outcome -eq 'Done') { return New-StepResult -Status Done -Message 'Chrome installed' }
-    if ($outcome -eq 'DoneReboot') { return New-StepResult -Status Done -Message 'Chrome installed (reboot needed)' }
+    if ($outcome -eq 'Done') {
+      Add-SetupActivity -Text ((Get-AppLabel -Name 'Google Chrome') + ' installed')
+      return New-StepResult -Status Done -Message 'Chrome installed'
+    }
+    if ($outcome -eq 'DoneReboot') {
+      Add-SetupActivity -Text ((Get-AppLabel -Name 'Google Chrome') + ' installed')
+      return New-StepResult -Status Done -Message 'Chrome installed (reboot needed)'
+    }
     if ($outcome -eq 'Retry' -and $try -lt $maxTries) {
       Write-SetupLog -Message 'Another installation is running; waiting before trying Chrome again' -Level WARN -Data @{ attempt = $try; of = $maxTries; waitSeconds = $RetrySeconds }
       Wait-SetupDelay -Seconds $RetrySeconds
@@ -133,7 +176,8 @@ function Invoke-StepChrome {
 
 # --- AnyDesk (step 8) -------------------------------------------------------------------------
 # The AnyDesk ID identifies the customer's machine to Ben. It is kept in State.AnyDeskId and shown on the
-# final screen and in the report; it is never written to the log and never put in a step message.
+# progress screen and the final screen, and kept in activity.txt and the report; it is never written to
+# setup.log (the activity line passes a LogText without it) and never put in a step message.
 
 function Get-AnyDeskIdFromText {
   <#
@@ -296,6 +340,9 @@ function Invoke-StepAnyDesk {
   if ($id) {
     $Context.State.AnyDeskId = $id
     Write-SetupLog -Message 'AnyDesk ID read'
+    # The ID is shown on the screen and kept in activity.txt, never in setup.log: LogText replaces it there.
+    $label = Get-AppLabel -Name 'AnyDesk'
+    Add-SetupActivity -Text "$label - ID $id" -LogText "$label - ID recorded"
     return New-StepResult -Status Done -Message $(if ($freshInstall) { 'AnyDesk installed' } else { 'AnyDesk already installed' })
   }
 
@@ -320,5 +367,7 @@ function Invoke-StepSevenZip {
   [OutputType([pscustomobject])]
   param([Parameter(Mandatory)][hashtable]$Context)
 
-  return Invoke-WingetInstall -Id ([string]$Context.Config.apps.sevenZip.wingetId) -Source winget -Context $Context
+  $result = Invoke-WingetInstall -Id ([string]$Context.Config.apps.sevenZip.wingetId) -Source winget -Context $Context
+  if ($result.Status -eq 'Done') { Add-SetupActivity -Text ((Get-AppLabel -Name '7-Zip') + ' installed') }
+  return $result
 }
