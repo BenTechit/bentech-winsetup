@@ -9,7 +9,8 @@
   "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },
   "signers": {
     "google": ["Google LLC"], "anydesk": ["AnyDesk Software GmbH"], "microsoft": ["Microsoft Corporation"],
-    "dell": ["Dell Inc", "Dell Technologies"], "lenovo": ["Lenovo"], "hp": ["HP Inc"]
+    "dell": ["Dell Inc", "Dell Technologies"], "lenovo": ["Lenovo"], "hp": ["HP Inc"],
+    "craft": ["Learning Machines Inc"]
   },
   "winget": { "bundleUrl": "https://aka.ms/getwinget" },
   "apps": {
@@ -27,6 +28,22 @@
       "products": { "BUSINESS": "O365BusinessRetail", "HOME": "O365HomePremRetail" },
       "languages": ["he-il", "en-us"], "channel": "Current", "edition": "64",
       "excludeApps": ["Access", "Publisher", "Teams", "OneDrive", "Groove", "Lync", "Bing", "OutlookForWindows"]
+    },
+    "craft": {
+      "signer": "craft",
+      "items": [
+        { "name": "WordCraft", "repo": "storytold/wordcraft", "assetPrefix": "wordcraft",
+          "displayName": "^WordCraft", "startMenuName": "^WordCraft", "shortcut": "Word" },
+        { "name": "GridCraft", "repo": "storytold/gridcraft", "assetPrefix": "gridcraft",
+          "displayName": "^GridCraft", "startMenuName": "^GridCraft", "shortcut": "Excel" },
+        { "name": "DeckCraft", "repo": "storytold/deckcraft", "assetPrefix": "deckcraft",
+          "displayName": "^DeckCraft", "startMenuName": "^DeckCraft", "shortcut": "PowerPoint" },
+        { "name": "PdfCraft", "repo": "storytold/pdfcraft", "assetPrefix": "pdfcraft",
+          "displayName": "^PdfCraft", "startMenuName": "^PdfCraft", "shortcut": "PDF Reader" },
+        { "name": "ArtCraft Launcher", "repo": "storytold/craft-launcher", "assetPrefix": "artcraft-launcher",
+          "displayName": "^ArtCraft Launcher", "startMenuName": "^ArtCraft Launcher", "shortcut": "ArtCraft Launcher",
+          "launcher": true }
+      ]
     }
   },
   "vendors": {

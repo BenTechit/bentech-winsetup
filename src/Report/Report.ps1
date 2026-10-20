@@ -2,7 +2,8 @@
 # The setup report (spec 8.7): C:\BenTech\Setup\Logs\Setup-Report.txt. Finalize (Finalize.ps1) writes it,
 # and R on the final screen opens it. Format-SetupReport is pure. Get-ActivationStatus,
 # Get-SmartAppControlState and Get-InstalledAppVersions are the read-only collectors it needs; Finalize
-# calls them.
+# calls them. Get-InstalledAppVersions also reports the Craft apps (apps.craft.items of the config it is
+# given) and reads the per-user Uninstall view, where the ArtCraft Launcher registers.
 # Needs Catalog.ps1 + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
 # ConvertFrom-StateTime, Format-HoursMinutes), DefaultBrowser.ps1 (Read-RegistryStringValue),
 # Office.ps1 ($script:OfficeReleaseKey) and Logging.ps1; the bundle holds every file.
@@ -15,10 +16,12 @@
 # opposed to Office and other products that also license through SPP.
 $script:WindowsLicensingApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'
 
-# Both registry views: a 32-bit installer (AnyDesk) registers under WOW6432Node.
+# Both machine registry views (a 32-bit installer such as AnyDesk registers under WOW6432Node), then the
+# per-user one (an MSI installed for the user only, such as the ArtCraft Launcher, registers under HKCU).
 $script:UninstallRegistryKeys = @(
   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+  'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
 )
 
 # The name the report uses -> the DisplayName pattern of its Uninstall entry.
@@ -93,13 +96,21 @@ function Get-InstalledAppVersions {
     The versions of the apps this tool installs, as @{ <name> = <version> }. Read-only; never throws.
   .DESCRIPTION
     Google Chrome, AnyDesk and 7-Zip: DisplayVersion of the first Uninstall entry (64-bit view, then
-    the 32-bit WOW6432Node view) whose DisplayName matches 'Google Chrome*', 'AnyDesk*' or '7-Zip*'
-    and that has a version. Microsoft 365: VersionToReport under ClickToRun\Configuration. An app that
-    is not found is left out. A registry view that cannot be read is a WARN; the rest is still read.
+    the 32-bit WOW6432Node view, then the per-user HKCU view) whose DisplayName matches 'Google Chrome*',
+    'AnyDesk*' or '7-Zip*' and that has a version. Microsoft 365: VersionToReport under
+    ClickToRun\Configuration. An app that is not found is left out. A registry view that cannot be read
+    is a WARN; the rest is still read.
+
+    With Config, the Craft apps too: each item of apps.craft.items is reported under its name, from the
+    first Uninstall entry that has a version and whose DisplayName matches (-match, case-insensitive) the
+    item's displayName regex. Without Config, or without apps.craft in it, no Craft app is reported.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
-  param()
+  param([AllowNull()]$Config)
+
+  $craftItems = @()
+  if ($null -ne $Config) { $craftItems = @($Config.apps.craft.items | Where-Object { $null -ne $_ -and -not [string]::IsNullOrEmpty([string]$_.name) -and -not [string]::IsNullOrEmpty([string]$_.displayName) }) }
 
   $versions = @{}
   foreach ($key in $script:UninstallRegistryKeys) {
@@ -114,6 +125,11 @@ function Get-InstalledAppVersions {
         foreach ($app in $script:ReportedUninstallApps.Keys) {
           if (-not $versions.ContainsKey($app) -and [string]$nameProperty.Value -like $script:ReportedUninstallApps[$app]) {
             $versions[$app] = $version
+          }
+        }
+        foreach ($item in $craftItems) {
+          if (-not $versions.ContainsKey([string]$item.name) -and [string]$nameProperty.Value -match [string]$item.displayName) {
+            $versions[[string]$item.name] = $version
           }
         }
       }

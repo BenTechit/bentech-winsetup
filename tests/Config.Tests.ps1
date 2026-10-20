@@ -33,7 +33,7 @@ Describe 'config.json' {
     foreach ($r in $cfg.bloatware.remove) { foreach ($p in $cfg.bloatware.protect) { $r | Should -Not -BeLike $p } }
   }
   It 'every signer key referenced exists' {
-    $refs = @($cfg.apps.chrome.signer, $cfg.apps.anydesk.signer, $cfg.apps.office.signer) +
+    $refs = @($cfg.apps.chrome.signer, $cfg.apps.anydesk.signer, $cfg.apps.office.signer, $cfg.apps.craft.signer) +
             @($cfg.vendors.PSObject.Properties.Value | ForEach-Object { $_.tool.signer } | Where-Object { $_ })
     foreach ($s in $refs) { @(Get-Signers -Config $cfg -Key $s).Count | Should -BeGreaterThan 0 }
   }
@@ -62,6 +62,18 @@ Describe 'config.json' {
 } }
 '@ | ConvertFrom-Json
     @(Get-BadVerifyVendors -Config $synthetic) | Should -Be @('EMPTY', 'EMPTYLIST', 'NUMBER')
+  }
+  It 'lists the five Craft items in install order, the launcher last' {
+    $items = @($cfg.apps.craft.items)
+    @($items.name) | Should -Be @('WordCraft', 'GridCraft', 'DeckCraft', 'PdfCraft', 'ArtCraft Launcher')
+    @($items.repo) | Should -Be @('storytold/wordcraft', 'storytold/gridcraft', 'storytold/deckcraft', 'storytold/pdfcraft', 'storytold/craft-launcher')
+    @($items.assetPrefix) | Should -Be @('wordcraft', 'gridcraft', 'deckcraft', 'pdfcraft', 'artcraft-launcher')
+    @($items.shortcut) | Should -Be @('Word', 'Excel', 'PowerPoint', 'PDF Reader', 'ArtCraft Launcher')
+    @($items | Where-Object { $_.launcher -eq $true }).name | Should -Be 'ArtCraft Launcher'
+  }
+  It 'trusts the Craft MSIs by company name only' { @(Get-Signers -Config $cfg -Key $cfg.apps.craft.signer) | Should -Be @('Learning Machines Inc') }
+  It 'every Craft displayName and startMenuName is a valid regular expression' {
+    foreach ($i in $cfg.apps.craft.items) { foreach ($p in $i.displayName, $i.startMenuName) { $p | Should -Not -BeNullOrEmpty; { [void][regex]::new($p) } | Should -Not -Throw } }
   }
   It 'installs Windows updates one at a time by default' { $cfg.windowsUpdate.installMode | Should -Be 'OneAtATime' }
   It 'throws on a missing key' {

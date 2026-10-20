@@ -62,6 +62,7 @@ $BundleOrder = @(
   'Steps\Winget.ps1'
   'Steps\Apps.ps1'
   'Steps\Office.ps1'
+  'Steps\CraftApps.ps1'
   'Steps\DefaultBrowser.ps1'
   'Steps\Vendor.ps1'
   'Steps\WindowsUpdate.ps1'

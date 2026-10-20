@@ -486,6 +486,7 @@ Describe 'Get-InstalledAppVersions' {
     $script:Uninstall64 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
     $script:Uninstall32 = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     $script:C2R = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $script:craftCfg = '{"apps":{"craft":{"items":[{"name":"WordCraft","displayName":"^WordCraft"},{"name":"PdfCraft","displayName":"^PdfCraft"},{"name":"ArtCraft Launcher","displayName":"^ArtCraft Launcher"}]}}}' | ConvertFrom-Json
   }
   BeforeEach {
     Mock Write-SetupLog { }
@@ -524,6 +525,16 @@ Describe 'Get-InstalledAppVersions' {
     $v['AnyDesk'] | Should -Be '9.5.3'
     $v['Microsoft 365'] | Should -Be '16.0.19127.20000'
     $v.ContainsKey('Google Chrome') | Should -BeFalse
+  }
+  It 'with the config it also reports the Craft apps, the launcher from the per-user view' {
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'WordCraft'; DisplayVersion = '0.8.0' } } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'ArtCraft Launcher'; DisplayVersion = '0.5.1' } } -ParameterFilter { @($Path) -contains 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' }
+    $v = Get-InstalledAppVersions -Config $craftCfg
+    $v['WordCraft'] | Should -Be '0.8.0'; $v['ArtCraft Launcher'] | Should -Be '0.5.1'; $v.ContainsKey('PdfCraft') | Should -BeFalse
+  }
+  It 'without the config it reports no Craft app' {
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'WordCraft'; DisplayVersion = '0.8.0' } } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    (Get-InstalledAppVersions).ContainsKey('WordCraft') | Should -BeFalse
   }
 }
 
@@ -963,6 +974,10 @@ Describe 'Complete-SetupFinalization on its own (ruling R26)' {
     $ctx.State.Steps['finalize'].Message | Should -Be 'Setup report could not be written'
     (Read-RunState -Root $ctx.Root).Steps['finalize'].Status | Should -Be 'Failed'
     $script:unregisterCalls | Should -Be 1
+  }
+  It 'asks for the app versions with the config, so the report lists the Craft apps' {
+    $null = Complete-SetupFinalization -Context (New-FinalizeContext)
+    Should -Invoke Get-InstalledAppVersions -ParameterFilter { $null -ne $Config }
   }
 }
 

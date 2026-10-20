@@ -566,7 +566,7 @@ function Complete-SetupFinalization {
   $verdict = Get-RunVerdict -State $runState
   $reportPath = Join-Path $Context.LogDir $script:SetupReportFileName
   try {
-    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions) -SmartAppControl (Get-SmartAppControlState)
+    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions -Config $Context.Config) -SmartAppControl (Get-SmartAppControlState)
     Write-SetupReport -Path $reportPath -Lines $lines
     Write-SetupLog -Message 'Setup report written' -Data @{ path = $reportPath; result = $verdict.Color }
     $result = New-StepResult -Status Done -Message 'Finalized'
