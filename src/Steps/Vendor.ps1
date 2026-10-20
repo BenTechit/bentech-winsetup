@@ -376,7 +376,7 @@ function ConvertTo-VendorStepResult {
 
 # --- the driver tool's log, shown in NOW ------------------------------------------------------
 # While a pass runs, the progress screen shows the tool's name and the last line of its own log (display
-# only: the text is never parsed, so a Hebrew Windows changes nothing but a '?' or two).
+# only: nothing decides on that text, so a Hebrew Windows changes nothing but a '?' or two).
 
 function Get-VendorLogSource {
   <#
@@ -409,19 +409,30 @@ function Get-VendorLogSource {
 function Get-LastLogLine {
   <#
   .SYNOPSIS
-    Pure. The last non-blank line of Text, whole, as plain ASCII (ConvertTo-ScreenText); '' when there
-    is none. The timestamp the tool puts in front stays.
+    Pure. The last line of Text worth showing, as plain ASCII (ConvertTo-ScreenText); '' when there is
+    no non-blank line at all. Display only.
+  .DESCRIPTION
+    Two things make a log line fit for a screen row (ruling V2-R10):
+    - A leading '[yyyy-MM-dd HH:mm:ss] : ' (Dell Command Update's prefix) is dropped: it takes about 36
+      of the 80 columns and cuts the update name off. A line without that prefix stays as it is.
+    - A line containing 'synchronized view' (case-insensitive) is skipped. DCU writes a pair of those
+      housekeeping lines within a second of every progress line, more than half of its log, so the real
+      last line would otherwise be on screen for almost none of the install. When every non-blank line
+      is housekeeping, the last non-blank line of any kind is used.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param([AllowNull()][AllowEmptyString()][string]$Text)
 
+  $fallback = ''
   $lines = @([string]$Text -split "`r`n|`r|`n")
   for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-    $clean = ConvertTo-ScreenText $lines[$i]
-    if ($clean -ne '') { return $clean }
+    $shown = (ConvertTo-ScreenText $lines[$i]) -replace '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\]\s*:\s*', ''
+    if ($shown -eq '') { continue }
+    if ($shown -notmatch 'synchronized view') { return $shown }
+    if ($fallback -eq '') { $fallback = $shown }
   }
-  return ''
+  return $fallback
 }
 
 function Get-VendorNowLines {

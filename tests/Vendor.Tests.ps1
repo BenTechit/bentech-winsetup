@@ -682,8 +682,35 @@ Describe 'Get-VendorLogSource' {
 
 Describe 'Get-LastLogLine' {
   It 'is the last non-blank line' { Get-LastLogLine -Text "first`r`nsecond`r`n`r`n   `r`n" | Should -Be 'second' }
-  It 'keeps the whole line, timestamp included' {
-    Get-LastLogLine -Text "[2026-10-20 00:16:10] : Finished installing the updates. `r`n" | Should -Be '[2026-10-20 00:16:10] : Finished installing the updates.'
+  It 'strips the leading [yyyy-MM-dd HH:mm:ss] : timestamp so the text gets the width' {
+    Get-LastLogLine -Text "[2026-10-20 00:16:10] : Finished installing the updates. `r`n" | Should -Be 'Finished installing the updates.'
+  }
+  It 'leaves a line without that prefix as it is (Lenovo, HP)' {
+    Get-LastLogLine -Text "Downloading package 3 of 9 [2026-10-20 00:16:10] : x`r`n" | Should -Be 'Downloading package 3 of 9 [2026-10-20 00:16:10] : x'
+    Get-LastLogLine -Text "Analyzing system`r`n" | Should -Be 'Analyzing system'
+  }
+  It 'a line that is only a timestamp counts as blank' {
+    Get-LastLogLine -Text "[2026-10-20 00:16:10] : Real text`r`n[2026-10-20 00:16:11] : `r`n" | Should -Be 'Real text'
+  }
+  # Real lines 73-75 of a Dell Command Update log: after every "Installing updates" line, DCU writes a pair
+  # of housekeeping lines within a second, which would otherwise be on screen for most of the install.
+  It 'skips the DCU "synchronized view" housekeeping lines and shows the real progress line' {
+    $dcu = @(
+      '[2026-10-20 00:09:07] : Installing updates (1 of 6). Update Name: Dell SupportAssist OS Recovery Plugin for Dell Update  '
+      '[2026-10-20 00:09:08] : Temporary closing synchronized view for the original memory map space in SSM '
+      '[2026-10-20 00:09:08] : Re-Initializing synchronized view for the original memory map space in SSM '
+    ) -join "`r`n"
+    Get-LastLogLine -Text ($dcu + "`r`n") | Should -Be 'Installing updates (1 of 6). Update Name: Dell SupportAssist OS Recovery Plugin for Dell Update'
+  }
+  It 'the housekeeping filter ignores case' {
+    Get-LastLogLine -Text "Step A`r`nTEMPORARY CLOSING SYNCHRONIZED VIEW x`r`n" | Should -Be 'Step A'
+  }
+  It 'falls back to the last non-blank line when every line is housekeeping' {
+    $noise = @(
+      '[2026-10-20 00:09:08] : Temporary closing synchronized view for the original memory map space in SSM '
+      '[2026-10-20 00:09:08] : Re-Initializing synchronized view for the original memory map space in SSM '
+    ) -join "`r`n"
+    Get-LastLogLine -Text ($noise + "`r`n`r`n") | Should -Be 'Re-Initializing synchronized view for the original memory map space in SSM'
   }
   It 'turns Hebrew into ?' { Get-LastLogLine -Text "Installing $script:Hebrew driver" | Should -Be 'Installing ????? driver' }
   It 'is empty for nothing' {
@@ -711,6 +738,14 @@ Describe 'Get-VendorNowLines' {
       $w.Flush()
       Get-VendorNowLines -Source @{ Folder = $d } | Should -Be @('Log: Downloading package 3')
     } finally { $w.Dispose() }
+  }
+  It 'shows the Dell progress line of the real log (lines 73-75), not the housekeeping after it' {
+    $p = "$TestDrive\dcu-real.log"
+    [IO.File]::WriteAllText($p, ((
+      '[2026-10-20 00:09:07] : Installing updates (1 of 6). Update Name: Dell SupportAssist OS Recovery Plugin for Dell Update  ',
+      '[2026-10-20 00:09:08] : Temporary closing synchronized view for the original memory map space in SSM ',
+      '[2026-10-20 00:09:08] : Re-Initializing synchronized view for the original memory map space in SSM ') -join "`r`n") + "`r`n")
+    Get-VendorNowLines -Source @{ Path = $p } | Should -Be @('Log: Installing updates (1 of 6). Update Name: Dell SupportAssist OS Recovery Plugin for Dell Update')
   }
   It 'reads a UTF-16 log' {
     $d = "$TestDrive\u16"
@@ -779,7 +814,7 @@ Describe 'Invoke-VendorPass shows the tool and its log in NOW' {
     [IO.File]::WriteAllText((Join-Path $ctx.LogDir 'dcu-pass1.log'), "[2026-10-20 00:16:10] : Downloading 3 of 6`r`n")
     $null = Invoke-VendorPass -Context $ctx -Pass 1
     $lines = @(& $script:now.Provider $script:now.ProviderArgument)
-    $lines | Should -Be @('Log: [2026-10-20 00:16:10] : Downloading 3 of 6')
+    $lines | Should -Be @('Log: Downloading 3 of 6')
   }
   It 'a brand without a vendor tool leaves NOW alone' {
     $null = Invoke-VendorPass -Context (New-VendorContext -Brand ASUS) -Pass 1
