@@ -12,7 +12,7 @@ BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
                  'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
-                 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Main') {
+                 'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Main') {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
@@ -74,6 +74,10 @@ Describe 'Start-BenTechSetup' {
     Mock Invoke-WuRound { }
     Mock Test-OnACPower { $true }                 # the -WuRound child reads the power status; never the real one here
     Mock Disable-ConsoleQuickEdit { $true }       # never changes the console the tests run in
+    Mock Resize-SetupConsole { $true }            # never resizes the console the tests run in
+    Mock Initialize-SetupActivity { }
+    Mock Reset-SetupActivityLog { }
+    Mock Add-SetupActivity { }
     Mock Register-ScheduledTask { throw 'blocked: Register-ScheduledTask' }
     Mock Unregister-ScheduledTask { throw 'blocked: Unregister-ScheduledTask' }
     Mock Restart-Computer { throw 'blocked: Restart-Computer' }
@@ -82,6 +86,10 @@ Describe 'Start-BenTechSetup' {
 
   AfterEach {
     Remove-Variable -Name SetupVersion -Scope Script -ErrorAction SilentlyContinue
+    # A test that mocks Unregister-SetupTick leaves the real tick registered: drop it, so no later test
+    # inherits a handler.
+    $script:SetupTickHandler = $null
+    $script:SetupTickContext = $null
   }
 
   Context 'start-up and the run lock' {
@@ -429,6 +437,52 @@ Describe 'Start-BenTechSetup' {
       Invoke-Entry | Should -Be 0
       Should -Invoke Invoke-SetupRun -Times 1 -Exactly
       $crashes.Count | Should -Be 0
+    }
+  }
+
+  # v2 spec 4.3, 4.4: the activity feed, the tick that redraws the progress screen, the console size.
+  Context 'activity feed, tick and console size' {
+    It 'initializes the activity feed in Root\Logs and resizes the console once' {
+      Invoke-Entry | Out-Null
+      Should -Invoke Initialize-SetupActivity -Times 1 -Exactly -ParameterFilter { $LogDirectory -eq (Join-Path $TestDrive 'Logs') }
+      Should -Invoke Resize-SetupConsole -Times 1 -Exactly
+    }
+    It 'a new run archives the previous activity under its RunId, after the start screen' {
+      $script:order = New-Object System.Collections.ArrayList
+      Mock Read-RunState { New-FakeState -RunId '20261019-090000' -EndedAt '2026-10-19T11:00:00' }
+      Mock Show-StartScreen { [void]$script:order.Add('start'); $script:choices }
+      Mock Reset-SetupActivityLog { [void]$script:order.Add('archive') }
+      Invoke-Entry | Out-Null
+      @($order) | Should -Be @('start', 'archive')
+      Should -Invoke Reset-SetupActivityLog -Times 1 -Exactly -ParameterFilter { $PreviousRunId -eq '20261019-090000' }
+    }
+    It 'Escape archives nothing' { Mock Show-StartScreen { $null }; Invoke-Entry | Out-Null; Should -Invoke Reset-SetupActivityLog -Times 0 -Exactly }
+    It 'a resume writes "Back after restart N"' {
+      Mock Read-RunState { $s = New-FakeState; $s.RebootCount = 3; $s }
+      Invoke-Entry -Resume $true | Out-Null
+      Should -Invoke Add-SetupActivity -Times 1 -Exactly -ParameterFilter { $Text -eq 'Back after restart 3' }
+    }
+    It 'registers the tick with the context before the run and unregisters it before the final screen' {
+      $script:order = New-Object System.Collections.ArrayList
+      Mock Register-SetupTick { [void]$script:order.Add('register'); $script:tickCtx = $Context }
+      Mock Invoke-SetupRun { [void]$script:order.Add('run'); 'Completed' }
+      Mock Unregister-SetupTick { [void]$script:order.Add('unregister') }
+      Mock Show-FinalScreen { [void]$script:order.Add('final') }
+      Invoke-Entry | Out-Null
+      $order.IndexOf('register') | Should -BeLessThan $order.IndexOf('run')
+      $order.IndexOf('unregister') | Should -BeLessThan $order.IndexOf('final')
+      $tickCtx.State.RunId | Should -Be 'new-run'
+    }
+    It 'a crash unregisters the tick before the crash screen' {
+      $script:order = New-Object System.Collections.ArrayList
+      Mock Invoke-SetupRun { throw 'boom' }; Mock Unregister-SetupTick { [void]$script:order.Add('unregister') }
+      Invoke-Entry -CrashScreen { param($t) [void]$script:order.Add('crash') } | Out-Null
+      $order[0] | Should -Be 'unregister'; $order | Should -Contain 'crash'
+    }
+    It '-WuRound: no tick, no resize, no activity feed' {
+      Mock Register-SetupTick { }
+      Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
+      Should -Invoke Register-SetupTick -Times 0 -Exactly; Should -Invoke Resize-SetupConsole -Times 0 -Exactly; Should -Invoke Initialize-SetupActivity -Times 0 -Exactly
     }
   }
 }

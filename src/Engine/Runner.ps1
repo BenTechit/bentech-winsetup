@@ -1,8 +1,13 @@
 ﻿# src/Engine/Runner.ps1
 # The step runner: runs every pending plan step in order, persists the state around each call,
 # survives crashes and forced reboots (attempt cap), loops on Continue (with a guard), and reboots
-# only through Invoke-ControlledReboot (reboot cap). Needs State.ps1, StepResult.ps1, Logging.ps1
-# and Reboot.ps1; the default catalog comes from Catalog.ps1.
+# only through Invoke-ControlledReboot (reboot cap). Needs State.ps1, StepResult.ps1, Logging.ps1,
+# Activity.ps1 and Reboot.ps1; the default catalog comes from Catalog.ps1.
+#
+# The runner writes the activity feed's step lines (v2 spec 4.4): "<Title> started" on a step's very
+# first call, then one line for its result (done / skipped / FAILED). A Continue writes nothing: the step
+# writes its own round summaries. The NOW state is cleared before and after every step call, so one
+# step's live detail can never show under the next one.
 #
 # Callbacks (OnProgress, RestartAction) run in a child scope of the runner, so they see the runner's
 # variables first. The runner therefore avoids the generic names a caller is likely to capture
@@ -159,6 +164,10 @@ function Save-StepOutcome {
   # Private. Records a step's new status (pending after Continue, or Done/Skipped/Failed), merges
   # Data, saves and reports progress. A Skipped or Failed step never gets an empty message, so the
   # verdict never shows "Title: ".
+  # A final status also goes to the activity feed, before the save, so the redraw OnProgress triggers
+  # already shows it: "<Title> done - <Message>" ("<Title> done" without a message), "<Title> skipped -
+  # <Message>", "<Title> FAILED - <Message>". The title comes from -Titles (id -> catalog Title), else
+  # the id. 'pending' (a Continue) writes nothing.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Context,
@@ -167,7 +176,8 @@ function Save-StepOutcome {
     [Parameter(Mandatory)][ValidateSet('pending', 'Done', 'Skipped', 'Failed')][string]$Status,
     [string]$Message = '',
     [hashtable]$Data,
-    [switch]$ResetAttempts
+    [switch]$ResetAttempts,
+    [hashtable]$Titles
   )
 
   if (($Status -in 'Skipped', 'Failed') -and [string]::IsNullOrWhiteSpace($Message)) { $Message = '(no details)' }
@@ -176,6 +186,17 @@ function Save-StepOutcome {
   if ($null -ne $Data -and $Data.Count -gt 0) { $fields['Data'] = $Data }
   if ($ResetAttempts) { $fields['ResetAttempts'] = $true }
   Set-StepState @fields
+
+  if ($Status -ne 'pending') {
+    $stepTitle = $StepId
+    if ($null -ne $Titles -and $Titles.ContainsKey($StepId)) { $stepTitle = [string]$Titles[$StepId] }
+    $activityLine = switch ($Status) {
+      'Done' { if ([string]::IsNullOrWhiteSpace($Message)) { '{0} done' -f $stepTitle } else { '{0} done - {1}' -f $stepTitle, $Message } }
+      'Skipped' { '{0} skipped - {1}' -f $stepTitle, $Message }
+      'Failed' { '{0} FAILED - {1}' -f $stepTitle, $Message }
+    }
+    Add-SetupActivity -Text $activityLine
+  }
   Save-SetupProgress -Context $Context -OnProgress $OnProgress
 
   $level = if ($Status -eq 'Failed') { 'WARN' } else { 'INFO' }
@@ -210,6 +231,10 @@ function Invoke-SetupRun {
     its defaults (Restart-Computer -ErrorAction Stop, then shutdown.exe) are the production ones.
     Every saved state transition is followed by OnProgress (called with the Context; a throwing
     OnProgress is logged and ignored). After the last step, returns 'Completed'.
+    Activity feed: "<Title> started" before a step's first call ever (its StartedAt still empty, so
+    not again after a Continue or a restart), and one line per final result (Save-StepOutcome), also
+    for the failures decided without a call (attempt cap, interruptions, catalog, refused reboot).
+    Clear-SetupNow runs before and after every step call.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -225,17 +250,22 @@ function Invoke-SetupRun {
   $maxContinueRounds = 50
   $runState = $Context.State
   $maxAttempts = [int]$Context.Config.caps.maxStepAttempts
-  $outcome = @{ Context = $Context; OnProgress = $OnProgress }   # splatted into Save-StepOutcome
+
+  $entries = @{}
+  $titles = @{}   # id -> catalog Title (else the id), for the activity feed
+  foreach ($entry in @($Catalog)) {
+    if ($null -eq $entry -or [string]::IsNullOrEmpty([string]$entry.Id)) { continue }
+    $catalogId = [string]$entry.Id
+    $entries[$catalogId] = $entry
+    $titles[$catalogId] = if ([string]::IsNullOrWhiteSpace([string]$entry.Title)) { $catalogId } else { [string]$entry.Title }
+  }
+
+  $outcome = @{ Context = $Context; OnProgress = $OnProgress; Titles = $titles }   # splatted into Save-StepOutcome
   # The restart actions are passed on only when given, so their production defaults live in one
   # place: Invoke-ControlledReboot.
   $reboot = @{ Context = $Context; CountdownSeconds = $CountdownSeconds }
   if ($PSBoundParameters.ContainsKey('RestartAction')) { $reboot['RestartAction'] = $RestartAction }
   if ($PSBoundParameters.ContainsKey('FallbackRestartAction')) { $reboot['FallbackRestartAction'] = $FallbackRestartAction }
-
-  $entries = @{}
-  foreach ($entry in @($Catalog)) {
-    if ($null -ne $entry -and -not [string]::IsNullOrEmpty([string]$entry.Id)) { $entries[[string]$entry.Id] = $entry }
-  }
 
   Write-SetupLog -Message 'Run started' -Data @{ steps = @($runState.Plan).Count; rebootCount = $runState.RebootCount }
 
@@ -287,11 +317,15 @@ function Invoke-SetupRun {
 
     $continueRounds = 0
     while ($true) {
+      Clear-SetupNow
+      # StartedAt is set by the first 'running' below and never cleared, so this is the first call ever.
+      if ([string]::IsNullOrEmpty([string]$stepState.StartedAt)) { Add-SetupActivity -Text ('{0} started' -f $titles[$stepId]) }
       Set-StepState -State $runState -StepId $stepId -Status running -IncrementAttempt
       Save-SetupProgress -Context $Context -OnProgress $OnProgress
       Write-SetupLog -Message 'Step started' -Data @{ step = $stepId; attempt = $runState.Steps[$stepId].Attempts }
 
       $result = Invoke-SetupStepFunction -Context $Context -StepId $stepId -FunctionName $functionName
+      Clear-SetupNow
       Add-StepResultMessages -State $runState -Result $result
       $data = Get-StepResultData -Result $result -StepId $stepId
       $message = [string]$result.Message

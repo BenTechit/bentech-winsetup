@@ -165,7 +165,8 @@ function Invoke-SetupWuRoundProcess {
 function Complete-SetupRun {
   # Private. After a 'Completed' run: finishes the finalization when the finalize step is not Done
   # (ruling R26: a failed final restart, or a finalize that failed or never finished, would otherwise
-  # leave the resume task, the setup policies and no report), removes the resume task in any case, and
+  # leave the resume task, the setup policies and no report), removes the resume task in any case,
+  # unregisters the tick (the progress screen keeps drawing during the finalization until then), and
   # shows the final screen.
   # A finalization (or the save after it) that throws is not a crash: it is logged, recorded as the Error
   # 'Finalization failed: <message>' (so the final screen is red), and the final screen still shows the
@@ -202,6 +203,8 @@ function Complete-SetupRun {
 
   $verdict = Get-RunVerdict -State $Context.State
   Write-SetupLog -Message 'Setup finished' -Data @{ result = $verdict['Color'] }
+  # The final screen owns the window from here: no progress-screen redraw may land on it.
+  Unregister-SetupTick
   $null = Show-FinalScreen -State $Context.State -Verdict $verdict -ReportPath (Join-Path $Root 'Logs\Setup-Report.txt')
 }
 
@@ -233,6 +236,7 @@ function Invoke-SetupMainFlow {
     }
     $config = Read-SetupConfig -Path $configPath
     Write-SetupLog -Message 'Resuming the run' -Data @{ runId = $runState['RunId'] }
+    Add-SetupActivity -Text ('Back after restart {0}' -f [int]$runState['RebootCount'])
   } else {
     $config = Read-SetupConfig -Path $configPath
     $previous = Read-RunState -Root $Root -LogDir $logDir
@@ -247,6 +251,9 @@ function Invoke-SetupMainFlow {
       $null = Unregister-ResumeTask
       return 'Cancelled'
     }
+    # A new run starts an empty feed: the previous run's activity.txt is archived under its RunId.
+    $previousRunId = if ($null -ne $previous) { [string]$previous['RunId'] } else { $null }
+    Reset-SetupActivityLog -LogDirectory $logDir -PreviousRunId $previousRunId
     if ($null -ne $previous) { $null = Backup-RunState -Root $Root -LogDir $logDir }
     $plan = @(Get-StepPlan -Machine $machine -Choices $choices -Config $config)
     $runState = New-RunState -Machine $machine -Choices $choices -Plan $plan -Version $Version -Previous $previous
@@ -256,8 +263,13 @@ function Invoke-SetupMainFlow {
   }
 
   $ctx = New-SetupContext -Config $config -State $runState -Root $Root -ScriptPath $ScriptPath
-  # The runner passes the Context to OnProgress, so the callback does not depend on variable lookup.
-  $outcome = Invoke-SetupRun -Context $ctx -OnProgress { param($progressContext) Show-ProgressScreen -State $progressContext.State -Catalog $script:StepCatalog }
+  # The tick draws the progress screen: at most once a second during long waits (Invoke-External,
+  # downloads, Wait-SetupDelay), and at once on every state transition (OnProgress forces it). The tick
+  # and the runner pass the Context to their callbacks, so neither depends on variable lookup. The first
+  # frame clears the window (the start screen is still on it).
+  Reset-ConsoleFrame
+  Register-SetupTick -Context $ctx -Handler { param($tickContext) Show-ProgressScreen -State $tickContext.State -Catalog $script:StepCatalog }
+  $outcome = Invoke-SetupRun -Context $ctx -OnProgress { param($progressContext) Invoke-SetupTick -Force }
   if ($outcome -eq 'Rebooting') { return 'Rebooting' }
 
   $null = Complete-SetupRun -Context $ctx -Root $Root
@@ -272,32 +284,39 @@ function Start-BenTechSetup {
   .DESCRIPTION
     -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide, the
     state's Machine.IsWindows10 and the power status read now (-OnAC; a failed read is battery); no lock,
-    no transcript, no screen. 0 when the round ran, 1 when it could not (logged).
+    no transcript, no screen: no activity feed, no tick, no console resize. 0 when the round ran, 1 when
+    it could not (logged).
 
     Otherwise:
-      1. Logging: Initialize-SetupLog <Root>\Logs; QuickEdit turned off for this console
-         (Disable-ConsoleQuickEdit, best effort: a click into the window must not pause the run); a
-         transcript in <Root>\Logs\transcript-<stamp>.txt (best effort), and the start line with the
-         version ('dev' when unbundled).
+      1. Logging: Initialize-SetupLog <Root>\Logs; the activity feed (Initialize-SetupActivity, its
+         history from <Root>\Logs\activity.txt); QuickEdit turned off for this console
+         (Disable-ConsoleQuickEdit, best effort: a click into the window must not pause the run); the
+         console enlarged (Resize-SetupConsole, best effort); a transcript in
+         <Root>\Logs\transcript-<stamp>.txt (best effort), and the start line with the version ('dev'
+         when unbundled).
       2. Lock: Enter-RunLock. Held by another live run: 'Setup is already running on this machine', 2.
       3. Not resuming: the previous run's summary, the machine facts, the fresh-install check, the start
          screen (Escape: a leftover resume task is removed (R27), nothing else changes, 0). Then the
-         previous state is archived, the plan built, and the new state saved.
-         Resuming: the saved state. None: the resume task is removed, 0.
-      4. Invoke-SetupRun, drawing the progress screen on every transition.
+         previous activity.txt is archived as activity-<previous RunId>.txt, the previous state is
+         archived, the plan built, and the new state saved.
+         Resuming: the saved state, and 'Back after restart <RebootCount>' in the activity feed. None: the
+         resume task is removed, 0.
+      4. The tick is registered (it draws the progress screen), then Invoke-SetupRun, which forces a
+         redraw on every transition.
          'Rebooting': 0, and the lock is kept: the restart ends the process, and the next start finds the
          lock stale.
          'Completed': the finalization is completed when the finalize step is not Done (R26); if that
          throws, the error is logged and added to State.Errors (red), not a crash. The resume task is
-         removed in any case, and the final screen is shown. 0.
-    The lock is released in a finally block (also on Ctrl+C on the start screen), except after
-    'Rebooting'. The transcript is stopped in the same finally block.
+         removed in any case, the tick unregistered, and the final screen is shown. 0.
+    The tick is unregistered and the lock released in a finally block (also on Ctrl+C on the start
+    screen), the lock except after 'Rebooting'. The transcript is stopped in the same finally block.
 
-    Any other unexpected exception is a crash: logged as ERROR, the red crash text "Setup crashed:
-    <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with -NoWait), and 1. The
-    resume task stays registered, so the next logon retries. The runner's attempt caps bound only a
-    crash inside a step (that step is failed after maxStepAttempts interruptions); a crash before or
-    after the run (config, state, machine detection, screens) repeats at every logon until it is fixed.
+    Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash
+    text "Setup crashed: <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with
+    -NoWait), and 1. The resume task stays registered, so the next logon retries. The runner's attempt
+    caps bound only a crash inside a step (that step is failed after maxStepAttempts interruptions); a
+    crash before or after the run (config, state, machine detection, screens) repeats at every logon
+    until it is fixed.
 
     -Root, -ScriptPath, -CrashScreen and -NoWait exist for tests; production uses the defaults
     (C:\BenTech\Setup, <Root>\setup.ps1, the red console text, waiting for a key).
@@ -337,8 +356,12 @@ function Start-BenTechSetup {
   $transcriptStarted = $false
   try {
     $null = Initialize-SetupLog -LogDirectory $logDir
+    # The activity feed reads its history back from Logs\activity.txt, so it survives a restart.
+    $null = Initialize-SetupActivity -LogDirectory $logDir
     # Final review I3: never on the -WuRound path above (that child has no screen of its own).
     $null = Disable-ConsoleQuickEdit
+    # Best effort, about 100 x 45 (Windows Terminal refuses; the screens fit whatever size they get).
+    $null = Resize-SetupConsole
     try {
       $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
       $null = Start-Transcript -Path (Join-Path $logDir "transcript-$stamp.txt") -ErrorAction Stop
@@ -362,6 +385,8 @@ function Start-BenTechSetup {
       $exitCode = 0
     }
   } catch {
+    # First: no progress-screen redraw may land on the crash text.
+    Unregister-SetupTick
     $message = $_.Exception.Message
     Write-SetupLog -Level ERROR -Message 'Setup crashed' -Data @{
       error = $message; type = $_.Exception.GetType().FullName; stack = $_.ScriptStackTrace }
@@ -381,6 +406,7 @@ function Start-BenTechSetup {
     }
     $exitCode = 1
   } finally {
+    Unregister-SetupTick
     if ($lockHeld -and -not $keepLock) { $null = Exit-RunLock -Root $Root }
     if ($transcriptStarted) {
       try {

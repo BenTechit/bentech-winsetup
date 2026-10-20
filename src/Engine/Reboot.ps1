@@ -98,9 +98,9 @@ function Invoke-ControlledReboot {
     so the runner reports 'restart failed' and carries on.
     At or above Config.caps.maxReboots: sets State.RebootCapHit, saves, logs a WARN and returns
     $false without restarting. Otherwise: increments State.RebootCount and saves *before* anything
-    else, so a restart that happens sooner than expected still counts against the cap; then logs,
-    shows "Restarting in N s ..." once per second (only when CountdownSeconds is above 0) and calls
-    RestartAction.
+    else, so a restart that happens sooner than expected still counts against the cap; then adds
+    "Restarting (restart <RebootCount>)" to the activity feed, logs, shows "Restarting in N s ..."
+    once per second (only when CountdownSeconds is above 0) and calls RestartAction.
     A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
     failure (hence -ErrorAction Stop). When it throws, a WARN is logged and FallbackRestartAction
     (shutdown.exe /r /t 5 /f; exit code 0, 1190 "shutdown already scheduled" or 1115 "shutdown in
@@ -148,6 +148,7 @@ function Invoke-ControlledReboot {
 
   $runState.RebootCount = $rebootCount + 1
   Save-RunState -State $runState -Root $Context.Root
+  Add-SetupActivity -Text ('Restarting (restart {0})' -f $runState.RebootCount)
   Write-SetupLog -Message 'Restarting the computer' -Data @{ rebootCount = $runState.RebootCount; maxReboots = $maxReboots }
 
   for ($remaining = $CountdownSeconds; $remaining -gt 0; $remaining--) {

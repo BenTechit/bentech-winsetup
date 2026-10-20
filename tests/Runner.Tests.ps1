@@ -204,6 +204,40 @@ Describe 'Invoke-SetupRun OnProgress' {
   }
 }
 
+Describe 'Activity feed and NOW state from the runner' {
+  BeforeEach { $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) } }
+  It 'writes "`<Title`> started" once and the final result once, nothing for Continue' {   # `< `> : a literal name, not a Pester template
+    $script:n = 0; function Step-A { param($Context) $script:n++; if ($script:n -lt 3) { New-StepResult -Status Continue -Message 'round' } else { New-StepResult -Status Done -Message 'all good' } }
+    function Step-B { param($Context) New-StepResult -Status Skipped -Message 'n/a' }
+    $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction { } -CountdownSeconds 0 | Out-Null
+    @($act) | Should -Be @('A started', 'A done - all good', 'B started', 'B skipped - n/a')
+  }
+  It 'writes FAILED with the reason, also for the attempt cap' {
+    function Step-A { param($Context) throw 'boom' }; function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.b.Status = 'running'; $c.State.Steps.b.Attempts = 3; $c.State.Steps.b.StartedAt = '2026-10-20T10:00:00'
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction { } -CountdownSeconds 0 | Out-Null
+    $act | Should -Contain 'A FAILED - boom'; $act | Should -Contain 'B FAILED - attempt cap reached'
+  }
+  It 'no started line when the step already ran before (resume)' {
+    function Step-A { param($Context) New-StepResult -Status Done }; function Step-B { param($Context) New-StepResult -Status Done }
+    $c = New-Ctx @('a','b'); $c.State.Steps.a.StartedAt = '2026-10-20T10:00:00'
+    Invoke-SetupRun -Context $c -Catalog $cat -RestartAction { } -CountdownSeconds 0 | Out-Null
+    $act | Should -Not -Contain 'A started'; $act | Should -Contain 'A done'
+  }
+  It 'clears the NOW state before and after every step' {
+    function Step-A { param($Context) $script:seenA = (Get-SetupNow).SubTitle; Set-SetupNow -SubTitle 'tool A'; New-StepResult -Status Done }
+    function Step-B { param($Context) $script:seenB = (Get-SetupNow).SubTitle; New-StepResult -Status Done }
+    Set-SetupNow -SubTitle 'left over'; $c = New-Ctx @('a','b'); Invoke-SetupRun -Context $c -Catalog $cat -RestartAction { } -CountdownSeconds 0 | Out-Null
+    $seenA | Should -BeNullOrEmpty; $seenB | Should -BeNullOrEmpty; (Get-SetupNow).SubTitle | Should -BeNullOrEmpty
+  }
+  It 'Invoke-ControlledReboot writes "Restarting (restart N)" after the count is saved' {
+    $c = New-Ctx @('a'); $c.State.RebootCount = 1
+    Mock Add-SetupActivity { [void]$script:act.Add(@($Text, (Read-RunState -Root $c.Root).RebootCount)) }
+    Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction { } | Should -BeTrue
+    $act[0][0] | Should -Be 'Restarting (restart 2)'; $act[0][1] | Should -Be 2
+  }
+}
+
 Describe 'Invoke-ControlledReboot' {
   BeforeEach { $script:restarts = 0 }
   It 'saves the incremented RebootCount before calling the restart action' {
