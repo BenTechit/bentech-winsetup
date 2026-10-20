@@ -100,12 +100,13 @@ If the installs fail, an extra run helps: sign in to the VM's Microsoft Store wi
 
 **Question:** does Lenovo System Update cover consumer lines (IdeaPad, Yoga) as well as business ThinkPads, and what does it report back?
 
-**Three more questions** (added after the Lenovo step was built; the code makes an assumption for each until they are answered):
+**Four more questions** (added after the Lenovo step was built; the code makes an assumption for each until they are answered):
 - **Does `tvsu /CM` accept `-packagetypes 1,2`?** The on-battery variant relies on it to keep firmware and BIOS packages out (ruling R21). If tvsu rejects the parameter, the Lenovo battery run fails visibly (red) instead of flashing, and the argument needs another form.
 - **Which reboot types do BIOS/firmware packages use on this model?** The AC variant installs reboot types 1, 3 and 5 and never type 4 (forced shutdown); the battery variant leaves out type 5. A BIOS or firmware package that carries type 1 or 3 would slip past the reboot-type filter, which is why `-packagetypes` exists.
 - **Which registry view does tvsu read `AdminCommandLine` from?** tvsu is a 32-bit program. The tool currently writes the value to both the 64-bit and the `WOW6432Node` policy keys (ruling R19) and removes both afterwards. Once the answer is known, the unused view can be dropped.
+- **v2: does `-action LIST` through `AdminCommandLine` leave the `-exporttowmi` install records alone?** The v2 design ([section 4.5](specs/2026-10-20-progress-visibility-design.md)) gives Dell and HP a list of the updates a driver pass will install, but Lenovo none: a LIST run exports through the same `Lenovo_Updates` records that decide v1's install result, and stale records are already a known problem ([testing.md](testing.md) 3.3). The spike already records `LenovoUpdatesBefore` (before the LIST run) and `LenovoUpdates` (after it) in `lenovo-result.json`: compare them. If the LIST run adds, changes or removes records, it is not safe to use before the install and Lenovo stays without a list; if the records are the same, a Lenovo list can be built from the LIST output.
 
-The spike script as it stands lists the available packages (search only) and dumps every property of every `Lenovo_Updates` record, which may show each package's type and reboot type. It does not test `-packagetypes` or watch the registry yet; those two need a small extension of `Spike-LenovoSystemUpdate.ps1` (a second search-only run with `-packagetypes 1,2` added, and a registry-access trace of `tvsu.exe`).
+The spike script as it stands lists the available packages (search only, `-action LIST` through `AdminCommandLine` with `-exporttowmi`), dumps every property of every `Lenovo_Updates` record before and after that run, which may show each package's type and reboot type, and so also answers the v2 question. It does not test `-packagetypes` or watch the registry yet; those two need a small extension of `Spike-LenovoSystemUpdate.ps1` (a second search-only run with `-packagetypes 1,2` added, and a registry-access trace of `tvsu.exe`).
 
 **Which machine:** a **real Lenovo laptop** (not a VM). Run it on two of them if you can:
 - an IdeaPad or Yoga (consumer),
@@ -126,6 +127,7 @@ It installs Lenovo System Update if it isn't there, then runs it in **search-onl
 - If System Update reports updates on the consumer laptop, the result parsing is built from the real property names in the JSON.
 - If it reports nothing on consumer models, the Lenovo path switches to the LSUClient fallback, with the same function signature.
 - The three extra questions: if `-packagetypes` is rejected, the battery variant in Task 13 gets another way to keep firmware out; the reboot types decide the `-includerebootpackages` lists; the registry view decides which `AdminCommandLine` key is kept.
+- The v2 question: whether Lenovo gets an update list in NOW before its install, or keeps showing only the live log line and the timer.
 
 ---
 
@@ -156,7 +158,9 @@ powershell -ExecutionPolicy Bypass -File E:\spikes\Spike-DriverListCapture.ps1
    powershell -ExecutionPolicy Bypass -File E:\spikes\Spike-DriverListCapture.ps1 -InventoryOnly
    ```
    It skips the Dell/HP tool (Dell Command Update may already be removed by then) and only records the brand's **services, Start-menu shortcuts and Store packages**. Those are the `verify` values for the vendor-app check (v2 design, section 9.3). The inventory is part of every run, so the first capture also shows what was on the laptop before setup; the second one shows what the setup run left behind.
-2. Take **`dcu-pass1.log`** (Dell) or the **`HPIA-pass1` folder** (HP) from the stick's `BenTech-Logs\<PC name>` folder (Task 15 of the v2 plan). Until that task ships, they are in `C:\BenTech\Setup\Logs` on the laptop. They hold what the apply run logged (v2 design, section 7).
+2. Take **`dcu-pass1.log`** (Dell) or the **`HPIA-pass1` folder** (HP) from the stick's `BenTech-Logs\<PC name>` folder: the setup tool copies its `Logs` folder there when you press Enter on the final screen and then deletes `C:\BenTech`. (If the run did not end with Enter, for example after a crash, they are still in `C:\BenTech\Setup\Logs` on the laptop.) They hold what the apply run logged (v2 design, section 7).
+
+**The `-InventoryOnly` run after setup supplies the `verify` values** for the vendor-app check (v2 design, section 9.3): the brand's services, Start-menu shortcuts and Store packages that the setup run left behind go into `consumerApp.verify` in `config.json` (`paths` and/or `services`). Until they are there the step stays as in v1 (Done after winget reports success, without looking for the app).
 
 **What the result changes:**
 - The Dell and HP list readers: which report fields and log lines exist and how to read them.

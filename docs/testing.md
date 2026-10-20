@@ -1,15 +1,17 @@
 # Testing: VMs and real laptops
 
-The Pester suite (`tools\Invoke-Tests.ps1`) mocks everything that touches the machine. It cannot prove Task Scheduler, `icacls`, the Windows Update COM API, vendor tools, the Store, winget, reboots, power settings or console colours. This checklist is for exactly those things: every item here was only unit-tested. Spec reference: [section 17](specs/2026-10-18-bentech-winsetup-design.md). Open research questions (SPIKE#1 to #4) are in [spikes.md](spikes.md).
+The Pester suite (`tools\Invoke-Tests.ps1`) mocks everything that touches the machine. It cannot prove Task Scheduler, `icacls`, the Windows Update COM API, vendor tools, the Store, winget, reboots, power settings or console colours. This checklist is for exactly those things: every item here was only unit-tested. Spec reference: [section 17](specs/2026-10-18-bentech-winsetup-design.md) for v1, and [sections 7, 9 and 10](specs/2026-10-20-progress-visibility-design.md) for v2 (the progress screens, Office in the background, no leftover folder). Open research questions (SPIKE#1 to #5) are in [spikes.md](spikes.md).
 
-How to use it: tick the boxes on a printed or copied file. Make one filled copy of section 1 per VM type, and one copy of section 3 per laptop. Keep each filled copy next to the machine's `Logs\` folder, copied out after the run.
+How to use it: tick the boxes on a printed or copied file. Make one filled copy of section 1 per VM type, and one copy of section 3 per laptop. Keep each filled copy next to the machine's `Logs\` folder, copied out after the run (v2: from the stick's `BenTech-Logs\<PC name>` folder, see section 0).
+
+The v2 items are sections 1.10 to 1.16 (every VM) and 3.7 to 3.9 (laptops). The older items in sections 1.3 to 1.9 were brought up to date with v2 where it behaves differently (the start screen, the final screen, the cleanup and the re-run).
 
 ## 0. Before you start
 
 - [ ] A release is published and `dist\BenTechSetup.cmd` is current. Its SHA-256 equals the hash in `keys\launcher.sha256`.
 - [ ] Each VM has a **checkpoint** taken right after OOBE: a local administrator account with **no password**, no Microsoft account, no domain, internet works. Roll back to it before every run.
 - [ ] Copy `BenTechSetup.cmd` into the VM from a USB stick, mounted VHD or ISO, or the VM's file-copy integration. Don't download it in a browser (that adds the Mark-of-the-Web, which the real USB flow doesn't have).
-- [ ] After each run, copy `C:\BenTech\Setup\Logs\` (and `state.json` if it exists) out of the machine. This is the evidence.
+- [ ] **Where the evidence is (v2).** `C:\BenTech` is deleted when the final screen is finished with Enter, so after a normal run the evidence is the USB stick's `BenTech-Logs\<PC name>\` folder. Keep a USB stick formatted exFAT with `BenTechSetup.cmd` in its root plugged in for the whole run, or plug it in while the final screen shows `No BenTech USB stick`. After a **crash**, or after anything that does not end in Enter on the final screen, nothing is deleted: copy `C:\BenTech\Setup\Logs\` (and `state.json`) out of the machine from an elevated prompt before you touch the machine again. To keep a VM's logs without a stick, copy them out by hand **before** pressing Enter (with no stick, Enter deletes the logs without asking).
 - [ ] Note the release version and the date on each filled copy.
 
 ---
@@ -40,20 +42,20 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 
 ### 1.3 Start screen
 
-- [ ] Shows the machine, serial, `Windows 11 ... x64` (or Windows 10), `Power`, and `New name` (at most 15 characters).
-- [ ] **(a)** On a VM: `Detected : VM` and the arrow is on **Desktop** (VM to Desktop). No vendor steps appear later.
+- [ ] Shows the machine, serial, power (`ON CHARGER` / `ON BATTERY`) and `New PC name` (at most 15 characters), then WHAT WILL HAPPEN with the keys that change each line (see 1.11 for the v2 screen checks).
+- [ ] **(a)** On a VM: the `Type` line is `DESKTOP (no driver tool for this brand)` (a VM defaults to Desktop). No vendor steps appear later.
 - [ ] A VM shows no `ON BATTERY` line.
-- [ ] The countdown goes 10 to 0 and starts by itself. `L`, `D`, `Z` and `O` change the mode, 7-Zip and Office (OFF, BUSINESS, HOME) and reset the countdown to 10. `Enter` starts at once.
-- [ ] `Esc` cancels. Afterwards `Get-ScheduledTask BenTechSetup-Resume` finds nothing, there is no `state.json`, and `run.lock` is gone.
+- [ ] The countdown goes 30 to 0 and starts by itself. `L`, `D`, `Z` and `O` change the mode, 7-Zip and Office (OFF, BUSINESS, HOME) and reset the countdown to 30. `Enter` starts at once.
+- [ ] `Esc` cancels. Afterwards `Get-ScheduledTask BenTechSetup-Resume` finds nothing and, on a fresh machine (no earlier run), `C:\BenTech` is gone too (v2 spec 10.6, see 1.16). After an *unfinished* earlier run, Esc deletes nothing.
 - [ ] Press Enter repeatedly while the launcher is still downloading: the start screen still counts down (stray keys are thrown away).
-- [ ] Put more than 1 GB in Documents and run again: the yellow line `This doesn't look like a fresh install: press Enter to run anyway` appears and nothing starts by itself.
+- [ ] Put more than 1 GB in Documents and run again: the yellow text `This PC already has user files or is older than 14 days - press ENTER to run anyway` appears and nothing starts by itself.
 - [ ] Steps turned off on the start screen (7-Zip OFF, Office OFF) are absent from the progress screen and the report.
 
 ### 1.4 Resume, reboots and power
 
 - [ ] **(b)** The run resumes by itself after **each** reboot (automatic sign-in because there is no password), with no click.
 - [ ] **The reboot after the PC rename resumes too.** The resume task is registered for `<old name>\<user>`; check it survives the rename. Before the rename: `Get-ScheduledTask BenTechSetup-Resume | Select -Expand Principal`, and `... | Select -Expand Actions` shows `Execute` as the full `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` path (triage 180). After the restart: the setup window appears at logon, and `Get-ScheduledTaskInfo BenTechSetup-Resume` shows a fresh `LastRunTime`. If this fails, the machine sits at an empty desktop after the rename. Unit tests cannot show this, so it is the first thing to check.
-- [ ] **(c)** After every logon the progress screen is in front: `[OK]` done steps, `[>>]` with a running timer, `[..]` pending, and the reboot count.
+- [ ] **(c)** After every logon the progress screen is in front: `[OK]` done steps, `[>>]` for the running step, `[..]` pending, the NOW timer running, and `Restarts N` in the header (see 1.12). After a real restart `Back after restart N` is the newest JUST HAPPENED line.
 - [ ] Before every restart a `Restarting in N s ...` countdown (15 s) is on screen, and the reboot count never goes above 12.
 - [ ] Nothing ever waits for input: no "Let's finish setting up your device", no Store sign-in, no second UAC, no BitLocker recovery screen.
 - [ ] Double-click the launcher while a run (or its resume) is active: `Setup is already running on this machine`, exit code 2, and `setup.ps1` and `state.json` are untouched.
@@ -74,8 +76,8 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 - [ ] **Chrome.** Installed; the report shows its version. The step logged a valid `Google LLC` signature before running the MSI.
 - [ ] **AnyDesk `--get-id`.** The ID (9 or 10 digits) is read within the 2-minute budget. Note whether it came from `AnyDesk.exe --get-id` or from the `service.conf` fallback (`ad.anynet.id=`). The same ID is on the final screen, in the report, and in the AnyDesk window.
 - [ ] AnyDesk starts with Windows and has a desktop icon. A connection attempt makes the customer **accept** it. Settings, Security: unattended access is **off** and no password is set.
-- [ ] **Office (ODT).** The ODT comes from winget (`C:\Program Files\OfficeDeploymentTool\setup.exe`, Microsoft signature checked), `/quiet /extract:` extracts to `Downloads\ODT`, and `setup.exe /configure` runs without any dialog. Exit codes 0, 3010 and 1641 are all Done (3010 and 1641 show `Office installed (restart pending)`). Word opens with Hebrew UI first, English also installed; Groove and Lync are absent. The report lists `Microsoft 365` with a version.
-- [ ] **Chrome as default browser (SPIKE#1).** After the final sign-in, `https` resolves to `ChromeHTML`. Check `HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoiceLatest` (ProgId) or Settings, Default apps. If it did not work, the final screen must be YELLOW with the Chrome hint, and **B** must open the Chrome page in Default apps.
+- [ ] **Office (ODT).** The ODT comes from winget (`C:\Program Files\OfficeDeploymentTool\setup.exe`, Microsoft signature checked), `/quiet /extract:` extracts to `Downloads\ODT`, and `setup.exe /configure` runs without any dialog. Exit codes 0, 3010 and 1641 are all Done (3010 and 1641 show `Office installed (restart pending)`). Word opens with Hebrew UI first, English also installed. In v2 only Word, Excel, PowerPoint, Outlook (classic) and OneNote are installed, and the install runs in the background (checks in 1.14). The report lists `Microsoft 365` with a version.
+- [ ] **Chrome as default browser (SPIKE#1).** After the final sign-in, `https` resolves to `ChromeHTML`. Check `HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoiceLatest` (ProgId) or Settings, Default apps. If it did not work, the final screen must be YELLOW with the Chrome hint, and **B** must open the Chrome page in Default apps. v2 waits up to 120 s for it after the final restart (checks in 1.10).
 - [ ] 7-Zip installed via winget when it was ON.
 
 ### 1.6 Windows Update (real COM)
@@ -83,7 +85,7 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 - [ ] Microsoft Update is registered on the first run, and the search finds updates on a fresh machine.
 - [ ] Rounds run as search, download, install. `setup.log` shows one entry per round, each in a `-WuRound` child process, and a reboot between rounds when a restart is required.
 - [ ] The loop ends when a search returns nothing. Note the number of rounds and the total time. The cap is 6 rounds (`caps.maxWuRounds`); a fresh machine that needs close to 6 is a sign to raise it.
-- [ ] Optional updates (`BrowseOnly=1`) are skipped; updates that need user input are skipped and logged; Defender definitions don't keep the loop going.
+- [ ] Optional updates (`BrowseOnly=1`) are skipped; software updates that need user input are skipped and logged (driver updates are not, see 3.7); Defender definitions don't keep the loop going.
 - [ ] **Busy and reboot-pending codes.** A fresh install often has the Windows Update orchestrator busy. Look in `setup.log` for `0x80240016` or `0x8024A000` (the step waits 120 s and continues) and `0x80242014` (continues with a reboot). They must not hide good updates: those rounds don't raise the per-update failure counts.
 - [ ] **Hiding a mandatory update.** Some updates cannot be hidden (`0x80248016`). If a failing update shows up, the round continues, and the verdict lists `Windows update hidden after repeated failures: ...` in red. To provoke it on purpose: disable the Windows Modules Installer service in the checkpoint before the run (not verified to give this exact error).
 - [ ] **Enablement package (SPIKE#2).** From a Windows 11 **24H2** checkpoint, the 25H2 enablement package is offered, installed, and the build moves to 25H2 after one reboot. If it is offered only with `BrowseOnly=1`, Task 14 needs a third search (see [spikes.md](spikes.md)).
@@ -91,28 +93,29 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
 
 ### 1.7 Final screen on a real console
 
-- [ ] **(d)** The whole console turns the verdict colour: dark green, dark yellow or dark red. The banner matches (`SETUP COMPLETE`, `COMPLETE - CHECK NOTES`, `COMPLETED WITH ERRORS`).
+- [ ] **(d)** The whole console turns the verdict colour: GREEN is White on DarkGreen, YELLOW is **Black on Yellow**, RED is White on DarkRed. The banner matches (`SETUP COMPLETE`, `COMPLETE - CHECK NOTES`, `COMPLETED WITH ERRORS`). **All three are readable in a `powershell.exe` window started by the resume task with the default console profile** (the v1 YELLOW was white on near-white there, spec 9.1).
 - [ ] Check all three colours at least once across the VMs. For RED, make a step fail on purpose (for example a hosts-file entry blocking `dl.google.com` before the run): the Chrome step fails and the screen is red.
 - [ ] The AnyDesk ID is in big digits, readable from 3 to 5 metres. Machine, new name, total time and reboot count are shown.
-- [ ] Failures (`X`) and notes (`!`) are listed with one-line reasons, at most 4 failures and 3 notes, each list then `... and N more: see the report`.
-- [ ] **Worst-case final screen in a 30-row window (triage 240).** Set the console to 30 rows (Properties > Layout > Window size, height 30; in Windows Terminal, a profile with `"rows": 30`), and provoke more than 4 failures and 3 notes with Chrome not the default (for example block `dl.google.com` and `download.anydesk.com` in `hosts` and turn 7-Zip and Office on with winget broken). The layout is exactly 30 lines: the top `=====` frame, the banner and the AnyDesk ID must all be visible without scrolling, and the report line is the last row.
-- [ ] **B** opens Settings, Default apps for Google Chrome; **R** opens `Setup-Report.txt` in Notepad. Both keep the final screen up. Any other key closes it.
-- [ ] A key pressed during the last step doesn't close the screen early.
+- [ ] Failures (`X`) and notes (`!`) are listed with one-line reasons, at most **3 failures and 2 notes**, each list then `... and N more: see the report`.
+- [ ] **Worst-case final screen in a 30-row window (triage 240).** Set the console to 30 rows (Properties > Layout > Window size, height 30; in Windows Terminal, a profile with `"rows": 30`), and provoke more than 3 failures and 2 notes with Chrome not the default (for example block `dl.google.com` and `download.anydesk.com` in `hosts` and turn 7-Zip and Office on with winget broken). The layout is 29 lines, so with the row the frame writer keeps free it fills the window exactly: the top `=====` frame, the banner and the AnyDesk ID must all be visible without scrolling, the USB stick line sits above the report line, and the report line is the last row of text.
+- [ ] **Enter finishes** the screen (and starts the cleanup, see 1.16). **B** opens Settings, Default apps for Google Chrome; **R** opens `Setup-Report.txt` in Notepad. Both keep the final screen up. Every other key (Esc, Space, Q, ...) does nothing.
+- [ ] A key pressed during the last step doesn't finish the screen early, and a buffered Enter does not skip the cleanup's `Press ENTER to delete ... anyway` stop (1.16).
+- [ ] The stick line follows plugging the stick in and out within a second (1.16).
 - [ ] Colours are back to normal when the final screen closes (in a console that stays open). Try the Windows 11 default terminal (Windows Terminal) and, once, the classic console host.
 
 ### 1.8 Report and cleanup
 
-- [ ] **(e)** `C:\BenTech\Setup\Logs\Setup-Report.txt` exists and is complete: tool version, result, started/finished (`dd/MM/yyyy HH:mm`), duration, machine and serial, PC name old to new, mode and detected type, Windows build and architecture, activation, BitLocker, Smart App Control (`Off`, `On`, `Evaluation` or `Unknown`; compare with Windows Security > App & browser control), AnyDesk ID, apps with versions, the Windows Update line, one line per step with its time, and the Failures and Notes sections. Its result matches the final screen. The file is plain ASCII.
-- [ ] **(f)** After the run, none of these exist:
+- [ ] **(e)** `C:\BenTech\Setup\Logs\Setup-Report.txt` (while the final screen is up; afterwards on the stick) exists and is complete: tool version, result, started/finished (`dd/MM/yyyy HH:mm`), duration, machine and serial, PC name old to new, mode and detected type, Windows build and architecture (the `Windows` line has **no `??`** before the product name on Hebrew Windows, spec 9.5), activation, BitLocker, Smart App Control (`Off`, `On`, `Evaluation` or `Unknown`; compare with Windows Security > App & browser control), AnyDesk ID, apps with versions, the Windows Update line, the `Windows updates installed` list (one line per update, per round), one line per step with its time, and the Failures and Notes sections. Its result matches the final screen. The file is plain ASCII.
+- [ ] **(f)** While the final screen is up (before Enter), none of these exist:
   - [ ] the resume task (`Get-ScheduledTask BenTechSetup-Resume` finds nothing)
   - [ ] `NoAutoRebootWithLoggedOnUsers` under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`
   - [ ] `C:\BenTech\Setup\Downloads\`
   - [ ] `DefaultAssociationsConfiguration` under `HKLM\SOFTWARE\Policies\Microsoft\Windows\System`, and `%ProgramData%\BenTech\DefaultAssociations.xml`
   - [ ] the Lenovo `AdminCommandLine` value (both registry views; Lenovo laptops only)
-  - [ ] `C:\BenTech\Setup\setup.ps1`, `config.json` and `run.lock`
+  - [ ] `C:\BenTech\Setup\setup.ps1` and `config.json`
   - [ ] installers left in `%TEMP%`
-- [ ] `Logs\` and `state.json` are still there. Vendor tool logs are in `Logs\`.
-- [ ] **Read the logs the safe way (M9).** Open them with **R** on the final screen or from an elevated prompt (`notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal), never by browsing `C:\BenTech` in Explorer: Explorer's "Continue" button adds your account to the folder's permissions, and the next re-run then refuses the folder with exit code 5. (To see it happen once on a VM: browse there in Explorer, click Continue, run the launcher again: exit 5.)
+- [ ] While the final screen is up, `Logs\` and `state.json` are still there. Vendor tool logs are in `Logs\`. After Enter, `C:\BenTech` is gone and the same files are in the stick's `BenTech-Logs\<PC name>\` (1.16).
+- [ ] **Read the logs the safe way (M9).** While `C:\BenTech` exists (the final screen is up, or after a crash), open them with **R** on the final screen or from an elevated prompt (`notepad C:\BenTech\Setup\Logs\setup.log` in an administrator Terminal), never by browsing `C:\BenTech` in Explorer: Explorer's "Continue" button adds your account to the folder's permissions, and the next re-run then refuses the folder with exit code 5. (To see it happen once on a VM: browse there in Explorer, click Continue, run the launcher again: exit 5.)
 - [ ] Final power settings: on AC never sleep and screen off after 15 minutes; on battery the Windows defaults (the originals are in `state.json` under `Power`). Fast Startup stays off. The lid action is back to what it was.
 
 ### 1.9 Release and re-run checks
@@ -127,13 +130,84 @@ Use SIDs when you read ACLs: Administrators `S-1-5-32-544`, SYSTEM `S-1-5-18`.
   ```
 
   In an **elevated** command prompt in the VM run `BenTechSetup.cmd -BaseUrl file:///C:/tamper -NoPause`. Expected: red `SECURITY CHECK FAILED - files are not signed by BenTech. Nothing was run.`, exit code **3**, no `C:\BenTech`, no resume task. Repeat with only `config.json` changed (still exit 3), with a `.sig` deleted (exit 4), and with a release signed by a different throwaway key (create it outside the repo with `tools\New-SigningKey.ps1 -PrivateKeyPath <p> -PublicKeyOut <p>`, sign with `tools\Sign-File.ps1 -PrivateKeyPath <p>`; exit 3). The `-BaseUrl` parameter is the one the launcher tests use. If it doesn't reach the launcher, the real release is downloaded and a normal run starts: roll the checkpoint back. `tests\Launcher.Tests.ps1` covers this against `file://` folders; this repeats it with the real launcher on a clean machine.
-- [ ] **(spec 8.8) Re-run on the same machine after GREEN.** The start screen shows `Previous run: dd/MM/yyyy HH:mm - GREEN`. The old state is archived as `Logs\state-<RunId>.json`, counters start at zero, and every step runs again but finishes quickly. Nothing is duplicated: one AnyDesk, one Chrome, the same PC name, the Hebrew keyboard added once.
-- [ ] Re-run after a RED run: updates that were hidden are un-hidden and get one more try.
+- [ ] **(spec 8.8, v2 spec 10.7) Re-run on the same machine after GREEN.** A finished run (Enter) leaves nothing behind, so the start screen shows **no** `Previous run:` line, there is no state to archive and the counters start at zero, and every step runs again but finishes quickly. Nothing is duplicated: one AnyDesk, one Chrome, the same PC name, the Hebrew keyboard added once. The stick's `BenTech-Logs\<PC name>` folder is replaced by the new run's logs, not added to.
+- [ ] Re-run after a RED run **that was finished with Enter**: v2 deletes `state.json`, so the list of updates the run hid (`PreviousHiddenUpdateIds`) is gone and they are **not** un-hidden by the next run (they stay hidden in Windows Update). Note the result; see section 5. After a RED run that was **not** finished with Enter (a crash, or Esc on the start screen), the state is still there and the hidden updates are un-hidden and get one more try, as in v1.
 - [ ] **Re-run after an *unfinished* run keeps the real power settings (final review I2).** Before the first run note the originals: `powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE`, `... SUB_SLEEP HIBERNATEIDLE`, `... SUB_VIDEO VIDEOIDLE` and `... SUB_BUTTONS LIDACTION` (read only the hex AC/DC values). Start a run and stop it before Finalize (while Windows Update runs, remove the resume task in an elevated PowerShell with `Unregister-ScheduledTask BenTechSetup-Resume -Confirm:$false`, then power the VM off at once; in this order, because after power-on the automatic sign-in would fire the task before you could remove it). Double-click the launcher again and let the new run finish. Expected: the start screen says `Previous run: ... - UNFINISHED`; afterwards, on battery (DC) the four values are the ones you noted (not 0), and on a laptop the lid action is back to what it was. If they are 0, the run must show the yellow note `Some power settings could not be restored`, never green.
 - [ ] Re-run with a corrupt `state.json` (cut the file in half): it is archived as `Logs\state.corrupt-<time>.json` and a new run starts without a crash.
 - [ ] Re-run on a machine that no longer looks fresh: no auto-start, Enter needed.
 - [ ] Once a second release exists: a new release published **during** a run does not change that run (resumes use the pinned local copy; the report keeps the old version), and the next launcher run uses the newest one.
 - [ ] Variants worth one run each: a Windows account with **Hebrew letters and a space** in its name (the resume task and child processes still start), and **Hebrew display language** (power settings, ACLs and Windows Update filtering still work).
+
+### 1.10 The fixes from the first real-machine test (v2 spec 9)
+
+The Dell test of release `v2026.10.19.1` found these. They are the first things to check on the section 9 release. The final-screen colours are checked in 1.7 (d) and the report's `Windows` line in 1.8 (e); the Windows Update, vendor-app and firmware items are laptop checks in 3.8.
+
+- [ ] **Chrome as default after the final restart (spec 9.4).** After the final sign-in `setup.log` shows either `Chrome is the default browser` with `reads` and `waitedSeconds` (how long `ChromeHTML` took to appear after the sign-in; the wait is up to 120 s, polled every 5 s), or `Chrome is still not the default browser after the wait` after 120 s (then the verdict is YELLOW with the Chrome note and the **B** hint). The policy value and `DefaultAssociations.xml` are removed only after that. The screen keeps moving during the wait (NOW shows the wait timer).
+- [ ] **No wait without a sign-in.** When the final restart was refused or failed (no resume task, reboot cap), nobody signed in after the policy was set: `setup.log` says `No wait for Chrome as default` and the default browser is read once. The run must not sit 120 s for nothing.
+- [ ] **Is the policy honoured on Windows 11 Home at all?** Record the result for the Home VM (2.2, SPIKE#1): `reads`/`waitedSeconds` in `setup.log`, or the Note and the **B** hint.
+- [ ] **Activation attempt (spec 9.5), on a machine with a product key** (Hebrew Windows 11 Home: the Dell). Before the final restart `setup.log` shows `Trying to activate Windows`, then `Windows activated` or `Windows activation attempt failed` with its exit code. After the run the `Windows not activated` Note is gone, or it stays and the failed attempt is in `setup.log`. A machine with no key logs `No Windows activation attempt: no product key is installed`; an already activated one logs `No Windows activation attempt needed`.
+- [ ] **Sleep during the attempt (ruling V2-R8).** The attempt runs after the power settings are put back (on battery the Windows defaults), up to 3 minutes. A laptop on battery and idle may sleep in the middle: note whether it did and whether the run carried on after waking.
+
+### 1.11 Start screen, v2 (spec 4.1)
+
+- [ ] The countdown is **30 s** (`Starts by itself in N s` with a 20-character bar that empties) and the run starts by itself at 0.
+- [ ] **Any key restarts it at 30 s**: `L`, `D`, `Z`, `O`, and an unknown key such as Space, F5 or Q. Only Enter starts at once and Esc cancels. Holding a key down stays smooth (no flicker, no lag).
+- [ ] Colours, all on a **black** window with no blue strips, in the classic console host (conhost) with the default `powershell.exe` profile and in Windows Terminal: frame grey, the chosen values green, `NO` and `OFF` dark grey, the ON BATTERY and not-fresh lines yellow.
+- [ ] The `Type` line: `LAPTOP (driver tool + laptop app)`, `DESKTOP (no laptop app)`, and for a brand without a driver tool (ASUS, a VM) `(no driver tool for this brand)`.
+- [ ] In an **80x25** window the ON BATTERY line (85 characters) and a very long model name are cut at the window edge and nothing else wraps.
+- [ ] The not-fresh text (`This PC already has user files or is older than 14 days - press ENTER to run anyway`) appears with no countdown; `Previous run: dd/MM/yyyy HH:mm - UNFINISHED` appears only after an unfinished run (a crash, or Esc on the start screen after one), never after a run finished with Enter.
+
+### 1.12 Progress screen, tick and activity feed (v2 spec 4.2 to 4.4)
+
+- [ ] **Rendering.** In conhost the window is enlarged to about 100x45 at start (as far as the screen allows); in Windows Terminal it is not (a script cannot resize it) and the layout fits whatever size it has. Resize the window during a step in both: JUST HAPPENED shrinks first, then the NOW list; the header, the checklist and the first NOW line always stay.
+- [ ] **Colours**, all on black, no blue strips: `[OK]` green, `[>>]` cyan, `[X ]` red, `[--]` dark grey, `[..]` default. Readable from a metre away.
+- [ ] **A sign of life.** The spinner in the header turns and the timers (Total, NOW, `(bg)`) move every second during Windows Update round 1, a vendor pass, the Office restart wait, a download and the Chrome wait. No flicker and no scrolling over a 30-minute step. The first frame after a clear lands at the top even on a scrolled buffer, and text a child process prints between two frames does not leave debris.
+- [ ] **Tick cost.** A redraw stays around 50 ms or less in conhost and in Windows Terminal: a step that takes N minutes without the screen does not take noticeably longer with it.
+- [ ] **The reboot countdown** (`Restarting in N s ...`, 15 s) is still readable over the frame, and after the restart `Back after restart N` is the newest JUST HAPPENED line. A restart that was not ours (power-off, a vendor tool's forced restart) can show a lagging N: note it.
+- [ ] **The transcript holds no redraws.** `Logs\transcript-*.txt` does not contain the progress screen repeated every second, and not the final screen's one-second redraw either.
+- [ ] **Failed and skipped steps** show `[X ]` / `[--]` in the checklist and their reason in JUST HAPPENED (`<Title> FAILED - <reason>`, `<Title> skipped - <reason>`).
+- [ ] **JUST HAPPENED survives a restart** (the history is still there after the machine comes back). A new run (not a resume) archives the old feed as `Logs\activity-<RunId>.txt` and starts empty.
+- [ ] **The AnyDesk ID** appears in `Logs\activity.txt` (`AnyDesk <version> - ID <id>`) and **never** in `Logs\setup.log` (search `setup.log` for the ID: no match).
+- [ ] The feed holds the facts a technician cares about: app versions, the new PC name, each bloatware app removed, BitLocker changes, time zone and keyboard, each Windows Update round's summary, each driver pass's summary, Office started and finished, the shortcuts.
+
+### 1.13 Windows Update, one update at a time (v2 spec 4.5)
+
+- [ ] **English titles on Hebrew Windows.** `UserLocale` 1033 is accepted by the WUA session: NOW and the report's `Windows updates installed` list show English titles (the Dell's round 1 had a Hebrew Defender title). If the session refuses it, the titles are ASCII-filtered with the KB number first.
+- [ ] **One at a time vs batch.** On a fresh Windows 11 with 10 or more updates, run once with the default `OneAtATime` and once with `windowsUpdate.installMode` set to `Batch` in `config.json` (a throwaway build). Expected: the same end state (same updates installed, same restarts, same hidden list). Note the round times against the 90-minute cap (`timeoutsMinutes.wuRound`).
+- [ ] **Live progress.** NOW shows `Installing 3 of 7` with the list and a marker per update; `Logs\wu-round<N>.progress.json` changes while the round runs (read it from an elevated prompt). With `Batch` the screen shows only the phase and the list.
+- [ ] **A busy agent** (a fresh machine): whether it shows up as an exception from Install() or as a result HResult. Either way the loop stops there and the v1 handling of `0x80240016` / `0x8024A000` / `0x80242014` applies (1.6).
+
+### 1.14 Microsoft 365 in the background (v2 spec 4.6 and 4.7)
+
+- [ ] **The ODT accepts every `ExcludeApp` id** in `config.json` (`Access`, `Publisher`, `Teams`, `OneDrive`, `Groove`, `Lync`, `Bing`, `OutlookForWindows`). Drop any id the ODT rejects from `config.json`. Only Word, Excel, PowerPoint, Outlook (classic) and OneNote are installed.
+- [ ] **It runs in the background.** After the drivers pass the `office` step ends Done at once (`Microsoft 365 installing in the background`), the checklist shows `[>>] Microsoft 365 (bg) mm:ss` with its own timer, and Windows Update round 1 runs next to it. The hidden `setup.exe` console window never shows, and its exit code is readable (activity line `Microsoft 365 setup ended (exit 0)`).
+- [ ] **A restart waits for Office.** NOW shows `Waiting for Microsoft 365 to finish before restarting` with the timer against the 60-minute limit, and the restart comes after Office ends. At the deadline (test with `timeoutsMinutes.office` set to 2 in a throwaway build) the `setup.exe` tree is killed, the activity line says `Microsoft 365 setup stopped at its 2 min limit` and `office-finish` is Failed `Office setup timed out`. Check whether the Click-to-Run service keeps installing after that kill.
+- [ ] **A forced restart in the middle of the install** (reset the VM while Office installs): after the restart `office-finish` makes **one** foreground install attempt (the ODT runs in the foreground); if that fails too the step is Failed and nothing is retried, also not after another crash. When it cannot tell what happened it is Failed `Office setup did not complete` and does not start an install beside one that may still be running.
+- [ ] **`office-finish` after Windows Update** waits for a still-running Office (NOW `Waiting for Microsoft 365 to finish`); exit 0 is Done, 3010 and 1641 are Done with a restart (none extra when a restart already followed).
+- [ ] **The four shortcuts** (Word, Excel, PowerPoint, Outlook) are on the **public desktop** with their icons, also for an already-installed Office (the step says `Office already installed`). `InstallationPath` in `HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration` really holds the folder that contains `root\Office16`. A re-run leaves existing shortcuts alone, and a program that is not installed is skipped without a Note. The activity line reads `Desktop shortcuts: ...`.
+- [ ] **Office OFF**: no Microsoft 365 line on the checklist, and neither `office` nor `office-finish` in the report.
+
+### 1.15 Downloads and waits (v2 spec 4.3)
+
+- [ ] A real HTTPS download through `DownloadFileTaskAsync` (the Chrome MSI, AnyDesk): the screen keeps moving. On a slow line (throttle the VM's network) the spinner stays alive for the whole download.
+- [ ] **A stalled download.** Cut the network in the middle of one: the attempt is cancelled after **100 s** with no first byte or **300 s** with no growth after that (`download stalled`) and retried. The 30-minute cap per attempt holds on a very slow line. The cancelled `.part` file is released, so the next attempt can write it.
+- [ ] **Waits that still do not tick:** starting the Dell service (up to 60 s) and the kill path of `Invoke-External`'s timeout (about 10 s). Note how long the screen stands still; anything longer is a bug.
+
+### 1.16 No leftover folder (v2 spec 10)
+
+Pressing Enter on the final screen copies the logs to the stick, deletes the Desktop launcher and deletes `C:\BenTech`. Use a VM checkpoint for each variant.
+
+- [ ] **The stick is found by its serial**, also after it comes back under another drive letter (change the letter in Disk Management and press Enter), and by `BenTechSetup.cmd` in its root when the launcher ran from a Desktop. The system drive is never taken as the stick and network drives are not looked at.
+- [ ] **The live line** `USB stick found (E:) - logs will be saved there` / `No BenTech USB stick - plug it in now to keep the logs` follows plugging the stick in and out within a second.
+- [ ] **The copy to exFAT.** `E:\BenTech-Logs\<PC name>\` holds the whole `Logs` folder (`setup.log`, `Setup-Report.txt`, `activity.txt`, the vendor logs). A re-run replaces that folder instead of adding to it.
+- [ ] **A link is never followed.** On an NTFS stick make `E:\BenTech-Logs` a junction (`mklink /J E:\BenTech-Logs C:\somewhere`; check that the command worked): the screen says `BenTech-Logs on the USB stick is a link; logs not saved`, and nothing in the junction target is copied or deleted.
+- [ ] **A failed copy** (write-protected or full stick) shows why and `Press ENTER to delete C:\BenTech anyway`. Only Enter goes on, and an Enter pressed earlier does not skip that stop. With **no stick** it shows `No USB stick found: the logs are not saved` and goes on without waiting.
+- [ ] **`C:\BenTech` is deleted while the final process still runs from `C:\BenTech\Setup\setup.ps1`**, and `C:\ProgramData\BenTech` is gone when it is empty (and stays when something else is in it). With a file locked (open `setup.log` in Notepad before Enter) it retries 3 times, 2 s apart, then shows `Could not delete C:\BenTech - delete it by hand` and waits for a key.
+- [ ] **The Desktop launcher** is deleted when the run started from the user's Desktop, and from the public Desktop (also on a OneDrive-redirected Desktop); only a `.cmd` file is ever deleted. Does `cmd.exe` print `The batch file cannot be found` when the launcher it was running is gone (a run with no restart)? A launcher on the stick is never deleted. A launcher run from another local disk (for example `D:\Downloads`) sends the logs to that disk instead of the stick (a known limitation): note what happens.
+- [ ] **A PC whose system drive is not C:** `C:\BenTech` is kept and the screen says `Not deleting ...`.
+- [ ] **Esc on the start screen of a fresh machine leaves nothing** (no `C:\BenTech`, no resume task). Esc when an unfinished run left a state deletes nothing.
+- [ ] **A crash leaves everything** for diagnosis: `C:\BenTech`, its logs and the resume task stay and the `Setup crashed` text shows. (Provoke one in a VM, for example by cutting `config.json` in half before a resume; not verified to crash.)
+- [ ] `Previous run:` on the next start screen appears only after an unfinished run.
 
 ---
 
@@ -239,6 +313,31 @@ For each Store app above (SupportAssist, Vantage, MyASUS):
 
 - [ ] Record the `winget install --source msstore` exit code with only a local account signed in. If it needs a Store sign-in, the step must end **Skipped (yellow)** with a clear reason, not Failed (red). If it ends red, the Store-app Skipped rule from [spikes.md](spikes.md) is still missing.
 
+### 3.7 Driver passes on the screen (v2 spec 4.5)
+
+Until the Spike 5 capture is folded in (build order A), a driver pass shows the tool's name, the elapsed time against the 60-minute limit and the tool's latest log line; there is no update list yet.
+
+- [ ] **Dell.** NOW shows `Log: <last line of dcu-pass<N>.log>`. The format of `D:\Setup\Logs\dcu-pass1.log` (from the first test) is `[yyyy-MM-dd HH:mm:ss] : <text>`; the timestamp is cut for display. During installs the line reads `Log: Installing updates (n of N). Update Name: ...` and the `synchronized view ... in SSM` housekeeping lines are skipped. Long update names are cut at the window width.
+- [ ] **HP.** Does HP Image Assistant write its live `*.log` directly into `Logs\HPIA-pass<N>`, or into a sub-folder (NOW would then show no line)? Does the newest `*.log` give a useful line? (On NTFS a folder's newest write time can be stale.)
+- [ ] **Lenovo.** The names, encoding and format of the logs in `%ProgramData%\Lenovo\SystemUpdate\logs`, and whether the newest `*.log` is the live one. The folder keeps old sessions, so NOW can show the previous session's last line until `tvsu` writes a new one. Is the line useful?
+
+### 3.8 The first-test fixes, on a laptop (v2 spec 9.2 and 9.3)
+
+- [ ] **Driver updates that ask for input.** Windows Update installs the driver updates whose `InstallationBehavior.CanRequestUserInput` is true (all 9 on the Dell) under `ForceQuiet`, without a prompt, and afterwards Windows has nothing left to install by itself (no "restart pending" after the run).
+- [ ] **A driver re-offered after it installed** is hidden after 2 rounds (R24c) and turns the verdict red. Watch for it on a Dell; it would be a false red.
+- [ ] **The `DriverClass` of the Dell firmware updates.** `setup.log` has one `Windows Update driver found` line per driver update with its `driverClass`. Record the real value for the firmware updates: the code compares it with `Firmware`.
+- [ ] **Firmware only on mains power.** Battery run (see 3.1): the firmware updates are left alone (not hidden, not counted as failures) and the Note `On battery: BIOS/firmware updates skipped` is shown. On AC they install.
+- [ ] **Vendor-app `verify`.** The Dell, Lenovo and HP `consumerApp` entries have no `verify` yet, so the step is Done after winget (v1). Take the values from Ben's Start-menu check of the Dell and from the `-InventoryOnly` capture after setup (Spike 5), put them into `config.json` and then check both ways: with the app there, the message reads `<name> installed (found file ...)` or `(found service ...)` and an activity line says which check passed; with the app missing the step is Failed `<name> was not found after install` and the business updater stays.
+
+### 3.9 Spike 5 capture script (v2 spec 7)
+
+`tools\spikes\Spike-DriverListCapture.ps1` is list-only and meant for customer Dell and HP laptops (see [spikes.md](spikes.md)). Things only a real laptop shows:
+
+- [ ] **Dell:** the exit codes of `dcu-cli /scan`, the quoting of `-outputLog`, and the fields of the report XML (`DCUApplicableUpdates.xml`: name, version, category).
+- [ ] **HP:** HP Image Assistant's `/Action:List` (where the report is and what it holds). The self-extractor with `/s /e /f` blocks until it is done (otherwise the script says `HPImageAssistant.exe was not found`). Where HPIA writes its logs. The myHP package name in the inventory.
+- [ ] **Left behind:** `%TEMP%\BenTechCapture` (one `HPIA-<stamp>` folder per run) stays on the laptop: delete it by hand. The extracted `HPImageAssistant.exe`'s signature is recorded in `capture.json`, not enforced before it runs.
+- [ ] **After the setup run** on the same laptop: `-InventoryOnly` (services, Start-menu shortcuts, Store packages: the `verify` values), and `dcu-pass1.log` / `HPIA-pass1` from the stick's `BenTech-Logs\<PC name>\`.
+
 ---
 
 ## 4. When something fails
@@ -247,11 +346,15 @@ Fix it in the owning task's files with a regression test, run the full suite (`F
 
 ## 5. Known open items (deferred until VM data exists, ruling R32)
 
-Not fixed in v1 on purpose; each needs what the VM runs above show:
+Not fixed on purpose; each needs what the VM runs above show. The items marked (v2) were found while building the progress-visibility release.
 
 - **Signer matching is a substring** (`HP Inc` also matches `CN=HP Incubator Ltd`). Record the real signer subjects of every installer in `setup.log`, then anchor the match to the exact CN.
 - **The resume task names the user, not the SID** (`<old name>\<user>`). Section 1.4's rename check decides whether it must move to the SID.
 - **State times are local, not UTC.** If OOBE left a non-Israel time zone, "Total time" and the step times can be off by the zone difference (the Region step changes the zone mid-run). Note any odd duration.
-- **The default-browser check may run before Explorer applied the policy** right after the final sign-in (a false "Chrome is not the default" note). Note whether it happens.
-- **A refused policy-value removal only logs a WARN** (`Remove-RegistryValueIfPresent`, Finalize). If `DefaultAssociationsConfiguration` stays, Windows keeps resetting the default browser to Chrome at every sign-in, with no note on screen. Note any `Registry value could not be removed` line in `setup.log`.
+- **The default-browser check may run before Explorer applied the policy** right after the final sign-in (a false "Chrome is not the default" note). v2 waits up to 120 s for it (section 1.10); note the `waitedSeconds` in `setup.log`, and whether the note still appears after the wait.
+- **A refused policy-value removal only logs a WARN** (`Remove-RegistryValueIfPresent`, Finalize; v1 R35, unchanged in v2). If `DefaultAssociationsConfiguration` stays, Windows keeps resetting the default browser to Chrome at every sign-in, with no note on screen. Note any `Registry value could not be removed` line in `setup.log`.
 - **Leftovers:** the empty `...\WindowsUpdate\AU` and Lenovo `UserSettings\General` policy keys, and `C:\Program Files\OfficeDeploymentTool`, stay after the run.
+- **(v2) Esc after a corrupt `state.json`, or after a crash before the first save, deletes those logs.** The cleanup decides "an earlier run left something" from a readable `state.json` (`HadPrevious`), so Esc on the start screen of such a machine counts as a fresh machine and deletes `C:\BenTech` with the logs. Ben's call whether that matters.
+- **(v2) `Back after restart N` can show a lagging number** after an unexpected restart (a power-off, a vendor tool's forced restart): the count is only raised by the controlled restart.
+- **(v2) The Office background job's `StartedAt` and `DeadlineAt` are local time without an offset.** The end of daylight saving time (the last Sunday of October) lengthens a wait by an hour on a run that spans it.
+- **(v2) Updates hidden by a finished RED run stay hidden.** A run finished with Enter deletes `state.json`, so the next run no longer has the list it used to un-hide (`PreviousHiddenUpdateIds`, section 1.9). The report on the stick names what was hidden; un-hide by hand in Windows Update if needed. A run that was not finished with Enter (a crash, Esc after an unfinished run) keeps the state and the old behaviour.
