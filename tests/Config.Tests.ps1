@@ -34,7 +34,7 @@ Describe 'config.json' {
     foreach ($r in $cfg.bloatware.remove) { foreach ($p in $cfg.bloatware.protect) { $r | Should -Not -BeLike $p } }
   }
   It 'every signer key referenced exists' {
-    $refs = @($cfg.apps.chrome.signer, $cfg.apps.anydesk.signer, $cfg.apps.office.signer, $cfg.apps.craft.signer) +
+    $refs = @($cfg.apps.chrome.signer, $cfg.apps.anydesk.signer, $cfg.apps.office.signer, $cfg.apps.craft.signer, $cfg.apps.screenconnect.signer) +
             @($cfg.vendors.PSObject.Properties.Value | ForEach-Object { $_.tool.signer } | Where-Object { $_ })
     foreach ($s in $refs) { @(Get-Signers -Config $cfg -Key $s).Count | Should -BeGreaterThan 0 }
   }
@@ -77,6 +77,21 @@ Describe 'config.json' {
     foreach ($i in $cfg.apps.craft.items) { foreach ($p in $i.displayName, $i.startMenuName) { $p | Should -Not -BeNullOrEmpty; { [void][regex]::new($p) } | Should -Not -Throw } }
   }
   It 'installs Windows updates one at a time by default' { $cfg.windowsUpdate.installMode | Should -Be 'OneAtATime' }
+  It 'pins the ScreenConnect values (screenconnect spec 4.3)' {
+    $cfg.defaults.remote | Should -BeExactly 'ANYDESK'
+    $sc = $cfg.apps.screenconnect
+    $sc.signer | Should -BeExactly 'connectwise'
+    $sc.url | Should -BeExactly 'https://github.com/BenTechit/bentech-winsetup/releases/download/v{version}/ScreenConnect.ClientSetup.exe'
+    $sc.sha256 | Should -BeExactly '74E058E0F597CF197132775552FBB6F4BDD21F8A0870E1A638D41A63F7C3FD99'
+    $sc.serviceName | Should -BeExactly 'ScreenConnect Client (b58e7c32699a96bf)'
+    $cfg.timeoutsMinutes.screenconnect | Should -Be 10; $cfg.timeoutsMinutes.screenconnectService | Should -Be 3
+  }
+  It 'trusts the ScreenConnect installer by the quoted name Windows shows' { @(Get-Signers -Config $cfg -Key 'connectwise') | Should -Be @('"ConnectWise, LLC"') }
+  It 'the ScreenConnect link names a release of the repo Publish uploads to, never latest' {
+    $repo = (Get-Content "$PSScriptRoot\..\tools\publish.settings.json" -Raw | ConvertFrom-Json).repo
+    $cfg.apps.screenconnect.url | Should -BeLike "https://github.com/$repo/releases/download/v{version}/*"
+    $cfg.apps.screenconnect.url | Should -Not -Match 'latest'
+  }
   It 'throws on a missing key' {
     '{"defaults":{}}' | Set-Content "$TestDrive\c.json"; { Read-SetupConfig -Path "$TestDrive\c.json" } | Should -Throw '*config missing key*'
   }

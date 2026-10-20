@@ -1,7 +1,8 @@
 ﻿# src/UI/StartScreen.ps1
-# The start screen (spec 8.1, v2 Q1): what was detected, what will happen, the L / D / Z / O toggles and
-# a 30-second countdown that any key restarts. Needs ConsoleFrame.ps1 (the screen is drawn through a
-# console writer, never Write-Host or Clear-Host) and Catalog.ps1 (Test-HasDriverTool).
+# The start screen (spec 8.1, v2 Q1): what was detected, what will happen, the L / D / Z / O / R toggles
+# and a 30-second countdown that any key restarts. Needs ConsoleFrame.ps1 (the screen is drawn through a
+# console writer, never Write-Host or Clear-Host) and Catalog.ps1 (Test-HasDriverTool, Get-RemoteChoice
+# and $script:RemoteChoices, which the R key cycles).
 #
 # Split in two on purpose:
 #   * Format-StartScreen, Get-StartScreenSegments, Update-StartChoices and New-DefaultChoices are pure
@@ -84,12 +85,14 @@ function Format-HoursMinutes {
 function New-DefaultChoices {
   <#
   .SYNOPSIS
-    The choices the start screen opens with: mode from the detected machine, 7-Zip and Office from
-    config.defaults.
+    The choices the start screen opens with: mode from the detected machine, 7-Zip, Office and the
+    remote tool from config.defaults.
   .DESCRIPTION
     LAPTOP only for a laptop that is not a virtual machine. An Office default that is not CRAFT,
     BUSINESS, HOME or OFF becomes OFF (nothing gets installed that nobody asked for). The default
-    in config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365.
+    in config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365. A remote
+    default (defaults.remote) that is not ANYDESK, SCREENCONNECT or BOTH, or is missing, becomes
+    ANYDESK (Get-RemoteChoice), the tool every run installed before this choice existed.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -102,7 +105,9 @@ function New-DefaultChoices {
   $office = ([string]$Config.defaults.office).ToUpperInvariant()
   if ($script:OfficeChoices -notcontains $office) { $office = 'OFF' }
 
-  return @{ Mode = $mode; SevenZip = [bool]$Config.defaults.sevenZip; Office = $office }
+  $remote = Get-RemoteChoice -Choices @{ Remote = [string]$Config.defaults.remote }
+
+  return @{ Mode = $mode; SevenZip = [bool]$Config.defaults.sevenZip; Office = $office; Remote = $remote }
 }
 
 function Update-StartChoices {
@@ -111,8 +116,10 @@ function Update-StartChoices {
     Applies one key press to the choices. Returns @{ Choices; Action; ResetCountdown }.
   .DESCRIPTION
     Key names are [ConsoleKey] names ('L', 'Enter', 'Escape'), matched case-insensitively.
-    L / D set the mode, Z toggles 7-Zip, O cycles Office CRAFT -> BUSINESS -> HOME -> OFF -> CRAFT; each
-    of them resets the countdown. Enter returns Action 'Start', Escape returns 'Cancel'. Any other key (Q1: an
+    L / D set the mode, Z toggles 7-Zip, O cycles Office CRAFT -> BUSINESS -> HOME -> OFF -> CRAFT, R cycles
+    the remote tool ANYDESK -> SCREENCONNECT -> BOTH -> ANYDESK (choices without a valid Remote count as
+    ANYDESK, so R goes to SCREENCONNECT); each of them resets the countdown. Enter returns Action 'Start',
+    Escape returns 'Cancel'. Any other key (Q1: an
     unknown key too) changes nothing but resets the countdown, so a technician who is still reading
     does not get the run started under them. An empty or null key is no key at all. The input table is
     never changed: Choices is a copy.
@@ -137,6 +144,11 @@ function Update-StartChoices {
       $next['Office'] = $script:OfficeChoices[($at + 1) % $script:OfficeChoices.Count]
       $reset = $true
     }
+    'R' {
+      $at = [array]::IndexOf($script:RemoteChoices, (Get-RemoteChoice -Choices $next))
+      $next['Remote'] = $script:RemoteChoices[($at + 1) % $script:RemoteChoices.Count]
+      $reset = $true
+    }
     'Enter'  { $action = 'Start' }
     'Escape' { $action = 'Cancel' }
     default  { if (-not [string]::IsNullOrEmpty($Key)) { $reset = $true } }
@@ -154,6 +166,11 @@ function Format-StartScreen {
     The machine, the new name, then WHAT WILL HAPPEN with the key that changes each choice on the right
     (from StartHelpColumn). -HasDriverTool says whether the brand has a vendor tool (Test-HasDriverTool);
     it only changes the words after the mode.
+
+    The Remote line shows ANYDESK, SCREENCONNECT or ANYDESK + SCREENCONNECT (Get-RemoteChoice: a missing or
+    invalid value reads as ANYDESK). When it includes SCREENCONNECT one reminder line follows it
+    (ScreenConnect spec 4.1): the client gives unattended access, so the customer's OK comes first. It is
+    a reminder only; the countdown runs as usual.
 
     With -IsFresh the last block is the countdown ("Starts by itself in N s" and a bar that empties over
     StartCountdownSeconds); without it the countdown is replaced by the two-line "older than N days" notice
@@ -193,6 +210,12 @@ function Format-StartScreen {
     'HOME'     { 'HOME (Hebrew + English)' }
     default    { ConvertTo-ScreenText $Choices['Office'] }
   }
+  $remote = Get-RemoteChoice -Choices $Choices
+  $remoteText = switch ($remote) {
+    'SCREENCONNECT' { 'SCREENCONNECT' }
+    'BOTH'          { 'ANYDESK + SCREENCONNECT' }
+    default         { 'ANYDESK' }
+  }
 
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add($frame)
@@ -203,7 +226,11 @@ function Format-StartScreen {
   $lines.Add('')
   $lines.Add('   WHAT WILL HAPPEN'.PadRight($helpAt) + 'TO CHANGE IT, PRESS')
   $lines.Add(('   Type     ' + $typeText).PadRight($helpAt) + 'L = laptop   D = desktop')
-  $lines.Add('   Chrome + AnyDesk   always')
+  $lines.Add('   Chrome   always')
+  $lines.Add(('   Remote   ' + $remoteText).PadRight($helpAt) + 'R = anydesk / sc / both')
+  if ($remote -ne 'ANYDESK') {
+    $lines.Add("   ScreenConnect = unattended access: get the customer's OK first")
+  }
   $lines.Add(('   7-Zip    ' + $sevenZipText).PadRight($helpAt) + 'Z = yes / no')
   $lines.Add(('   Office   ' + $officeText).PadRight($helpAt) + 'O = craft / 365 / off')
   $lines.Add('')
@@ -243,18 +270,20 @@ function Get-StartScreenSegments {
     One start-screen row as coloured segments @{ Text; Color } for Write-ConsoleFrame -Colorize. Pure.
   .DESCRIPTION
     On the Type, 7-Zip and Office lines the chosen value (the word from column 12 to the next space) is
-    Green, or DarkGray when it is NO or OFF, so the choices stand out. The battery line and the two
-    not-fresh text lines are one Yellow segment. Every other row is one segment without a Color (the
-    frame's Gray). No segment sets a background: the frame's Black applies. Emitted one by one: wrap the
-    call in @().
+    Green, or DarkGray when it is NO or OFF, so the choices stand out. On the Remote line the whole value
+    is Green, also ANYDESK + SCREENCONNECT (the one choice that is several words). The battery line, the
+    two not-fresh text lines and the ScreenConnect reminder are one Yellow segment. Every other row is
+    one segment without a Color (the frame's Gray). No segment sets a background: the frame's Black
+    applies. Emitted one by one: wrap the call in @().
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
 
-  if ($Line -match '^   (ON BATTERY:|This PC already has user files|press ENTER to run anyway)') {
+  if ($Line -match '^   (ON BATTERY:|This PC already has user files|press ENTER to run anyway|ScreenConnect = unattended access)') {
     return @{ Text = $Line; Color = 'Yellow' }
   }
-  $choice = [regex]::Match($Line, '^(   (?:Type {5}|7-Zip {4}|Office {3}))(\S+)(.*)$')
+  # The value is the first word, or on the Remote line the whole 'ANYDESK + SCREENCONNECT'.
+  $choice = [regex]::Match($Line, '^(   (?:Type {5}|7-Zip {4}|Office {3}|Remote {3}))(\S+(?: \+ \S+)*)(.*)$')
   if (-not $choice.Success) { return @{ Text = $Line; Color = $null } }
 
   $value = $choice.Groups[2].Value

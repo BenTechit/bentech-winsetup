@@ -132,6 +132,13 @@ Describe 'Update-StartChoices' {
     $r = Update-StartChoices -Choices @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT' } -Key 'O'
     $seen = @($r.Choices.Office); foreach ($i in 1..3) { $r = Update-StartChoices -Choices $r.Choices -Key 'o'; $seen += $r.Choices.Office }
     $seen | Should -Be @('BUSINESS', 'HOME', 'OFF', 'CRAFT'); $r.ResetCountdown | Should -BeTrue }
+  It 'R cycles ANYDESK -> SCREENCONNECT -> BOTH -> ANYDESK and resets the countdown' {
+    $r = Update-StartChoices -Choices @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT'; Remote = 'ANYDESK' } -Key 'R'
+    $seen = @($r.Choices.Remote); foreach ($i in 1..2) { $r = Update-StartChoices -Choices $r.Choices -Key 'r'; $seen += $r.Choices.Remote }
+    $seen | Should -Be @('SCREENCONNECT', 'BOTH', 'ANYDESK'); $r.ResetCountdown | Should -BeTrue }
+  It 'R from choices without Remote, or an invalid one, goes to SCREENCONNECT' {
+    (Update-StartChoices -Choices $c -Key 'R').Choices.Remote | Should -Be 'SCREENCONNECT'
+    (Update-StartChoices -Choices @{ Remote = 'TEAMVIEWER' } -Key 'R').Choices.Remote | Should -Be 'SCREENCONNECT' }
   It 'Z toggles and resets the countdown' { $r = Update-StartChoices -Choices $c -Key 'Z'; $r.Choices.SevenZip | Should -BeFalse; $r.ResetCountdown | Should -BeTrue }
   It 'D switches to desktop' { (Update-StartChoices -Choices $c -Key 'D').Choices.Mode | Should -Be 'DESKTOP' }
   It 'Enter starts, Esc cancels, and any other key resets the countdown (Q1)' {
@@ -145,7 +152,7 @@ Describe 'Update-StartChoices' {
     $r.Choices.Mode | Should -Be 'LAPTOP'; $r.ResetCountdown | Should -BeTrue; $r.Action | Should -Be 'None'
   }
   It 'every toggle key resets the countdown, Enter and Escape do not' {
-    foreach ($k in 'L','D','Z','O') { (Update-StartChoices -Choices $c -Key $k).ResetCountdown | Should -BeTrue }
+    foreach ($k in 'L','D','Z','O','R') { (Update-StartChoices -Choices $c -Key $k).ResetCountdown | Should -BeTrue }
     foreach ($k in 'Enter','Escape') { (Update-StartChoices -Choices $c -Key $k).ResetCountdown | Should -BeFalse }
   }
   It 'returns a new table and leaves the input alone' {
@@ -175,6 +182,11 @@ Describe 'New-DefaultChoices' {
   It 'picks DESKTOP for a laptop-looking virtual machine' {
     (New-DefaultChoices -Machine @{ IsLaptop = $true; IsVM = $true } -Config $cfg).Mode | Should -Be 'DESKTOP'
   }
+  It 'opens on ANYDESK; a lower-case default counts, an invalid or missing one is ANYDESK' {
+    (New-DefaultChoices -Machine $m -Config $cfg).Remote | Should -BeExactly 'ANYDESK'
+    foreach ($case in @(@{ V = 'both'; E = 'BOTH' }, @{ V = 'screenconnect'; E = 'SCREENCONNECT' }, @{ V = 'TEAMVIEWER'; E = 'ANYDESK' }, @{ V = $null; E = 'ANYDESK' })) {
+      $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT'; remote = $case.V } }
+      (New-DefaultChoices -Machine $m -Config $x).Remote | Should -BeExactly $case.E } }
   It 'follows the config defaults and falls back to OFF for an unknown Office value' {
     $off = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $false; office = 'home' } }
     $r = New-DefaultChoices -Machine $m -Config $off
@@ -194,13 +206,22 @@ Describe 'Format-StartScreen (v2)' {
     $l | Should -Contain '   New PC name: DELL-7HX2K93'
     $l | Should -Contain ('   WHAT WILL HAPPEN'.PadRight(53) + 'TO CHANGE IT, PRESS')
     $l | Should -Contain ('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop')
-    $l | Should -Contain '   Chrome + AnyDesk   always'
+    $l | Should -Contain '   Chrome   always'
+    $l | Should -Contain ('   Remote   ANYDESK'.PadRight(53) + 'R = anydesk / sc / both')
+    ($l -join "`n") | Should -Not -Match 'unattended'
     $l | Should -Contain ('   7-Zip    YES'.PadRight(53) + 'Z = yes / no')
     $l | Should -Contain ('   Office   BUSINESS (Hebrew + English)'.PadRight(53) + 'O = craft / 365 / off')
     $l | Should -Contain ('   Starts by itself in 25 s   ' + ('#' * 17) + ('.' * 3))
     $l | Should -Contain '   ENTER = start now           ESC = cancel, change nothing'
     @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0
   }
+  It 'shows <Text>, then the reminder, between Chrome and 7-Zip' -ForEach @(@{ Remote = 'SCREENCONNECT'; Text = 'SCREENCONNECT' }, @{ Remote = 'BOTH'; Text = 'ANYDESK + SCREENCONNECT' }) {
+    $l = @(F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT'; Remote = $Remote })
+    $at = [array]::IndexOf($l, (('   Remote   ' + $Text).PadRight(53) + 'R = anydesk / sc / both'))
+    $at | Should -BeGreaterThan 0; $l[$at - 1] | Should -BeExactly '   Chrome   always'
+    $l[$at + 1] | Should -BeExactly "   ScreenConnect = unattended access: get the customer's OK first"
+    $l[$at + 2] | Should -BeLike '   7-Zip    *'
+    @($l | Where-Object { $_.Length -gt 79 }).Count | Should -Be 0 }
   It 'shows the CRAFT line and still fits 79 columns' {
     $l = F @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT' }
     $l | Should -Contain ('   Office   CRAFT (free Word/Excel/PowerPoint/PDF)'.PadRight(53) + 'O = craft / 365 / off')
@@ -257,7 +278,7 @@ Describe 'start screen colours' {
     $s = @(Get-StartScreenSegments -Line ('   Office   CRAFT (free Word/Excel/PowerPoint/PDF)'.PadRight(53) + 'O = craft / 365 / off'))
     $s[1].Text | Should -Be 'CRAFT'; $s[1].Color | Should -Be 'Green' }
   It 'the segments of a line add up to the line, and the labels stay uncoloured' {
-    foreach ($line in @(('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop'), ('   7-Zip    NO'.PadRight(53) + 'Z = yes / no'), '   Chrome + AnyDesk   always', '')) {
+    foreach ($line in @(('   Type     LAPTOP (driver tool + laptop app)'.PadRight(53) + 'L = laptop   D = desktop'), ('   7-Zip    NO'.PadRight(53) + 'Z = yes / no'), '   Chrome   always', '')) {
       (@(Get-StartScreenSegments -Line $line) | ForEach-Object { $_.Text }) -join '' | Should -Be $line
     }
     $type = @(Get-StartScreenSegments -Line ('   Type     DESKTOP (no laptop app)'.PadRight(53) + 'L = laptop   D = desktop'))
@@ -270,10 +291,16 @@ Describe 'start screen colours' {
     foreach ($line in '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', '   This PC already has user files or is older than 14 days -', '   press ENTER to run anyway') {
       $s = @(Get-StartScreenSegments -Line $line); $s.Count | Should -Be 1; $s[0].Color | Should -Be 'Yellow'; $s[0].Text | Should -Be $line
     }
-    foreach ($line in '   Chrome + AnyDesk   always', '   WHAT WILL HAPPEN', '   ESC = cancel, change nothing', '   Starts by itself in 30 s   ####', '') {
+    foreach ($line in '   Chrome   always', '   WHAT WILL HAPPEN', '   ESC = cancel, change nothing', '   Starts by itself in 30 s   ####', '') {
       $s = @(Get-StartScreenSegments -Line $line); $s.Count | Should -Be 1; $s[0].Color | Should -BeNullOrEmpty; $s[0].Text | Should -Be $line
     }
   }
+  It 'the whole Remote value is green; the reminder is one yellow segment' {
+    $line = '   Remote   ANYDESK + SCREENCONNECT'.PadRight(53) + 'R = anydesk / sc / both'
+    $s = @(Get-StartScreenSegments -Line $line)
+    $s[0].Text | Should -Be '   Remote   '; $s[1].Text | Should -Be 'ANYDESK + SCREENCONNECT'; $s[1].Color | Should -Be 'Green'; $s[2].Color | Should -BeNullOrEmpty
+    (@($s | ForEach-Object { $_.Text }) -join '') | Should -Be $line
+    $y = @(Get-StartScreenSegments -Line "   ScreenConnect = unattended access: get the customer's OK first"); $y.Count | Should -Be 1; $y[0].Color | Should -Be 'Yellow' }
 }
 
 Describe 'Show-StartScreen' {
@@ -350,6 +377,11 @@ Describe 'Show-StartScreen' {
     $r | Should -BeNullOrEmpty
     Get-ElapsedSeconds | Should -BeGreaterOrEqual 40
   }
+  It 'R picks ScreenConnect, shows the reminder and restarts the countdown' {
+    $script:rSent = $false
+    $r = Invoke-StartScreen -KeyAt { param($s) if (-not $script:rSent -and $s -ge 4) { $script:rSent = $true; 'R' } }
+    $r.Remote | Should -Be 'SCREENCONNECT'; Get-ElapsedSeconds | Should -BeGreaterOrEqual 34
+    $screens[0] | Should -Not -Match 'unattended access'; @($screens | Where-Object { $_ -match 'unattended access' }).Count | Should -BeGreaterThan 0 }
   It 'the L, D and O toggles change the returned choices' {
     $script:sent = New-Object System.Collections.Queue
     foreach ($k in 'D','O','O','L') { $script:sent.Enqueue($k) }
@@ -415,7 +447,7 @@ Describe 'Show-StartScreen' {
     $screens.Count | Should -Be 30
   }
   It 'Write-StartScreenLines draws through the writer: one clear on Black, the value green, the warnings yellow, nothing else coloured' {
-    Write-StartScreenLines -Writer $writer -Lines @(('   7-Zip    YES'.PadRight(53) + 'Z = yes / no'), '', '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', '   press ENTER to run anyway', '   Chrome + AnyDesk   always')
+    Write-StartScreenLines -Writer $writer -Lines @(('   7-Zip    YES'.PadRight(53) + 'Z = yes / no'), '', '   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.', '   press ENTER to run anyway', '   Chrome   always', "   ScreenConnect = unattended access: get the customer's OK first")
     @($fw.Calls | Where-Object { $_ -eq 'clear' }).Count | Should -Be 1
     $fw.ClearBack | Should -Be 'Black'
     $w = @($fw.Calls | Where-Object { $_ -is [hashtable] })
@@ -423,7 +455,8 @@ Describe 'Show-StartScreen' {
     @($w | Where-Object { $_.T -eq 'YES' })[0].C | Should -Be 'Green'
     @($w | Where-Object { $_.T -like '   ON BATTERY*' })[0].C | Should -Be 'Yellow'
     @($w | Where-Object { $_.T -like '   press ENTER*' })[0].C | Should -Be 'Yellow'
-    @($w | Where-Object { $_.T -like '   Chrome + AnyDesk*' })[0].C | Should -Be 'Gray'
+    @($w | Where-Object { $_.T -like '   Chrome   always*' })[0].C | Should -Be 'Gray'   # the row is padded to the window width, hence the *
+    @($w | Where-Object { $_.T -like '   ScreenConnect =*' })[0].C | Should -Be 'Yellow'
     @($w | Where-Object { $_.T -like '   7-Zip    ' })[0].C | Should -Be 'Gray'
   }
   It 'Write-StartScreenLines never uses Write-Host or Clear-Host, and does not clear again for the same window size' {

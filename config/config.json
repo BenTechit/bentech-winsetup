@@ -1,16 +1,17 @@
 {
   "schemaVersion": 1,
-  "defaults": { "sevenZip": true, "office": "CRAFT" },
+  "defaults": { "sevenZip": true, "office": "CRAFT", "remote": "ANYDESK" },
   "caps": { "maxReboots": 12, "maxWuRounds": 6, "maxStepAttempts": 3, "wuFailuresBeforeHide": 2 },
   "timeoutsMinutes": { "default": 30, "msi": 20, "office": 60, "vendor": 60, "wuRound": 90,
-                       "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2 },
+                       "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2,
+                       "screenconnect": 10, "screenconnectService": 3 },
   "power": { "finalAcMonitorMinutes": 15 },
   "windowsUpdate": { "installMode": "OneAtATime" },
   "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },
   "signers": {
     "google": ["Google LLC"], "anydesk": ["AnyDesk Software GmbH"], "microsoft": ["Microsoft Corporation"],
     "dell": ["Dell Inc", "Dell Technologies"], "lenovo": ["Lenovo"], "hp": ["HP Inc"],
-    "craft": ["Learning Machines Inc"]
+    "craft": ["Learning Machines Inc"], "connectwise": ["\"ConnectWise, LLC\""]
   },
   "winget": { "bundleUrl": "https://aka.ms/getwinget" },
   "apps": {
@@ -19,6 +20,11 @@
       "ARM64": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi" } },
     "anydesk": { "signer": "anydesk", "url": "https://download.anydesk.com/AnyDesk.exe",
                  "installDir": "C:\\Program Files (x86)\\AnyDesk" },
+    "screenconnect": {
+      "signer": "connectwise",
+      "url": "https://github.com/BenTechit/bentech-winsetup/releases/download/v{version}/ScreenConnect.ClientSetup.exe",
+      "sha256": "74E058E0F597CF197132775552FBB6F4BDD21F8A0870E1A638D41A63F7C3FD99",
+      "serviceName": "ScreenConnect Client (b58e7c32699a96bf)" },
     "sevenZip": { "wingetId": "7zip.7zip" },
     "office": {
       "signer": "microsoft", "odtWingetId": "Microsoft.OfficeDeploymentTool",

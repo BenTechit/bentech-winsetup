@@ -54,6 +54,22 @@ Describe 'Test-HasDriverTool' {
     foreach ($mach in @{ Brand = 'VM' }, @{ Brand = 'OTHER' }, @{ Brand = '' }, @{ }) { Test-HasDriverTool -Machine $mach | Should -BeFalse }
   }
 }
+Describe 'Get-RemoteChoice (screenconnect spec 4.1)' {
+  It '<Why> is <Expected>' -ForEach @(
+    @{ Why = 'ANYDESK';                Choices = @{ Remote = 'ANYDESK' };       Expected = 'ANYDESK' }
+    @{ Why = 'SCREENCONNECT';          Choices = @{ Remote = 'SCREENCONNECT' }; Expected = 'SCREENCONNECT' }
+    @{ Why = 'BOTH';                   Choices = @{ Remote = 'BOTH' };          Expected = 'BOTH' }
+    @{ Why = 'a lower-case both';      Choices = @{ Remote = 'both' };          Expected = 'BOTH' }
+    @{ Why = 'choices without Remote'; Choices = @{ Mode = 'LAPTOP' };          Expected = 'ANYDESK' }
+    @{ Why = 'an empty Remote';        Choices = @{ Remote = '' };              Expected = 'ANYDESK' }
+    @{ Why = 'an unknown Remote';      Choices = @{ Remote = 'TEAMVIEWER' };    Expected = 'ANYDESK' }
+    @{ Why = 'no choices at all';      Choices = $null;                         Expected = 'ANYDESK' }
+  ) { Get-RemoteChoice -Choices $Choices | Should -BeExactly $Expected }
+  It 'a state.json from an older version (no Remote) reads as ANYDESK (Review Focus 1)' {
+    $old = ConvertTo-HashtableDeep -InputObject ('{"Choices":{"Mode":"LAPTOP","SevenZip":true,"Office":"CRAFT"}}' | ConvertFrom-Json)
+    Get-RemoteChoice -Choices $old.Choices | Should -BeExactly 'ANYDESK'
+  }
+}
 Describe 'Get-StepPlan' {
   It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,default-browser,vendor-pass1,office,windows-update,office-finish,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
   It 'Dell desktop: vendor passes, no consumer app, no cleanup' { $p = P DELL DESKTOP; $p | Should -Contain 'vendor-pass1'; $p | Should -Not -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-cleanup' }

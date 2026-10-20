@@ -45,6 +45,32 @@ $script:StepCatalog = @(
 # tool runs for drivers + BIOS, and whose pre-installed business updater is removed on laptops.
 $script:BusinessUpdaterBrands = @('DELL', 'LENOVO', 'HP')
 
+# The remote-access choices (ScreenConnect spec 4.1), in the order the R key cycles them. ANYDESK is the
+# default and what a missing or invalid value means.
+$script:RemoteChoices = @('ANYDESK', 'SCREENCONNECT', 'BOTH')
+
+function Get-RemoteChoice {
+  <#
+  .SYNOPSIS
+    The remote-access choice in a Choices table: ANYDESK, SCREENCONNECT or BOTH. Never anything else.
+  .DESCRIPTION
+    Missing, empty, unknown or null all mean ANYDESK, which is what a run started by a version without
+    this choice did (ScreenConnect spec 4.1). The value is matched case-insensitively and returned in
+    upper case. Every reader (the start screen, the plan, the final screen and the report) decides
+    through this function, never from the plan list, so they cannot disagree. AnyDesk is wanted when the
+    result is not SCREENCONNECT; ScreenConnect when it is not ANYDESK. Never throws.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()]$Choices)
+
+  if ($Choices -is [System.Collections.IDictionary] -and $Choices.Contains('Remote')) {
+    $value = ([string]$Choices['Remote']).ToUpperInvariant()
+    if ($script:RemoteChoices -contains $value) { return $value }
+  }
+  return 'ANYDESK'
+}
+
 function Test-HasConsumerApp {
   # True when config.vendors has an entry for this brand and that entry has a consumerApp.
   # Uses PSObject.Properties so a missing brand or a missing consumerApp is $false, not an error

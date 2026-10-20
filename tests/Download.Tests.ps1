@@ -445,4 +445,20 @@ Describe 'Test-FileSignature' {
       $log | Should -Match '\[WARN\]'; $log | Should -Match '"commonName":\s*"Learning Machines Incorporated"'
     }
   }
+
+  Context 'the real ScreenConnect subject (screenconnect spec 4.3, Review Focus 2)' {
+    BeforeAll {
+      . "$PSScriptRoot\..\src\Common\Config.ps1"
+      $script:scSigners = @(Get-Signers -Config (Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json") -Key 'connectwise')
+      $script:scSubject = 'CN="ConnectWise, LLC", O="ConnectWise, LLC", L=Tampa, S=Florida, C=US'
+      function Use-ScSignature([string]$Status) {
+        $script:fake = [pscustomobject]@{ Status = [Management.Automation.SignatureStatus]$Status; SignerCertificate = [pscustomobject]@{ Subject = $script:scSubject } }
+        Mock Get-AuthenticodeSignature { $script:fake } }
+    }
+    It 'the quoted config entry accepts the real subject' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners $scSigners | Should -BeTrue }
+    It 'an entry without the quotes would refuse it' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners @('ConnectWise, LLC') | Should -BeFalse }
+    It '-ExactCN refuses the quoted subject, so the step does not use it' { Use-ScSignature 'Valid'; Test-FileSignature -Path $ps -AllowedSigners $scSigners -ExactCN | Should -BeFalse }
+    It 'refuses status <_> (an expired installer is not Valid)' -ForEach 'UnknownError', 'NotTrusted', 'HashMismatch', 'NotSigned' {
+      Use-ScSignature $_; Test-FileSignature -Path $ps -AllowedSigners $scSigners | Should -BeFalse }
+  }
 }
