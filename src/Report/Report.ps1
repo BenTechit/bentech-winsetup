@@ -3,8 +3,10 @@
 # and R on the final screen opens it. Format-SetupReport is pure. Get-ActivationStatus,
 # Get-SmartAppControlState and Get-InstalledAppVersions are the read-only collectors it needs; Finalize
 # calls them. Get-InstalledAppVersions also reports the Craft apps (apps.craft.items of the config it is
-# given) and reads the per-user Uninstall view, where the ArtCraft Launcher registers.
-# Needs Catalog.ps1 + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
+# given) and reads the per-user Uninstall view, where the ArtCraft Launcher registers. With the same
+# Config it reports ScreenConnect by apps.screenconnect.serviceName, and Format-SetupReport shows the
+# remote tools (AnyDesk ID, ScreenConnect) by Choices.Remote.
+# Needs Catalog.ps1 + Verdict.ps1 (Get-StepTitle, Get-RemoteChoice), StartScreen.ps1 (ConvertTo-ScreenText,
 # ConvertFrom-StateTime, Format-HoursMinutes), DefaultBrowser.ps1 (Read-RegistryStringValue),
 # Office.ps1 ($script:OfficeReleaseKey) and Logging.ps1; the bundle holds every file.
 #
@@ -104,6 +106,10 @@ function Get-InstalledAppVersions {
     With Config, the Craft apps too: each item of apps.craft.items is reported under its name, from the
     first Uninstall entry that has a version and whose DisplayName matches (-match, case-insensitive) the
     item's displayName regex. Without Config, or without apps.craft in it, no Craft app is reported.
+
+    With Config, ScreenConnect too: the first Uninstall entry that has a version and whose DisplayName
+    equals (case-insensitive, not a pattern) apps.screenconnect.serviceName. Without Config, or without
+    that name in it, no ScreenConnect is reported.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -111,6 +117,12 @@ function Get-InstalledAppVersions {
 
   $craftItems = @()
   if ($null -ne $Config) { $craftItems = @($Config.apps.craft.items | Where-Object { $null -ne $_ -and -not [string]::IsNullOrEmpty([string]$_.name) -and -not [string]::IsNullOrEmpty([string]$_.displayName) }) }
+
+  # ScreenConnect registers its product under the same name as its service (spec 3), with a suffix that
+  # belongs to Ben's instance: the name comes from apps.screenconnect.serviceName, so a new suffix is one
+  # config edit (spec 4.5). Without Config no ScreenConnect is reported.
+  $screenConnectName = ''
+  if ($null -ne $Config) { $screenConnectName = [string]$Config.apps.screenconnect.serviceName }
 
   $versions = @{}
   foreach ($key in $script:UninstallRegistryKeys) {
@@ -131,6 +143,9 @@ function Get-InstalledAppVersions {
           if (-not $versions.ContainsKey([string]$item.name) -and [string]$nameProperty.Value -match [string]$item.displayName) {
             $versions[[string]$item.name] = $version
           }
+        }
+        if ($screenConnectName -ne '' -and -not $versions.ContainsKey('ScreenConnect') -and [string]$nameProperty.Value -eq $screenConnectName) {
+          $versions['ScreenConnect'] = $version
         }
       }
     } catch {
@@ -181,7 +196,12 @@ function Format-SetupReport {
       Tool version / Result (the verdict banner) / Started / Finished / Duration (h:mm) / Machine /
       PC name (old -> new) / Mode (chosen, and detected LAPTOP|DESKTOP|VM) / Windows / Activation /
       BitLocker / Smart App Control (Off|On|Evaluation|Unknown; -SmartAppControl, 'Unknown' when not
-      given) / AnyDesk ID ('not available' when there is none)
+      given) / AnyDesk ID ('not available' when there is none; 'not chosen' when Choices.Remote is
+      SCREENCONNECT) / ScreenConnect
+    Choices.Remote is read with Get-RemoteChoice (a missing or invalid one is ANYDESK; ScreenConnect spec
+    4.1). The ScreenConnect line reads 'not chosen' (ANYDESK), 'installed (service running)' (the
+    screenconnect step is Done and its Data.Service is Running), 'installed (service not running)' (Done
+    with any other service state) or 'not installed' (the step failed or has no entry).
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, failed repeatedly (left to Windows Update):
@@ -216,8 +236,21 @@ function Format-SetupReport {
   $ended = ConvertFrom-StateTime $State['EndedAt']
   $duration = if ($null -ne $started -and $null -ne $ended) { Format-HoursMinutes ($ended - $started) } else { 'unknown' }
   $detected = if ($machine['IsVM'] -eq $true) { 'VM' } elseif ($machine['IsLaptop'] -eq $true) { 'LAPTOP' } else { 'DESKTOP' }
+  # ScreenConnect spec 4.1: Choices.Remote decides (a missing or invalid one is ANYDESK), never the plan list.
+  $remote = Get-RemoteChoice -Choices $choices
   $anyDesk = ConvertTo-ScreenText $State['AnyDeskId']
   if ($anyDesk -eq '') { $anyDesk = 'not available' }
+  if ($remote -eq 'SCREENCONNECT') { $anyDesk = 'not chosen' }
+
+  $screenConnect = 'not chosen'
+  if ($remote -ne 'ANYDESK') {
+    $screenConnect = 'not installed'
+    $scStep = $steps['screenconnect']
+    if ($scStep -is [System.Collections.IDictionary] -and [string]$scStep['Status'] -eq 'Done') {
+      $scData = if ($scStep['Data'] -is [System.Collections.IDictionary]) { $scStep['Data'] } else { @{} }
+      $screenConnect = if ([string]$scData['Service'] -eq 'Running') { 'installed (service running)' } else { 'installed (service not running)' }
+    }
+  }
 
   $lines = New-Object 'System.Collections.Generic.List[string]'
   $lines.Add('BenTech Windows Setup - Report')
@@ -236,6 +269,7 @@ function Format-SetupReport {
   if ($smartAppControlText -eq '') { $smartAppControlText = 'Unknown' }
   $lines.Add('Smart App Control : ' + $smartAppControlText)
   $lines.Add('AnyDesk ID   : ' + $anyDesk)
+  $lines.Add('ScreenConnect: ' + $screenConnect)
 
   $lines.Add('')
   $lines.Add('Apps:')

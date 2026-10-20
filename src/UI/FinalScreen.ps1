@@ -1,15 +1,17 @@
 ﻿# src/UI/FinalScreen.ps1
 # The final screen (spec 8.6): the whole console turns green, yellow or red, the AnyDesk ID is shown
-# in big digits (Ben reads it from across the room) and the screen waits for a key. Every colour is
-# named outright, foreground and background (spec 9.1): the powershell.exe console profile remaps
-# DarkYellow to near white, so a YELLOW screen of white text on DarkYellow could not be read.
+# in big digits (Ben reads it from across the room; left out when AnyDesk was not chosen, and the New
+# name line then carries the ScreenConnect status, ScreenConnect spec 4.4) and the screen waits for a
+# key. Every colour is named outright, foreground and background (spec 9.1): the powershell.exe console
+# profile remaps DarkYellow to near white, so a YELLOW screen of white text on DarkYellow could not be
+# read.
 #
 # Format-BigDigits and Format-FinalScreen are pure. Show-FinalScreen reaches the console, the keyboard,
 # the clock, the USB stick and the launcher only through injectable script blocks with production
 # defaults, so the tests drive it with a scripted key sequence and a fake clock. Uses ConvertTo-ScreenText,
 # Limit-ScreenLine, ConvertFrom-StateTime and Format-HoursMinutes from StartScreen.ps1, the console frame
-# writer from ConsoleFrame.ps1, Find-SetupStick and Format-StickLine from Entry\Cleanup.ps1, and the
-# default-browser helpers from DefaultBrowser.ps1 and Apps.ps1.
+# writer from ConsoleFrame.ps1, Find-SetupStick and Format-StickLine from Entry\Cleanup.ps1, the
+# default-browser helpers from DefaultBrowser.ps1 and Apps.ps1, and Get-RemoteChoice from Catalog.ps1.
 
 $script:FinalScreenWidth = 80
 # Triage 240, v2 spec 10: with both lists over their caps, the Chrome hint, the USB stick line and a
@@ -114,6 +116,13 @@ function Format-FinalScreen {
     The total time runs from State.StartedAt to State.EndedAt, or to -Now while the run has no end
     time. At most 3 failures and 2 notes are listed (then "... and N more"), and each is cut to 79
     columns, so the worst case is 29 lines (a 30-row window less the row the frame writer keeps free).
+
+    The remote tool comes from State.Choices through Get-RemoteChoice (a missing or invalid Remote is
+    ANYDESK, so a state without Choices still shows the ID; ScreenConnect spec 4.1), never from the plan.
+    Unless it is ANYDESK, the New name line ends with '     ScreenConnect: installed' (the screenconnect
+    step is Done) or '     ScreenConnect: NOT installed' (it failed, or State.Steps has no entry for it).
+    With SCREENCONNECT alone the AnyDesk ID lines (and the blank line after them) are left out. The
+    status sits on an existing line, so the 29-line worst case does not change.
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -139,17 +148,30 @@ function Format-FinalScreen {
   $lines.Add($frame)
   $lines.Add('')
   $lines.Add(('  Machine  : {0}  {1}        SN: {2}' -f (ConvertTo-ScreenText $machine['Manufacturer']), (ConvertTo-ScreenText $machine['FriendlyModel']), (ConvertTo-ScreenText $machine['Serial'])))
-  $lines.Add('  New name : ' + (ConvertTo-ScreenText $machine['NewName']))
+  # ScreenConnect spec 4.1: Choices.Remote decides (a missing or invalid one is ANYDESK), never the plan list.
+  $remote = Get-RemoteChoice -Choices $State['Choices']
+  $newNameLine = '  New name : ' + (ConvertTo-ScreenText $machine['NewName'])
+  if ($remote -ne 'ANYDESK') {
+    # The status sits on this existing line: the screen is already at its 29-line limit with every list full.
+    $steps = if ($State['Steps'] -is [System.Collections.IDictionary]) { $State['Steps'] } else { @{} }
+    $sc = $steps['screenconnect']
+    $installed = ($sc -is [System.Collections.IDictionary]) -and ([string]$sc['Status'] -eq 'Done')
+    $newNameLine += '     ScreenConnect: ' + $(if ($installed) { 'installed' } else { 'NOT installed' })
+  }
+  $lines.Add($newNameLine)
   $lines.Add('')
 
-  $groups = ConvertTo-DigitGroups ([string]$State['AnyDeskId'])
-  if ($groups -eq '') {
-    $lines.Add('  AnyDesk ID: not available')
-  } else {
-    $lines.Add('  AnyDesk ID:')
-    foreach ($row in (Format-BigDigits -Text $groups)) { $lines.Add('    ' + $row) }
+  # With ScreenConnect alone there is no AnyDesk line at all (spec 4.4).
+  if ($remote -ne 'SCREENCONNECT') {
+    $groups = ConvertTo-DigitGroups ([string]$State['AnyDeskId'])
+    if ($groups -eq '') {
+      $lines.Add('  AnyDesk ID: not available')
+    } else {
+      $lines.Add('  AnyDesk ID:')
+      foreach ($row in (Format-BigDigits -Text $groups)) { $lines.Add('    ' + $row) }
+    }
+    $lines.Add('')
   }
-  $lines.Add('')
 
   $started = ConvertFrom-StateTime $State['StartedAt']
   $ended = ConvertFrom-StateTime $State['EndedAt']

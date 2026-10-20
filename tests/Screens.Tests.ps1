@@ -888,6 +888,29 @@ Describe 'Format-FinalScreen' {
     ($l -join "`n") -match '[^\x20-\x7E\r\n]' | Should -BeFalse
     $l | Should -Contain '  X  BitLocker: ??'
   }
+
+  # ScreenConnect spec 4.1 and 4.4: the state's Choices.Remote decides (Get-RemoteChoice), never the plan list.
+  It 'SCREENCONNECT alone: no AnyDesk line at all, the status on the New name line' {
+    $st = New-FinalState; $st.Choices = @{ Remote = 'SCREENCONNECT' }; $st.Steps = @{ screenconnect = @{ Status = 'Done' } }
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+    $l | Should -Contain '  New name : DELL-7HX2K93     ScreenConnect: installed'
+    @($l | Where-Object { $_ -match 'AnyDesk|#' }).Count | Should -Be 0
+    $with = @(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+    $l.Count | Should -Be ($with.Count - 7)   # 'AnyDesk ID:', 5 digit rows and the blank after them
+  }
+  It 'NOT installed when the step failed or never ran' -ForEach @(@{ Steps = @{ screenconnect = @{ Status = 'Failed' } } }, @{ Steps = @{} }, @{ Steps = $null }) {
+    $st = New-FinalState; $st.Choices = @{ Remote = 'SCREENCONNECT' }; $st.Steps = $Steps
+    Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true | Should -Contain '  New name : DELL-7HX2K93     ScreenConnect: NOT installed'
+  }
+  It 'BOTH: the AnyDesk ID and the status; the worst case still fits 29 lines' {
+    $st = New-FinalState; $st.AnyDeskId = '1234567890'; $st.Choices = @{ Remote = 'BOTH' }; $st.Steps = @{ screenconnect = @{ Status = 'Done' } }
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | % { "Failure $_" }) -Notes @(1..20 | % { "Note $_" })) -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false -StickLine '  No BenTech USB stick - plug it in now to keep the logs')
+    $l.Count | Should -BeLessOrEqual 29; $l | Should -Contain '  AnyDesk ID:'; $l | Should -Contain '  New name : DELL-7HX2K93     ScreenConnect: installed'
+  }
+  It 'ANYDESK, choices without Remote and an invalid Remote: the ID and no status (Review Focus 1)' -ForEach @(@{ Choices = @{ Remote = 'ANYDESK' } }, @{ Choices = @{ Mode = 'LAPTOP' } }, @{ Choices = @{ Remote = 'TEAMVIEWER' } }) {
+    $st = New-FinalState; $st.Choices = $Choices; $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+    $l | Should -Contain '  New name : DELL-7HX2K93'; $l | Should -Contain '  AnyDesk ID:'; ($l -join "`n") | Should -Not -Match 'ScreenConnect'
+  }
 }
 
 Describe 'Show-FinalScreen' {

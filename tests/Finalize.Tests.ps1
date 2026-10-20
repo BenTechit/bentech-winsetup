@@ -195,6 +195,21 @@ Describe 'Format-SetupReport' {
   It 'has the version and result' { $l | Should -Contain 'Tool version : 2026.10.18.1'; $l | Should -Contain 'Result       : SETUP COMPLETE' }
 }
 
+Describe 'Format-SetupReport: remote tools (screenconnect spec 4.4)' {
+  # Not "R": PowerShell's built-in alias r (Invoke-History) wins over a function of that name.
+  BeforeAll { function Get-RemoteReport([hashtable]$Choices, $Step) {
+      $s = New-RunState -Machine $script:fm -Choices $Choices -Plan @('chrome') -Version '2026.10.20.1'; $s.AnyDeskId = '123456789'
+      if ($Step) { $s.Steps['screenconnect'] = $Step }
+      @(Format-SetupReport -State $s -Verdict (Get-RunVerdict -State $s) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{}) } }
+  It '<Why>' -ForEach @(
+    @{ Why = 'no Remote: AnyDesk only (Review Focus 1)'; Choices = @{ Mode = 'LAPTOP' }; Step = $null; AnyDesk = 'AnyDesk ID   : 123456789'; Sc = 'ScreenConnect: not chosen' }
+    @{ Why = 'SCREENCONNECT, service running'; Choices = @{ Remote = 'SCREENCONNECT' }; Step = @{ Status = 'Done'; Message = 'ScreenConnect installed'; Data = @{ Service = 'Running' } }; AnyDesk = 'AnyDesk ID   : not chosen'; Sc = 'ScreenConnect: installed (service running)' }
+    @{ Why = 'BOTH, service not running'; Choices = @{ Remote = 'BOTH' }; Step = @{ Status = 'Done'; Message = 'ScreenConnect installed'; Data = @{ Service = 'NotRunning' } }; AnyDesk = 'AnyDesk ID   : 123456789'; Sc = 'ScreenConnect: installed (service not running)' }
+    @{ Why = 'SCREENCONNECT, step failed'; Choices = @{ Remote = 'SCREENCONNECT' }; Step = @{ Status = 'Failed'; Message = 'ScreenConnect installer check failed'; Data = @{} }; AnyDesk = 'AnyDesk ID   : not chosen'; Sc = 'ScreenConnect: not installed' }
+    @{ Why = 'SCREENCONNECT, step never recorded'; Choices = @{ Remote = 'SCREENCONNECT' }; Step = $null; AnyDesk = 'AnyDesk ID   : not chosen'; Sc = 'ScreenConnect: not installed' }
+  ) { $l = Get-RemoteReport $Choices $Step; $l | Should -Contain $AnyDesk; [array]::IndexOf($l, $Sc) | Should -Be ([array]::IndexOf($l, $AnyDesk) + 1) }
+}
+
 Describe 'Format-SetupReport content' {
   BeforeAll {
     $script:green = @(Format-SetupReport -State $st -Verdict (Get-RunVerdict -State $st) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{ 'Google Chrome' = '155.0.8059.85' })
@@ -216,8 +231,9 @@ Describe 'Format-SetupReport content' {
   }
   It 'starts with the title and lists the header lines in order' {
     $expected = 'BenTech Windows Setup - Report', 'Tool version : ', 'Result       : ', 'Started      : ', 'Finished     : ', 'Duration     : ',
-      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : '
+      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : ', 'ScreenConnect: '
     for ($i = 0; $i -lt $expected.Count; $i++) { $green[$i] | Should -BeLike ($expected[$i] + '*') }
+    $green | Should -Contain 'ScreenConnect: not chosen'   # the state has Choices without Remote: AnyDesk only (spec 4.1)
   }
   It 'shows Smart App Control as given, and Unknown when it was not passed (M8)' {
     $green | Should -Contain 'Smart App Control : Unknown'
@@ -535,6 +551,15 @@ Describe 'Get-InstalledAppVersions' {
   It 'without the config it reports no Craft app' {
     Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'WordCraft'; DisplayVersion = '0.8.0' } } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
     (Get-InstalledAppVersions).ContainsKey('WordCraft') | Should -BeFalse
+  }
+  It 'with the config it reports ScreenConnect by the exact name of Ben''s client' {
+    $scCfg = '{"apps":{"screenconnect":{"serviceName":"ScreenConnect Client (b58e7c32699a96bf)"}}}' | ConvertFrom-Json
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'ScreenConnect Client (0123456789abcdef)'; DisplayVersion = '25.1.0.1' }
+      [pscustomobject]@{ DisplayName = 'ScreenConnect Client (b58e7c32699a96bf)'; DisplayVersion = '26.6.6.9747' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall32 }
+    (Get-InstalledAppVersions -Config $scCfg)['ScreenConnect'] | Should -Be '26.6.6.9747'
+    (Get-InstalledAppVersions).ContainsKey('ScreenConnect') | Should -BeFalse
   }
 }
 
