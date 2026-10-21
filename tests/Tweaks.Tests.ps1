@@ -40,6 +40,7 @@ BeforeAll {
   #   $script:reg            '<path>|<name>' -> @{ Value; Kind }, seeded with the fresh-install accessibility Flags
   #   $script:writes         one @{ Fn; Path; Name; Value } per Set-RegistryDword / Set-RegistryString call
   #   $script:refuse / $script:throwOn / $script:readBackWrong   value names the writers refuse, throw on, or store wrong
+  #   $script:unreadable     '<path>|<name>' entries Get-RegistryValue cannot read (Failed, as on access denied)
   #   $script:protection     what Test-AdminProtection answers (default Off)
   #   $script:activity / $script:logs   Add-SetupActivity texts / Write-SetupLog calls (@{ Message; Level; Data })
   function Initialize-TweakMocks {
@@ -49,12 +50,13 @@ BeforeAll {
       'HKCU:\Control Panel\Accessibility\Keyboard Response|Flags' = @{ Value = '126'; Kind = 'String' }
     }
     $script:writes = New-Object System.Collections.ArrayList
-    $script:refuse = @(); $script:throwOn = @(); $script:readBackWrong = @()
+    $script:refuse = @(); $script:throwOn = @(); $script:readBackWrong = @(); $script:unreadable = @()
     $script:protection = 'Off'
     $script:activity = New-Object System.Collections.ArrayList
     $script:logs = New-Object System.Collections.ArrayList
 
     Mock Get-RegistryValue {
+      if ($script:unreadable -contains "$Path|$Name") { return @{ Exists = $false; Value = $null; Kind = ''; Failed = $true } }
       $e = $script:reg["$Path|$Name"]
       if ($null -eq $e) { @{ Exists = $false; Value = $null; Kind = '' } } else { @{ Exists = $true; Value = $e.Value; Kind = $e.Kind } } }
     Mock Set-RegistryDword { Add-FakeWrite 'Set-RegistryDword' 'DWord' $Path $Name $Value }
@@ -182,6 +184,23 @@ Describe 'Invoke-StepTweaks (toolbox spec 5.3)' {
     $lines = @($script:logs | Where-Object { $_.Message -eq 'Tweak value' })   # catalog order: numLock (two values) before fileExtensions
     $lines.Count | Should -Be 3; @($lines.Data.result) | Should -Be @('applied', 'applied', 'unchanged'); $lines[0].Data.original | Should -Be 'absent'
     (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'a DWord whose original cannot be read is never written: refused, the Note, logged as unreadable (TB-R4)' {
+    $script:unreadable = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideFileExt')
+    $r = Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('fileExtensions'))
+    Should -Invoke Set-RegistryDword -Times 0 -Exactly; Should -Invoke Set-RegistryString -Times 0 -Exactly; @($script:writes).Count | Should -Be 0
+    $r.Status | Should -Be 'Done'; $r.Message | Should -BeExactly '0 tweaks applied'
+    @($r.Data.Refused) | Should -Be @('fileExtensions'); @($r.Notes) | Should -Be @('Show file extensions could not be applied')
+    $line = @($script:logs | Where-Object { $_.Message -eq 'Tweak value' }); $line.Count | Should -Be 1
+    $line[0].Data.original | Should -BeExactly 'unreadable'; $line[0].Data.result | Should -BeExactly 'refused' }
+  It 'a clearBit whose original cannot be read keeps the customer''s bits: that value is not written, the tweak is refused as a whole (TB-R4)' {
+    $script:unreadable = @('HKCU:\Control Panel\Accessibility\StickyKeys|Flags')
+    $r = Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('accessKeys', 'noAds'))
+    @($script:writes | Where-Object { $_.Path -like '*StickyKeys' }).Count | Should -Be 0
+    @($script:writes | Where-Object { $_.Name -eq 'Flags' } | ForEach-Object { '{0}|{1}' -f $_.Path, $_.Value }) | Should -Be @('HKCU:\Control Panel\Accessibility\Keyboard Response|122')
+    @($r.Data.Refused) | Should -Be @('accessKeys'); @($r.Data.Applied) | Should -Be @('noAds')
+    @($r.Notes) | Should -Be @('Accessibility shortcuts off could not be applied')
+    @($script:logs | Where-Object { $_.Message -eq 'Tweak value' -and $_.Data.tweak -eq 'accessKeys' } | ForEach-Object { '{0}|{1}' -f $_.Data.original, $_.Data.result }) |
+      Should -Be @('unreadable|refused', '126|applied') }
   It 'nothing effective is Skipped with a message' {
     $r = Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('numLock') -Mode LAPTOP); $r.Status | Should -Be 'Skipped'; $r.Message | Should -BeExactly 'No tweaks chosen' }
 }

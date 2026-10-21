@@ -45,14 +45,17 @@ function Invoke-TweakValue {
   .SYNOPSIS
     Applies one value of a tweak. Returns 'applied', 'unchanged', 'refused' or 'differs'. Never throws.
   .DESCRIPTION
-    Reads the original (Get-RegistryValue) and works out the target: Value for a set (an [int] for a DWord, a
+    Reads the original (Get-RegistryValue). An original that cannot be read (Failed: anything but "not there",
+    such as access denied) is never written over: the result is 'refused' and original is logged as
+    'unreadable' (ruling TB-R4: the original must be logged first, and a clearBit would lose the customer's
+    other bits). Otherwise it works out the target: Value for a set (an [int] for a DWord, a
     [string] for a String), Get-ClearBitValue of the original for a clearBit. An original that already equals
     the target with the same kind is not written ('unchanged'), which keeps UCPD out of the way on a re-run.
     Otherwise the value is written (Set-RegistryDword or Set-RegistryString): a refused write is 'refused';
     then it is read back, which must exist with the same kind and equal the target ('applied'), else
     'differs'. Any exception is 'refused' (a WARN). Every call logs one INFO 'Tweak value' line with
     @{ tweak; path; name; type; original; new; readBack; result }, original and readBack being the value as
-    text or 'absent'. Only ASCII reaches the log.
+    text, 'absent' or 'unreadable'. Only ASCII reaches the log.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -65,32 +68,38 @@ function Invoke-TweakValue {
              original = 'absent'; new = ''; readBack = ''; result = 'refused' }
   try {
     $original = Get-RegistryValue -Path $Value.Path -Name $Value.Name
-    if ($original.Exists) { $line.original = ConvertTo-ScreenText ([string]$original.Value) }
-
-    if ($Value.Op -ceq 'clearBit') {
-      $current = if ($original.Exists) { [string]$original.Value } else { $null }
-      $target = Get-ClearBitValue -Current $current -Bit $Value.Bit -Fresh ([string]$Value.Value)
-    } elseif ($Value.Type -ceq 'DWord') {
-      $target = [int]$Value.Value
+    if ($original.Failed -eq $true) {
+      # TB-R4: a value that could not be read (anything but "not there") is never written. Its original could
+      # not be logged (spec 6.1 rule 3), and a clearBit would replace the customer's other bits. 'refused'.
+      $line.original = 'unreadable'
     } else {
-      $target = [string]$Value.Value
-    }
-    $line.new = ConvertTo-ScreenText ([string]$target)
+      if ($original.Exists) { $line.original = ConvertTo-ScreenText ([string]$original.Value) }
 
-    if ($original.Exists -and $original.Kind -ceq $Value.Type -and [string]$original.Value -ceq [string]$target) {
-      $line.readBack = $line.original
-      $line.result = 'unchanged'
-    } else {
-      $written = if ($Value.Type -ceq 'DWord') {
-        Set-RegistryDword -Path $Value.Path -Name $Value.Name -Value $target
+      if ($Value.Op -ceq 'clearBit') {
+        $current = if ($original.Exists) { [string]$original.Value } else { $null }
+        $target = Get-ClearBitValue -Current $current -Bit $Value.Bit -Fresh ([string]$Value.Value)
+      } elseif ($Value.Type -ceq 'DWord') {
+        $target = [int]$Value.Value
       } else {
-        Set-RegistryString -Path $Value.Path -Name $Value.Name -Value $target
+        $target = [string]$Value.Value
       }
-      if ($written -eq $true) {
-        $after = Get-RegistryValue -Path $Value.Path -Name $Value.Name
-        $line.readBack = if ($after.Exists) { ConvertTo-ScreenText ([string]$after.Value) } else { 'absent' }
-        $same = $after.Exists -and $after.Kind -ceq $Value.Type -and [string]$after.Value -ceq [string]$target
-        $line.result = if ($same) { 'applied' } else { 'differs' }
+      $line.new = ConvertTo-ScreenText ([string]$target)
+
+      if ($original.Exists -and $original.Kind -ceq $Value.Type -and [string]$original.Value -ceq [string]$target) {
+        $line.readBack = $line.original
+        $line.result = 'unchanged'
+      } else {
+        $written = if ($Value.Type -ceq 'DWord') {
+          Set-RegistryDword -Path $Value.Path -Name $Value.Name -Value $target
+        } else {
+          Set-RegistryString -Path $Value.Path -Name $Value.Name -Value $target
+        }
+        if ($written -eq $true) {
+          $after = Get-RegistryValue -Path $Value.Path -Name $Value.Name
+          $line.readBack = if ($after.Failed -eq $true) { 'unreadable' } elseif ($after.Exists) { ConvertTo-ScreenText ([string]$after.Value) } else { 'absent' }
+          $same = $after.Exists -and $after.Kind -ceq $Value.Type -and [string]$after.Value -ceq [string]$target
+          $line.result = if ($same) { 'applied' } else { 'differs' }
+        }
       }
     }
   } catch {
