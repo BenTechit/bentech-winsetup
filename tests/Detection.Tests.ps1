@@ -67,4 +67,12 @@ Describe 'Test-AdminProtection (toolbox spec 5.3)' {
     @{ Why = 'no signed-in user (RDP, early logon)'; P = 'PC1\Dana'; S = '';      E = 'Unknown' }
   ) { $script:pu = $P; $script:su = $S; Mock Get-ProcessUserName { $script:pu }; Mock Get-SignedInUserName { $script:su }; Test-AdminProtection | Should -BeExactly $E }
   It 'a CIM failure is Unknown, never a throw' { Mock Get-ProcessUserName { 'PC1\Dana' }; Mock Get-SignedInUserName { throw 'RPC unavailable' }; Test-AdminProtection | Should -BeExactly 'Unknown' }
+  It 'reads the signed-in user with a 10-second CIM limit, so a wedged WMI cannot hang the window (review M5)' {
+    Mock Get-CimInstance { [pscustomobject]@{ UserName = 'PC1\Dana' } }
+    Get-SignedInUserName | Should -BeExactly 'PC1\Dana'
+    Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_ComputerSystem' -and $OperationTimeoutSec -eq 10 } }
+  It 'a CIM read that times out is Unknown (review M5)' {
+    Mock Get-ProcessUserName { 'PC1\Dana' }
+    Mock Get-CimInstance { Write-Error -Message 'The operation did not complete within the time allotted' -Category OperationTimeout }
+    Test-AdminProtection | Should -BeExactly 'Unknown' }
 }

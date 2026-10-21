@@ -5,7 +5,7 @@
 # on its own. Restore-FinalPowerSettings and Unregister-ResumeTask are used later by Finalize and the
 # entry point. Needs StepResult.ps1, Logging.ps1 and Process.ps1.
 # The registry helpers Set-RegistryDword, Set-RegistryString and Get-RegistryValue are shared with other steps
-# (Desktop, BitLocker, Tweaks, the restore point in Finalize). The two toolbox ones log exception text through
+# (Desktop, BitLocker, Tweaks, the restore point in Finalize). All three log exception text through
 # ConvertTo-ScreenText (StartScreen.ps1; the bundle holds every file), so nothing Hebrew reaches setup.log.
 #
 # Nothing here reads localized text. The one exception is Get-PowerIndexFromQueryOutput, which takes
@@ -550,7 +550,8 @@ function Set-RegistryDword {
     New-ItemProperty -LiteralPath $Path -Name $Name -Value ([int]$Value) -PropertyType DWord -Force -ErrorAction Stop | Out-Null
     return $true
   } catch {
-    Write-SetupLog -Message 'Registry value could not be written' -Level WARN -Data @{ path = $Path; name = $Name; error = $_.Exception.Message }
+    # ASCII only (toolbox review M4): a Hebrew Windows words the refusal in Hebrew.
+    Write-SetupLog -Message 'Registry value could not be written' -Level WARN -Data @{ path = $Path; name = $Name; error = (ConvertTo-ScreenText $_.Exception.Message) }
     return $false
   }
 }
@@ -583,11 +584,13 @@ function Set-RegistryString {
 function Get-RegistryValue {
   <#
   .SYNOPSIS
-    Reads one registry value as @{ Exists; Value; Kind }. Never throws.
+    Reads one registry value as @{ Exists; Value; Kind; Failed }. Never throws.
   .DESCRIPTION
     Value is the raw data (REG_EXPAND_SZ not expanded); Kind is the RegistryValueKind name ('String', 'DWord',
-    ...). An empty -Name is the key's default value. A missing key or value is @{ Exists = $false; Value = $null;
-    Kind = '' }; any other failure is the same answer and a WARN in the log.
+    ...). An empty -Name is the key's default value. A missing key or value is absent: @{ Exists = $false;
+    Value = $null; Kind = ''; Failed = $false }. Any other failure (access denied, ...) is the same answer with
+    Failed = $true, and a WARN in the log: the value may well be there, so a caller must not treat it as absent
+    (toolbox review M3).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -596,21 +599,22 @@ function Get-RegistryValue {
     [Parameter(Mandatory)][AllowEmptyString()][string]$Name
   )
 
-  $missing = @{ Exists = $false; Value = $null; Kind = '' }
   $key = $null
   try {
     $key = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if (@($key.GetValueNames()) -notcontains $Name) { return $missing }
+    if (@($key.GetValueNames()) -notcontains $Name) { return @{ Exists = $false; Value = $null; Kind = ''; Failed = $false } }
     return @{
       Exists = $true
       Value  = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
       Kind   = [string]$key.GetValueKind($Name)
+      Failed = $false
     }
   } catch {
-    if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
-      Write-SetupLog -Message 'Registry value could not be read' -Level WARN -Data @{ path = $Path; name = $Name; error = (ConvertTo-ScreenText $_.Exception.Message) }
+    if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound) {
+      return @{ Exists = $false; Value = $null; Kind = ''; Failed = $false }
     }
-    return $missing
+    Write-SetupLog -Message 'Registry value could not be read' -Level WARN -Data @{ path = $Path; name = $Name; error = (ConvertTo-ScreenText $_.Exception.Message) }
+    return @{ Exists = $false; Value = $null; Kind = ''; Failed = $true }
   } finally {
     if ($null -ne $key -and $null -ne $key.PSObject.Methods['Dispose']) { $key.Dispose() }
   }

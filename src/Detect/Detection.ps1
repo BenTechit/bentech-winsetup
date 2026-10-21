@@ -207,12 +207,13 @@ function Get-ProcessUserName {
 
 function Get-SignedInUserName {
   # The account signed in at the console, DOMAIN\user (Win32_ComputerSystem.UserName): empty in an RDP
-  # session or early in a logon. Read-only; throws when CIM cannot be read.
+  # session or early in a logon. Read-only; throws when CIM cannot be read or does not answer within 10 s
+  # (nothing may wait without a deadline: the toolbox window asks before the run starts).
   [CmdletBinding()]
   [OutputType([string])]
   param()
 
-  return [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName
+  return [string](Get-CimInstance -ClassName Win32_ComputerSystem -OperationTimeoutSec 10 -ErrorAction Stop).UserName
 }
 
 function Test-AdminProtection {
@@ -224,7 +225,7 @@ function Test-AdminProtection {
     and the resume task would belong to that account; an admin password typed for another account does the
     same. The process user (Get-ProcessUserName) is compared with the signed-in user (Get-SignedInUserName),
     ignoring case: equal is 'Off', different is 'On'. An empty signed-in name (RDP, an early logon) or a read
-    that fails is 'Unknown'. Never throws and logs nothing: the callers decide and log.
+    that fails or times out (10 s) is 'Unknown'. Never throws and logs nothing: the callers decide and log.
   #>
   [CmdletBinding()]
   [OutputType([string])]

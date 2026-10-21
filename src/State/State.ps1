@@ -58,6 +58,8 @@ function New-RunState {
     HiddenUpdatesRestored ($true once Finalize un-hid what the run hid) start $false (final review C1).
     RestorePointTried ($true, saved, before the one attempt) and RestorePointCreated ($true once a new restore
     point was confirmed) start $false too (toolbox spec 5.4); an older state without them reads as $false.
+    RestorePointOriginalFrequency starts $null; the attempt saves @{ Exists; Value } of the
+    SystemRestorePointCreationFrequency value it found, so a later finalize can put it back (review M1).
     From -Previous (the earlier run's state, if any):
       - PreviousHiddenUpdateIds = the union of its HiddenUpdateIds and its own PreviousHiddenUpdateIds,
         without duplicates (compared without regard to case, first spelling kept), so Windows Update
@@ -122,6 +124,7 @@ function New-RunState {
     HiddenUpdatesRestored   = $false
     RestorePointTried       = $false
     RestorePointCreated     = $false
+    RestorePointOriginalFrequency = $null
     Notes                   = @()
     Errors                  = @()
     AnyDeskId               = $null

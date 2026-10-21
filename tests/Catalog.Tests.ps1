@@ -162,6 +162,110 @@ Describe 'Get-EffectiveTweaks (toolbox spec 5.3)' {
     @(Get-EffectiveTweaks -Choices @{ Mode = 'DESKTOP' } -Config $cfg).Count | Should -Be 0
     @(Get-EffectiveTweaks -Choices $null -Config $cfg).Count | Should -Be 0; @(Get-EffectiveTweaks -Choices @{ Tweaks = @('noAds') } -Config $null).Count | Should -Be 0 }
 }
+Describe 'Get-TweakCatalog guard: every rule keeps or drops (toolbox spec 5.3, review I1)' {
+  BeforeAll {
+    # How many tweaks Get-TweakCatalog keeps from a config whose only entry is the given JSON. GOOD in the text
+    # stands for a valid value; the value tables use an entry "t1" around one value.
+    $script:good = '{"path":"HKCU:\\Software\\BenTech","name":"n","type":"DWord","op":"set","value":0}'
+    function Get-KeptCount([string]$EntryJson) {
+      @(Get-TweakCatalog -Config (('{"tweaks":[' + $EntryJson.Replace('GOOD', $script:good) + ']}') | ConvertFrom-Json)).Count }
+    function Get-ValueEntry([string]$ValueJson) { '{"id":"t1","title":{"en":"T"},"values":[' + $ValueJson + ']}' }
+  }
+  It 'keeps a value whose path is <Why>' -ForEach @(
+    @{ Why = 'under HKCU:\';                         P = '"HKCU:\\Software\\BenTech"' }
+    @{ Why = 'under HKLM:\';                         P = '"HKLM:\\SOFTWARE\\BenTech"' }
+    @{ Why = 'under the sign-in profile';            P = '"Registry::HKEY_USERS\\.DEFAULT\\Control Panel\\Keyboard"' }
+    @{ Why = 'a lower-case hive';                    P = '"hkcu:\\software\\BenTech"' }
+    @{ Why = 'a CLSID key with braces';              P = '"HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32"' }
+    @{ Why = 'Policies only inside a longer segment'; P = '"HKCU:\\Software\\MyPolicies\\Policies2"' }
+  ) { Get-KeptCount (Get-ValueEntry ('{"path":' + $P + ',"name":"n","type":"DWord","op":"set","value":0}')) | Should -Be 1 }
+  It 'drops a value whose path <Why>' -ForEach @(
+    @{ Why = 'is in HKCR:';                          P = '"HKCR:\\Software\\BenTech"' }
+    @{ Why = 'names HKCU through the provider';      P = '"Registry::HKEY_CURRENT_USER\\Software\\BenTech"' }
+    @{ Why = 'names HKLM through the provider';      P = '"Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\BenTech"' }
+    @{ Why = 'is another user''s hive';               P = '"Registry::HKEY_USERS\\S-1-5-21-1-2-3-1001\\Software\\BenTech"' }
+    @{ Why = 'is relative';                          P = '"Software\\BenTech"' }
+    @{ Why = 'is empty';                             P = '""' }
+    @{ Why = 'is not a string';                      P = '5' }
+    @{ Why = 'is missing';                           P = 'null' }
+    @{ Why = 'has \Policies\ in the middle';         P = '"HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows"' }
+    @{ Why = 'ends in \Policies';                    P = '"HKLM:\\SOFTWARE\\Policies"' }
+    @{ Why = 'has Policies in mixed case';           P = '"HKCU:\\Software\\pOlIcIeS\\BenTech"' }
+    @{ Why = 'has Policies under WOW6432Node';       P = '"HKLM:\\SOFTWARE\\WOW6432Node\\Policies\\Microsoft"' }
+    @{ Why = 'has /Policies/';                       P = '"HKLM:\\SOFTWARE/Policies/Microsoft"' }
+    @{ Why = 'has any /';                            P = '"HKCU:\\Software/BenTech"' }
+    @{ Why = 'has a *';                              P = '"HKCU:\\Software\\*"' }
+    @{ Why = 'has a ?';                              P = '"HKCU:\\Software\\Ben?ech"' }
+    @{ Why = 'has a [';                              P = '"HKCU:\\Software\\[ab]"' }
+    @{ Why = 'has a ]';                              P = '"HKCU:\\Software\\ab]"' }
+    @{ Why = 'has a .. segment';                     P = '"HKCU:\\Software\\Microsoft\\..\\Classes"' }
+    @{ Why = 'ends in ..';                           P = '"HKCU:\\Software\\Microsoft\\.."' }
+    @{ Why = 'has a . segment';                      P = '"HKCU:\\Software\\.\\BenTech"' }
+  ) { Get-KeptCount (Get-ValueEntry ('{"path":' + $P + ',"name":"n","type":"DWord","op":"set","value":0}')) | Should -Be 0 }
+  It 'keeps <Why>' -ForEach @(
+    @{ Why = 'a DWord set of 0';                      F = '"name":"n","type":"DWord","op":"set","value":0' }
+    @{ Why = 'a DWord set of 0x7FFFFFFF';             F = '"name":"n","type":"DWord","op":"set","value":2147483647' }
+    @{ Why = 'a String set';                          F = '"name":"n","type":"String","op":"set","value":"2"' }
+    @{ Why = 'a String set of the default value to an empty string'; F = '"name":"","type":"String","op":"set","value":""' }
+    @{ Why = 'a clearBit of bit 1';                   F = '"name":"Flags","type":"String","op":"clearBit","bit":1,"value":"506"' }
+    @{ Why = 'a clearBit of bit 0x80000000';          F = '"name":"Flags","type":"String","op":"clearBit","bit":2147483648,"value":"506"' }
+  ) { Get-KeptCount (Get-ValueEntry ('{"path":"HKCU:\\Software\\BenTech",' + $F + '}')) | Should -Be 1 }
+  It 'drops a value with <Why>' -ForEach @(
+    @{ Why = 'type ExpandString';                     F = '"name":"n","type":"ExpandString","op":"set","value":"x"' }
+    @{ Why = 'type QWord';                            F = '"name":"n","type":"QWord","op":"set","value":0' }
+    @{ Why = 'type dword in lower case';              F = '"name":"n","type":"dword","op":"set","value":0' }
+    @{ Why = 'no type';                               F = '"name":"n","op":"set","value":0' }
+    @{ Why = 'op delete';                             F = '"name":"n","type":"DWord","op":"delete","value":0' }
+    @{ Why = 'op Set in another case';                F = '"name":"n","type":"DWord","op":"Set","value":0' }
+    @{ Why = 'no op';                                 F = '"name":"n","type":"DWord","value":0' }
+    @{ Why = 'clearBit on a DWord';                   F = '"name":"Flags","type":"DWord","op":"clearBit","bit":4,"value":"506"' }
+    @{ Why = 'clearBit of bit 3 (not a power of two)'; F = '"name":"Flags","type":"String","op":"clearBit","bit":3,"value":"506"' }
+    @{ Why = 'clearBit of bit 0';                     F = '"name":"Flags","type":"String","op":"clearBit","bit":0,"value":"506"' }
+    @{ Why = 'clearBit of bit 0x100000000';           F = '"name":"Flags","type":"String","op":"clearBit","bit":4294967296,"value":"506"' }
+    @{ Why = 'clearBit without a bit';                F = '"name":"Flags","type":"String","op":"clearBit","value":"506"' }
+    @{ Why = 'clearBit with the bit as text';         F = '"name":"Flags","type":"String","op":"clearBit","bit":"4","value":"506"' }
+    @{ Why = 'clearBit with a negative value';        F = '"name":"Flags","type":"String","op":"clearBit","bit":4,"value":"-1"' }
+    @{ Why = 'clearBit with a value that is not digits'; F = '"name":"Flags","type":"String","op":"clearBit","bit":4,"value":"50a"' }
+    @{ Why = 'clearBit with an empty value';          F = '"name":"Flags","type":"String","op":"clearBit","bit":4,"value":""' }
+    @{ Why = 'clearBit with a value above 32 bits';   F = '"name":"Flags","type":"String","op":"clearBit","bit":4,"value":"4294967296"' }
+    @{ Why = 'clearBit with a number, not text';      F = '"name":"Flags","type":"String","op":"clearBit","bit":4,"value":506' }
+    @{ Why = 'clearBit with an empty name';           F = '"name":"","type":"String","op":"clearBit","bit":4,"value":"506"' }
+    @{ Why = 'a DWord of -1';                         F = '"name":"n","type":"DWord","op":"set","value":-1' }
+    @{ Why = 'a DWord of 0x80000000';                 F = '"name":"n","type":"DWord","op":"set","value":2147483648' }
+    @{ Why = 'a DWord given as text';                 F = '"name":"n","type":"DWord","op":"set","value":"0"' }
+    @{ Why = 'a DWord of 1.5';                        F = '"name":"n","type":"DWord","op":"set","value":1.5' }
+    @{ Why = 'a DWord without a value';               F = '"name":"n","type":"DWord","op":"set"' }
+    @{ Why = 'a DWord with an empty name';            F = '"name":"","type":"DWord","op":"set","value":0' }
+    @{ Why = 'a String without a value';              F = '"name":"n","type":"String","op":"set","value":null' }
+    @{ Why = 'a String given a number';               F = '"name":"n","type":"String","op":"set","value":5' }
+    @{ Why = 'no name';                               F = '"type":"DWord","op":"set","value":0' }
+    @{ Why = 'a name that is not text';               F = '"name":5,"type":"DWord","op":"set","value":0' }
+  ) { Get-KeptCount (Get-ValueEntry ('{"path":"HKCU:\\Software\\BenTech",' + $F + '}')) | Should -Be 0 }
+  It 'keeps an entry with <Why>' -ForEach @(
+    @{ Why = 'every rule field set';                  E = '{"id":"t1","title":{"en":"T"},"desktopOnly":true,"office365Only":false,"minBuild":22000,"values":[GOOD]}' }
+    @{ Why = 'a 32-character id';                     E = '{"id":"tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","title":{"en":"T"},"values":[GOOD]}' }
+  ) { Get-KeptCount $E | Should -Be 1 }
+  It 'drops an entry with <Why>' -ForEach @(
+    @{ Why = 'a space in its id';                     E = '{"id":"bad id","title":{"en":"T"},"values":[GOOD]}' }
+    @{ Why = 'an id that starts with a digit';        E = '{"id":"1abc","title":{"en":"T"},"values":[GOOD]}' }
+    @{ Why = 'a dash in its id';                      E = '{"id":"a-b","title":{"en":"T"},"values":[GOOD]}' }
+    @{ Why = 'a 33-character id';                     E = '{"id":"tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","title":{"en":"T"},"values":[GOOD]}' }
+    @{ Why = 'no id';                                 E = '{"title":{"en":"T"},"values":[GOOD]}' }
+    @{ Why = 'an empty title';                        E = '{"id":"t1","title":{"en":""},"values":[GOOD]}' }
+    @{ Why = 'no title';                              E = '{"id":"t1","values":[GOOD]}' }
+    @{ Why = 'no values';                             E = '{"id":"t1","title":{"en":"T"},"values":[]}' }
+    @{ Why = 'no values property';                    E = '{"id":"t1","title":{"en":"T"}}' }
+    @{ Why = 'one good and one bad value';            E = '{"id":"t1","title":{"en":"T"},"values":[GOOD,{"path":"HKLM:\\SOFTWARE\\Policies\\x","name":"n","type":"DWord","op":"set","value":0}]}' }
+    @{ Why = 'desktopOnly given as text';             E = '{"id":"t1","title":{"en":"T"},"desktopOnly":"yes","values":[GOOD]}' }
+    @{ Why = 'office365Only given as a number';       E = '{"id":"t1","title":{"en":"T"},"office365Only":1,"values":[GOOD]}' }
+    @{ Why = 'a minBuild of 1.5';                     E = '{"id":"t1","title":{"en":"T"},"minBuild":1.5,"values":[GOOD]}' }
+    @{ Why = 'a minBuild given as text';              E = '{"id":"t1","title":{"en":"T"},"minBuild":"22000","values":[GOOD]}' }
+    @{ Why = 'a negative minBuild';                   E = '{"id":"t1","title":{"en":"T"},"minBuild":-1,"values":[GOOD]}' }
+  ) { Get-KeptCount $E | Should -Be 0 }
+  It 'keeps the first of two ids that differ only in case' {
+    $x = '{"tweaks":[{"id":"t1","title":{"en":"First"},"values":[GOOD]},{"id":"T1","title":{"en":"Second"},"values":[GOOD]}]}'.Replace('GOOD', $script:good) | ConvertFrom-Json
+    @(Get-TweakCatalog -Config $x | ForEach-Object { $_.Title.en }) | Should -Be @('First') }
+}
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'
                $s.Steps.chrome.Status = 'Done'; $s.Steps.office.Status = 'Done' }

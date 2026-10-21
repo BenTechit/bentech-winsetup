@@ -134,8 +134,15 @@ function ConvertTo-TweakValueEntry {
 
   $rooted = $false
   foreach ($prefix in $script:TweakPathPrefixes) { if ($path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $rooted = $true } }
-  # No \Policies\ path: a policy makes Settings say "managed by your organization".
-  if (-not $rooted -or $path.IndexOf('\Policies\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $null }
+  if (-not $rooted) { return $null }
+  # The path is judged as written, so nothing may change it on the way (review I1): the registry provider turns
+  # '/' into '\' and resolves '.' and '..' segments, and New-Item -Path takes * ? [ ] as wildcards.
+  if ($path.IndexOfAny([char[]]'/*?[]') -ge 0) { return $null }
+  foreach ($segment in $path.Split('\')) {
+    # No Policies key anywhere, the last segment included: a policy makes Settings say "managed by your
+    # organization". -eq ignores case.
+    if ($segment -eq '.' -or $segment -eq '..' -or $segment -eq 'Policies') { return $null }
+  }
   if (($type -cnotin 'String', 'DWord') -or ($op -cnotin 'set', 'clearBit')) { return $null }
   if ($name -eq '' -and -not ($type -ceq 'String' -and $op -ceq 'set')) { return $null }
 
@@ -209,8 +216,9 @@ function Get-TweakCatalog {
     An entry is left out, silently, when (tests\Config.Tests.ps1 proves the shipped entries all pass):
       - its id does not match ^[A-Za-z][A-Za-z0-9]{0,31}$, or an earlier entry has the same id (any case);
       - title.en is empty, or values is empty;
-      - a value's path does not start with HKCU:\, HKLM:\ or Registry::HKEY_USERS\.DEFAULT\ (any case), or it
-        contains \Policies\;
+      - a value's path does not start with HKCU:\, HKLM:\ or Registry::HKEY_USERS\.DEFAULT\ (any case); has a
+        Policies segment anywhere (any case, the last one too); or has a '/', a '*', '?', '[' or ']', or a '.'
+        or '..' segment (the provider would change the path after this check: review I1);
       - a value's type is not String or DWord, or its op not set or clearBit;
       - a clearBit value is not a String with a power-of-two bit in 1..0x80000000 and a decimal-digit value;
       - a DWord set value is not an integer in 0..0x7FFFFFFF; a String value is not a string (it may be empty);

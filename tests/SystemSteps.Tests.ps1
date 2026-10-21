@@ -16,6 +16,7 @@ BeforeAll {
   # Prepare.ps1, and Bloatware.ps1 runs its Appx calls through Invoke-PowerShellChild from Winget.ps1.
   # The bundle holds every file, so the steps below use them directly.
   foreach ($f in 'Prepare', 'Winget', 'BitLocker', 'Region', 'Desktop', 'Bloatware', 'Rename') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: Set-RegistryDword logs a refusal as ASCII (toolbox review M4)
   # Loads the WinUserLanguage type used to build fake language lists. Read-only.
   Import-Module International -ErrorAction Stop
 

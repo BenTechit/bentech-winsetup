@@ -128,7 +128,9 @@ Describe 'config.json' {
     $owned = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power', 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU',
       'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System', 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
     foreach ($v in @($cfg.tweaks.values)) {
-      $v.path | Should -Match '^(HKCU:\\|HKLM:\\|Registry::HKEY_USERS\\\.DEFAULT\\)'; $v.path | Should -Not -Match '(?i)\\Policies\\'
+      $v.path | Should -Match '^(HKCU:\\|HKLM:\\|Registry::HKEY_USERS\\\.DEFAULT\\)'; $v.path | Should -Not -Match '(?i)\\Policies(\\|$)'
+      # The registry provider turns '/' into '\' and resolves '.' and '..'; New-Item -Path takes * ? [ ] as wildcards (review I1).
+      $v.path | Should -Not -Match '[/*?\[\]]'; $v.path | Should -Not -Match '(^|\\)\.{1,2}(\\|$)'
       $owned | Should -Not -Contain $v.path; $managed | Should -Not -Contain ('{0}|{1}' -f $v.path, $v.name) } }
   It 'all nine tweaks pass Get-TweakCatalog''s checks' { . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; @(Get-TweakCatalog -Config $cfg).Id | Should -Be @($cfg.tweaks.id) }
   It 'holds non-ASCII text only inside "he" values (toolbox spec 4.3)' {

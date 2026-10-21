@@ -394,6 +394,45 @@ function Invoke-WindowsActivation {
   return 'Activated'
 }
 
+function Test-RestorePointFrequency {
+  # Private. $true when a Get-RegistryValue answer shows the recorded original of the creation frequency
+  # (@{ Exists; Value }): the same value as text, or absent when it was absent. A read that failed is $false.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Current,
+    [Parameter(Mandatory)][System.Collections.IDictionary]$Original
+  )
+
+  if ($Current['Failed'] -eq $true) { return $false }
+  if ($Original['Exists'] -eq $true) { return ($Current['Exists'] -eq $true -and [string]$Current['Value'] -ceq [string]$Original['Value']) }
+  return ($Current['Exists'] -ne $true)
+}
+
+function Restore-RestorePointFrequency {
+  <#
+  .SYNOPSIS
+    Private. Puts SystemRestorePointCreationFrequency back to the recorded original (@{ Exists; Value }).
+    Returns $true when a read-back shows it. Never throws.
+  .DESCRIPTION
+    A value that already is the original is left alone. Otherwise an original that existed is written back
+    (Set-RegistryDword) and an absent one is removed again (Remove-RegistryValueIfPresent: the value only, never
+    the key); then it is read back. The original was read before anything changed it (Invoke-SetupRestorePoint
+    makes no attempt when that read failed), so removing a value here never deletes one the customer had.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][System.Collections.IDictionary]$Original)
+
+  if (Test-RestorePointFrequency -Current (Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName) -Original $Original) { return $true }
+  if ($Original['Exists'] -eq $true) {
+    if ($null -ne $Original['Value']) { $null = Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value $Original['Value'] }
+  } else {
+    Remove-RegistryValueIfPresent -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
+  }
+  return (Test-RestorePointFrequency -Current (Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName) -Original $Original)
+}
+
 function Invoke-SetupRestorePoint {
   <#
   .SYNOPSIS
@@ -401,18 +440,24 @@ function Invoke-SetupRestorePoint {
     'NotConfirmed'. Never throws.
   .DESCRIPTION
     - Choices.RestorePoint not $true (not chosen, or an older state without it): 'NotChosen'; nothing is read.
-    - State.RestorePointTried already $true (a repeated finalize): never a second attempt. 'Created' when
-      State.RestorePointCreated is $true, else 'NotConfirmed' with the Note.
-    - Otherwise RestorePointTried = $true (RestorePointCreated $false) is saved FIRST. A save that throws is
-      'NotConfirmed' with the Note, and nothing else happens: no child, the frequency value untouched.
-    Then, in order:
-      1. the original SystemRestorePointCreationFrequency is recorded (logged: its value, or absent);
-      2. it is set to 0 (a refusal is a WARN: the child still runs and its sequence check decides);
-      3. the NOW sub-title 'Creating a restore point';
-      4. $script:RestorePointCommand in one child (Invoke-PowerShellChild) limited to
+    - State.RestorePointTried already $true (a repeated finalize): never a second attempt. When the attempt
+      recorded the original frequency value (State.RestorePointOriginalFrequency) and the value is not back to
+      it (the console was closed, or the PC crashed, during the child), it is put back now, without a child;
+      a value that cannot be put back is the Note 'Restore point frequency value could not be put back'
+      (review M1). Then 'Created' when State.RestorePointCreated is $true, else 'NotConfirmed' with the Note.
+    Otherwise, in order:
+      1. the original SystemRestorePointCreationFrequency is read (logged: its value, or absent). A read that
+         fails (not just "absent") means no attempt at all: nothing is written or removed, no child, the Note
+         'Restore point could not be confirmed', and RestorePointTried stays $false (review M3);
+      2. RestorePointTried = $true, RestorePointCreated = $false and RestorePointOriginalFrequency = the
+         original (@{ Exists; Value }) are saved FIRST. A save that throws is 'NotConfirmed' with the Note, and
+         nothing else happens: no child, the frequency value untouched;
+      3. inside one try, so its finally always runs (review M2): the value is set to 0 (a refusal is a WARN:
+         the child still runs and its sequence check decides), the NOW sub-title 'Creating a restore point',
+         and $script:RestorePointCommand in one child (Invoke-PowerShellChild) limited to
          Config.timeoutsMinutes.restorePoint minutes (10 when missing or not above 0);
-      5. whatever the child did (finally): an original that existed is written back, an absent one is removed
-         again (Remove-RegistryValueIfPresent), and it is read back. A value that is not back is its own Note,
+      4. finally, whatever happened: Restore-RestorePointFrequency puts the original back (written back, or
+         removed again when it was absent) and reads it back; a value that is not back is its own Note,
          'Restore point frequency value could not be put back', so a value stuck at 0 is never silent. The
          sub-title is cleared.
     Exit 0 without a timeout is 'Created' (RestorePointCreated = $true, activity 'Restore point created').
@@ -425,17 +470,31 @@ function Invoke-SetupRestorePoint {
 
   $runState = $Context.State
   $notConfirmed = 'Restore point could not be confirmed'
+  $notBack = 'Restore point frequency value could not be put back'
   $choices = if ($runState.Choices -is [System.Collections.IDictionary]) { $runState.Choices } else { @{} }
   if (-not (($choices['RestorePoint'] -is [bool]) -and $choices['RestorePoint'])) { return 'NotChosen' }
 
   if ($runState.RestorePointTried -eq $true) {
+    $recorded = $runState.RestorePointOriginalFrequency
+    if ($recorded -is [System.Collections.IDictionary] -and -not (Restore-RestorePointFrequency -Original $recorded)) {
+      Add-FinalizeMessage -State $runState -Field Notes -Text $notBack
+    }
     if ($runState.RestorePointCreated -eq $true) { return 'Created' }
     Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
     return 'NotConfirmed'
   }
 
+  $original = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
+  if ($original.Failed -eq $true) {
+    Write-SetupLog -Message 'No restore point: the creation frequency could not be read, so it is left alone' -Level WARN
+    Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
+    return 'NotConfirmed'
+  }
+  $recorded = @{ Exists = ($original.Exists -eq $true); Value = $(if ($original.Exists -eq $true) { $original.Value } else { $null }) }
+
   $runState.RestorePointTried = $true
   $runState.RestorePointCreated = $false
+  $runState.RestorePointOriginalFrequency = $recorded
   try {
     Save-RunState -State $runState -Root $Context.Root
   } catch {
@@ -449,34 +508,26 @@ function Invoke-SetupRestorePoint {
   if ([double]::TryParse([string]$Context.Config.timeoutsMinutes.restorePoint, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$configured) -and $configured -gt 0) {
     $timeout = $configured
   }
-
-  $original = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
-  $originalText = if ($original.Exists) { ConvertTo-ScreenText ([string]$original.Value) } else { 'absent' }
+  $originalText = if ($recorded.Exists) { ConvertTo-ScreenText ([string]$recorded.Value) } else { 'absent' }
   Write-SetupLog -Message 'Restore point: creation frequency recorded' -Data @{ original = $originalText; timeoutMinutes = $timeout }
-  if ((Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value 0) -ne $true) {
-    Write-SetupLog -Message 'Restore point: the creation frequency could not be set to 0; trying anyway' -Level WARN
-  }
 
   $created = $false
-  Set-SetupNow -SubTitle 'Creating a restore point'
   try {
+    if ((Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value 0) -ne $true) {
+      Write-SetupLog -Message 'Restore point: the creation frequency could not be set to 0; trying anyway' -Level WARN
+    }
+    Set-SetupNow -SubTitle 'Creating a restore point'
     $run = Invoke-PowerShellChild -Command $script:RestorePointCommand -TimeoutMinutes $timeout
     $created = (-not $run.TimedOut) -and ($null -ne $run.ExitCode) -and ([int]$run.ExitCode -eq 0)
     if (-not $created) {
       Write-SetupLog -Message 'Restore point could not be confirmed' -Level WARN -Data @{ exitCode = $run.ExitCode; timedOut = [bool]$run.TimedOut; tail = (ConvertTo-ScreenText (Get-OutputTail -Output $run.Output)) }
     }
   } catch {
-    Write-SetupLog -Message 'Restore point child could not run' -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
+    $created = $false
+    Write-SetupLog -Message 'Restore point attempt failed' -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
   } finally {
-    # The value must never stay at 0 on the customer's PC, whatever the child did.
-    if ($original.Exists) {
-      $null = Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value $original.Value
-    } else {
-      Remove-RegistryValueIfPresent -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
-    }
-    $after = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
-    $back = if ($original.Exists) { $after.Exists -and ([string]$after.Value -ceq [string]$original.Value) } else { -not $after.Exists }
-    if (-not $back) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Restore point frequency value could not be put back' }
+    # The value must never stay at 0 on the customer's PC, whatever happened above.
+    if (-not (Restore-RestorePointFrequency -Original $recorded)) { Add-FinalizeMessage -State $runState -Field Notes -Text $notBack }
     Set-SetupNow -SubTitle ''
   }
 

@@ -100,6 +100,35 @@ Describe 'Set-RegistryString and Get-RegistryValue' {
     (Get-RegistryValue -Path 'HKCU:\x' -Name 'Nope').Exists | Should -BeFalse
     Mock Get-Item { Write-Error -Message 'Cannot find path' -Category ObjectNotFound }
     (Get-RegistryValue -Path 'HKCU:\gone' -Name 'Flags').Exists | Should -BeFalse }
+  It 'tells "absent" from "could not be read": only a read that fails is Failed, and only it is a WARN (review M3, M7b)' {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    $fake = [pscustomobject]@{} | Add-Member -PassThru ScriptMethod GetValueNames { @('Flags') } |
+      Add-Member -PassThru ScriptMethod GetValue { param($n, $d, $o) '510' } |
+      Add-Member -PassThru ScriptMethod GetValueKind { param($n) [Microsoft.Win32.RegistryValueKind]::String } | Add-Member -PassThru ScriptMethod Dispose { }
+    Mock Get-Item { $fake }
+    (Get-RegistryValue -Path 'HKCU:\x' -Name 'Flags').Failed | Should -BeFalse
+    (Get-RegistryValue -Path 'HKCU:\x' -Name 'Nope').Failed | Should -BeFalse
+    Mock Get-Item { Write-Error -Message 'Cannot find path' -Category ObjectNotFound }
+    $r = Get-RegistryValue -Path 'HKCU:\gone' -Name 'Flags'; $r.Exists | Should -BeFalse; $r.Failed | Should -BeFalse
+    @($script:logs).Count | Should -Be 0
+    Mock Get-Item { Write-Error -Message 'Requested registry access is not allowed' -Category PermissionDenied }
+    $r = Get-RegistryValue -Path 'HKLM:\SECURITY\x' -Name 'Flags'; $r.Exists | Should -BeFalse; $r.Failed | Should -BeTrue
+    @($script:logs | ForEach-Object { '{0}|{1}' -f $_.Level, $_.Message }) | Should -Be @('WARN|Registry value could not be read') }
+  It 'Set-RegistryDword logs a Hebrew refusal as ASCII (review M4)' {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    $he = [string]::new([char[]]@(0x05D2, 0x05D9, 0x05E9, 0x05D4))   # four Hebrew letters
+    Mock Test-Path { $true }; Mock New-ItemProperty { Write-Error -Message "$he denied" -Category PermissionDenied }
+    Set-RegistryDword -Path 'HKCU:\x' -Name 'n' -Value 1 | Should -BeFalse
+    @($script:logs).Count | Should -Be 1; $script:logs[0].Level | Should -Be 'WARN'; $script:logs[0].Data.error | Should -BeExactly '???? denied' }
+  It 'Set-RegistryString logs a Hebrew refusal as ASCII (review M7d)' {
+    $script:logs = New-Object System.Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    $he = [string]::new([char[]]@(0x05D2, 0x05D9, 0x05E9, 0x05D4))
+    Mock Test-Path { $true }; Mock New-ItemProperty { Write-Error -Message "$he denied" -Category PermissionDenied }
+    Set-RegistryString -Path 'HKCU:\x' -Name 'n' -Value 'v' | Should -BeFalse
+    @($script:logs).Count | Should -Be 1; $script:logs[0].Level | Should -Be 'WARN'; $script:logs[0].Data.error | Should -BeExactly '???? denied' }
 }
 Describe 'Invoke-StepTweaks (toolbox spec 5.3)' {
   BeforeEach { Initialize-TweakMocks }
@@ -131,7 +160,15 @@ Describe 'Invoke-StepTweaks (toolbox spec 5.3)' {
     @($script:writes | Where-Object { $_.Path -like 'HKCU:\*' }).Count | Should -Be 0
     @($script:writes).Path | Should -Be @('Registry::HKEY_USERS\.DEFAULT\Control Panel\Keyboard')
     @($r.Data.Applied) | Should -Be @('numLock'); @($r.Data.Skipped) | Should -Be @('accessKeys', 'noAds')
-    @($r.Notes) | Should -Be @('Per-user tweaks skipped: Windows Administrator protection is on') }
+    @($r.Notes) | Should -Be @('Per-user tweaks skipped: Windows Administrator protection is on')
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is on: per-user tweak values are skipped' }).Count | Should -Be 1   # review M7e
+    @($script:logs | Where-Object { $_.Message -eq 'Tweak value' -and $_.Data.result -eq 'skipped' }).Count | Should -Be 10 }   # 2 accessKeys + 1 NumLock + 7 noAds
+  It 'rewrites a value whose text matches but whose kind differs (HideFileExt stored as REG_SZ "0", review M7c)' {
+    $script:reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideFileExt'] = @{ Value = '0'; Kind = 'String' }
+    $r = Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('fileExtensions'))
+    @($script:writes | ForEach-Object { '{0}|{1}|{2}' -f $_.Fn, $_.Name, $_.Value }) | Should -Be @('Set-RegistryDword|HideFileExt|0')
+    @($r.Data.Applied) | Should -Be @('fileExtensions')
+    $script:reg['HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideFileExt'].Kind | Should -Be 'DWord' }
   It 'Unknown protection is the same user, logged at WARN' {
     $script:protection = 'Unknown'; (Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('noAds'))).Data.Applied | Should -Be 'noAds'
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like '*Administrator protection state unknown*' }).Count | Should -Be 1 }

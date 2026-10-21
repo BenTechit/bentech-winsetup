@@ -1362,7 +1362,7 @@ Describe 'Windows activation attempt (spec 9.5)' {
 Describe 'restore point at the end (toolbox spec 5.4)' {
   BeforeEach { Initialize-FinalizeMocks
     $script:sr = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'; $script:fn = 'SystemRestorePointCreationFrequency'
-    $script:dwords = New-Object Collections.ArrayList; $script:freqStuck = $false; $script:saveThrows = $false; $script:savedTried = $null
+    $script:dwords = New-Object Collections.ArrayList; $script:freqStuck = $false; $script:saveThrows = $false; $script:savedTried = $null; $script:savedOriginal = $null
     $script:child = @{ ExitCode = 0; TimedOut = $false; Output = '' }; $script:childSeen = $null
     # The frequency value lives in $script:regPresent, so Remove-RegistryValueIfPresent (Get-ItemProperty / Remove-ItemProperty mocks) sees it too.
     Mock Get-RegistryValue { $v = $script:regPresent[$Path]
@@ -1370,9 +1370,9 @@ Describe 'restore point at the end (toolbox spec 5.4)' {
     Mock Set-RegistryDword { [void]$script:dwords.Add(@{ Path = $Path; Name = $Name; Value = [int]$Value })
       if (-not ($script:freqStuck -and [int]$Value -ne 0)) { if ($null -eq $script:regPresent[$Path]) { $script:regPresent[$Path] = @{} }; $script:regPresent[$Path][$Name] = [int]$Value }
       $true }
-    Mock Save-RunState { if ($script:saveThrows) { throw 'disk full' }; $script:savedTried = [bool]$State.RestorePointTried }
+    Mock Save-RunState { if ($script:saveThrows) { throw 'disk full' }; $script:savedTried = [bool]$State.RestorePointTried; $script:savedOriginal = $State.RestorePointOriginalFrequency }
     Mock Invoke-PowerShellChild {
-      $script:childSeen = @{ Command = $Command; Timeout = $TimeoutMinutes; Tried = $script:ctx.State.RestorePointTried; Saved = $script:savedTried
+      $script:childSeen = @{ Command = $Command; Timeout = $TimeoutMinutes; Tried = $script:ctx.State.RestorePointTried; Saved = $script:savedTried; SavedOriginal = $script:savedOriginal
         Freq = $(if ($script:regPresent[$script:sr]) { $script:regPresent[$script:sr][$script:fn] }); SetupGone = -not (Test-Path (Join-Path $script:ctx.Root 'setup.ps1'))
         EndedAt = $script:ctx.State.EndedAt }
       if ($script:child -is [scriptblock]) { & $script:child } else { $script:child } }
@@ -1395,6 +1395,8 @@ Describe 'restore point at the end (toolbox spec 5.4)' {
     $script:child = $Child; if ($null -ne $Before) { $script:regPresent[$sr] = @{ $fn = $Before } }
     $null = Complete-SetupFinalization -Context $ctx
     $script:dwords[0].Value | Should -Be 0; $childSeen | Should -Not -BeNullOrEmpty
+    # The original is saved with the attempt, before the child (review M1).
+    if ($null -eq $Before) { $childSeen.SavedOriginal.Exists | Should -BeFalse } else { $childSeen.SavedOriginal.Exists | Should -BeTrue; $childSeen.SavedOriginal.Value | Should -Be $Before }
     if ($null -eq $Before) { @($script:regRemoved.Name) | Should -Contain $fn; $script:regPresent[$sr].ContainsKey($fn) | Should -BeFalse }
     else { $script:dwords[-1].Value | Should -Be $Before; $script:regPresent[$sr][$fn] | Should -Be $Before }
     $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back'
@@ -1414,6 +1416,43 @@ Describe 'restore point at the end (toolbox spec 5.4)' {
     $ctx.State.Choices.Remove('RestorePoint'); $null = Complete-SetupFinalization -Context $ctx
     Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; Should -Invoke Get-RegistryValue -Times 0 -Exactly
     Get-ReportLines -Context $ctx | Should -Contain 'Restore point: not chosen' }
+  It 'a repeated finalize after a stopped attempt puts the recorded original back, with no child (review M1): <Why>' -ForEach @(
+    @{ Why = '1440 before';   Recorded = @{ Exists = $true; Value = 1440 } }
+    @{ Why = 'absent before'; Recorded = @{ Exists = $false; Value = $null } }
+  ) {
+    $ctx.State.RestorePointTried = $true; $ctx.State.RestorePointOriginalFrequency = $Recorded
+    $script:regPresent[$sr] = @{ $fn = 0 }   # the console was closed during the child: the value is still 0
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly
+    if ($Recorded.Exists) { $script:regPresent[$sr][$fn] | Should -Be 1440 } else { $script:regPresent[$sr].ContainsKey($fn) | Should -BeFalse }
+    $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back'
+    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed' }
+  It 'a repeated finalize leaves a value that is already back alone, and says when it cannot put one back (review M1)' {
+    $ctx.State.RestorePointTried = $true; $ctx.State.RestorePointOriginalFrequency = @{ Exists = $true; Value = 1440 }
+    $script:regPresent[$sr] = @{ $fn = 1440 }
+    $null = Complete-SetupFinalization -Context $ctx; @($script:dwords).Count | Should -Be 0
+    $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back'
+    $script:regPresent[$sr] = @{ $fn = 0 }; $script:freqStuck = $true
+    $null = Complete-SetupFinalization -Context $ctx; $ctx.State.Notes | Should -Contain 'Restore point frequency value could not be put back' }
+  It 'an original that cannot be read: no attempt, nothing written or removed, the Note (review M3)' {
+    Mock Get-RegistryValue { @{ Exists = $false; Value = $null; Kind = ''; Failed = $true } }
+    $script:regPresent[$sr] = @{ $fn = 1440 }
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; @($script:dwords).Count | Should -Be 0; @($script:regRemoved).Count | Should -Be 0
+    $script:regPresent[$sr][$fn] | Should -Be 1440; $ctx.State.RestorePointTried | Should -BeFalse
+    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed' }
+  It 'a refused write of 0 is a WARN and the child still runs: its sequence check decides (review M7a)' {
+    Mock Set-RegistryDword { [void]$script:dwords.Add(@{ Path = $Path; Name = $Name; Value = [int]$Value }); [int]$Value -ne 0 }
+    $null = Complete-SetupFinalization -Context $ctx
+    $childSeen | Should -Not -BeNullOrEmpty; $ctx.State.RestorePointCreated | Should -BeTrue
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like '*could not be set to 0*' }).Count | Should -Be 1
+    $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back' }
+  It 'a write of 0 that throws still ends in the finally: no child, NOW cleared, the Note (review M2)' {
+    Mock Set-RegistryDword { throw 'registry exploded' }
+    { Complete-SetupFinalization -Context $ctx } | Should -Not -Throw
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; $script:SetupNowState.SubTitle | Should -BeNullOrEmpty
+    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'
+    $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back' }
   It 'a missing timeoutsMinutes.restorePoint is 10' { $ctx.Config.timeoutsMinutes.PSObject.Properties.Remove('restorePoint'); $null = Complete-SetupFinalization -Context $ctx; $childSeen.Timeout | Should -Be 10 }
 }
 
