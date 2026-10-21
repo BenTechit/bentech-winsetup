@@ -1,12 +1,13 @@
 ﻿# src/Toolbox/SetupPlanner.ps1
 # The BenTech Toolbox's planning rules (toolbox spec 5.2, 10b.5, 10b.6): the profiles of config.json, the
 # choices a profile fills in, the check every Choices table passes before a run starts, and whether a run's
-# choices still match its profile (the report's "(changed)").
+# choices still match its profile (the report's "(changed)"). Also the toolbox window's model (New-ToolboxModel)
+# and its "What will happen" lines (Get-ToolboxPlanLines), which Toolbox.ps1 renders (toolbox spec 4.1).
 #
 # Pure: no logging, no I/O, no console. Values in, values out; the callers log (ConvertTo-ValidChoices returns
 # the dropped tweak ids for that). Needs Catalog.ps1 (Get-TweakCatalog, Get-EffectiveTweaks, Get-RemoteChoice,
-# $script:RemoteChoices) and StartScreen.ps1 (New-DefaultChoices, $script:OfficeChoices); the bundle holds every
-# file.
+# Get-StepPlan, $script:RemoteChoices, $script:StepCatalog) and StartScreen.ps1 (New-DefaultChoices,
+# $script:OfficeChoices); the bundle holds every file.
 #
 # A profile only fills in the options (spec 5.2): Office, Remote, 7-Zip, the tweak selection and the restore
 # point. The Type (laptop or desktop) is never part of a profile: it is detected. Choices keep ASCII ids only, so
@@ -202,4 +203,74 @@ function Test-ProfileChanged {
   $run = @(Get-EffectiveTweaks -Choices $c -Config $Config -Machine $Machine) -join ','
   $fill = @(Get-EffectiveTweaks -Choices @{ Mode = $c['Mode']; Office = $profileChoices.Office; Tweaks = $profileChoices.Tweaks } -Config $Config -Machine $Machine) -join ','
   return ($run -cne $fill)
+}
+
+function New-ToolboxModel {
+  <#
+  .SYNOPSIS
+    The toolbox window's model (toolbox spec 4.1, 4.3): what the window shows, as plain values. Pure.
+  .DESCRIPTION
+    @{ Language; Choices; OnAC; AdminProtection; IsFresh; Previous; MaxAgeDays }:
+      - Language is config.toolbox.language when it is 'en' or 'he', else 'en' (the switch lasts for one run);
+      - Choices is New-DefaultChoices (the default profile; Tweaks holds its selection, not yet filtered by
+        the Type, Office and build rules);
+      - OnAC, IsFresh and Previous (@{ StartedAt; Color } or $null) are the values the console start screen
+        shows; AdminProtection is Test-AdminProtection's answer ('On', 'Off' or 'Unknown'; anything else is
+        'Unknown');
+      - MaxAgeDays is freshInstall.maxInstallAgeDays, for the "older than N days" warning.
+    The window renders it (Update-ToolboxView); nothing here reads the machine.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Machine,
+    [Parameter(Mandatory)]$Config,
+    [AllowNull()][hashtable]$Previous,
+    [Parameter(Mandatory)][bool]$IsFresh,
+    [Parameter(Mandatory)][bool]$OnAC,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$AdminProtection
+  )
+
+  $language = 'en'
+  $wanted = $Config.toolbox.language
+  if ($wanted -is [string] -and $wanted -cin 'en', 'he') { $language = $wanted }
+  $protection = 'Unknown'
+  foreach ($value in 'On', 'Off') { if ($AdminProtection -eq $value) { $protection = $value } }
+
+  return @{
+    Language        = $language
+    Choices         = (New-DefaultChoices -Machine $Machine -Config $Config)
+    OnAC            = $OnAC
+    AdminProtection = $protection
+    IsFresh         = $IsFresh
+    Previous        = $Previous
+    MaxAgeDays      = [int]$Config.freshInstall.maxInstallAgeDays
+  }
+}
+
+function Get-ToolboxPlanLines {
+  <#
+  .SYNOPSIS
+    The window's "What will happen" column: one line per planned step, '{0,2}  {1}' -f <n>, <catalog Title>. Pure.
+  .DESCRIPTION
+    The plan is Get-StepPlan on the Choices that Start would hand over (ConvertTo-ValidChoices on the model's
+    Choices), so the column shows exactly what the run will do. Titles are the catalog's English ones (ASCII,
+    shown left-to-right in both languages). Emitted one by one: wrap the call in @().
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Model,
+    [Parameter(Mandatory)][hashtable]$Machine,
+    [Parameter(Mandatory)]$Config
+  )
+
+  $choices = (ConvertTo-ValidChoices -Choices $Model['Choices'] -Config $Config -Machine $Machine).Choices
+  $titles = @{}
+  foreach ($step in $script:StepCatalog) { $titles[$step.Id] = $step.Title }
+  $n = 0
+  foreach ($id in @(Get-StepPlan -Machine $Machine -Choices $choices -Config $Config)) {
+    $n++
+    '{0,2}  {1}' -f $n, $titles[$id]
+  }
 }

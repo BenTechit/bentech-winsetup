@@ -45,3 +45,12 @@ Describe 'Test-ProfileChanged (spec 10b.6)' {
     $c[$K] = $V; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeTrue }
   It 'an unknown or empty profile is never "changed"' { $c.Profile = 'gone'; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
 }
+Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
+  It 'opens on the default profile in the configured language' {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'
+    $mo.Language | Should -Be 'en'; $mo.Choices.Profile | Should -Be 'home'; $mo.MaxAgeDays | Should -Be 14
+    $x = $cfg.PSObject.Copy(); $x.toolbox = [pscustomobject]@{ language = 'fr' }; (New-ToolboxModel -Machine $m -Config $x -IsFresh $true -OnAC $true -AdminProtection 'Off').Language | Should -Be 'en' }
+  It 'numbers the plan with catalog titles, the tweaks step right after the desktop icons' {
+    $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg)
+    $l[0] | Should -BeExactly ' 1  Prepare machine'; $l[4] | Should -BeExactly ' 5  System tweaks'; $l[-1] | Should -Match '^\d\d  Finalize$' }
+}
