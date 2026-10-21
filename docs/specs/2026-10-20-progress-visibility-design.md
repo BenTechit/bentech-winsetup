@@ -46,6 +46,7 @@ The v1 goal is unchanged. Ben double-clicks one file on 5–7 machines in parall
 
 **Non-goals**
 - No GUI (WinForms/WPF). The console stays the only UI.
+  Amended by [the toolbox spec, section 8](2026-10-21-toolbox-design.md): one WPF window before the run.
 - No Hebrew on the console: it stays ASCII, as in spec §5.
 - No percent-complete bar for the whole run. Its length can't be known, so a bar would lie.
 - No Office copy on the USB stick. It would go stale, against Ben's "always up to date" (spec Q6).

@@ -1,12 +1,14 @@
 # bentech-winsetup
 
-Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt and walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits when AnyDesk was chosen. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool`, only after Microsoft 365, and a few empty policy keys).
+Zero-touch Windows post-install setup by BENTECH IT. Ben double-clicks one launcher file on a freshly installed PC, accepts the UAC prompt, plans the PC in the BenTech Toolbox window (a profile, a few switches) and presses Start, then walks away. The tool survives any number of reboots, installs the standard apps, runs the vendor driver tool and Windows Update until nothing is left, and finishes on a full-screen green, yellow or red result with the AnyDesk ID in big digits when AnyDesk was chosen. While it works, one glance at the screen says what it is doing right now, that it is alive and what it has already done. When Ben presses Enter on the final screen it saves its logs to the USB stick and deletes its own folder, so nothing of setup's own is left in `C:\BenTech` on the customer's PC (the known leftovers are listed in [docs/testing.md](docs/testing.md) section 5: `C:\Program Files\OfficeDeploymentTool`, only after Microsoft 365, and a few empty policy keys).
 
 The launcher (`BenTechSetup.cmd`) is tiny and rarely changes. It downloads the newest signed `setup.ps1` and `config.json` from this repo's latest GitHub Release, verifies the signatures against the public key built into the launcher, and only then runs them. Updating the tool means publishing a release, never re-copying a file to the USB stick (usually; see [Publishing](#publishing-a-new-version)).
 
-Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first) and, for the free Craft office suite that is now the default, [docs/specs/2026-10-20-craft-apps-design.md](docs/specs/2026-10-20-craft-apps-design.md) (it amends both) and, for ScreenConnect as a remote-access choice next to AnyDesk, [docs/specs/2026-10-20-screenconnect-design.md](docs/specs/2026-10-20-screenconnect-design.md) (it amends all three). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md), [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md), [docs/superpowers/plans/2026-10-20-craft-apps.md](docs/superpowers/plans/2026-10-20-craft-apps.md) and [docs/superpowers/plans/2026-10-20-screenconnect.md](docs/superpowers/plans/2026-10-20-screenconnect.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
+Design: [docs/specs/2026-10-18-bentech-winsetup-design.md](docs/specs/2026-10-18-bentech-winsetup-design.md) (the spec is binding) and, for the progress screens, Microsoft 365 in the background and the "no leftover folder" cleanup, [docs/specs/2026-10-20-progress-visibility-design.md](docs/specs/2026-10-20-progress-visibility-design.md) (it amends the first) and, for the free Craft office suite that is now the default, [docs/specs/2026-10-20-craft-apps-design.md](docs/specs/2026-10-20-craft-apps-design.md) (it amends both) and, for ScreenConnect as a remote-access choice next to AnyDesk, [docs/specs/2026-10-20-screenconnect-design.md](docs/specs/2026-10-20-screenconnect-design.md) (it amends all three) and, for the BenTech Toolbox, the window that opens first (profiles, options, curated system tweaks, a closing restore point, English or Hebrew), [docs/specs/2026-10-21-toolbox-design.md](docs/specs/2026-10-21-toolbox-design.md) (it amends all four) with its [tweak fact cards](docs/specs/2026-10-21-toolbox-tweak-factcards.md). Plans: [docs/superpowers/plans/2026-10-18-bentech-winsetup.md](docs/superpowers/plans/2026-10-18-bentech-winsetup.md), [docs/superpowers/plans/2026-10-20-progress-visibility.md](docs/superpowers/plans/2026-10-20-progress-visibility.md), [docs/superpowers/plans/2026-10-20-craft-apps.md](docs/superpowers/plans/2026-10-20-craft-apps.md), [docs/superpowers/plans/2026-10-20-screenconnect.md](docs/superpowers/plans/2026-10-20-screenconnect.md) and [docs/superpowers/plans/2026-10-21-toolbox.md](docs/superpowers/plans/2026-10-21-toolbox.md). Test checklist: [docs/testing.md](docs/testing.md). Open research questions: [docs/spikes.md](docs/spikes.md).
 
 ## What it does
+
+The **BenTech Toolbox** window opens first: you pick a profile, adjust the options and the tweaks (English or Hebrew) and press Start; the console screens then run as before. The window is described in [Daily use](#daily-use), the tweaks in [System tweaks](#system-tweaks) and the restore point in [The restore point](#the-restore-point).
 
 In this order (steps that don't apply to the machine are left out):
 
@@ -14,31 +16,53 @@ In this order (steps that don't apply to the machine are left out):
 2. **Turn off BitLocker / device encryption** and prevent it coming back.
 3. **Time zone + Hebrew keyboard**: Israel Standard Time, Hebrew added next to English.
 4. **Desktop icons**: This PC and the user folder.
-5. **Remove bloatware**: a conservative list from `config.json`.
-6. **Rename the PC** to `<BRAND>-<SERIAL>` (max 15 characters).
-7. **winget** ready (installs App Installer if missing).
-8. **Google Chrome** (always), then the **remote tool** that **R** picked on the start screen: **AnyDesk** (the default; no unattended password, the customer accepts every connection), **ScreenConnect**, or both.
+5. **System tweaks** (the `tweaks` step): the curated registry tweaks the toolbox has switched on, from nine to choose from (see [System tweaks](#system-tweaks)). It lands before the first restart, so Explorer picks the values up at the next sign-in. A tweak Windows refuses is a yellow note, never red. Left out when no tweak is chosen.
+6. **Remove bloatware**: a conservative list from `config.json`.
+7. **Rename the PC** to `<BRAND>-<SERIAL>` (max 15 characters).
+8. **winget** ready (installs App Installer if missing).
+9. **Google Chrome** (always), then the **remote tool** chosen in the toolbox (**R** on the console start screen): **AnyDesk** (the default; no unattended password, the customer accepts every connection), **ScreenConnect**, or both.
     - ScreenConnect is **unattended on purpose**: it connects without the customer clicking Accept, so get the customer's OK at the counter (for example on the repair form). It enrols the PC in Ben's ScreenConnect list (name, IP, user name). That is the one exception to "the tool collects nothing off-machine" (v1 spec, section 5).
     - The installer is Ben's own `ScreenConnect.ClientSetup.exe`, taken from the run's own release. It runs only after its SHA-256 matches the one in the signed `config.json` and it carries a `ConnectWise, LLC` signature. The step then waits for the `ScreenConnect Client (b58e7c32699a96bf)` service. How Ben builds a new installer: [A new ScreenConnect installer](#a-new-screenconnect-installer).
-9. **7-Zip**, optional.
-10. **Craft apps** (Office CRAFT, the default): the free **WordCraft, GridCraft, DeckCraft and PdfCraft** (Word, Excel, PowerPoint and a PDF reader), then the **ArtCraft Launcher**, meant to keep them up to date (checked on the first laptop, [docs/testing.md](docs/testing.md) 1.17).
+10. **7-Zip**, optional.
+11. **Craft apps** (Office CRAFT, the default): the free **WordCraft, GridCraft, DeckCraft and PdfCraft** (Word, Excel, PowerPoint and a PDF reader), then the **ArtCraft Launcher**, meant to keep them up to date (checked on the first laptop, [docs/testing.md](docs/testing.md) 1.17).
     - Each is the MSI for the PC's processor (x64 or arm64) from the latest GitHub release of its project. It runs only after its `SHA256SUMS.txt` line and its `Learning Machines Inc` signature check out, and an app already at that version is skipped.
     - Desktop shortcuts `Word`, `Excel`, `PowerPoint` and `PDF Reader`, normally on the public desktop (**all users**). When an MSI put its own shortcut on the signed-in user's desktop, it is renamed there and stays that user's only. `ArtCraft Launcher` goes on the **signed-in user's** desktop, unless the MSI already put it on a desktop. A shortcut of that name already on a desktop stays; nothing is overwritten or deleted.
     - A failed app is red; the launcher or a shortcut alone is a yellow note. GitHub limits and the fields: [Changing apps and lists](#changing-apps-and-lists).
-11. **Chrome as default browser** (best effort). After the final restart Windows may take a while to apply it, so the end of the run waits up to 2 minutes for it before checking.
-12. **Vendor drivers + BIOS, pass 1** for Dell, Lenovo and HP (laptops and brand-name desktops).
-13. **Microsoft 365** (Hebrew + English), with Office BUSINESS or HOME. It **starts here and installs in the background** while Windows Update round 1 runs. Only **Word, Excel, PowerPoint, Outlook (classic) and OneNote** are installed. A restart waits for it, for at most 60 minutes.
-14. **Windows Update** in rounds, **one update at a time**, with reboots, until the search comes back empty (capped). Driver updates are installed even when they ask for input; firmware updates only on mains power.
-15. **Microsoft 365, finish**, with Office BUSINESS or HOME: collects the result of the background install (this step has no line of its own on the screen) and puts **Word, Excel, PowerPoint and Outlook shortcuts on the desktop of all users**, also when Office was already installed.
-16. **Vendor drivers + BIOS, pass 2**, for what only became applicable after Windows Update.
-17. **Vendor consumer app** on laptops (SupportAssist, Vantage, HP Support Assistant, MyASUS, ...). When `config.json` says how to recognise the app (`verify`, see [Changing apps and lists](#changing-apps-and-lists)), the step checks that the app is really there after winget reports success, and fails if it is not. Then the business updater is removed if the consumer app installed.
-18. **Finalize**: final power settings, an attempt to activate Windows when it has a product key but is not activated, the final restart, cleanup, `Setup-Report.txt`, the final screen.
+12. **Chrome as default browser** (best effort). After the final restart Windows may take a while to apply it, so the end of the run waits up to 2 minutes for it before checking.
+13. **Vendor drivers + BIOS, pass 1** for Dell, Lenovo and HP (laptops and brand-name desktops).
+14. **Microsoft 365** (Hebrew + English), with Office BUSINESS or HOME. It **starts here and installs in the background** while Windows Update round 1 runs. Only **Word, Excel, PowerPoint, Outlook (classic) and OneNote** are installed. A restart waits for it, for at most 60 minutes.
+15. **Windows Update** in rounds, **one update at a time**, with reboots, until the search comes back empty (capped). Driver updates are installed even when they ask for input; firmware updates only on mains power.
+16. **Microsoft 365, finish**, with Office BUSINESS or HOME: collects the result of the background install (this step has no line of its own on the screen) and puts **Word, Excel, PowerPoint and Outlook shortcuts on the desktop of all users**, also when Office was already installed.
+17. **Vendor drivers + BIOS, pass 2**, for what only became applicable after Windows Update.
+18. **Vendor consumer app** on laptops (SupportAssist, Vantage, HP Support Assistant, MyASUS, ...). When `config.json` says how to recognise the app (`verify`, see [Changing apps and lists](#changing-apps-and-lists)), the step checks that the app is really there after winget reports success, and fails if it is not. Then the business updater is removed if the consumer app installed.
+19. **Finalize**: final power settings, an attempt to activate Windows when it has a product key but is not activated, the final restart, cleanup, the **restore point** when it was chosen (see [The restore point](#the-restore-point)), `Setup-Report.txt`, the final screen.
 
 ## Daily use
 
-1. **Put the launcher on a USB stick formatted exFAT or FAT32**: copy `dist\BenTechSetup.cmd` to the stick (see [Publishing](#publishing-a-new-version) for when to re-copy it). exFAT/FAT32 files carry no Mark-of-the-Web, so there is no SmartScreen warning. Spaces, Hebrew letters and apostrophes in the launcher's path are fine. **Leave the stick in the PC:** at the end the logs are saved to it (see step 5). The v2 release does not change the launcher, so a stick that holds the current one stays valid.
-2. **On the fresh PC**: finish OOBE with a local account (no password), connect to the internet, double-click `BenTechSetup.cmd`, click **Yes** on the UAC prompt.
-3. **The start screen** gives you 30 seconds to read it, then starts by itself:
+1. **Put the launcher on a USB stick formatted exFAT or FAT32**: copy `dist\BenTechSetup.cmd` to the stick (see [Publishing](#publishing-a-new-version) for when to re-copy it). exFAT/FAT32 files carry no Mark-of-the-Web, so there is no SmartScreen warning. Spaces, Hebrew letters and apostrophes in the launcher's path are fine. **Leave the stick in the PC:** at the end the logs are saved to it (see step 5). Neither the v2 nor the toolbox release changes the launcher, so a stick that holds the current one stays valid.
+2. **On the fresh PC**: finish OOBE with a local account (no password), connect to the internet, double-click `BenTechSetup.cmd`, click **Yes** on the UAC prompt. The BenTech Toolbox window opens on top of the console.
+3. **The BenTech Toolbox window opens** (on top, after the UAC prompt) and waits for you. There is no countdown: nothing starts until you press **Start**. It is a dark window of about 1000 x 680 with English or Hebrew text.
+
+   - **Machine card:** make and model, serial number (`SN`), the name the PC will get (`New name`) and the power state (`On charger` / `On battery`). The power state is read again every 5 seconds, so plugging the charger in or out shows within seconds. The machine values always read left to right, also in Hebrew.
+   - **Profiles:** three tiles, **Home PC** (the one the window opens on), **Business PC** and **Clean Windows**. **A profile only fills in the options**: every option stays switchable for this PC, and changing one never changes the profile tile (the report then names the profile with `(changed)`). The Type (laptop or desktop) is never part of a profile: it is detected.
+
+     | Profile | Office | Remote | 7-Zip | Tweaks | Restore point |
+     |---|---|---|---|---|---|
+     | Home PC | Craft (free) | AnyDesk | yes | the defaults | yes |
+     | Business PC | 365 Business | Both (AnyDesk and ScreenConnect) | yes | the defaults | yes |
+     | Clean Windows | none | AnyDesk | no | none | yes |
+
+   - **The tiles and switches:** **Type** (Laptop / Desktop), **Office** (Craft (free) / 365 Business / 365 Home / None), **Remote** (AnyDesk / ScreenConnect / Both) and **Apps** (Chrome is always installed; 7-Zip is a switch). They are the choices the console screen makes with `L` / `D`, `O`, `R` and `Z`. While ScreenConnect is chosen (ScreenConnect or Both) a yellow reminder reads `ScreenConnect = unattended access: get the customer's OK first`; it is only a reminder, nothing waits for it. **Tweaks** have one row each, with a switch, an icon, the title and a one-line explanation, and the full text in a tooltip ([System tweaks](#system-tweaks)). The last switch is **Restore point at the end** ([The restore point](#the-restore-point)). A row the rules rule out is hidden (NumLock on a laptop, classic Outlook without Microsoft 365, the three Windows 11 tweaks on Windows 10).
+   - **What will happen** (right-hand column): the numbered list of the steps this PC will run. It comes from the same plan the run uses, so it always matches; it changes with every click, shows the step names in the window's language and scrolls by itself when it is longer than the window. **Start** (the large blue button) and **Cancel** are under it.
+   - **Yellow banner:** the warnings the console screen has always shown: `This PC already has user files or is older than 14 days` (it does not look like a fresh install), `Previous run: <date> - <result>` (details below) and `On battery: BIOS updates will be skipped`. It is not there when there is nothing to warn about.
+   - **Red banner and a disabled Start: Administrator protection.** When setup runs as another user than the one signed in, the banner says `Setup is running as a different user than the one signed in (Windows Administrator protection, or an admin password typed for another account). It would not resume after a restart: sign in as this PC's administrator, or turn Administrator protection off in Windows Security.` Start stays disabled while that lasts (the resume task would register the wrong, hidden account): **turn Administrator protection off in Windows Security, then start the launcher again**. Cancel and the X still work. A signed-in user name that is empty (an RDP session, an early logon) or cannot be read counts as the same user and does not block.
+   - **EN | HE:** the switch in the title bar changes the window's language **for this run only** (the window opens in `toolbox.language`, `en` as shipped). Hebrew turns the whole window right-to-left. `setup.log`, the report and the console stay English. The title bar also drags the window, and the X is Cancel.
+   - **Start** works with the mouse only. It is not the default button and cannot take the keyboard focus, so Enter and Space never start a run, and **Esc does nothing**. Start closes the window and the run goes on exactly as before: the console progress screen, the restarts, the final screen.
+   - **Cancel, the X and Alt+F4** do what Esc does on the console start screen: no setup step runs, any leftover resume task is removed, and on a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too. If an earlier run left its state, nothing is deleted.
+   - **Small screens:** on a small screen (the basic display driver at 1024 x 768, or 150% scaling) the window takes the whole work area and its content scrolls, sideways too when the window is narrower than the content. Start stays at the bottom of the "What will happen" column, whose list scrolls on its own.
+   - **Ctrl+C** pressed in the console behind the window takes effect only after the window closes.
+
+   **The emergency path: the console start screen.** It appears only when the window cannot open (the line `Toolbox not available; using the console start screen` in `setup.log`: the thread is not STA, the session is not interactive or is session 0, or WPF cannot be loaded) or when the window fails once it is open (`Toolbox failed; using the console start screen`). A failure is never read as Cancel. The console screen is unchanged and keeps its own 30-second auto-start: it gives you 30 seconds to read it, then starts by itself. It has no lines or keys for profiles, tweaks or the restore point: the run takes the default profile's tweaks and restore point (`L` / `D` and `O` still drop or bring back NumLock and classic Outlook). It has no Administrator-protection block either; the tweaks step then skips the per-user values with a note.
 
    ```
     =============================================================================
@@ -62,7 +86,7 @@ In this order (steps that don't apply to the machine are left out):
    - **Top block:** the PC (make, model, serial number `SN`), whether it is on its charger or on battery, and the name it will get.
    - **WHAT WILL HAPPEN:** one line per choice, with the key that changes it on the right. The `Type` line says what the mode means: a laptop gets the vendor driver tool and the laptop app; a brand-name desktop gets the driver tool but no laptop app; a brand with no driver tool (ASUS, a VM) gets no driver tool and the line says `no driver tool for this brand` (an ASUS laptop still gets its laptop app, MyASUS; a VM gets neither). Chrome always gets installed.
    - **Remote:** the default is **ANYDESK**, as before. **R** goes to SCREENCONNECT, then BOTH (the line reads `ANYDESK + SCREENCONNECT`), then back to ANYDESK. While ScreenConnect is chosen a yellow line follows: `ScreenConnect = unattended access: get the customer's OK first`. It is only a reminder: nothing waits for it and the countdown runs as usual.
-   - **Office:** the default is **CRAFT**, the free Craft apps (WordCraft, GridCraft, DeckCraft, PdfCraft and the ArtCraft Launcher; see "What it does", item 10). They are alpha, so Microsoft 365 is one key press away: **O** goes to BUSINESS, then HOME (both install Microsoft 365), then OFF, then back to CRAFT. The tool installs one suite or the other, never both.
+   - **Office:** the default is **CRAFT**, the free Craft apps (WordCraft, GridCraft, DeckCraft, PdfCraft and the ArtCraft Launcher; see "What it does", item 11). They are alpha, so Microsoft 365 is one key press away: **O** goes to BUSINESS, then HOME (both install Microsoft 365), then OFF, then back to CRAFT. The tool installs one suite or the other, never both.
    - **Colours:** on a black screen, the value of each choice is green (yes / on) or dark grey (`NO` / `OFF`); a yellow line is a warning.
    - **The countdown:** `Starts by itself in N s` and a bar that empties. **Every key you press restarts it at 30 s**, also a key that does nothing (Space, F5, ...), so the run starts by itself only when nobody touches the keyboard.
 
@@ -73,10 +97,10 @@ In this order (steps that don't apply to the machine are left out):
    | `O` | Office cycles CRAFT (the default), BUSINESS, HOME, OFF. CRAFT is the free Craft apps; BUSINESS and HOME are Microsoft 365 (Hebrew + English) |
    | `R` | Remote tool cycles ANYDESK (the default), SCREENCONNECT, BOTH. ScreenConnect is unattended access: get the customer's OK first |
    | `Enter` | Start now |
-   | `Esc` | Cancel: no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing of setup's own is left. If an earlier run left its state, Esc deletes nothing: its logs stay for diagnosis |
+   | `Esc` | Cancel (the same as Cancel in the toolbox): no setup step runs, and any leftover resume task is removed. On a PC that no earlier run touched, the `C:\BenTech` folder the launcher made is deleted too, so nothing of setup's own is left. If an earlier run left its state, Esc deletes nothing: its logs stay for diagnosis |
    | any other key | Nothing changes, but the countdown goes back to 30 s |
 
-   On battery a yellow line warns that BIOS updates are skipped unless you plug in. If the PC does not look like a fresh install (Windows older than 14 days, or more than 1 GB in Desktop/Documents/Downloads) there is no countdown and the screen says `This PC already has user files or is older than 14 days - press ENTER to run anyway`. A `Previous run: <date> - <result>` line appears when an earlier run left its `state.json` behind: normally after an unfinished run (`UNFINISHED`: a crash, or a run stopped half way). A run that was finished with Enter deletes `C:\BenTech` and so shows nothing; if its folder survived (the window was closed instead of pressing Enter, `rd` could not delete it, or Windows is not on drive C:) the line shows that run's colour, for example `GREEN`.
+   The three warnings below are the ones the toolbox's yellow banner shows too (the window has no countdown and no `press ENTER`). On battery a yellow line warns that BIOS updates are skipped unless you plug in. If the PC does not look like a fresh install (Windows older than 14 days, or more than 1 GB in Desktop/Documents/Downloads) there is no countdown and the screen says `This PC already has user files or is older than 14 days - press ENTER to run anyway`. A `Previous run: <date> - <result>` line appears when an earlier run left its `state.json` behind: normally after an unfinished run (`UNFINISHED`: a crash, or a run stopped half way). A run that was finished with Enter deletes `C:\BenTech` and so shows nothing; if its folder survived (the window was closed instead of pressing Enter, `rd` could not delete it, or Windows is not on drive C:) the line shows that run's colour, for example `GREEN`.
 4. **Walk away.** The progress screen (below) shows what is happening. The machine reboots by itself (a 15 s `Restarting in N s ...` countdown on screen), logs in by itself and carries on. If Microsoft 365 is still installing in the background, the restart waits for it (the screen says so). Nothing asks for input.
 5. **Come back to the final screen.** The whole console is green, yellow or red. Press **Enter** to finish. Keys:
 
@@ -97,6 +121,37 @@ In this order (steps that don't apply to the machine are left out):
    3. **Deletes `C:\BenTech`** (and `C:\ProgramData\BenTech` when it is empty), so **no setup folder is left**. If it cannot be deleted the screen says `delete it by hand` and waits for a key. On a PC whose Windows is not on drive C: the folder is kept (`Not deleting ...`). The folder is also kept while the resume task could not be removed (`Resume task BenTechSetup-Resume is still registered: C:\BenTech kept - delete the task, then the folder, as administrator`, then a key): that task starts `C:\BenTech\Setup\setup.ps1` as administrator at every sign-in, and only the admin-only folder stops anyone else from putting a file of that name there. Delete the task first (`Unregister-ScheduledTask BenTechSetup-Resume -Confirm:$false` in an administrator PowerShell), then the folder.
 
    A **crash** is different: it leaves everything in place (the folder, the logs and the resume task) so you can see what went wrong. See [Setup crashed](#setup-crashed).
+
+### System tweaks
+
+The toolbox offers nine small, safe Windows settings, one switch each. A tweak ships only if it passes the five rules of [toolbox spec 6.1](docs/specs/2026-10-21-toolbox-design.md) (it works on Windows 11 Home and Pro, nothing harmful, reversible, no `\Policies\` path, a clear benefit); the exact values and the research are in the [fact cards](docs/specs/2026-10-21-toolbox-tweak-factcards.md).
+
+| Tweak | Default | What it does |
+|---|---|---|
+| `accessKeys` Accessibility shortcuts off | **on** | Sticky Keys (Shift x5) and Filter Keys (hold right Shift) stop popping up; both stay available in Settings. Clears bit 4 of the two accessibility `Flags` values (REG_SZ). |
+| `numLock` NumLock on at sign-in | **on, desktops only** | The number pad works at the sign-in screen. Writes the sign-in screen's own profile (`HKEY_USERS\.DEFAULT`) and the account's. Offered and applied only when Type is Desktop: a laptop with a number pad inside the letter keys would type digits into the password box. |
+| `startClean` Start menu: no recommended tips and apps, no account nags | **on** | Turns off the recommendations in Start and the account notifications on Start. |
+| `noAds` No tips, suggestions and ads in Windows | **on** | No tips notifications, no suggested content in Settings, no lock-screen fun facts, no OneDrive or Microsoft 365 banners in File Explorer. |
+| `classicOutlook` Keep classic Outlook | **on, only with Office 365 Business or Home** | Hides the "Try the new Outlook" switch. |
+| `fileExtensions` Show file extensions | off | Shows `invoice.pdf.exe` as what it is. Off everywhere (Q27): no profile turns it on, you switch it on per PC. |
+| `taskbarLeft` Taskbar icons on the left | off | The Windows 10 layout. Windows 11 only. |
+| `classicMenu` Classic right-click menu | off | The full right-click menu in one click. Windows 11 only. |
+| `endTask` End task in the taskbar right-click menu | off | Closes a frozen app from the taskbar, without asking to save. Windows 11 only. |
+
+- **They take effect at the next sign-in**, which the run's restarts provide. They reach only the account that runs setup, which is the customer's account (as the other steps assume): accounts created later get the Windows defaults.
+- **A refused tweak is a yellow note**, `<title> could not be applied`, and the other tweaks still run. A tweak is never red: Windows works without it. (Windows' UCPD driver refuses some writes from PowerShell; none of the nine values is known to be on its list. With Windows Administrator protection on, which the toolbox blocks but the console fallback does not, the per-user values are skipped with one note, `Per-user tweaks skipped: Windows Administrator protection is on`, and NumLock's sign-in screen value is still written.)
+- **There is no undo**: the toolbox is gone after the run. **Every original is in `Logs\setup.log`**, one `Tweak value` line per value with the path, name, type, the original (`absent` when there was none), the new value, the value read back and the result. To reverse a tweak by hand, write the original back, or delete the value when it was `absent`. A value that cannot be read is never written over, and a value already at its target is left alone on a re-run.
+- The report has a `Tweaks       :` line (`5 applied: accessKeys, numLock, ...`, with `(refused: ...)` and `(skipped, Administrator protection: ...)` when there are any), and JUST HAPPENED gets `Tweaks: 5 applied`.
+
+### The restore point
+
+**Restore point at the end** (on in all three profiles) creates a Windows restore point named `BenTech setup` at the very end of the run, in Finalize: after the resume task, the downloads and the setup files are gone, and before the report is written. The snapshot is then the finished PC, not the setup's temporary policies, power values or resume task.
+
+- **System Protection is turned on** for the system drive (a restore point needs it) and reserves a few percent of the disk. The report says so: `Restore point: created (System Protection is now on and reserves a few percent of the disk)`.
+- **One bounded child process** does the work, limited by `timeoutsMinutes.restorePoint` (10 minutes); NOW reads `Creating a restore point`. It counts as created only when the newest restore point's number rose. Once per run.
+- **The frequency value:** Windows silently skips a second restore point within 24 hours, so before the child starts the main setup process records `SystemRestorePointCreationFrequency` (under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore`) in `setup.log` (`Restore point: creation frequency recorded`) and in `state.json`, and sets it to 0. **It puts the original back afterwards, whatever happened** (and removes the value again when it was absent), even after a timeout.
+- **A restore point that is not confirmed** (timeout, error, no new point) is a yellow note, `Restore point could not be confirmed`; a frequency value that could not be put back is a second note, `Restore point frequency value could not be put back`.
+- **Known gap:** a power cut, or a console closed, during these last minutes can leave the frequency value at 0 for good, because the resume task is already removed and nothing resumes to put it back. The original is in `setup.log` and in `state.json` (`RestorePointOriginalFrequency`). [docs/testing.md](docs/testing.md) 1.19 checks the value after a normal run.
 
 ### Reading the progress screen
 
@@ -142,7 +197,7 @@ The final screen is white text on dark green (GREEN), **black text on yellow** (
 | Colour | Banner | Meaning |
 |---|---|---|
 | GREEN | `SETUP COMPLETE` | Every step done, no notes. |
-| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated (or its status could not be read), BitLocker still decrypting, Windows 10 (no security updates), a Lenovo result that could not be verified, BIOS or firmware updates left alone because the PC was on battery, the Office or Craft desktop shortcuts, the ArtCraft Launcher (the apps work without it), the power settings or the resume task that could not be put back. |
+| YELLOW | `COMPLETE - CHECK NOTES` | No failures, but something needs a look: a step skipped (unsupported model, Store sign-in needed, ARM64), Chrome is not the default, Windows not activated (or its status could not be read), BitLocker still decrypting, Windows 10 (no security updates), a Lenovo result that could not be verified, BIOS or firmware updates left alone because the PC was on battery, the Office or Craft desktop shortcuts, the ArtCraft Launcher (the apps work without it), the power settings or the resume task that could not be put back, a system tweak Windows refused (or per-user tweaks skipped under Administrator protection), the restore point that could not be confirmed (or its frequency value that could not be put back). |
 | RED | `COMPLETED WITH ERRORS` | A step failed or never finished, a Windows update failed repeatedly (`left to Windows Update`: setup hid it during the run and un-hid it at the end; one it could not un-hide says `Windows update still hidden: ... - un-hide it in Windows Update`), a cap was hit (reboots or update rounds), the drive is still encrypted, or a restart was refused. |
 
 The final screen lists at most 3 failures and 2 notes, each with a one-line reason, then `... and N more: see the report`. The report lists them all.
@@ -153,7 +208,7 @@ The final screen lists at most 3 failures and 2 notes, each with a one-line reas
 
 | What | Where |
 |---|---|
-| Report | `C:\BenTech\Setup\Logs\Setup-Report.txt` (also lists the Windows updates installed, per round) |
+| Report | `C:\BenTech\Setup\Logs\Setup-Report.txt` (also lists the Windows updates installed, per round, and after the `ScreenConnect:` line the `Profile`, `Tweaks` and `Restore point` lines) |
 | Our log | `C:\BenTech\Setup\Logs\setup.log` |
 | The JUST HAPPENED feed | `C:\BenTech\Setup\Logs\activity.txt` (an earlier run's: `activity-<RunId>.txt`). The AnyDesk ID is here and in the report, never in `setup.log` |
 | Windows Update rounds | `C:\BenTech\Setup\Logs\wu-round<N>.json` (the round's result) and `wu-round<N>.progress.json` (the live list the screen reads) |
@@ -176,7 +231,7 @@ The launcher window stays open for 15 seconds after a failure. The exit code is 
 
 | Code | Message | What to do |
 |---|---|---|
-| 0 | (none) | Setup ran and ended normally. This includes Esc on the start screen and a restart in progress. The colour of the final screen is the result, not the exit code. |
+| 0 | (none) | Setup ran and ended normally. This includes Cancel in the toolbox (Esc on the console start screen) and a restart in progress. The colour of the final screen is the result, not the exit code. |
 | 1 | `Setup could not start: ...` | Unexpected launcher error. Read the message. If the console shows `Setup crashed`, see below. |
 | 2 | `Setup is already running on this machine` | A run (or its resume after a reboot) holds the lock. Look for the setup window on the taskbar and don't double-click twice. If no window exists, restart Windows and try again: a lock left by a dead run is detected and ignored. |
 | 3 | `SECURITY CHECK FAILED - files are not signed by BenTech` | A downloaded file does not match its signature. Nothing was written or run. Try once more (a captive portal or proxy can corrupt a download). Check the stick holds the current launcher: `Get-FileHash <stick>\BenTechSetup.cmd -Algorithm SHA256` must equal the hash in `keys\launcher.sha256` (ignore upper/lower case). A launcher built for an old signing key fails against releases signed with a new one. If it still fails, treat it as a possible tampering incident: check the GitHub account and the release files before doing anything else. Never bypass it. |
@@ -190,9 +245,9 @@ A red screen reads `Setup crashed: <message> - see C:\BenTech\Setup\Logs`. Press
 1. Read the tail of `Logs\setup.log` and the newest `Logs\transcript-*.txt`. The log has the stack trace.
 2. Fix it in the repo and publish a new release, or re-run if it looks transient.
 3. **Re-run:** double-click the launcher again. It downloads the newest release, archives the old state to `Logs\state-<RunId>.json` and the old activity feed to `Logs\activity-<RunId>.txt`, resets the counters, and runs every step again. Steps that were already done finish in seconds. The start screen shows `Previous run: <date> - UNFINISHED`.
-4. To stop the retries without running again: double-click the launcher and press **Esc**. That removes the leftover resume task and runs no step. When the crashed run saved its state, Esc deletes nothing: the launcher's fresh `setup.ps1`, `config.json` and the `Logs\` folder stay in `C:\BenTech\Setup`. Copy the logs out (from an elevated prompt) before you delete the folder by hand. **Exception:** a crash before the run's first state save (or a corrupt `state.json`) leaves no readable state, and then Esc deletes `C:\BenTech` with its logs, so copy the logs out before you press Esc.
+4. To stop the retries without running again: double-click the launcher and press **Cancel** in the toolbox (Esc does nothing there; Esc is for the console start screen). That removes the leftover resume task and runs no step. When the crashed run saved its state, Cancel deletes nothing: the launcher's fresh `setup.ps1`, `config.json` and the `Logs\` folder stay in `C:\BenTech\Setup`. Copy the logs out (from an elevated prompt) before you delete the folder by hand. **Exception:** a crash before the run's first state save (or a corrupt `state.json`) leaves no readable state, and then Cancel deletes `C:\BenTech` with its logs, so copy the logs out before you press Cancel.
 
-An unreadable `state.json` (power cut mid-write) is archived as `Logs\state.corrupt-<time>.json` and a new run starts by itself. (Known gap, in two cases: after a corrupt `state.json`, and after a crash before the first save, there is no readable state, so Esc on the start screen counts as a fresh PC and deletes `C:\BenTech` with those logs. Copy out what you need first.)
+An unreadable `state.json` (power cut mid-write) is archived as `Logs\state.corrupt-<time>.json` and a new run starts by itself. (Known gap, in two cases: after a corrupt `state.json`, and after a crash before the first save, there is no readable state, so Cancel on the start screen (Esc on the console one) counts as a fresh PC and deletes `C:\BenTech` with those logs. Copy out what you need first.)
 
 ## Publishing a new version
 
@@ -312,7 +367,7 @@ If the plain-text file was ever in a synced folder (OneDrive, a cloud-backed Des
 
 ## Changing apps and lists
 
-Everything Ben may want to change without touching code is in `config\config.json`: the 7-Zip and Office defaults, the Chrome and AnyDesk download URLs, the ScreenConnect installer's pin, winget IDs, the Office products and languages, the vendor tool matrix and consumer app IDs, expected Authenticode signers, the bloatware remove/protect lists, caps and timeouts.
+Everything Ben may want to change without touching code is in `config\config.json`: the 7-Zip and Office defaults, the Chrome and AnyDesk download URLs, the ScreenConnect installer's pin, winget IDs, the Office products and languages, the vendor tool matrix and consumer app IDs, expected Authenticode signers, the bloatware remove/protect lists, the toolbox profiles and tweaks, caps and timeouts.
 
 Edit it, run the tests (they check that the remove and protect lists don't overlap, that every signer reference exists and that every `verify` entry is well formed), commit, push, publish. No launcher update is needed. Keep it UTF-8 and valid JSON.
 
@@ -347,6 +402,20 @@ Settings worth knowing:
   ```
 
   (The values above are only an example of the shape.) `paths` and `services` are both optional, but at least one must list something. `%VARIABLES%` and wildcards in a path are fine. The paths are tried first, then the services; the first hit counts. Found: the step is Done and an activity line says which check passed. Not found: the step is Failed with `<app> was not found after install`, and the business updater stays. **Leave `verify` out and the step is Done as soon as winget reports success** (the v1 behaviour; no brand has a `verify` entry yet). The real values come from Ben's check of the Start menu and from the `-InventoryOnly` run of Spike 5 after a setup run.
+- **`profiles`** (with **`defaults.profile`**): the toolbox's built-in profiles, in the order of the tiles. Each has:
+  - `id`: lower-case letters, digits and `-`, starting with a letter, at most 32 characters; a repeated id is ignored;
+  - `name`: `{ "en": ..., "he": ... }` (`en` is required, else the profile is ignored; a missing `he` shows the English name);
+  - `office` (`CRAFT`, `BUSINESS`, `HOME` or `OFF`), `remote` (`ANYDESK`, `SCREENCONNECT` or `BOTH`), `sevenZip` and `restorePoint` (true or false): a value that is not valid is repaired, never a reason to lose the profile (an invalid `office` takes `defaults.office`, or `OFF`; an invalid `remote` is `ANYDESK`; `sevenZip` takes `defaults.sevenZip`; `restorePoint` is true);
+  - `tweaks` (a list of tweak ids): the profile's tweaks **instead of** the ones marked `default` (an empty list means no tweaks, as in Clean Windows); without this field the profile takes every tweak with `"default": true`. `tweaksAdd` adds ids on top. An id that is not in the catalog is dropped.
+
+  The Type is never a profile field: it is detected. **Adding or changing a profile means a new release** (Q22: built-in profiles only, in the signed `config.json`). `defaults.profile` is the profile the window opens on, and the one the console fallback runs; it wins over `defaults.office`, `defaults.remote` and `defaults.sevenZip`, which stay for a profile that does not set them. A `defaults.profile` that names no valid profile means no profile (the `defaults.*` values and the tweaks marked `default`).
+- **`tweaks`**: the catalog the toolbox draws its switches from. An entry has `id` (a letter, then letters and digits, at most 32 characters), `default` (on by default?), `title` and `description` (`en` and `he`), `icon` (the hex code of a glyph in the Segoe Fluent / MDL2 icon fonts, for example `E765`) and `values`, plus the optional rules `desktopOnly` (offered and applied only when Type is Desktop), `office365Only` (only with Office BUSINESS or HOME) and `minBuild` (hidden and not applied below that Windows build; `22000` is Windows 11). Each value is `{ path, name, type, op, value }`, and `bit` for `clearBit`:
+  - `path` starts with `HKCU:\`, `HKLM:\` or `Registry::HKEY_USERS\.DEFAULT\` (PowerShell has no `HKU:` drive); the rules of [toolbox spec 6.1](docs/specs/2026-10-21-toolbox-design.md) apply, among them **no `\Policies\` path** (a policy makes Settings say "managed by your organization") and nothing the run's other steps already manage (power, `HiberbootEnabled`, `WindowsUpdate\AU`, the `nags` values, the desktop icons, the default browser). An entry that breaks a rule is left out without a message (`tests\Config.Tests.ps1` proves that all nine shipped entries survive);
+  - `type` is `String` (REG_SZ) or `DWord` (REG_DWORD), nothing else; `op` is `set`, or `clearBit` for the accessibility `Flags`. An empty `name` is the key's default value and is allowed only for a String `set` (the classic right-click menu writes a real empty REG_SZ there);
+  - `bit` is the **mask** to clear, not a bit index: `4` means 0x4, so `510` becomes `506`. `clearBit` reads the current REG_SZ number, clears the mask and writes it back as REG_SZ; when the value is missing or is not a number it writes `value`, the fresh-install number.
+- **`toolbox.language`**: `"en"` or `"he"`, the language the window opens in (anything else means `en`); the EN | HE switch changes it for one run only.
+- **`timeoutsMinutes.restorePoint`**: how long the restore point's child process may take (10).
+- **Hebrew text:** all Hebrew lives in the `he` values of `config.json` and in `src\Toolbox\Strings.ps1` (the toolbox's own texts, including the Hebrew step names); nothing else in `src` may contain a non-ASCII character.
 
 ## Open spikes
 
@@ -378,6 +447,15 @@ Pass means the last line reads `Failed: 0`. Pass a single file to `-Path` to run
 - **Never parse localized output.** Machines may run Hebrew Windows: use exit codes, CIM, registry values, GUIDs and SIDs.
 - Downloads use `System.Net.WebClient` with TLS 1.2, never `Invoke-WebRequest`.
 - Never run setup steps, the launcher or `ScreenConnect.ClientSetup.exe` on the dev PC (the installer would enrol it in the ScreenConnect list). Tests mock everything, and none reads the real installer.
+- The console is English and ASCII; **the toolbox window is the one exception**. `src\Toolbox\Strings.ps1` is the only non-ASCII `src` file (`tests\Encoding.Tests.ps1` enforces it), and the window uses hex colours. No test opens a window or stops WPF.
+
+**Preview the toolbox:** `tools\Preview-Toolbox.ps1` draws the window offscreen into four PNG files (nothing is shown, no window is opened), in `dist\toolbox-preview` unless `-OutDir` names another folder:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\Preview-Toolbox.ps1
+```
+
+It prints each file's path: `toolbox-en.png` and `toolbox-he.png` (the default profile on a sample Dell laptop, with the yellow banner), `toolbox-en-business-desktop.png` (the Business profile as a desktop: the ScreenConnect reminder, NumLock and classic Outlook) and `toolbox-en-blocked.png` (Administrator protection: the red banner and the disabled Start). Run it after any change to `src\Toolbox\`, to a profile or a tweak title in `config.json`, and look at the pictures before a VM run; the look was approved on these pictures (Q29).
 
 **Build the bundle by hand:**
 
@@ -391,11 +469,11 @@ This writes `dist\setup.ps1` and `dist\config.json`. Sign with `tools\Sign-File.
 
 | Path | Holds |
 |---|---|
-| `src\` | The code: Common, State, Detect, Engine, Steps, Report, UI, Entry |
+| `src\` | The code: Common, State, Detect, Engine, Steps, Report, UI, Toolbox, Entry |
 | `tests\` | Pester tests and fixtures |
 | `config\config.json` | All data: URLs, IDs, signers, lists, caps, timeouts |
 | `launcher\` | The launcher template (polyglot cmd + PowerShell) |
-| `tools\` | Bundle, launcher, signing and publish tooling; `spikes\` has the research scripts |
+| `tools\` | Bundle, launcher, signing and publish tooling; `Preview-Toolbox.ps1` renders the toolbox; `spikes\` has the research scripts |
 | `keys\` | `public-key.xml` and `launcher.sha256` |
 | `docs\` | Spec, plan, spikes, testing checklist |
 | `dist\` | Build output (ignored by Git) |

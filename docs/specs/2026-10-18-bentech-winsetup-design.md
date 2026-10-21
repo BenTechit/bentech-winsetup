@@ -34,6 +34,7 @@ A friend's tool (`winAutomationFull.exe`, from 1007.co.il/1) proved the idea: a 
 - An offline installer cache. Ben's internet is strong, and freshness matters more than bandwidth.
 - Building the tool into the Windows install media (autounattend.xml). This could come later; see §18.
 - Any GUI framework. A console UI is enough.
+  Amended by [the toolbox spec, section 8](2026-10-21-toolbox-design.md): one WPF window before the run.
 - Activating Windows or Office. Licensing is the customer's business; the report only shows activation status.
 
 ## 4. Anti-goals: failure even if it "works"
