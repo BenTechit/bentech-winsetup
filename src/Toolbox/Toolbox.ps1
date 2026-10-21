@@ -8,6 +8,13 @@
 # language walk (Set-ToolboxLanguage) and the view (Update-ToolboxView), which renders the pure model of
 # SetupPlanner.ps1.
 #
+# And it runs the window (Task 3): the handlers (Register-ToolboxHandlers), the one function every handler calls
+# (Invoke-ToolboxAction: the model changes through Update-ToolboxModel, then the view follows), the outcome
+# (Close-ToolboxWindow: Start, Cancel or Failed; a failure is never read as Cancel), the dispatcher backstop
+# (Invoke-ToolboxUnhandled), the work-area clamp (Set-ToolboxWindowSize), the power timer (New-ToolboxPowerTimer)
+# and the dialog itself (Show-ToolboxWindow, which never throws and shows the window only through its -ShowDialog
+# seam).
+#
 # The WPF rules (spec 5.1; the plan's Global Constraints), which every later addition keeps:
 #   - The window's state lives in $window.Tag (the plan's "Toolbox model and window state"). Every handler is one
 #     line, { Invoke-ToolboxAction -Sender $this }: no closures over outer variables.
@@ -22,16 +29,39 @@
 #   - Hebrew turns the window right-to-left; the machine values stay left-to-right. The plan rows follow the
 #     language: their step names are the string table's step.<id> (ruling TB-R5), while the console, setup.log and
 #     the report keep the catalog's English titles.
-#   - Nothing here writes to the console (no Write-Host) or sleeps.
-#   - Nothing here opens the window as a dialog or stops WPF; no test does either.
+#   - Nothing here writes to the console (no Write-Host) or sleeps. setup.log gets English ASCII only: every
+#     exception message and every free value goes through ConvertTo-ScreenText first.
+#   - Only Show-ToolboxWindow's -ShowDialog default opens the window as a dialog, and nothing here stops WPF
+#     (Get-SetupChoices does, Task 4); no test does either.
 #
 # Needs: Toolbox\Strings.ps1 ($script:ToolboxStrings), Toolbox\Xaml.ps1 ($script:ToolboxXaml),
-# Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog,
-# Test-TweakAllowed, Get-RemoteChoice, $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun) and WPF
-# (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds every file.
+# Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, New-ToolboxModel, Update-ToolboxModel, ConvertTo-ValidChoices,
+# Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog, Test-TweakAllowed, Get-RemoteChoice,
+# $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText), Common\Logging.ps1
+# (Write-SetupLog), Detect\Detection.ps1 (Test-OnACPower, Test-AdminProtection: Show-ToolboxWindow's seam
+# defaults) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds
+# every file.
 
-# The window that is open, for the dispatcher backstop only (Task 3): the dispatcher's event has no window.
+# The window that is open, for the dispatcher backstop only: the dispatcher's event has no window (the plan's one
+# exception to "no outer variables"). Show-ToolboxWindow sets it around the dialog and clears it after.
 $script:ToolboxOpenWindow = $null
+
+# Display problems already logged (TB-R7): the window redraws on every click and every power tick, so the same
+# problem is logged once, not on every redraw. Diagnostics only; no decision depends on it.
+$script:ToolboxWarned = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+
+function Write-ToolboxWarningOnce {
+  # Private. One WARN line in setup.log per -Id for the life of the process. The caller passes ASCII text. Never
+  # throws (Write-SetupLog never does once its arguments bind).
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Id,
+    [Parameter(Mandatory)][string]$Message,
+    [hashtable]$Data
+  )
+
+  if ($script:ToolboxWarned.Add($Id)) { Write-SetupLog -Level WARN -Message $Message -Data $Data }
+}
 
 function New-ToolboxStringTable {
   <#
@@ -75,7 +105,8 @@ function Get-ToolboxString {
     One text of the string table in a language, formatted with -Arguments. Never throws.
   .DESCRIPTION
     The language's text, else the English one, else the key itself (so a missing key shows on screen instead of
-    an empty space). A text that does not format with the arguments is returned unformatted.
+    an empty space). A text that does not format with the arguments is returned unformatted, and logged once per
+    key (WARN 'Toolbox text could not be formatted').
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -100,7 +131,9 @@ function Get-ToolboxString {
     }
     if ($null -ne $Arguments -and $Arguments.Count -gt 0) { $text = $text -f $Arguments }
   } catch {
-    # Best effort: the text as found so far (a bad format string must never break the window).
+    # The text as found so far: a bad format string must never break the window.
+    Write-ToolboxWarningOnce -Id "text:$Key" -Message 'Toolbox text could not be formatted' `
+      -Data @{ key = (ConvertTo-ScreenText -Text $Key); error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
   return $text
 }
@@ -284,7 +317,7 @@ function Set-ToolboxLanguage {
 function Get-ToolboxDigitIndent {
   # Private. How much wider a digit is than a space in the plan rows' font: a row numbered 1 to 9 (' 1  ...') is
   # moved in by this much, so its number and title line up with the rows numbered 10 and up. The row's Text stays
-  # exactly '{0,2}  {1}'. Never throws (0 when it cannot be measured).
+  # exactly '{0,2}  {1}'. Never throws: 0 when it cannot be measured, logged once (WARN).
   [CmdletBinding()]
   [OutputType([double])]
   param(
@@ -300,6 +333,7 @@ function Get-ToolboxDigitIndent {
     })
     return [double][math]::Max(0, $widths[0] - $widths[1])
   } catch {
+    Write-ToolboxWarningOnce -Id 'indent' -Message 'Toolbox plan indent could not be measured' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     return [double]0
   }
 }
@@ -396,5 +430,342 @@ function Update-ToolboxView {
     $block.TextEffects = New-Object System.Windows.Media.TextEffectCollection
     $null = $block.TextEffects.Add($number)
     $null = $plan.Children.Add($block)
+  }
+}
+
+function Register-ToolboxHandlers {
+  <#
+  .SYNOPSIS
+    Wires the window's handlers (spec 5.1). Each is one line that calls Invoke-ToolboxAction. Returns nothing.
+  .DESCRIPTION
+    - Click on every element whose Tag starts 'a:': the tiles, the switches, EN | HE, Start, Cancel and the X,
+      the generated profile tiles and tweak switches too;
+    - MouseLeftButtonDown on the title bar (Drag; a button in the bar handles its own press first);
+    - PreviewMouseWheel on the plan's scroller (Wheel: the wheel passes on to the body when the plan cannot
+      scroll, TB-R7);
+    - ContentRendered (Rendered) and Closing (Closing) on the window.
+    No key handler and no key binding: Esc and Enter do nothing (spec 4.1). The handlers use no outer variable:
+    the window's state is in its Tag, and the sender ($this) leads back to the window.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $pending = New-Object System.Collections.Stack
+  $pending.Push($Window)
+  while ($pending.Count -gt 0) {
+    $node = $pending.Pop()
+    if ($node -is [System.Windows.FrameworkElement] -and $node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal)) {
+      $node.Add_Click({ Invoke-ToolboxAction -Sender $this })
+    }
+    foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($node)) {
+      if ($child -is [System.Windows.DependencyObject]) { $pending.Push($child) }
+    }
+  }
+  $Window.FindName('TitleBar').Add_MouseLeftButtonDown({ Invoke-ToolboxAction -Sender $this -Action 'Drag' })
+  $Window.FindName('PlanScroll').Add_PreviewMouseWheel({ Invoke-ToolboxAction -Sender $this -Action 'Wheel' -EventArgs $_ })
+  $Window.Add_ContentRendered({ Invoke-ToolboxAction -Sender $this -Action 'Rendered' })
+  $Window.Add_Closing({ Invoke-ToolboxAction -Sender $this -Action 'Closing' })
+}
+
+function Invoke-ToolboxAction {
+  <#
+  .SYNOPSIS
+    Runs one window action. Every handler of the window calls this and nothing else (spec 5.1). Never throws.
+  .DESCRIPTION
+    The window is the sender itself (a Window), the sender's Tag (the power timer's) or the window the sender is
+    in ([Windows.Window]::GetWindow); only a window whose Tag is the toolbox state counts. The action and its value
+    are -Action and -Value, else the sender's a:<Action>:<Value> Tag. -EventArgs is the event's arguments, for
+    the one action that needs them (Wheel).
+      - Start: refused while Administrator protection is On, with WARN 'Start refused: Administrator protection
+        is on' (spec 5.3; a click raised on the disabled button still lands here). Otherwise Tag.Choices is the
+        validated Choices (ConvertTo-ValidChoices; dropped tweak ids are logged WARN) and the window closes as
+        Start.
+      - Cancel: the window closes as Cancel (the Cancel button and the X).
+      - Closing: Tag.Closing = $true; a window that closes without an outcome (Alt+F4) is Cancel.
+      - Rendered: the window is activated, then no longer Topmost (it opens Topmost so it never opens behind the
+        console after UAC; spec 5.1).
+      - Drag: DragMove(). Its InvalidOperationException (the button is already up) is ignored: the one benign
+        exception.
+      - Power: Tag.ReadOnAC. A read that throws keeps the last value and logs WARN 'Could not read the power
+        state for the toolbox'; otherwise the model (Update-ToolboxModel -Action Power), then the view.
+      - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
+        handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
+      - Any other action (Profile, Mode, Office, Remote, SevenZip, RestorePoint, Tweak, Language):
+        Update-ToolboxModel, then Update-ToolboxView. A control never decides its own state: the model does.
+    Any exception: the window closes as Failed with the message in ASCII (Close-ToolboxWindow), and setup.log
+    gets one ERROR line 'Toolbox action failed' with @{ action; error } (ASCII). A failure is never read as
+    Cancel (spec 5.1).
+  #>
+  [CmdletBinding()]
+  param(
+    [AllowNull()]$Sender,
+    [AllowEmptyString()][string]$Action = '',
+    [AllowEmptyString()][string]$Value = '',
+    [AllowNull()]$EventArgs
+  )
+
+  $window = $null
+  try {
+    $found = $null
+    if ($Sender -is [System.Windows.Window]) { $found = $Sender }
+    elseif ($Sender -is [System.Windows.Threading.DispatcherTimer]) { $found = $Sender.Tag }
+    elseif ($Sender -is [System.Windows.DependencyObject]) { $found = [System.Windows.Window]::GetWindow($Sender) }
+    if ($found -isnot [System.Windows.Window] -or $found.Tag -isnot [hashtable]) { throw 'The event did not come from a toolbox window' }
+    $window = $found
+    $state = $window.Tag
+
+    if ([string]::IsNullOrEmpty($Action)) {
+      $parts = ([string]$Sender.Tag).Split([char]':', 3)
+      if ($parts.Count -ne 3 -or $parts[0] -cne 'a') { throw 'The element has no a:<Action>:<Value> tag' }
+      $Action = $parts[1]
+      $Value = $parts[2]
+    }
+
+    switch -CaseSensitive ($Action) {
+      'Start' {
+        if ($state.Model.AdminProtection -eq 'On') {
+          Write-SetupLog -Level WARN -Message 'Start refused: Administrator protection is on'
+        } else {
+          $valid = ConvertTo-ValidChoices -Choices $state.Model.Choices -Config $state.Config -Machine $state.Machine
+          if (@($valid.Dropped).Count -gt 0) {
+            Write-SetupLog -Level WARN -Message 'Unknown tweak ids dropped' -Data @{ tweaks = @($valid.Dropped | ForEach-Object { ConvertTo-ScreenText -Text $_ }) }
+          }
+          $state.Choices = $valid.Choices
+          Close-ToolboxWindow -Window $window -Outcome 'Start'
+        }
+      }
+      'Cancel' { Close-ToolboxWindow -Window $window -Outcome 'Cancel' }
+      'Closing' {
+        $state.Closing = $true
+        if ($null -eq $state.Outcome) { $state.Outcome = 'Cancel' }
+      }
+      'Rendered' {
+        $null = $window.Activate()
+        $window.Topmost = $false
+      }
+      'Drag' {
+        try { $window.DragMove() }
+        catch [System.InvalidOperationException] { <# the button is already up: nothing to drag (the one benign exception) #> }
+      }
+      'Power' {
+        $onAC = $null
+        try {
+          $onAC = [bool](& $state.ReadOnAC)
+        } catch {
+          Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+        }
+        if ($null -ne $onAC) {
+          $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config
+          Update-ToolboxView -Window $window
+        }
+      }
+      'Wheel' {
+        $wheel = [System.Windows.Input.MouseWheelEventArgs]$EventArgs
+        $plan = $window.FindName('PlanScroll')
+        $canScroll = if ($wheel.Delta -lt 0) { $plan.VerticalOffset -lt $plan.ScrollableHeight } else { $plan.VerticalOffset -gt 0 }
+        if (-not $canScroll) {
+          $wheel.Handled = $true
+          $forward = New-Object System.Windows.Input.MouseWheelEventArgs($wheel.MouseDevice, $wheel.Timestamp, $wheel.Delta)
+          $forward.RoutedEvent = [System.Windows.UIElement]::MouseWheelEvent
+          $window.FindName('ContentScroll').RaiseEvent($forward)
+        }
+      }
+      default {
+        $state.Model = Update-ToolboxModel -Model $state.Model -Action $Action -Value $Value -Config $state.Config
+        Update-ToolboxView -Window $window
+      }
+    }
+  } catch {
+    $message = ConvertTo-ScreenText -Text $_.Exception.Message
+    Write-SetupLog -Level ERROR -Message 'Toolbox action failed' -Data @{ action = (ConvertTo-ScreenText -Text $Action); error = $message }
+    if ($null -ne $window) { Close-ToolboxWindow -Window $window -Outcome 'Failed' -ErrorText $message }
+  }
+}
+
+function Close-ToolboxWindow {
+  <#
+  .SYNOPSIS
+    Records the window's outcome in its Tag and closes it. Returns nothing; never throws.
+  .DESCRIPTION
+    Tag.Outcome becomes -Outcome, except that Failed always wins: once Failed, the outcome stays Failed and keeps
+    its first Error (the cause, not a later consequence). Failed sets Tag.Error to -ErrorText (ASCII).
+    Close() is called only while Tag.Closing is $false (a Close() while the window is closing would throw), inside
+    try: a Close() that fails anyway is logged WARN. The Closing handler then marks the window as closing.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [Parameter(Mandatory)][ValidateSet('Start', 'Cancel', 'Failed')][string]$Outcome,
+    [AllowEmptyString()][string]$ErrorText = ''
+  )
+
+  $state = $Window.Tag
+  if ($Outcome -eq 'Failed') {
+    if ($state.Outcome -ne 'Failed') { $state.Error = $ErrorText }
+    $state.Outcome = 'Failed'
+  } elseif ($state.Outcome -ne 'Failed') {
+    $state.Outcome = $Outcome
+  }
+  if ($state.Closing -ne $true) {
+    try {
+      $Window.Close()
+    } catch {
+      Write-SetupLog -Level WARN -Message 'Could not close the toolbox window' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+  }
+}
+
+function Invoke-ToolboxUnhandled {
+  <#
+  .SYNOPSIS
+    The dispatcher backstop (spec 5.1): an exception no handler caught (layout, rendering, WPF itself). Never throws.
+  .DESCRIPTION
+    Marks the exception handled, so WPF does not end the process. When a toolbox window is open
+    ($script:ToolboxOpenWindow), closes it as Failed with the message in ASCII. Logs ERROR 'Toolbox error' with
+    @{ error } (ASCII).
+  #>
+  [CmdletBinding()]
+  param([AllowNull()]$EventArgs)
+
+  try {
+    $message = ''
+    if ($null -ne $EventArgs) {
+      $EventArgs.Handled = $true
+      $message = ConvertTo-ScreenText -Text $EventArgs.Exception.Message
+    }
+    $open = $script:ToolboxOpenWindow
+    if ($null -ne $open) { Close-ToolboxWindow -Window $open -Outcome 'Failed' -ErrorText $message }
+    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = $message }
+  } catch {
+    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+  }
+}
+
+function Set-ToolboxWindowSize {
+  <#
+  .SYNOPSIS
+    Fits the window into the screen's work area (spec 4.1): at most 1000 x 680, centred. Returns nothing.
+  .DESCRIPTION
+    On a small screen (the basic display driver at 1024x768, or 150% scaling) the window takes the whole work
+    area and its content scrolls (ContentScroll). -WorkArea is in device-independent pixels, as
+    [Windows.SystemParameters]::WorkArea gives it, and may start away from 0,0 (a second monitor, a taskbar at
+    the top or the left).
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [Parameter(Mandatory)][System.Windows.Rect]$WorkArea
+  )
+
+  $width = [math]::Min(1000, $WorkArea.Width)
+  $height = [math]::Min(680, $WorkArea.Height)
+  $Window.Width = $width
+  $Window.Height = $height
+  $Window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+  $Window.Left = $WorkArea.Left + ($WorkArea.Width - $width) / 2
+  $Window.Top = $WorkArea.Top + ($WorkArea.Height - $height) / 2
+}
+
+function New-ToolboxPowerTimer {
+  <#
+  .SYNOPSIS
+    The timer that re-reads the power state every 5 seconds (spec 4.1: "every few seconds"; Plan call). Not
+    started.
+  .DESCRIPTION
+    Its Tag is the window, so its Tick handler (Invoke-ToolboxAction -Action Power) finds the window without an
+    outer variable. It runs on the window's dispatcher, so it ticks only while the dialog runs.
+  #>
+  [CmdletBinding()]
+  [OutputType([System.Windows.Threading.DispatcherTimer])]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $timer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Background, $Window.Dispatcher)
+  $timer.Interval = [TimeSpan]::FromSeconds(5)
+  $timer.Tag = $Window
+  $timer.Add_Tick({ Invoke-ToolboxAction -Sender $this -Action 'Power' })
+  return $timer
+}
+
+function Show-ToolboxWindow {
+  <#
+  .SYNOPSIS
+    Shows the toolbox and returns @{ Outcome = 'Start'|'Cancel'|'Failed'; Choices; Error }. Never throws.
+  .DESCRIPTION
+    The same inputs as Show-StartScreen. In order:
+      1. software rendering for the whole process (spec 5.1: the PC has no GPU driver yet);
+      2. the power state (a read that throws counts as on AC, logged WARN) and Administrator protection (logged
+         WARN when it is not Off);
+      3. the model, the window (its power timer reads -OnAC), the handlers and the work-area clamp;
+      4. the power timer, started (Tag.Timer);
+      5. the dispatcher backstop (Invoke-ToolboxUnhandled), for exceptions no handler caught;
+      6. the dialog, through the -ShowDialog seam, with $script:ToolboxOpenWindow set for the backstop;
+      7. finally: the timer stops, the backstop is removed, $script:ToolboxOpenWindow is cleared and the window
+         is closed (a Close() that fails is logged WARN).
+    The result is Tag's Outcome, Choices and Error. An Outcome still empty after the dialog is Failed, never
+    Cancel (spec 5.1: a failure is never read as a Cancel). Any exception is Failed with its message in ASCII,
+    logged ERROR 'Toolbox window failed'. WPF is not shut down here (Get-SetupChoices does that, Task 4).
+
+    The seams (production defaults shown):
+      -ShowDialog       shows the window as a dialog; the only place that does
+      -OnAC             $true when on mains power (also what the power timer reads)
+      -AdminProtection  'On', 'Off' or 'Unknown'
+      -WorkArea         the screen's work area, in device-independent pixels
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Machine,
+    [Parameter(Mandatory)]$Config,
+    [Parameter(Mandatory)][string]$Version,
+    [AllowNull()][hashtable]$Previous,
+    [Parameter(Mandatory)][bool]$IsFresh,
+    [scriptblock]$ShowDialog = { param($w) $w.ShowDialog() },
+    [scriptblock]$OnAC = { Test-OnACPower },
+    [scriptblock]$AdminProtection = { Test-AdminProtection },
+    [scriptblock]$WorkArea = { [Windows.SystemParameters]::WorkArea }
+  )
+
+  try {
+    [System.Windows.Media.RenderOptions]::ProcessRenderMode = [System.Windows.Interop.RenderMode]::SoftwareOnly
+
+    $onACNow = $true
+    try {
+      $onACNow = [bool](& $OnAC)
+    } catch {
+      Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+    $model = New-ToolboxModel -Machine $Machine -Config $Config -Previous $Previous -IsFresh $IsFresh -OnAC $onACNow -AdminProtection ([string](& $AdminProtection))
+    if ($model.AdminProtection -ne 'Off') { Write-SetupLog -Level WARN -Message 'Administrator protection is not off' -Data @{ state = $model.AdminProtection } }
+
+    $window = New-ToolboxWindow -Model $model -Machine $Machine -Config $Config -Version $Version -ReadOnAC $OnAC
+    $timer = $null
+    $backstop = { Invoke-ToolboxUnhandled -EventArgs $_ }
+    try {
+      Register-ToolboxHandlers -Window $window
+      Set-ToolboxWindowSize -Window $window -WorkArea (& $WorkArea)
+      $timer = New-ToolboxPowerTimer -Window $window
+      $window.Tag.Timer = $timer
+      $timer.Start()
+      $window.Dispatcher.Add_UnhandledException($backstop)
+      $script:ToolboxOpenWindow = $window
+      $null = & $ShowDialog $window
+    } finally {
+      if ($null -ne $timer) { $timer.Stop() }
+      $window.Dispatcher.Remove_UnhandledException($backstop)
+      $script:ToolboxOpenWindow = $null
+      try {
+        $window.Close()
+      } catch {
+        Write-SetupLog -Level WARN -Message 'Could not close the toolbox window' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      }
+    }
+
+    $state = $window.Tag
+    if ($null -eq $state.Outcome) { return @{ Outcome = 'Failed'; Choices = $null; Error = 'The toolbox window closed without an outcome' } }
+    return @{ Outcome = $state.Outcome; Choices = $state.Choices; Error = $state.Error }
+  } catch {
+    $message = ConvertTo-ScreenText -Text $_.Exception.Message
+    Write-SetupLog -Level ERROR -Message 'Toolbox window failed' -Data @{ error = $message; line = $_.InvocationInfo.ScriptLineNumber }
+    return @{ Outcome = 'Failed'; Choices = $null; Error = $message }
   }
 }

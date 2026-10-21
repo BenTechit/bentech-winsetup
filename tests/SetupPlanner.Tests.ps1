@@ -5,6 +5,15 @@ BeforeAll {
   foreach ($f in 'Common\Config', 'Engine\Catalog', 'UI\StartScreen', 'Toolbox\SetupPlanner') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   $script:m = @{ IsLaptop = $true; IsVM = $false; OsBuild = 26200 }
+  # A model as JSON with every table's keys sorted: Hashtable.Clone() re-inserts the keys, so a copy can list
+  # them in another order although it holds exactly the same values.
+  function ConvertTo-SortedJson($Value) {
+    function Get-SortedValue($v) {
+      if ($v -is [Collections.IDictionary]) { $o = [ordered]@{}; foreach ($k in @($v.Keys | Sort-Object)) { $o[$k] = Get-SortedValue $v[$k] }; return $o }
+      Write-Output -NoEnumerate $v
+    }
+    ConvertTo-Json -InputObject (Get-SortedValue $Value) -Depth 5
+  }
 }
 Describe 'profiles (toolbox spec 5.2)' {
   It 'reads the three approved profiles; business takes the catalog defaults, without file extensions (Q27)' {
@@ -57,4 +66,31 @@ Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
     $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg `
       -Titles @{ prepare = 'Step one'; bitlocker = '' })
     $l[0] | Should -BeExactly ' 1  Step one'; $l[1] | Should -BeExactly ' 2  Turn off BitLocker' }
+}
+Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
+  BeforeEach { $script:mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off' }
+  It 'a profile fills the options and keeps the Type' {
+    $mo.Choices.Mode = 'DESKTOP'; $r = Update-ToolboxModel -Model $mo -Action 'Profile' -Value 'business' -Config $cfg
+    $r.Choices.Profile | Should -Be 'business'; $r.Choices.Office | Should -Be 'BUSINESS'; $r.Choices.Remote | Should -Be 'BOTH'; $r.Choices.Mode | Should -Be 'DESKTOP' }
+  It 'a changed option keeps the profile; the input model is untouched' {
+    $r = Update-ToolboxModel -Model $mo -Action 'Office' -Value 'HOME' -Config $cfg
+    $r.Choices.Office | Should -Be 'HOME'; $r.Choices.Profile | Should -Be 'home'; $mo.Choices.Office | Should -Be 'CRAFT' }
+  It 'toggles a tweak in catalog order, and ignores unknown values' {
+    $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'fileExtensions' -Config $cfg
+    @($r.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds', 'classicOutlook', 'fileExtensions')
+    @((Update-ToolboxModel -Model $r -Action 'Tweak' -Value 'accessKeys' -Config $cfg).Choices.Tweaks)[0] | Should -Be 'numLock'
+    foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''))) {
+      ConvertTo-SortedJson (Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg) | Should -Be (ConvertTo-SortedJson $mo) -Because ($a -join ' ') } }
+  It 'toggles 7-Zip and the restore point, sets the language and the power' {
+    (Update-ToolboxModel -Model $mo -Action 'SevenZip' -Config $cfg).Choices.SevenZip | Should -BeFalse
+    (Update-ToolboxModel -Model $mo -Action 'RestorePoint' -Config $cfg).Choices.RestorePoint | Should -BeFalse
+    (Update-ToolboxModel -Model $mo -Action 'Language' -Value 'he' -Config $cfg).Language | Should -Be 'he'
+    (Update-ToolboxModel -Model $mo -Action 'Power' -Value 'false' -Config $cfg).OnAC | Should -BeFalse }
+  It 'never changes the input: the Choices and the Tweaks array are copies' {
+    $before = $mo | ConvertTo-Json -Depth 5
+    $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'accessKeys' -Config $cfg
+    foreach ($a in @(@('Profile', 'clean'), @('Mode', 'DESKTOP'), @('SevenZip', ''), @('Language', 'he'), @('Power', 'false'))) { $null = Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg }
+    ($mo | ConvertTo-Json -Depth 5) | Should -Be $before   # the input itself: same table, same order
+    [object]::ReferenceEquals($r.Choices, $mo.Choices) | Should -BeFalse; [object]::ReferenceEquals($r.Choices.Tweaks, $mo.Choices.Tweaks) | Should -BeFalse
+    @($r.Choices.Tweaks) | Should -Not -Contain 'accessKeys'; @($mo.Choices.Tweaks) | Should -Contain 'accessKeys' }
 }

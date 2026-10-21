@@ -1,10 +1,13 @@
 ﻿# tests/Toolbox.Tests.ps1
 # BenTech Toolbox, Task 2: the window's look (toolbox spec 4.1-4.3): the XAML, the string table, the view and the
-# preview tool.
+# preview tool. Task 3: the window's logic (toolbox spec 4.1, 5.1): the handlers, the actions, Start / Cancel /
+# Failed, the dispatcher backstop, the power timer, the work-area clamp and Show-ToolboxWindow's seams.
 #
-# SAFETY: the window is only parsed, never shown. No ShowDialog, no Dispatcher.InvokeShutdown (it would stop WPF
-# for the rest of the test run), no registry, no CIM: the model gets its power and Administrator-protection values
-# as plain arguments. The preview tool writes its PNGs only into $TestDrive.
+# SAFETY: the window is only parsed, never shown. No ShowDialog (Show-ToolboxWindow always gets a -ShowDialog
+# seam), no Dispatcher.InvokeShutdown (it would stop WPF for the rest of the test run), no registry, no CIM: the
+# model gets its power and Administrator-protection values as plain arguments or seams. Events are raised in code
+# (RaiseEvent) and Close() is called on never-shown windows, which is safe. The preview tool writes its PNGs only
+# into $TestDrive.
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
   foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Engine\Catalog', 'UI\StartScreen',
@@ -26,8 +29,43 @@ BeforeAll {
   function Set-TestLayout($w, [double]$Width, [double]$Height) {
     $w.Content.Measure((New-Object Windows.Size $Width, $Height)); $w.Content.Arrange((New-Object Windows.Rect 0, 0, $Width, $Height)); $w.Content.UpdateLayout()
   }
+
+  # Task 3: a click raised in code (a disabled button still runs its handler), on a named element or on the first
+  # logical descendant with a Tag (the generated tiles and switches); a window with its handlers.
+  function Click($w, [string]$Name) { $w.FindName($Name).RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }
+  function Find-Tagged($w, [string]$Tag) {
+    $pending = New-Object Collections.Stack; $pending.Push($w)
+    while ($pending.Count -gt 0) {
+      $node = $pending.Pop()
+      if ($node -is [Windows.FrameworkElement] -and $node.Tag -is [string] -and $node.Tag -ceq $Tag) { return $node }
+      foreach ($child in [Windows.LogicalTreeHelper]::GetChildren($node)) { if ($child -is [Windows.DependencyObject]) { $pending.Push($child) } }
+    }
+    throw "no element tagged $Tag"
+  }
+  function ClickTag($w, [string]$Tag) { (Find-Tagged $w $Tag).RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }
+  function New-LiveWindow([hashtable]$Set = @{}) { $w = New-TestWindow $Set; Register-ToolboxHandlers -Window $w; $w }
+  # One wheel notch over the first plan row, as WPF input raises it: PreviewMouseWheel (tunnelling), then
+  # MouseWheel (bubbling) unless the preview was handled. Then a layout pass applies the scroll.
+  function Send-Wheel($w, [int]$Delta) {
+    $target = $w.FindName('PlanList').Children[0]
+    $preview = New-Object Windows.Input.MouseWheelEventArgs ([Windows.Input.Mouse]::PrimaryDevice, 0, $Delta)
+    $preview.RoutedEvent = [Windows.UIElement]::PreviewMouseWheelEvent; $target.RaiseEvent($preview)
+    if (-not $preview.Handled) {
+      $bubble = New-Object Windows.Input.MouseWheelEventArgs ([Windows.Input.Mouse]::PrimaryDevice, 0, $Delta)
+      $bubble.RoutedEvent = [Windows.UIElement]::MouseWheelEvent; $target.RaiseEvent($bubble)
+    }
+    $w.Content.UpdateLayout()
+  }
+  # Every Describe's BeforeEach (Pester 6 has no root BeforeEach): setup.log goes to $script:logs, and the power
+  # state is never read for real.
+  function Set-ToolboxTestMocks {
+    $script:logs = New-Object Collections.ArrayList
+    Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Test-OnACPower { $true }
+  }
 }
 Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
+  BeforeEach { Set-ToolboxTestMocks }
   It 'New-ToolboxWindow returns exactly one Window and the view returns nothing (Review Focus 2)' {
     $r = @(New-TestWindow); $r.Count | Should -Be 1; $r[0] | Should -BeOfType [Windows.Window]; @(Update-ToolboxView -Window $r[0]).Count | Should -Be 0 }
   It 'has every named element, the size, the fonts and no default or cancel button' {
@@ -100,6 +138,167 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $bottom | Should -BeGreaterThan 0; $bottom | Should -BeLessOrEqual ($scroll.ViewportHeight + 0.5)
     $start = $w.FindName('StartButton'); ($start.TranslatePoint((New-Object Windows.Point 0, $start.ActualHeight), $w.Content).Y) | Should -BeLessOrEqual 512
     $big = New-TestWindow; Set-TestLayout $big 1000 680; $big.FindName('PlanScroll').ScrollableHeight | Should -Be 0 }   # the default size needs no scrolling
+  It 'Get-ToolboxString: a missing key shows the key, Hebrew falls back to English, a bad format returns the text (TB-R7)' {
+    $script:ToolboxWarned.Clear()
+    $t = @{ en = @{ only = 'English only'; empty = 'English for empty'; arg = 'Hi {0}'; bad = 'Bad {0' }; he = @{ empty = ''; arg = 'Shalom {0}' } }
+    Get-ToolboxString -Table $t -Language 'he' -Key 'no.such.key' | Should -BeExactly 'no.such.key'
+    Get-ToolboxString -Table $t -Language 'he' -Key 'only' | Should -BeExactly 'English only'
+    Get-ToolboxString -Table $t -Language 'he' -Key 'empty' | Should -BeExactly 'English for empty'
+    Get-ToolboxString -Table $t -Language 'he' -Key 'arg' -Arguments @('x') | Should -BeExactly 'Shalom x'
+    Get-ToolboxString -Table $null -Language 'en' -Key 'only' | Should -BeExactly 'only'
+    $script:logs.Count | Should -Be 0
+    foreach ($i in 1, 2) { Get-ToolboxString -Table $t -Language 'en' -Key 'bad' -Arguments @('x') | Should -BeExactly 'Bad {0' }
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox text could not be formatted' -and $_.Data.key -eq 'bad' }).Count | Should -Be 1   # once per key, not on every render
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'the digit indent is 0, with one WARN, when the font cannot be measured (TB-R7)' {
+    $script:ToolboxWarned.Clear(); $w = New-TestWindow
+    Get-ToolboxDigitIndent -Window $w -FontSize 13 | Should -BeGreaterThan 0
+    foreach ($i in 1, 2) { Get-ToolboxDigitIndent -Window $w -FontSize 0 | Should -Be 0 }
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox plan indent could not be measured' }).Count | Should -Be 1 }
+  It 'after HE, a t: TextBlock in the tree holds the Hebrew text; EN brings the English back (TB-R7)' {
+    $w = New-LiveWindow; Click $w 'LangHe'
+    $label = Find-Tagged $w 't:row.profile'; $label | Should -BeOfType [Windows.Controls.TextBlock]
+    $label.Text | Should -BeExactly $script:ToolboxStrings.he['row.profile']; $label.Text | Should -Match '[א-ת]'
+    (Find-Tagged $w 't:tweak.accessKeys.title').Text | Should -BeExactly (@(Get-TweakCatalog -Config $cfg) | Where-Object { $_.Id -eq 'accessKeys' }).Title.he
+    $w.FindName('LangHe').IsChecked | Should -BeTrue; $w.FindName('LangEn').IsChecked | Should -BeFalse
+    Click $w 'LangEn'; $label.Text | Should -BeExactly 'PROFILE'; $w.FlowDirection | Should -Be 'LeftToRight'; $w.FindName('LangEn').IsChecked | Should -BeTrue }
+  It 're-renders a changed model: tiles, rows, reminder, banner, Start and plan (TB-R7)' {
+    $w = New-TestWindow; @($w.FindName('PlanList').Children).Text -join "`n" | Should -Not -Match 'Microsoft 365'
+    $w.Tag.Model.Choices.Office = 'HOME'; $w.Tag.Model.Choices.Remote = 'SCREENCONNECT'; $w.Tag.Model.AdminProtection = 'On'
+    Update-ToolboxView -Window $w
+    $w.FindName('OfficeHome').IsChecked | Should -BeTrue; $w.FindName('OfficeCraft').IsChecked | Should -BeFalse; $w.FindName('RemoteScreenConnect').IsChecked | Should -BeTrue
+    $w.Tag.TweakRows['classicOutlook'].Row.Visibility | Should -Be 'Visible'; $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'
+    $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'; $w.FindName('StartButton').IsEnabled | Should -BeFalse
+    (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match 'Microsoft 365' }
+}
+Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
+  BeforeEach { Set-ToolboxTestMocks }
+  It 'a click on Business fills the options, shows the reminder and updates the plan' {
+    $w = New-LiveWindow; ClickTag $w 'a:Profile:business'
+    $w.Tag.Model.Choices.Office | Should -Be 'BUSINESS'; $w.FindName('OfficeBusiness').IsChecked | Should -BeTrue
+    $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'; (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match 'Microsoft 365' }
+  It 'a tweak switch toggles from the model, not from the control' {
+    $w = New-LiveWindow; ClickTag $w 'a:Tweak:fileExtensions'
+    $w.Tag.Model.Choices.Tweaks | Should -Contain 'fileExtensions'; $w.Tag.TweakRows['fileExtensions'].Switch.IsChecked | Should -BeTrue
+    ClickTag $w 'a:Tweak:fileExtensions'; $w.Tag.Model.Choices.Tweaks | Should -Not -Contain 'fileExtensions' }
+  It 'Desktop shows NumLock (on, from the profile); Laptop hides it again' {
+    $w = New-LiveWindow; Click $w 'TypeDesktop'; $w.Tag.TweakRows['numLock'].Row.Visibility | Should -Be 'Visible'
+    Click $w 'TypeLaptop'; $w.Tag.TweakRows['numLock'].Row.Visibility | Should -Be 'Collapsed' }
+  It 'the other options go through the model too; a changed option keeps the profile (spec 5.2)' {
+    $w = New-LiveWindow; Click $w 'SevenZipSwitch'; Click $w 'RestoreSwitch'; ClickTag $w 'a:Remote:SCREENCONNECT'; Click $w 'OfficeOff'
+    $c = $w.Tag.Model.Choices; $c.SevenZip | Should -BeFalse; $c.RestorePoint | Should -BeFalse; $c.Remote | Should -Be 'SCREENCONNECT'; $c.Office | Should -Be 'OFF'
+    $w.FindName('SevenZipSwitch').IsChecked | Should -BeFalse; $w.FindName('RestoreSwitch').IsChecked | Should -BeFalse; $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'
+    $c.Profile | Should -Be 'home'; $w.Tag.ProfileTiles['home'].IsChecked | Should -BeTrue
+    (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Not -Match '7-Zip|AnyDesk|Craft' }
+  It 'HE switches every tagged text and the direction; the Choices stay ASCII' {
+    $w = New-LiveWindow; Click $w 'LangHe'
+    $w.FlowDirection | Should -Be 'RightToLeft'; $w.Tag.Model.Language | Should -Be 'he'
+    Click $w 'StartButton'; ($w.Tag.Choices | ConvertTo-Json -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'Start returns the validated Choices and closes; Cancel and Close return Cancel' {
+    $w = New-LiveWindow; Click $w 'TypeDesktop'; Click $w 'StartButton'
+    $w.Tag.Outcome | Should -Be 'Start'; $w.Tag.Closing | Should -BeTrue
+    @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks')
+    @($w.Tag.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds')
+    foreach ($b in 'CancelButton', 'CloseButton') { $c = New-LiveWindow; Click $c $b; $c.Tag.Outcome | Should -Be 'Cancel'; $c.Tag.Choices | Should -BeNullOrEmpty }
+    $x = New-LiveWindow; $x.Close(); $x.Tag.Outcome | Should -Be 'Cancel' }   # Alt+F4 and the window's X end in Closing
+  It 'Administrator protection On: red banner, Start disabled, a raised click refused (Review Focus 4)' {
+    $w = New-TestWindow -Protection 'On'; Register-ToolboxHandlers -Window $w
+    $s = $w.FindName('StartButton'); $s.IsEnabled | Should -BeFalse; $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'
+    $e = { (New-Object Windows.Automation.Peers.ButtonAutomationPeer $s).GetPattern('Invoke').Invoke() } | Should -Throw -PassThru   # a user cannot press it
+    $e.Exception.InnerException.GetType().Name | Should -Be 'ElementNotEnabledException'
+    Click $w 'StartButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $w.Tag.Choices | Should -BeNullOrEmpty; $w.Tag.Closing | Should -BeFalse
+    @($script:logs | Where-Object { $_.Message -eq 'Start refused: Administrator protection is on' }).Count | Should -Be 1 }
+  It 'an exception inside an action closes the window as Failed, never as Cancel (Review Focus 1)' {
+    $w = New-LiveWindow; Mock Update-ToolboxView { throw ('view broke ' + [char]0x05D0 + [char]0x05D1) }
+    { ClickTag $w 'a:Office:HOME' } | Should -Not -Throw
+    $w.Tag.Outcome | Should -Be 'Failed'; $w.Tag.Error | Should -BeExactly 'view broke ??'; $w.Tag.Closing | Should -BeTrue
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox action failed' -and $_.Data.action -eq 'Office' -and $_.Data.error -eq 'view broke ??' }).Count | Should -Be 1
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'Failed always wins over a later Start or Cancel; a Start after Failed keeps Failed' {
+    $w = New-LiveWindow; Close-ToolboxWindow -Window $w -Outcome 'Failed' -ErrorText 'first'
+    Close-ToolboxWindow -Window $w -Outcome 'Cancel'; Close-ToolboxWindow -Window $w -Outcome 'Start'
+    $w.Tag.Outcome | Should -Be 'Failed'; $w.Tag.Error | Should -BeExactly 'first' }
+  It 'an element without an action, or a sender outside any window, is Failed or logged, never thrown' {
+    $w = New-LiveWindow; { Invoke-ToolboxAction -Sender $w.FindName('TitleBar') } | Should -Not -Throw
+    $w.Tag.Outcome | Should -Be 'Failed'
+    { Invoke-ToolboxAction -Sender $null -Action 'Start' } | Should -Not -Throw
+    { Invoke-ToolboxAction -Sender (New-Object Windows.Controls.Button) -Action 'Start' } | Should -Not -Throw
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox action failed' }).Count | Should -Be 3 }
+  It 'the dispatcher backstop marks the error handled and fails the open window' {
+    $w = New-LiveWindow; $script:ToolboxOpenWindow = $w; $e = [pscustomobject]@{ Handled = $false; Exception = [Exception]('layout ' + [char]0x05D0) }
+    Invoke-ToolboxUnhandled -EventArgs $e; $e.Handled | Should -BeTrue; $w.Tag.Outcome | Should -Be 'Failed'; $w.Tag.Error | Should -BeExactly 'layout ?'
+    $script:ToolboxOpenWindow = $null; $e2 = [pscustomobject]@{ Handled = $false; Exception = [Exception]'late' }
+    { Invoke-ToolboxUnhandled -EventArgs $e2 } | Should -Not -Throw; $e2.Handled | Should -BeTrue
+    { Invoke-ToolboxUnhandled -EventArgs $null } | Should -Not -Throw
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox error' }).Count | Should -Be 3
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'ContentRendered activates the window and turns Topmost off; a stray drag is harmless' {
+    $w = New-LiveWindow; Invoke-ToolboxAction -Sender $w -Action 'Rendered'; $w.Topmost | Should -BeFalse
+    Invoke-ToolboxAction -Sender $w.FindName('TitleBar') -Action 'Drag'; $w.Tag.Outcome | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' }).Count | Should -Be 0 }
+  It 'the power timer refreshes every 5 s; a failed read keeps the last value' {
+    $w = New-LiveWindow; $t = New-ToolboxPowerTimer -Window $w; $t.Interval.TotalSeconds | Should -Be 5; $t.Tag | Should -Be $w; $t.IsEnabled | Should -BeFalse
+    $w.Tag.ReadOnAC = { $false }; Invoke-ToolboxAction -Sender $t -Action 'Power'
+    $w.Tag.Model.OnAC | Should -BeFalse; $w.FindName('WarnText').Text | Should -Match 'BIOS updates will be skipped'
+    $w.Tag.ReadOnAC = { throw 'no power status' }; Invoke-ToolboxAction -Sender $t -Action 'Power'; $w.Tag.Model.OnAC | Should -BeFalse; $w.Tag.Outcome | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 1 }
+  It 'clamps the window to a small work area and lets the content scroll' {
+    $w = New-LiveWindow; Set-ToolboxWindowSize -Window $w -WorkArea (New-Object Windows.Rect 0, 0, 683, 512)
+    $w.Width | Should -Be 683; $w.Height | Should -Be 512; $w.Left | Should -Be 0
+    Set-ToolboxWindowSize -Window $w -WorkArea (New-Object Windows.Rect 0, 0, 1024, 720); $w.Width | Should -Be 1000; $w.Height | Should -Be 680; $w.Left | Should -Be 12
+    $w.Top | Should -Be 20; $w.WindowStartupLocation | Should -Be 'Manual'
+    Set-ToolboxWindowSize -Window $w -WorkArea (New-Object Windows.Rect 1920, 40, 1920, 1000); $w.Left | Should -Be 2380; $w.Top | Should -Be 200   # a second monitor, a top taskbar
+    $w.FindName('ContentScroll').VerticalScrollBarVisibility | Should -Be 'Auto' }
+  It 'the wheel over a plan that fits scrolls the body (TB-R7)' {
+    $w = New-LiveWindow; Set-TestLayout $w 1000 600
+    $plan = $w.FindName('PlanScroll'); $body = $w.FindName('ContentScroll')
+    $plan.ScrollableHeight | Should -Be 0; $body.ScrollableHeight | Should -BeGreaterThan 0   # the case: the plan fits, the body does not
+    Send-Wheel $w -120; $body.VerticalOffset | Should -BeGreaterThan 0
+    Send-Wheel $w 120; $body.VerticalOffset | Should -Be 0 }
+  It 'the wheel scrolls a plan that can scroll, and passes on at its end (TB-R7)' {
+    $w = New-LiveWindow; Set-TestLayout $w 683 512
+    $plan = $w.FindName('PlanScroll'); $body = $w.FindName('ContentScroll'); $plan.ScrollableHeight | Should -BeGreaterThan 0
+    Send-Wheel $w -120; $plan.VerticalOffset | Should -BeGreaterThan 0; $body.VerticalOffset | Should -Be 0
+    foreach ($i in 1..10) { Send-Wheel $w -120 }
+    $plan.VerticalOffset | Should -Be $plan.ScrollableHeight; $body.VerticalOffset | Should -BeGreaterThan 0
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' }).Count | Should -Be 0 }
+}
+Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
+  BeforeEach { Set-ToolboxTestMocks }
+  BeforeAll { function Show([scriptblock]$Dialog, [string]$Protection = 'Off', [scriptblock]$OnAC = { $true }) {
+      Show-ToolboxWindow -Machine $m -Config $cfg -Version '2026.10.21.1' -Previous $null -IsFresh $true -ShowDialog $Dialog -OnAC $OnAC `
+        -AdminProtection ([scriptblock]::Create("'$Protection'")) -WorkArea { New-Object Windows.Rect 0, 0, 1920, 1040 } } }
+  It 'returns exactly one hashtable with the Choices on Start (Review Focus 2)' {
+    $r = @(Show { param($w) $script:shown = $w; Click $w 'StartButton' })
+    $r.Count | Should -Be 1; $r[0] | Should -BeOfType [hashtable]; $r[0].Outcome | Should -Be 'Start'; $r[0].Choices.Profile | Should -Be 'home'
+    $script:shown.Tag.Timer.IsEnabled | Should -BeFalse; $script:ToolboxOpenWindow | Should -BeNullOrEmpty
+    [Windows.Media.RenderOptions]::ProcessRenderMode | Should -Be 'SoftwareOnly' }
+  It 'opens with the timer running, the window registered for the backstop, clamped and centred' {
+    $null = Show { param($w) $script:seen = @{ Timer = $w.Tag.Timer.IsEnabled; Open = [object]::ReferenceEquals($script:ToolboxOpenWindow, $w); Width = $w.Width; Left = $w.Left; Top = $w.Top } }
+    $script:seen.Timer | Should -BeTrue; $script:seen.Open | Should -BeTrue; $script:seen.Width | Should -Be 1000; $script:seen.Left | Should -Be 460; $script:seen.Top | Should -Be 180 }
+  It 'a dialog that ends with nothing chosen is Cancel through Closing; one that throws is Failed' {
+    (Show { param($w) }).Outcome | Should -Be 'Cancel'
+    $r = Show { param($w) throw 'dialog broke' }; $r.Outcome | Should -Be 'Failed'; $r.Error | Should -BeExactly 'dialog broke'
+    $script:ToolboxOpenWindow | Should -BeNullOrEmpty }
+  It 'an Outcome still empty after the dialog is Failed, never Cancel' {
+    Mock Register-ToolboxHandlers { }   # no Closing handler, so nothing sets Cancel
+    $r = Show { param($w) }; $r.Outcome | Should -Be 'Failed'; $r.Error | Should -Not -BeNullOrEmpty }
+  It 'a failure before the dialog is Failed with an ASCII message, never thrown' {
+    Mock New-ToolboxWindow { throw ('xaml broke ' + [char]0x05D0) }
+    $r = @(Show { param($w) throw 'must not open' }); $r.Count | Should -Be 1; $r[0].Outcome | Should -Be 'Failed'; $r[0].Error | Should -BeExactly 'xaml broke ?'
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'a power read that throws counts as on AC; protection that is not Off is logged and blocks Start' {
+    $r = Show { param($w) $script:onAC = $w.Tag.Model.OnAC; Click $w 'StartButton' } -OnAC { throw 'no power status' }
+    $script:onAC | Should -BeTrue; $r.Outcome | Should -Be 'Start'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 1
+    $b = Show { param($w) Click $w 'StartButton' } -Protection 'On'; $b.Outcome | Should -Be 'Cancel'   # refused, then closed by the finally
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is not off' -and $_.Data.state -eq 'On' }).Count | Should -Be 1 }
+  It 'calls ShowDialog only through the seam; no key handlers, no closures (Toolbox.ps1 and Xaml.ps1, TB-R7)' {
+    $src = Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw
+    ([regex]::Matches($src, '\.ShowDialog\(')).Count | Should -Be 1; $src | Should -Match '\$ShowDialog = \{ param\(\$w\) \$w\.ShowDialog\(\) \}'
+    foreach ($file in 'Toolbox', 'Xaml') {
+      Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match 'Add_(Preview)?Key(Down|Up)|IsCancel="True"|GetNewClosure|KeyBinding|InputBindings' -Because $file }
+    $script:ToolboxXaml | Should -Not -Match 'IsCancel|IsDefault="True"' }
 }
 Describe 'tools\Preview-Toolbox.ps1' {
   It 'renders the four PNGs at 1000x680 without showing a window' {

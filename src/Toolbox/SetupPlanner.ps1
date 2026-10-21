@@ -1,8 +1,9 @@
 ﻿# src/Toolbox/SetupPlanner.ps1
 # The BenTech Toolbox's planning rules (toolbox spec 5.2, 10b.5, 10b.6): the profiles of config.json, the
 # choices a profile fills in, the check every Choices table passes before a run starts, and whether a run's
-# choices still match its profile (the report's "(changed)"). Also the toolbox window's model (New-ToolboxModel)
-# and its "What will happen" lines (Get-ToolboxPlanLines), which Toolbox.ps1 renders (toolbox spec 4.1).
+# choices still match its profile (the report's "(changed)"). Also the toolbox window's model (New-ToolboxModel),
+# how one click changes it (Update-ToolboxModel) and its "What will happen" lines (Get-ToolboxPlanLines), which
+# Toolbox.ps1 renders (toolbox spec 4.1).
 #
 # Pure: no logging, no I/O, no console. Values in, values out; the callers log (ConvertTo-ValidChoices returns
 # the dropped tweak ids for that). Needs Catalog.ps1 (Get-TweakCatalog, Get-EffectiveTweaks, Get-RemoteChoice,
@@ -246,6 +247,66 @@ function New-ToolboxModel {
     Previous        = $Previous
     MaxAgeDays      = [int]$Config.freshInstall.maxInstallAgeDays
   }
+}
+
+function Update-ToolboxModel {
+  <#
+  .SYNOPSIS
+    Applies one window action to the toolbox model and returns the new model. Pure, like Update-StartChoices.
+  .DESCRIPTION
+    The input is never changed: the model, its Choices and the Tweaks array are copies. Actions and values are
+    matched exactly (case-sensitive), as the window's a:<Action>:<Value> tags write them:
+      - Profile <id>: that profile's Office, Remote, SevenZip, RestorePoint, Tweaks and Profile (Get-ProfileChoices);
+        Mode stays (the Type is detected, never part of a profile). An unknown id changes nothing.
+      - Mode LAPTOP | DESKTOP, Office (one of $script:OfficeChoices), Remote (one of $script:RemoteChoices): set.
+      - SevenZip, RestorePoint: toggled (the value is ignored).
+      - Tweak <id>: that catalog id is toggled in the selection, which is then in catalog order, each id once.
+        The selection is not filtered by the Type or Office rules (Get-EffectiveTweaks does that), so NumLock
+        comes back with Desktop. An id that is not in the catalog changes nothing.
+      - Language en | he.
+      - Power: OnAC = ($Value -eq 'true').
+    Any other action or value changes nothing. A changed option never changes Profile (spec 5.2): the report
+    shows the profile's name with "(changed)" (Test-ProfileChanged).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Model,
+    [Parameter(Mandatory)][string]$Action,
+    [AllowNull()][AllowEmptyString()][string]$Value = '',
+    [Parameter(Mandatory)]$Config
+  )
+
+  $next = $Model.Clone()
+  $choices = $Model['Choices'].Clone()
+  if ($choices['Tweaks'] -is [array]) { $choices['Tweaks'] = $choices['Tweaks'].Clone() }
+  $next['Choices'] = $choices
+
+  switch -CaseSensitive ($Action) {
+    'Profile' {
+      $fill = Get-ProfileChoices -Config $Config -ProfileId $Value
+      if ($null -ne $fill) { foreach ($key in 'Office', 'Remote', 'SevenZip', 'RestorePoint', 'Tweaks', 'Profile') { $choices[$key] = $fill[$key] } }
+    }
+    'Mode' { if ($Value -cin 'LAPTOP', 'DESKTOP') { $choices['Mode'] = $Value } }
+    'Office' { if ($script:OfficeChoices -ccontains $Value) { $choices['Office'] = $Value } }
+    'Remote' { if ($script:RemoteChoices -ccontains $Value) { $choices['Remote'] = $Value } }
+    'SevenZip' { $choices['SevenZip'] = -not [bool]$choices['SevenZip'] }
+    'RestorePoint' { $choices['RestorePoint'] = -not [bool]$choices['RestorePoint'] }
+    'Tweak' {
+      $catalog = @(Get-TweakCatalog -Config $Config)
+      $known = $false
+      foreach ($tweak in $catalog) { if ($tweak.Id -ceq $Value) { $known = $true } }
+      if ($known) {
+        $selected = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($id in @($choices['Tweaks'])) { if ($null -ne $id) { $null = $selected.Add([string]$id) } }
+        if (-not $selected.Remove($Value)) { $null = $selected.Add($Value) }
+        $choices['Tweaks'] = [string[]]@(foreach ($tweak in $catalog) { if ($selected.Contains($tweak.Id)) { $tweak.Id } })
+      }
+    }
+    'Language' { if ($Value -cin 'en', 'he') { $next['Language'] = $Value } }
+    'Power' { $next['OnAC'] = ($Value -eq 'true') }
+  }
+  return $next
 }
 
 function Get-ToolboxPlanLines {
