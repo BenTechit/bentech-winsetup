@@ -53,4 +53,8 @@ Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
   It 'numbers the plan with catalog titles, the tweaks step right after the desktop icons' {
     $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg)
     $l[0] | Should -BeExactly ' 1  Prepare machine'; $l[4] | Should -BeExactly ' 5  System tweaks'; $l[-1] | Should -Match '^\d\d  Finalize$' }
+  It 'takes the titles of the window''s language, the catalog''s English where one is missing (TB-R5)' {
+    $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg `
+      -Titles @{ prepare = 'Step one'; bitlocker = '' })
+    $l[0] | Should -BeExactly ' 1  Step one'; $l[1] | Should -BeExactly ' 2  Turn off BitLocker' }
 }

@@ -276,6 +276,14 @@ Describe 'Format-StartScreen (v2)' {
     $l | Should -Contain '   Previous run: 02/01/2026 03:04 - GREEN'
     (F $c) -join "`n" | Should -Not -Match 'Previous run'
   }
+  It 'formats the previous run through the helper the toolbox shares, with its fallbacks (toolbox review M4)' {
+    $l = Format-StartScreen -Machine $m -Choices @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'OFF' } -SecondsLeft 9 -Version 'v1' -OnAC $true -IsFresh $true -Previous @{ StartedAt = 'garbage'; Color = '' }
+    $l | Should -Contain '   Previous run: unknown date - unfinished'
+    $p = Format-PreviousRun -Previous @{ StartedAt = '2026-10-20T09:05:00'; Color = "YEL$Hebrew" }
+    $p.When | Should -BeExactly '20/10/2026 09:05'; $p.Color | Should -BeExactly 'YEL?????'
+    $f = Format-PreviousRun -Previous @{ StartedAt = $null; Color = $null } -UnknownDate 'no date' -Unfinished 'not done'
+    $f.When | Should -BeExactly 'no date'; $f.Color | Should -BeExactly 'not done'
+  }
   It 'a DESKTOP choice or a VM keeps the same layout (ASCII, no line over 79)' {
     $vm = $m.Clone(); $vm.IsVM = $true; $vm.Manufacturer = "Dell`r`nInc."
     $l = Format-StartScreen -Machine $vm -Choices @{ Mode = 'DESKTOP'; SevenZip = $true; Office = 'HOME' } -SecondsLeft 3 -Version 'v1' -OnAC $true -IsFresh $true -Previous $null -HasDriverTool $false

@@ -76,6 +76,7 @@ $BundleOrder = @(
   'UI\FinalScreen.ps1'
   'Toolbox\Strings.ps1'
   'Toolbox\SetupPlanner.ps1'
+  'Toolbox\Xaml.ps1'
   'Toolbox\Toolbox.ps1'
   'Entry\Cleanup.ps1'
   'Entry\Main.ps1'

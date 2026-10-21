@@ -73,6 +73,35 @@ function ConvertFrom-StateTime {
   return $null
 }
 
+function Format-PreviousRun {
+  <#
+  .SYNOPSIS
+    The two parts of the "Previous run: <when> - <colour>" line: @{ When; Color }. Pure, never throws.
+  .DESCRIPTION
+    When is Previous.StartedAt as dd/MM/yyyy HH:mm (ConvertFrom-StateTime: an ISO string or a [datetime]), else
+    -UnknownDate. Color is Previous.Color as one ASCII line (ConvertTo-ScreenText), else -Unfinished when it is
+    empty. The console start screen takes the English defaults; the toolbox window passes its language's words.
+    Shared by both screens so they cannot drift (toolbox review M4).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [AllowNull()][hashtable]$Previous,
+    [string]$UnknownDate = 'unknown date',
+    [string]$Unfinished = 'unfinished'
+  )
+
+  $started = $null
+  $color = ''
+  if ($null -ne $Previous) {
+    $started = ConvertFrom-StateTime $Previous['StartedAt']
+    $color = ConvertTo-ScreenText $Previous['Color']
+  }
+  $when = if ($null -ne $started) { $started.ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture) } else { $UnknownDate }
+  if ($color -eq '') { $color = $Unfinished }
+  return @{ When = $when; Color = $color }
+}
+
 function Format-HoursMinutes {
   # h:mm, hours not wrapped at 24. A negative span counts as zero.
   [CmdletBinding()]
@@ -257,11 +286,8 @@ function Format-StartScreen {
     $lines.Add('   ON BATTERY: plug in the charger. BIOS updates will be skipped if still on battery.')
   }
   if ($null -ne $Previous) {
-    $started = ConvertFrom-StateTime $Previous['StartedAt']
-    $when = if ($null -ne $started) { $started.ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture) } else { 'unknown date' }
-    $color = ConvertTo-ScreenText $Previous['Color']
-    if ($color -eq '') { $color = 'unfinished' }
-    $lines.Add(('   Previous run: {0} - {1}' -f $when, $color))
+    $run = Format-PreviousRun -Previous $Previous
+    $lines.Add(('   Previous run: {0} - {1}' -f $run.When, $run.Color))
   }
 
   if ($IsFresh) {

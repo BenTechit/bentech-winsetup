@@ -251,26 +251,31 @@ function New-ToolboxModel {
 function Get-ToolboxPlanLines {
   <#
   .SYNOPSIS
-    The window's "What will happen" column: one line per planned step, '{0,2}  {1}' -f <n>, <catalog Title>. Pure.
+    The window's "What will happen" column: one line per planned step, '{0,2}  {1}' -f <n>, <step title>. Pure.
   .DESCRIPTION
     The plan is Get-StepPlan on the Choices that Start would hand over (ConvertTo-ValidChoices on the model's
-    Choices), so the column shows exactly what the run will do. Titles are the catalog's English ones (ASCII,
-    shown left-to-right in both languages). Emitted one by one: wrap the call in @().
+    Choices), so the column shows exactly what the run will do. Each title is -Titles[<step id>] (the window passes
+    its language's step.<id> names, ruling TB-R5), else the catalog's English Title; without -Titles the lines are
+    the catalog's, which is what the console, setup.log and the report show. Emitted one by one: wrap the call in
+    @().
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param(
     [Parameter(Mandatory)][hashtable]$Model,
     [Parameter(Mandatory)][hashtable]$Machine,
-    [Parameter(Mandatory)]$Config
+    [Parameter(Mandatory)]$Config,
+    [AllowNull()][hashtable]$Titles
   )
 
   $choices = (ConvertTo-ValidChoices -Choices $Model['Choices'] -Config $Config -Machine $Machine).Choices
-  $titles = @{}
-  foreach ($step in $script:StepCatalog) { $titles[$step.Id] = $step.Title }
+  $catalogTitles = @{}
+  foreach ($step in $script:StepCatalog) { $catalogTitles[$step.Id] = $step.Title }
   $n = 0
   foreach ($id in @(Get-StepPlan -Machine $Machine -Choices $choices -Config $Config)) {
     $n++
-    '{0,2}  {1}' -f $n, $titles[$id]
+    $title = $catalogTitles[$id]
+    if ($null -ne $Titles -and -not [string]::IsNullOrEmpty([string]$Titles[$id])) { $title = [string]$Titles[$id] }
+    '{0,2}  {1}' -f $n, $title
   }
 }

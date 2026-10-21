@@ -8,6 +8,10 @@
 # checks every other src file is ASCII). Nothing here reaches setup.log, the console or the report: those stay
 # English and ASCII, and Choices hold ASCII ids only. No Hebrew string contains an apostrophe (these are
 # single-quoted strings).
+#
+# step.<id> names every step of the catalog (Engine\Catalog.ps1) for the window's "What will happen" column
+# (ruling TB-R5): the English one is exactly the catalog's Title (tests\Toolbox.Tests.ps1 pins it); the console,
+# setup.log and the report keep reading the catalog's English titles.
 $script:ToolboxStrings = @{
   en = @{
     'app.title'             = 'BENTECH TOOLBOX'
@@ -18,6 +22,8 @@ $script:ToolboxStrings = @{
     'power.battery'         = 'On battery'
     'warn.notFresh'         = 'This PC already has user files or is older than {0} days'
     'warn.previous'         = 'Previous run: {0} - {1}'
+    'previous.unknownDate'  = 'unknown date'
+    'previous.unfinished'   = 'unfinished'
     'warn.battery'          = 'On battery: BIOS updates will be skipped'
     'warn.screenConnect'    = 'ScreenConnect = unattended access: get the customer''s OK first'
     'warn.adminProtection'  = 'Setup is running as a different user than the one signed in (Windows Administrator protection, or an admin password typed for another account). It would not resume after a restart: sign in as this PC''s administrator, or turn Administrator protection off in Windows Security.'
@@ -43,6 +49,28 @@ $script:ToolboxStrings = @{
     'plan.title'            = 'WHAT WILL HAPPEN'
     'button.start'          = 'START'
     'button.cancel'         = 'Cancel'
+    'step.prepare'          = 'Prepare machine'
+    'step.bitlocker'        = 'Turn off BitLocker'
+    'step.region'           = 'Time zone + Hebrew keyboard'
+    'step.desktop-icons'    = 'Desktop icons'
+    'step.tweaks'           = 'System tweaks'
+    'step.bloatware'        = 'Remove bloatware'
+    'step.rename'           = 'Rename PC'
+    'step.winget'           = 'Prepare winget'
+    'step.chrome'           = 'Google Chrome'
+    'step.anydesk'          = 'AnyDesk'
+    'step.screenconnect'    = 'ScreenConnect'
+    'step.7zip'             = '7-Zip'
+    'step.craft-apps'       = 'Craft apps'
+    'step.default-browser'  = 'Chrome as default browser'
+    'step.vendor-pass1'     = 'Vendor drivers + BIOS (pass 1)'
+    'step.office'           = 'Microsoft 365'
+    'step.windows-update'   = 'Windows Update'
+    'step.office-finish'    = 'Microsoft 365 (finish)'
+    'step.vendor-pass2'     = 'Vendor drivers + BIOS (pass 2)'
+    'step.consumer-app'     = 'Vendor app'
+    'step.vendor-cleanup'   = 'Remove business updater'
+    'step.finalize'         = 'Finalize'
   }
   he = @{
     'app.title'             = 'ארגז הכלים של BENTECH'
@@ -53,6 +81,8 @@ $script:ToolboxStrings = @{
     'power.battery'         = 'על סוללה'
     'warn.notFresh'         = 'במחשב כבר יש קבצי משתמש, או שהוא הותקן לפני יותר מ-{0} ימים'
     'warn.previous'         = 'הרצה קודמת: {0} - {1}'
+    'previous.unknownDate'  = 'תאריך לא ידוע'
+    'previous.unfinished'   = 'לא הסתיימה'
     'warn.battery'          = 'על סוללה: עדכוני BIOS ידולגו'
     'warn.screenConnect'    = 'ScreenConnect = גישה בלי אישור בכל חיבור: קודם לקבל את הסכמת הלקוח'
     'warn.adminProtection'  = 'ההתקנה רצה כמשתמש אחר מזה שמחובר (הגנת מנהל המערכת של Windows, או סיסמת מנהל שהוקלדה לחשבון אחר). היא לא תמשיך אחרי הפעלה מחדש: יש להתחבר כמנהל המחשב, או לכבות את Administrator protection באבטחת Windows.'
@@ -78,5 +108,28 @@ $script:ToolboxStrings = @{
     'plan.title'            = 'מה יקרה'
     'button.start'          = 'התחל'
     'button.cancel'         = 'ביטול'
+    'step.prepare'          = 'הכנת המחשב'
+    'step.bitlocker'        = 'כיבוי BitLocker'
+    'step.region'           = 'אזור זמן ומקלדת עברית'
+    'step.desktop-icons'    = 'סמלים בשולחן העבודה'
+    'step.tweaks'           = 'שיפורי מערכת'
+    'step.bloatware'        = 'הסרת תוכנות מיותרות'
+    'step.rename'           = 'שינוי שם המחשב'
+    'step.winget'           = 'הכנת winget'
+    'step.chrome'           = 'Google Chrome'
+    'step.anydesk'          = 'AnyDesk'
+    'step.screenconnect'    = 'ScreenConnect'
+    # A left-to-right mark first: in a right-to-left row the '-' would otherwise turn "7-Zip" into "Zip-7".
+    'step.7zip'             = ([string][char]0x200E + '7-Zip')
+    'step.craft-apps'       = 'אפליקציות Craft'
+    'step.default-browser'  = 'Chrome כדפדפן ברירת המחדל'
+    'step.vendor-pass1'     = 'דרייברי יצרן ו-BIOS (סבב 1)'
+    'step.office'           = 'Microsoft 365'
+    'step.windows-update'   = 'עדכוני Windows'
+    'step.office-finish'    = 'Microsoft 365 (סיום)'
+    'step.vendor-pass2'     = 'דרייברי יצרן ו-BIOS (סבב 2)'
+    'step.consumer-app'     = 'אפליקציית היצרן'
+    'step.vendor-cleanup'   = 'הסרת כלי העדכון העסקי'
+    'step.finalize'         = 'סיום'
   }
 }

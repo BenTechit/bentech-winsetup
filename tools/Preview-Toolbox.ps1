@@ -4,7 +4,7 @@
 # drawn into a bitmap. The window is never opened and WPF is never stopped.
 #
 # Loads only pure definitions: the config reader, the log writer, the step catalog, the start screen's helpers
-# (New-DefaultChoices, ConvertTo-ScreenText, ConvertFrom-StateTime) and the three Toolbox files. No step, runner or
+# (New-DefaultChoices, ConvertTo-ScreenText, Format-PreviousRun) and the four Toolbox files. No step, runner or
 # entry file is loaded, nothing is installed, nothing is written but the PNGs.
 #
 # Four views of one sample machine (a Dell Latitude 5440 laptop on Windows 11, not fresh, on battery, with a
@@ -28,7 +28,7 @@ if ([string]::IsNullOrEmpty($OutDir)) { $OutDir = Join-Path $repoRoot 'dist\tool
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-foreach ($file in 'Common\Config', 'Common\Logging', 'Engine\Catalog', 'UI\StartScreen', 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Toolbox') {
+foreach ($file in 'Common\Config', 'Common\Logging', 'Engine\Catalog', 'UI\StartScreen', 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox') {
   . (Join-Path $repoRoot "src\$file.ps1")
 }
 
