@@ -300,6 +300,93 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
       Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match 'Add_(Preview)?Key(Down|Up)|IsCancel="True"|GetNewClosure|KeyBinding|InputBindings' -Because $file }
     $script:ToolboxXaml | Should -Not -Match 'IsCancel|IsDefault="True"' }
 }
+Describe 'Test-ToolboxHost (toolbox spec 5.1)' {
+  It '<Why>' -ForEach @(
+    @{ Why = 'an MTA thread';     A = 'MTA'; I = $true;  S = 1; L = { };                     Want = 'not STA' }
+    @{ Why = 'no desktop';        A = 'STA'; I = $false; S = 1; L = { };                     Want = 'not interactive' }
+    @{ Why = 'session 0';         A = 'STA'; I = $true;  S = 0; L = { };                     Want = 'session 0' }
+    @{ Why = 'WPF missing';       A = 'STA'; I = $true;  S = 1; L = { throw 'no PresentationFramework' }; Want = 'WPF could not be loaded: no PresentationFramework' }
+  ) { $got = Test-ToolboxHost -ApartmentState $A -UserInteractive $I -SessionId $S -LoadWpf $L; $got.Ok | Should -BeFalse; $got.Reason | Should -BeExactly $Want }   # not $R: PowerShell variables are case-insensitive, $r would overwrite it
+  It 'all good is Ok' { (Test-ToolboxHost -ApartmentState 'STA' -UserInteractive $true -SessionId 1 -LoadWpf { }).Ok | Should -BeTrue }
+  It 'checks in order (the first failing check wins) and never loads WPF after an earlier failure' {
+    $script:loads = 0
+    $r = Test-ToolboxHost -ApartmentState 'MTA' -UserInteractive $false -SessionId 0 -LoadWpf { $script:loads++ }
+    $r.Reason | Should -BeExactly 'not STA'; $script:loads | Should -Be 0
+    (Test-ToolboxHost -ApartmentState 'STA' -UserInteractive $false -SessionId 0 -LoadWpf { $script:loads++ }).Reason | Should -BeExactly 'not interactive'
+    (Test-ToolboxHost -ApartmentState 'STA' -UserInteractive $true -SessionId 0 -LoadWpf { $script:loads++ }).Reason | Should -BeExactly 'session 0'
+    $script:loads | Should -Be 0 }
+  It 'returns exactly one hashtable, and a WPF message in Hebrew becomes ASCII' {
+    $r = @(Test-ToolboxHost -ApartmentState 'STA' -UserInteractive $true -SessionId 1 -LoadWpf { 'noise'; 42 })
+    $r.Count | Should -Be 1; $r[0] | Should -BeOfType [hashtable]; $r[0].Ok | Should -BeTrue
+    $h = Test-ToolboxHost -ApartmentState 'STA' -UserInteractive $true -SessionId 1 -LoadWpf { throw ('no wpf ' + [char]0x05D0) }
+    $h.Reason | Should -BeExactly 'WPF could not be loaded: no wpf ?' }
+  It 'with no seams it reads this thread, process and session, and never throws' {
+    $r = Test-ToolboxHost -LoadWpf { }
+    $r | Should -BeOfType [hashtable]; $r.Ok | Should -BeOfType [bool]
+    if (-not $r.Ok) { $r.Reason | Should -BeIn 'not STA', 'not interactive', 'session 0' } }
+}
+Describe 'Get-SetupChoices (toolbox spec 5.1)' {
+  BeforeAll {
+    $script:prev = @{ StartedAt = '2026-10-20T09:05:00'; Color = 'YELLOW' }
+    function Get([scriptblock]$Toolbox, [bool]$HostOk = $true, [scriptblock]$Console = { param($p) $script:consoleArgs = $p; New-DefaultChoices -Machine $p.Machine -Config $p.Config }) {
+      $script:shutdowns = 0; $script:consoleArgs = $null
+      Get-SetupChoices -Machine $m -Config $cfg -Version '2026.10.21.1' -Previous $prev -IsFresh $false -TestHost ([scriptblock]::Create("@{ Ok = `$$HostOk; Reason = 'session 0' }")) `
+        -ShowToolbox $Toolbox -ShowConsole $Console -ShutdownDispatcher { $script:shutdowns++ } }
+  }
+  BeforeEach { Set-ToolboxTestMocks }   # setup.log into $script:logs; the power state is never read for real
+  It 'Start returns the validated Choices, once, and stops WPF once (Review Focus 2)' {
+    $r = @(Get { param($p) @{ Outcome = 'Start'; Choices = @{ Mode = 'DESKTOP'; Office = 'CRAFT'; Remote = 'ANYDESK'; SevenZip = $true; Profile = 'home'; RestorePoint = $true; Tweaks = @('numLock', 'widgets') } } })
+    $r.Count | Should -Be 1; $r[0] | Should -BeOfType [hashtable]; @($r[0].Tweaks) | Should -Be @('numLock')
+    $script:shutdowns | Should -Be 1; $script:consoleArgs | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox closed' -and $_.Level -eq 'INFO' -and $_.Data.outcome -eq 'Start' -and $_.Data.profile -eq 'home' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Unknown tweak ids dropped' -and @($_.Data.tweaks) -ceq 'widgets' }).Count | Should -Be 1 }
+  It 'Cancel returns $null and never opens the console' {
+    $r = @(Get { param($p) @{ Outcome = 'Cancel' } }); $r.Count | Should -Be 1; $r[0] | Should -BeNullOrEmpty; $script:consoleArgs | Should -BeNullOrEmpty
+    $script:shutdowns | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox closed' -and $_.Level -eq 'INFO' -and $_.Data.outcome -eq 'Cancel' }).Count | Should -Be 1 }
+  It 'Failed falls back to the console; a throwing toolbox is Failed, never Cancel (Review Focus 1)' {
+    foreach ($tb in { param($p) @{ Outcome = 'Failed'; Error = 'view broke' } }, { param($p) throw ('boom ' + [char]0x05D0) }, { param($p) @{ Outcome = $null } }) {
+      $r = Get $tb; $r | Should -BeOfType [hashtable]; $script:consoleArgs | Should -Not -BeNullOrEmpty; $script:shutdowns | Should -Be 1 }
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]'
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox failed; using the console start screen' }).Count | Should -Be 3
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox failed; using the console start screen' -and $_.Data.error -ceq 'view broke' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox failed; using the console start screen' -and $_.Data.error -ceq 'boom ?' }).Count | Should -Be 1 }
+  It 'a Start with no usable Choices is Failed and falls back to the console (Task 3 review)' {
+    foreach ($tb in { param($p) @{ Outcome = 'Start' } }, { param($p) @{ Outcome = 'Start'; Choices = $null } }, { param($p) @{ Outcome = 'Start'; Choices = 'not a table' } }) {
+      $r = Get $tb; $r | Should -BeOfType [hashtable]; $script:consoleArgs | Should -Not -BeNullOrEmpty; $script:shutdowns | Should -Be 1 }
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox failed; using the console start screen' }).Count | Should -Be 3
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox closed' }).Count | Should -Be 0 }
+  It 'a toolbox that returns no table, a stray extra value or an unknown outcome is Failed too' {
+    foreach ($tb in { param($p) }, { param($p) 'noise'; @{ Outcome = 'Cancel' } }, { param($p) 'Start' }, { param($p) @{ Outcome = 'Maybe' } }) {
+      $r = Get $tb; $r | Should -BeOfType [hashtable]; $script:consoleArgs | Should -Not -BeNullOrEmpty; $script:shutdowns | Should -Be 1 }
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox failed; using the console start screen' }).Count | Should -Be 4 }
+  It 'no host: the console with Show-StartScreen''s exact parameters, no window, no shutdown' {
+    $r = Get { param($p) throw 'must not open' } -HostOk $false
+    [object]::ReferenceEquals($script:consoleArgs.Machine, $m) | Should -BeTrue; [object]::ReferenceEquals($script:consoleArgs.Config, $cfg) | Should -BeTrue
+    $script:consoleArgs.Version | Should -Be '2026.10.21.1'
+    $script:consoleArgs.Previous.Color | Should -Be 'YELLOW'; $script:consoleArgs.IsFresh | Should -BeFalse; $script:shutdowns | Should -Be 0
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox not available; using the console start screen' -and $_.Data.reason -eq 'session 0' }).Count | Should -Be 1 }
+  It 'a console Escape is $null; a console exception is not swallowed' {
+    Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) $null } | Should -BeNullOrEmpty
+    { Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) throw 'console broke' } } | Should -Throw '*console broke*' }
+  It 'the console''s Choices pass ConvertTo-ValidChoices too: unknown tweak ids are dropped and logged' {
+    $r = Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) @{ Mode = 'DESKTOP'; Office = 'CRAFT'; Remote = 'ANYDESK'; SevenZip = $true; Profile = 'home'; RestorePoint = $true; Tweaks = @('numLock', 'widgets') } }
+    @($r.Tweaks) | Should -Be @('numLock')
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Unknown tweak ids dropped' -and @($_.Data.tweaks) -ceq 'widgets' }).Count | Should -Be 1 }
+  It 'a dispatcher shutdown that throws is only a WARN: the Start result stands' {
+    $r = @(Get-SetupChoices -Machine $m -Config $cfg -Version '2026.10.21.1' -Previous $null -IsFresh $true -TestHost { @{ Ok = $true; Reason = '' } } `
+      -ShowToolbox { param($p) @{ Outcome = 'Start'; Choices = @{ Mode = 'DESKTOP'; Office = 'CRAFT'; Remote = 'ANYDESK'; SevenZip = $true; Profile = 'home'; RestorePoint = $true; Tweaks = @() } } } `
+      -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { throw ('stop failed ' + [char]0x05D0) })
+    $r.Count | Should -Be 1; $r[0] | Should -BeOfType [hashtable]; $r[0].Profile | Should -Be 'home'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not stop the toolbox dispatcher' -and $_.Data.error -ceq 'stop failed ?' }).Count | Should -Be 1 }
+  It 'the console and the window return the same tweaks for the same options (Review Focus 3)' {
+    $console = Get { param($p) @{ Outcome = 'Failed' } }
+    $window = Get { param($p) Show-ToolboxWindow @p -ShowDialog { param($w) Click $w 'StartButton' } -OnAC { $true } -AdminProtection { 'Off' } -WorkArea { New-Object Windows.Rect 0, 0, 1920, 1040 } }
+    @($window.Tweaks) | Should -Be @($console.Tweaks); $window.Office | Should -Be $console.Office; $window.Profile | Should -Be $console.Profile }
+  It 'InvokeShutdown appears once in src, as this seam''s default (no test can reach it)' {
+    $hits = @(Get-ChildItem "$PSScriptRoot\..\src" -Recurse -Filter *.ps1 | Select-String -Pattern 'InvokeShutdown' -SimpleMatch)
+    $hits.Count | Should -Be 1; $hits[0].Line | Should -Match '\$ShutdownDispatcher = \{ \[Windows\.Threading\.Dispatcher\]::CurrentDispatcher\.InvokeShutdown\(\) \}' }
+}
 Describe 'tools\Preview-Toolbox.ps1' {
   It 'renders the four PNGs at 1000x680 without showing a window' {
     $out = Join-Path $TestDrive 'preview'; & "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out | Out-Null

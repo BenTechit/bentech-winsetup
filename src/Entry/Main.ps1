@@ -1,6 +1,6 @@
 ﻿# src/Entry/Main.ps1
 # Start-BenTechSetup: the entry point of the bundled setup.ps1. It runs three ways:
-#   - from the launcher (first run): the start screen, then the run;
+#   - from the launcher (first run): the toolbox (the console start screen when it fails), then the run;
 #   - from the logon resume task (-Resume): straight back into the saved run;
 #   - as the Windows Update child process the windows-update step starts (-WuRound -ResultPath <p>):
 #     one round, no lock, no screen;
@@ -12,10 +12,11 @@
 # dot-source in tests (it only defines functions).
 
 function Get-PreviousRunSummary {
-  # Private. The @{ StartedAt; Color } summary of an earlier run that the start screen shows and the new
-  # state keeps as PreviousRun: the verdict colour of a run that ended, 'UNFINISHED' for one that never
-  # did, $null when there was no earlier run. An old state whose verdict cannot be computed (a damaged or
-  # older shape) is logged and shown as 'UNKNOWN', so a strange state.json can never block a new run.
+  # Private. The @{ StartedAt; Color } summary of an earlier run that the toolbox (or the console start
+  # screen) shows and the new state keeps as PreviousRun: the verdict colour of a run that ended,
+  # 'UNFINISHED' for one that never did, $null when there was no earlier run. An old state whose verdict
+  # cannot be computed (a damaged or older shape) is logged and shown as 'UNKNOWN', so a strange
+  # state.json can never block a new run.
   [CmdletBinding()]
   [OutputType([hashtable])]
   param([AllowNull()][hashtable]$State)
@@ -34,9 +35,10 @@ function Get-PreviousRunSummary {
 }
 
 function Test-SetupMachineFresh {
-  # Private. Whether this machine looks like a fresh install, so the start screen may count down and
-  # start by itself. Whatever cannot be judged is "not fresh", the safe side (the screen then waits for
-  # Enter): an empty or unparseable InstallDate, or any error measuring the user data. Never throws.
+  # Private. Whether this machine looks like a fresh install, so the console start screen (the toolbox's
+  # fallback) may count down and start by itself. Whatever cannot be judged is "not fresh", the safe side
+  # (the screen then waits for Enter): an empty or unparseable InstallDate, or any error measuring the
+  # user data. Never throws.
   [CmdletBinding()]
   [OutputType([bool])]
   param(
@@ -252,11 +254,11 @@ function Complete-SetupRun {
 
 function Invoke-SetupMainFlow {
   # Private; Start-BenTechSetup is its only caller. Everything that runs while this process holds the run
-  # lock. Returns @{ Outcome; State; HadPrevious }: Outcome is 'Cancelled' (Escape on the start screen: a
-  # leftover resume task is removed, nothing else changes), 'NoState' (resumed without a state),
-  # 'Rebooting' or 'Completed'; State is the run state ($null when there is none); HadPrevious says
-  # whether a run state was already there when this process started (an earlier run on a new run, the
-  # saved run on a resume). Exceptions propagate to Start-BenTechSetup's crash handler.
+  # lock. Returns @{ Outcome; State; HadPrevious }: Outcome is 'Cancelled' (Cancel in the toolbox, or Escape
+  # on the console start screen it falls back to: a leftover resume task is removed, nothing else
+  # changes), 'NoState' (resumed without a state), 'Rebooting' or 'Completed'; State is the run state
+  # ($null when there is none); HadPrevious says whether a run state was already there when this process
+  # started (an earlier run on a new run, the saved run on a resume). Exceptions propagate to Start-BenTechSetup's crash handler.
   # A new run records the launcher (Get-LauncherInfo on $env:BT_SELF, which the launcher sets) in the
   # state, so the final screen can find the USB stick (spec 10.2). A resume records nothing: the resume
   # task has no BT_SELF.
@@ -292,10 +294,12 @@ function Invoke-SetupMainFlow {
     $previousSummary = Get-PreviousRunSummary -State $previous
     $machine = Get-MachineInfo
     $fresh = Test-SetupMachineFresh -Machine $machine -Config $config
-    $choices = Show-StartScreen -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh
+    # The toolbox window, or the console start screen when the window fails (Get-SetupChoices; the same
+    # parameters and the same return contract as Show-StartScreen): Choices, or $null for Cancel.
+    $choices = Get-SetupChoices -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh
     if ($null -eq $choices) {
-      # Ruling R27 (spec 8.1, 8.5): cancel leaves no changes and no resume task, so a task left by an
-      # earlier, unfinished run is removed too. No state is saved.
+      # Ruling R27 (spec 8.1, 8.5): cancel (the toolbox's Cancel, X or Alt+F4, or Esc on the console) leaves no
+      # changes and no resume task, so a task left by an earlier, unfinished run is removed too. No state is saved.
       Write-SetupLog -Message 'Cancelled on the start screen; removing any leftover resume task, nothing else is changed'
       $null = Unregister-ResumeTask
       return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious }
@@ -316,7 +320,7 @@ function Invoke-SetupMainFlow {
   # The tick draws the progress screen: at most once a second during long waits (Invoke-External,
   # downloads, Wait-SetupDelay), and at once on every state transition (OnProgress forces it). The tick
   # and the runner pass the Context to their callbacks, so neither depends on variable lookup. The first
-  # frame clears the window (the start screen is still on it).
+  # frame clears the window (the console start screen, when it was used, is still on it).
   Reset-ConsoleFrame
   Register-SetupTick -Context $ctx -Handler { param($tickContext) Show-ProgressScreen -State $tickContext.State -Catalog $script:StepCatalog }
   $outcome = Invoke-SetupRun -Context $ctx -OnProgress { param($progressContext) Invoke-SetupTick -Force }
@@ -350,8 +354,9 @@ function Start-BenTechSetup {
          <Root>\Logs\transcript-<stamp>.txt (best effort), and the start line with the version ('dev'
          when unbundled).
       2. Lock: Enter-RunLock. Held by another live run: 'Setup is already running on this machine', 2.
-      3. Not resuming: the previous run's summary, the machine facts, the fresh-install check, the start
-         screen (Escape: a leftover resume task is removed (R27), nothing else changes, 0). Then the
+      3. Not resuming: the previous run's summary, the machine facts, the fresh-install check, the toolbox
+         window (Get-SetupChoices; the console start screen when the window fails) (Cancel, or Escape on the
+         console: a leftover resume task is removed (R27), nothing else changes, 0). Then the
          previous activity.txt is archived as activity-<previous RunId>.txt, the previous state is
          archived, the plan built, and the new state saved.
          Resuming: the saved state, and 'Back after restart <RebootCount>' in the activity feed. None: the
@@ -363,12 +368,14 @@ function Start-BenTechSetup {
          'Completed': the finalization is completed when the finalize step is not Done (R26); if that
          throws, the error is logged and added to State.Errors (red), not a crash. The resume task is
          removed in any case, the tick unregistered, and the final screen is shown until Enter. 0.
-    The tick is unregistered and the lock released in a finally block (also on Ctrl+C on the start
-    screen), the lock except after 'Rebooting'. The transcript is stopped in the same finally block.
+    The tick is unregistered and the lock released in a finally block (also on Ctrl+C on the console start
+    screen; on the console behind the toolbox, Ctrl+C takes effect once the window closes), the lock
+    except after 'Rebooting'. The transcript is stopped in the same finally block.
     After that finally block (v2 spec 10): 'Completed' runs Invoke-SetupCleanup -Mode Finish (the logs to
-    the USB stick, the Desktop launcher and C:\BenTech deleted), and Escape on the start screen with no
-    earlier run state runs -Mode Cancel (C:\BenTech deleted, because nothing ran). A crash, 'Rebooting',
-    'NoState', a cancel after an unfinished earlier run and a lock held by another run delete nothing.
+    the USB stick, the Desktop launcher and C:\BenTech deleted), and Cancel on the start screen (the
+    toolbox's, or Escape on the console) with no earlier run state runs -Mode Cancel (C:\BenTech deleted,
+    because nothing ran). A crash, 'Rebooting', 'NoState', a cancel after an unfinished earlier run and a
+    lock held by another run delete nothing.
     The exit code does not change.
 
     Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash

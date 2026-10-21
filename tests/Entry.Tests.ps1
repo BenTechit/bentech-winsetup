@@ -8,13 +8,17 @@
 # transcript, Write-Host, the lock, config and state I/O, machine detection, the screens, the plan, the
 # runner, the verdict, the finalization, the resume task and the Windows Update round. As a safety net,
 # Register-ScheduledTask, Unregister-ScheduledTask, Restart-Computer and Start-Process throw.
+# Toolbox Task 4: the start screen is Get-SetupChoices (the toolbox window, the console start screen when it
+# fails), mocked here. As a second safety net Show-ToolboxWindow and Test-ToolboxHost throw: this suite can never
+# open a window.
 # Task 15: Invoke-SetupCleanup deletes the parent of -Root (here the temp folder above $TestDrive), so
 # BeforeEach always mocks it, and Get-LauncherInfo (no CIM query from these tests).
 BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
                  'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
-                 'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen', 'Entry\Cleanup', 'Entry\Main') {
+                 'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen',
+                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Entry\Cleanup', 'Entry\Main') {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
@@ -65,7 +69,7 @@ Describe 'Start-BenTechSetup' {
     Mock Get-MachineInfo { $script:machine }
     Mock Get-UserDataBytes { [long]1024 }
     Mock Test-FreshInstall { $true }
-    Mock Show-StartScreen { $script:choices }
+    Mock Get-SetupChoices { $script:choices }
     Mock Get-StepPlan { 'prepare'; 'winget'; 'finalize' }
     Mock New-RunState { $script:newState }
     Mock New-SetupContext { @{ Config = $Config; State = $State; Root = $Root; ScriptPath = $ScriptPath; LogDir = (Join-Path $Root 'Logs') } }
@@ -88,6 +92,10 @@ Describe 'Start-BenTechSetup' {
     Mock Start-Process { throw 'blocked: Start-Process' }
     Mock Invoke-SetupCleanup { }                  # SAFETY: the real one deletes the parent of -Root
     Mock Get-LauncherInfo { @{ Path = 'E:\BenTechSetup.cmd'; Drive = 'E:'; VolumeSerial = '1A2B3C4D' } }
+    # SAFETY (toolbox Task 4): Get-SetupChoices is mocked, so neither is ever reached; if a test ever lets the real
+    # one through, it stops at these instead of opening a real window.
+    Mock Show-ToolboxWindow { throw 'blocked: Show-ToolboxWindow' }
+    Mock Test-ToolboxHost { throw 'blocked: Test-ToolboxHost' }
   }
 
   AfterEach {
@@ -112,6 +120,13 @@ Describe 'Start-BenTechSetup' {
       Invoke-Entry -Resume $true | Out-Null
       Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'BenTech Windows Setup 2026.10.18.9 starting' -and $Data.resume -eq $true }
     }
+    It 'cannot open a toolbox window: the real window functions are blocked here, and Main.ps1 asks Get-SetupChoices (toolbox Task 4)' {
+      { Test-ToolboxHost } | Should -Throw '*blocked: Test-ToolboxHost*'
+      { Show-ToolboxWindow -Machine $script:machine -Config $script:cfg -Version 'x' -Previous $null -IsFresh $true } | Should -Throw '*blocked: Show-ToolboxWindow*'
+      $main = Get-Content "$PSScriptRoot\..\src\Entry\Main.ps1" -Raw
+      $main | Should -Match '\$choices = Get-SetupChoices -Machine \$machine -Config \$config -Version \$Version -Previous \$previousSummary -IsFresh \$fresh'
+      $main | Should -Not -Match '= Show-StartScreen'
+    }
     It 'returns 2 and changes nothing when another run holds the lock' {
       Mock Enter-RunLock { $false }
       Invoke-Entry | Should -Be 2
@@ -119,7 +134,7 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Write-Host -ParameterFilter { "$Object" -eq 'Setup is already running on this machine' -and $ForegroundColor -eq 'Yellow' -and $BackgroundColor -eq 'Black' }
       Should -Invoke Read-SetupConfig -Times 0 -Exactly
       Should -Invoke Read-RunState -Times 0 -Exactly
-      Should -Invoke Show-StartScreen -Times 0 -Exactly
+      Should -Invoke Get-SetupChoices -Times 0 -Exactly
       Should -Invoke Save-RunState -Times 0 -Exactly
       Should -Invoke Invoke-SetupRun -Times 0 -Exactly
       Should -Invoke Exit-RunLock -Times 0 -Exactly    # the lock belongs to the other run
@@ -142,7 +157,7 @@ Describe 'Start-BenTechSetup' {
 
   Context 'first run' {
     It 'Escape on the start screen returns 0, removes a leftover resume task (R27), saves nothing and releases the lock' {
-      Mock Show-StartScreen { $null }
+      Mock Get-SetupChoices { $null }
       Mock Read-RunState { New-FakeState -RunId 'old-run' }   # an unfinished earlier run: its task may still be registered
       Invoke-Entry | Should -Be 0
       Should -Invoke Unregister-ResumeTask -Times 1 -Exactly
@@ -157,7 +172,7 @@ Describe 'Start-BenTechSetup' {
     It 'builds the state from the plan, saves it, and runs it' {
       $script:SetupVersion = '2026.10.18.9'
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter {
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter {
         $Machine.NewName -eq 'DELL-7HX2K93' -and $Config -eq $script:cfg -and $Version -eq '2026.10.18.9' -and $null -eq $Previous -and $IsFresh -eq $true }
       Should -Invoke Get-StepPlan -Times 1 -Exactly -ParameterFilter { $Choices.Mode -eq 'LAPTOP' -and $Machine.Brand -eq 'DELL' -and $Config -eq $script:cfg }
       Should -Invoke New-RunState -Times 1 -Exactly -ParameterFilter {
@@ -174,7 +189,7 @@ Describe 'Start-BenTechSetup' {
       Mock Read-RunState { $previous }
       Mock Get-RunVerdict { @{ Color = 'YELLOW' } } -ParameterFilter { $State.RunId -eq 'old-run' }
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $Previous.StartedAt -eq '2026-10-17T09:00:00' -and $Previous.Color -eq 'YELLOW' }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Previous.StartedAt -eq '2026-10-17T09:00:00' -and $Previous.Color -eq 'YELLOW' }
       Should -Invoke Backup-RunState -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive -and $LogDir -eq (Join-Path $TestDrive 'Logs') }
       Should -Invoke New-RunState -Times 1 -Exactly -ParameterFilter { $Previous.RunId -eq 'old-run' }
       Should -Invoke Save-RunState -Times 1 -Exactly -ParameterFilter { $State.PreviousRun.Color -eq 'YELLOW' -and $State.PreviousRun.StartedAt -eq '2026-10-17T09:00:00' }
@@ -182,7 +197,7 @@ Describe 'Start-BenTechSetup' {
     It 'an earlier run that never ended is UNFINISHED (no verdict is computed for it)' {
       Mock Read-RunState { New-FakeState -RunId 'old-run' }
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $Previous.Color -eq 'UNFINISHED' }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Previous.Color -eq 'UNFINISHED' }
       Should -Invoke Get-RunVerdict -Times 0 -Exactly -ParameterFilter { $State.RunId -eq 'old-run' }
       Should -Invoke Backup-RunState -Times 1 -Exactly
     }
@@ -190,7 +205,7 @@ Describe 'Start-BenTechSetup' {
       Mock Read-RunState { New-FakeState -RunId 'old-run' -EndedAt '2026-10-17T10:00:00' }
       Mock Get-RunVerdict { throw 'odd old state' } -ParameterFilter { $State.RunId -eq 'old-run' }
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $Previous.Color -eq 'UNKNOWN' }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Previous.Color -eq 'UNKNOWN' }
       Should -Invoke Invoke-SetupRun -Times 1 -Exactly
       $crashes.Count | Should -Be 0
     }
@@ -200,19 +215,19 @@ Describe 'Start-BenTechSetup' {
     It 'an empty InstallDate is not fresh' {
       $machine.InstallDate = ''
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
       Should -Invoke Test-FreshInstall -Times 0 -Exactly
     }
     It 'an unparseable InstallDate is not fresh' {
       $machine.InstallDate = 'not a date'
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
       Should -Invoke Test-FreshInstall -Times 0 -Exactly
     }
     It 'a failure measuring the user data is not fresh' {
       Mock Get-UserDataBytes { throw 'access denied' }
       Invoke-Entry | Should -Be 0
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $false }
       $crashes.Count | Should -Be 0
     }
     It 'passes the parsed date, the user data and the config limits to Test-FreshInstall, and its answer (<Answer>) on' -ForEach @(
@@ -224,7 +239,7 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Test-FreshInstall -Times 1 -Exactly -ParameterFilter {
         $InstallDate -eq [datetime]'2026-10-17T08:00:00' -and $UserDataBytes -eq 1024 -and
         $MaxAgeDays -eq $script:cfg.freshInstall.maxInstallAgeDays -and $MaxUserDataGB -eq $script:cfg.freshInstall.maxUserDataGB }
-      Should -Invoke Show-StartScreen -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $answer }
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $IsFresh -eq $answer }
     }
   }
 
@@ -232,7 +247,7 @@ Describe 'Start-BenTechSetup' {
     It 'with no state removes the resume task and returns 0' {
       Invoke-Entry -Resume $true | Should -Be 0
       Should -Invoke Unregister-ResumeTask -Times 1 -Exactly
-      Should -Invoke Show-StartScreen -Times 0 -Exactly
+      Should -Invoke Get-SetupChoices -Times 0 -Exactly
       Should -Invoke Get-MachineInfo -Times 0 -Exactly
       Should -Invoke Invoke-SetupRun -Times 0 -Exactly
       Should -Invoke Save-RunState -Times 0 -Exactly
@@ -244,7 +259,7 @@ Describe 'Start-BenTechSetup' {
       Invoke-Entry -Resume $true | Should -Be 0
       Should -Invoke Read-RunState -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive }
       Should -Invoke Invoke-SetupRun -Times 1 -Exactly -ParameterFilter { $Context.State.RunId -eq 'resumed-run' }
-      Should -Invoke Show-StartScreen -Times 0 -Exactly
+      Should -Invoke Get-SetupChoices -Times 0 -Exactly
       Should -Invoke Get-MachineInfo -Times 0 -Exactly
       Should -Invoke New-RunState -Times 0 -Exactly
       Should -Invoke Backup-RunState -Times 0 -Exactly
@@ -374,7 +389,7 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Enter-RunLock -Times 0 -Exactly
       Should -Invoke Exit-RunLock -Times 0 -Exactly
       Should -Invoke Start-Transcript -Times 0 -Exactly
-      Should -Invoke Show-StartScreen -Times 0 -Exactly
+      Should -Invoke Get-SetupChoices -Times 0 -Exactly
       Should -Invoke Invoke-SetupRun -Times 0 -Exactly
       Should -Invoke Save-RunState -Times 0 -Exactly
     }
@@ -445,7 +460,7 @@ Describe 'Start-BenTechSetup' {
     }
     It 'runs with no lock, no screen, no tick, no activity feed and no state' {
       Invoke-Entry -WuUnhide $true -ResultPath "$TestDrive\u.json" -UpdateIds $script:u1 | Should -Be 0
-      foreach ($c in 'Enter-RunLock', 'Start-Transcript', 'Show-StartScreen', 'Invoke-SetupRun', 'Register-SetupTick', 'Initialize-SetupActivity',
+      foreach ($c in 'Enter-RunLock', 'Start-Transcript', 'Get-SetupChoices', 'Invoke-SetupRun', 'Register-SetupTick', 'Initialize-SetupActivity',
                      'Disable-ConsoleQuickEdit', 'Resize-SetupConsole', 'Read-RunState', 'Save-RunState', 'Invoke-WuRound', 'Invoke-SetupCleanup') {
         Should -Invoke $c -Times 0 -Exactly -Because $c
       }
@@ -475,7 +490,7 @@ Describe 'Start-BenTechSetup' {
       Mock Initialize-SetupLog { $null = $script:order.Add('log') }
       Mock Disable-ConsoleQuickEdit { $null = $script:order.Add('quickedit'); $true }
       Mock Enter-RunLock { $null = $script:order.Add('lock'); $true }
-      Mock Show-StartScreen { $null = $script:order.Add('start-screen'); $script:choices }
+      Mock Get-SetupChoices { $null = $script:order.Add('start-screen'); $script:choices }
       Invoke-Entry | Should -Be 0
       Should -Invoke Disable-ConsoleQuickEdit -Times 1 -Exactly
       @($script:order) | Should -Be @('log', 'quickedit', 'lock', 'start-screen')
@@ -508,13 +523,13 @@ Describe 'Start-BenTechSetup' {
     It 'a new run archives the previous activity under its RunId, after the start screen' {
       $script:order = New-Object System.Collections.ArrayList
       Mock Read-RunState { New-FakeState -RunId '20261019-090000' -EndedAt '2026-10-19T11:00:00' }
-      Mock Show-StartScreen { [void]$script:order.Add('start'); $script:choices }
+      Mock Get-SetupChoices { [void]$script:order.Add('start'); $script:choices }
       Mock Reset-SetupActivityLog { [void]$script:order.Add('archive') }
       Invoke-Entry | Out-Null
       @($order) | Should -Be @('start', 'archive')
       Should -Invoke Reset-SetupActivityLog -Times 1 -Exactly -ParameterFilter { $PreviousRunId -eq '20261019-090000' }
     }
-    It 'Escape archives nothing' { Mock Show-StartScreen { $null }; Invoke-Entry | Out-Null; Should -Invoke Reset-SetupActivityLog -Times 0 -Exactly }
+    It 'Escape archives nothing' { Mock Get-SetupChoices { $null }; Invoke-Entry | Out-Null; Should -Invoke Reset-SetupActivityLog -Times 0 -Exactly }
     It 'a resume writes "Back after restart N"' {
       Mock Read-RunState { $s = New-FakeState; $s.RebootCount = 3; $s }
       Invoke-Entry -Resume $true | Out-Null
@@ -570,7 +585,7 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Finish' -and $State.RunId -eq 'resumed-run' }
     }
     It 'Escape with no earlier run cleans up (Cancel); after an unfinished earlier run it keeps the folder' {
-      Mock Show-StartScreen { $null }; Invoke-Entry | Out-Null; Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Cancel' }
+      Mock Get-SetupChoices { $null }; Invoke-Entry | Out-Null; Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Cancel' }
       Mock Read-RunState { New-FakeState }; Invoke-Entry | Out-Null; Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly
     }
     It 'a crash, a restart or a held lock cleans nothing' {

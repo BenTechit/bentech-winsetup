@@ -15,6 +15,11 @@
 # and the dialog itself (Show-ToolboxWindow, which never throws and shows the window only through its -ShowDialog
 # seam).
 #
+# And the seam (Task 4): Test-ToolboxHost (can this process show a WPF window at all?) and Get-SetupChoices, which
+# Main.ps1 calls where it called Show-StartScreen: the window, or the unchanged console start screen when the host
+# check or the window fails, with the same parameters and the same return contract (Choices, or $null for Cancel).
+# It is also the one place that stops WPF once the window is gone.
+#
 # The WPF rules (spec 5.1; the plan's Global Constraints), which every later addition keeps:
 #   - The window's state lives in $window.Tag (the plan's "Toolbox model and window state"). Every handler is one
 #     line, { Invoke-ToolboxAction -Sender $this }: no closures over outer variables.
@@ -31,13 +36,14 @@
 #     the report keep the catalog's English titles.
 #   - Nothing here writes to the console (no Write-Host) or sleeps. setup.log gets English ASCII only: every
 #     exception message and every free value goes through ConvertTo-ScreenText first.
-#   - Only Show-ToolboxWindow's -ShowDialog default opens the window as a dialog, and nothing here stops WPF
-#     (Get-SetupChoices does, Task 4); no test does either.
+#   - Only Show-ToolboxWindow's -ShowDialog default opens the window as a dialog, and only Get-SetupChoices'
+#     -ShutdownDispatcher default stops WPF; no test does either (both are seams, and a static test pins that).
 #
 # Needs: Toolbox\Strings.ps1 ($script:ToolboxStrings), Toolbox\Xaml.ps1 ($script:ToolboxXaml),
 # Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, New-ToolboxModel, Update-ToolboxModel, ConvertTo-ValidChoices,
 # Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog, Test-TweakAllowed, Get-RemoteChoice,
-# $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText), Common\Logging.ps1
+# $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and Show-StartScreen:
+# Get-SetupChoices' console fallback), Common\Logging.ps1
 # (Write-SetupLog), Detect\Detection.ps1 (Test-OnACPower, Test-AdminProtection: Show-ToolboxWindow's seam
 # defaults) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds
 # every file.
@@ -703,7 +709,7 @@ function Show-ToolboxWindow {
          is closed (a Close() that fails is logged WARN).
     The result is Tag's Outcome, Choices and Error. An Outcome still empty after the dialog is Failed, never
     Cancel (spec 5.1: a failure is never read as a Cancel). Any exception is Failed with its message in ASCII,
-    logged ERROR 'Toolbox window failed'. WPF is not shut down here (Get-SetupChoices does that, Task 4).
+    logged ERROR 'Toolbox window failed'. WPF is not shut down here (Get-SetupChoices does that).
 
     The seams (production defaults shown):
       -ShowDialog       shows the window as a dialog; the only place that does
@@ -768,4 +774,161 @@ function Show-ToolboxWindow {
     Write-SetupLog -Level ERROR -Message 'Toolbox window failed' -Data @{ error = $message; line = $_.InvocationInfo.ScriptLineNumber }
     return @{ Outcome = 'Failed'; Choices = $null; Error = $message }
   }
+}
+
+function Test-ToolboxHost {
+  <#
+  .SYNOPSIS
+    Whether this process can show the toolbox window (spec 5.1): @{ Ok = <bool>; Reason = <string> }. Never throws.
+  .DESCRIPTION
+    Four checks, in this order; the first one that fails gives Ok = $false with its reason, and the later ones
+    do not run (WPF is not loaded after an earlier failure):
+      - the thread is STA                      -> 'not STA'
+      - the session is interactive             -> 'not interactive'
+      - the session is not session 0           -> 'session 0'
+      - WPF loads (PresentationFramework, PresentationCore, WindowsBase)
+                                               -> 'WPF could not be loaded: <message in ASCII>'
+    Anything else that goes wrong while checking gives Ok = $false with 'host check failed: <message in ASCII>':
+    the console start screen then takes over, which is always safe. Ok = $true has an empty Reason.
+
+    The seams (production defaults shown, each resolved in the body when not given):
+      -ApartmentState  [Threading.Thread]::CurrentThread.GetApartmentState()
+      -UserInteractive [Environment]::UserInteractive
+      -SessionId       [Diagnostics.Process]::GetCurrentProcess().SessionId
+      -LoadWpf         { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop }
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [AllowNull()]$ApartmentState,
+    [AllowNull()]$UserInteractive,
+    [AllowNull()]$SessionId,
+    [scriptblock]$LoadWpf = { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop }
+  )
+
+  try {
+    if ($null -eq $ApartmentState) { $ApartmentState = [System.Threading.Thread]::CurrentThread.GetApartmentState() }
+    if ([string]$ApartmentState -ne 'STA') { return @{ Ok = $false; Reason = 'not STA' } }
+
+    if ($null -eq $UserInteractive) { $UserInteractive = [System.Environment]::UserInteractive }
+    if (-not $UserInteractive) { return @{ Ok = $false; Reason = 'not interactive' } }
+
+    if ($null -eq $SessionId) { $SessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId }
+    if ([int]$SessionId -eq 0) { return @{ Ok = $false; Reason = 'session 0' } }
+
+    try {
+      $null = & $LoadWpf
+    } catch {
+      return @{ Ok = $false; Reason = ('WPF could not be loaded: ' + (ConvertTo-ScreenText -Text $_.Exception.Message)) }
+    }
+    return @{ Ok = $true; Reason = '' }
+  } catch {
+    return @{ Ok = $false; Reason = ('host check failed: ' + (ConvertTo-ScreenText -Text $_.Exception.Message)) }
+  }
+}
+
+function Get-SetupChoices {
+  <#
+  .SYNOPSIS
+    The start screen of a new run (Main.ps1): the toolbox window, or the console start screen when the window
+    cannot be used. Returns the Choices to run with, or $null when the technician cancels.
+  .DESCRIPTION
+    The same parameters and the same return contract as Show-StartScreen, which it replaces at Main.ps1's
+    call. Exactly one value is returned: a Choices hashtable (always through ConvertTo-ValidChoices) or $null.
+      1. Host check (Test-ToolboxHost). Not Ok: WARN 'Toolbox not available; using the console start screen'
+         with @{ reason }, then the console (step 4).
+      2. The window (Show-ToolboxWindow), in try/finally. An exception becomes Failed (its message in ASCII).
+         Whatever happens, the WPF dispatcher is stopped exactly once afterwards, so the main thread does not keep
+         a hidden WPF window for the hours the run takes (spec 5.1); a failure of that stop is only a WARN.
+      3. The outcome:
+           Start   INFO 'Toolbox closed' with @{ outcome; profile }; the Choices are returned.
+           Cancel  INFO 'Toolbox closed' with @{ outcome }; $null is returned (Esc on the console does the same).
+           Failed  ERROR 'Toolbox failed; using the console start screen' with @{ error }, then the console. So
+                   does anything else: no result, more than one value, an unknown outcome, or a Start without
+                   Choices. A failure is never read as a Cancel (spec 5.1).
+      4. The console is Show-StartScreen, unchanged (it keeps its own 30-second countdown on a fresh machine: the
+         emergency path). Its $null (Escape) is returned as it is; its Choices pass ConvertTo-ValidChoices.
+         An exception from the console is not caught here: it reaches the entry point's crash handler, as before.
+    ConvertTo-ValidChoices drops unknown tweak ids; they are logged WARN 'Unknown tweak ids dropped'.
+
+    The seams (production defaults shown), so no test opens a window or stops WPF:
+      -TestHost            { Test-ToolboxHost }
+      -ShowToolbox         { param($p) Show-ToolboxWindow @p }
+      -ShowConsole         { param($p) Show-StartScreen @p }
+      -ShutdownDispatcher  stops the thread's WPF dispatcher; the only place in src that does
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Machine,
+    [Parameter(Mandatory)]$Config,
+    [Parameter(Mandatory)][string]$Version,
+    [AllowNull()][hashtable]$Previous,
+    [Parameter(Mandatory)][bool]$IsFresh,
+    [scriptblock]$TestHost = { Test-ToolboxHost },
+    [scriptblock]$ShowToolbox = { param($p) Show-ToolboxWindow @p },
+    [scriptblock]$ShowConsole = { param($p) Show-StartScreen @p },
+    [scriptblock]$ShutdownDispatcher = { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() }
+  )
+
+  $p = @{ Machine = $Machine; Config = $Config; Version = $Version; Previous = $Previous; IsFresh = $IsFresh }
+  $raw = $null
+  $fromToolbox = $false
+
+  $hostCheck = & $TestHost
+  if ($hostCheck -isnot [System.Collections.IDictionary] -or $hostCheck['Ok'] -ne $true) {
+    $reason = if ($hostCheck -is [System.Collections.IDictionary]) { [string]$hostCheck['Reason'] } else { 'the host check returned no result' }
+    Write-SetupLog -Level WARN -Message 'Toolbox not available; using the console start screen' -Data @{ reason = (ConvertTo-ScreenText -Text $reason) }
+  } else {
+    $result = $null
+    try {
+      $outputs = @(& $ShowToolbox $p)
+      if ($outputs.Count -eq 1) { $result = $outputs[0] }
+    } catch {
+      $result = @{ Outcome = 'Failed'; Error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    } finally {
+      try {
+        $null = & $ShutdownDispatcher
+      } catch {
+        Write-SetupLog -Level WARN -Message 'Could not stop the toolbox dispatcher' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      }
+    }
+
+    $failure = 'The toolbox returned no result'
+    if ($result -is [hashtable]) {
+      $outcome = $result['Outcome']
+      if ($outcome -ceq 'Cancel') {
+        Write-SetupLog -Level INFO -Message 'Toolbox closed' -Data @{ outcome = 'Cancel' }
+        return $null
+      } elseif ($outcome -ceq 'Start') {
+        if ($result['Choices'] -is [System.Collections.IDictionary]) {
+          $raw = $result['Choices']
+          $fromToolbox = $true
+        } else {
+          $failure = 'The toolbox returned Start without Choices'
+        }
+      } elseif ($outcome -ceq 'Failed') {
+        $failure = [string]$result['Error']
+      } else {
+        $failure = 'The toolbox returned an unknown outcome'
+      }
+    }
+    if (-not $fromToolbox) {
+      Write-SetupLog -Level ERROR -Message 'Toolbox failed; using the console start screen' -Data @{ error = (ConvertTo-ScreenText -Text $failure) }
+    }
+  }
+
+  if (-not $fromToolbox) {
+    $raw = & $ShowConsole $p
+    if ($null -eq $raw) { return $null }
+  }
+
+  $valid = ConvertTo-ValidChoices -Choices $raw -Config $Config -Machine $Machine
+  if (@($valid.Dropped).Count -gt 0) {
+    Write-SetupLog -Level WARN -Message 'Unknown tweak ids dropped' -Data @{ tweaks = @($valid.Dropped | ForEach-Object { ConvertTo-ScreenText -Text $_ }) }
+  }
+  if ($fromToolbox) {
+    Write-SetupLog -Level INFO -Message 'Toolbox closed' -Data @{ outcome = 'Start'; profile = [string]$valid.Choices.Profile }
+  }
+  return $valid.Choices
 }
