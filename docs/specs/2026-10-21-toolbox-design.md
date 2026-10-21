@@ -84,7 +84,7 @@ The content scrolls when the window is clamped to a small screen's work area.
 
 ### 4.3 Language (Q21)
 - **Strings:** every visible text comes from one string table with an English and a Hebrew entry for each key (`src\Toolbox\Strings.ps1`). Profile, tweak and option names come from `config.json` in both languages.
-- **Switching:** the EN | HE switch walks the elements tagged `Tag="t:<key>"` and sets their text. Hebrew sets `FlowDirection=RightToLeft` on the window. Machine values (model, serial, PC name) and step titles stay left-to-right.
+- **Switching:** the EN | HE switch walks the elements tagged `Tag="t:<key>"` and sets their text. Hebrew sets `FlowDirection=RightToLeft` on the window. Machine values (model, serial, PC name) stay left-to-right. The step list shows Hebrew step names in Hebrew mode (Q30).
 - **Default:** the language the window opens in is `config.json` `toolbox.language` (`"en"`). The switch lasts for that run only.
 - **What stays English:** nothing Hebrew reaches setup.log, the console or the report. Choices hold ASCII ids only.
 - **Encoding:** `Strings.ps1` is the only `src` file allowed to contain non-ASCII (UTF-8 with BOM, as every `.ps1`).
@@ -305,6 +305,8 @@ Every WinUtil tweak not listed in 6.3 was rejected by rule:
 | Q26 | The three profiles in 5.2 | **Approved as proposed**, on condition that every option stays switchable per PC (5.2). |
 | Q27 | Show file extensions | **Off everywhere.** It stays available as a switch, and no profile turns it on. |
 | Q28 | The spec | **Approved**; the implementation plan comes next. |
+| Q29 | The look (rendered screenshots, 22/10/2026) | **Approved as is.** |
+| Q30 | The "what will happen" list in Hebrew mode | **Hebrew too.** Each step gets a Hebrew name in the window only (`step.<id>` in `Strings.ps1`). The console, setup.log and the report keep the catalog's English titles. |
 
 ## 10b. Calls made without Ben (check while reading)
 1. **Administrator protection blocks Start** (5.3). The resume task would probably register the hidden admin account, so the run would stop after its first restart. An empty signed-in user name (RDP, early logon) counts as the same user, as today.
