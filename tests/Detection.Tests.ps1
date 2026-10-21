@@ -60,3 +60,11 @@ Describe 'New-PcName' {
     @($names | Sort-Object -Unique).Count | Should -BeGreaterThan 1     # random each time, so two such PCs differ
   }
 }
+Describe 'Test-AdminProtection (toolbox spec 5.3)' {
+  It '<Why> is <E>' -ForEach @(
+    @{ Why = 'the same account';                 P = 'PC1\Dana'; S = 'pc1\dana';  E = 'Off' }
+    @{ Why = 'a hidden admin account';           P = 'PC1\ADMIN_Dana'; S = 'PC1\Dana'; E = 'On' }
+    @{ Why = 'no signed-in user (RDP, early logon)'; P = 'PC1\Dana'; S = '';      E = 'Unknown' }
+  ) { $script:pu = $P; $script:su = $S; Mock Get-ProcessUserName { $script:pu }; Mock Get-SignedInUserName { $script:su }; Test-AdminProtection | Should -BeExactly $E }
+  It 'a CIM failure is Unknown, never a throw' { Mock Get-ProcessUserName { 'PC1\Dana' }; Mock Get-SignedInUserName { throw 'RPC unavailable' }; Test-AdminProtection | Should -BeExactly 'Unknown' }
+}

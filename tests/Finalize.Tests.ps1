@@ -10,7 +10,9 @@
 # Remove-LenovoAdminCommandLine, Get-ActivationStatus, Get-SmartAppControlState, Get-BitLockerState, Unregister-ResumeTask,
 # Get-InstalledAppVersions, Get-ItemProperty, Remove-ItemProperty, Start-Sleep, the read-only
 # SoftwareLicensingProduct query and Write-SetupLog. As a safety net, New-Item, New-ItemProperty,
-# Set-ItemProperty, Invoke-External, Invoke-PowerShellChild (the activation attempt), Register-ScheduledTask,
+# Set-ItemProperty, Get-RegistryValue and Set-RegistryDword (the restore point's frequency value: only the
+# restore-point Describe replaces them with recorders), Invoke-External, Invoke-PowerShellChild (the
+# activation attempt and the restore point), Register-ScheduledTask,
 # Unregister-ScheduledTask, Restart-Computer, any other Get-CimInstance and Invoke-CimMethod throw (and are
 # recorded), and so does Remove-Item for any path outside $TestDrive; AfterEach asserts that nothing
 # was blocked. The only real file I/O is inside $TestDrive: the fake working folder (Downloads,
@@ -20,6 +22,8 @@
 BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','Engine\Verdict','Engine\Reboot','Report\Report','Steps\Finalize') { . "$PSScriptRoot\..\src\$f.ps1" }
   # The helpers Finalize and the report reuse (the bundle holds every file), and the runner for the end-to-end tests.
   foreach ($f in 'Common\Logging','Common\Activity','Common\Process','Engine\Runner','UI\StartScreen','Steps\Prepare','Steps\Apps','Steps\Office','Steps\DefaultBrowser','Steps\BitLocker','Steps\Vendor','Steps\Winget','Steps\WindowsUpdate') { . "$PSScriptRoot\..\src\$f.ps1" }
+  # The report's profile line (toolbox spec 5.5), and Read-SetupConfig for its tests.
+  foreach ($f in 'Common\Config','Toolbox\SetupPlanner') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:st = New-RunState -Machine @{ Manufacturer='Dell Inc.'; FriendlyModel='Latitude 5440'; Serial='7HX2K93'; ComputerName='DESKTOP-AB12'; NewName='DELL-7HX2K93'; OsCaption='Windows 11 Pro'; OsDisplayVersion='25H2'; OsBuild=26200; Arch='x64'; IsLaptop=$true; IsVM=$false } -Choices @{Mode='LAPTOP';SevenZip=$true;Office='BUSINESS'} -Plan @('chrome') -Version '2026.10.18.1'
   $st.StartedAt = '2026-10-18T09:05:00'; $st.EndedAt = '2026-10-18T10:17:00'; $st.AnyDeskId = '123456789'; $st.Steps.chrome.Status = 'Done'
 
@@ -185,6 +189,8 @@ BeforeAll { foreach ($f in 'Common\StepResult','State\State','Engine\Catalog','E
     Mock Get-CimInstance { return $script:licensingProducts } -ParameterFilter { $ClassName -eq 'SoftwareLicensingProduct' }
     Mock Invoke-CimMethod { [void]$script:blocked.Add("Invoke-CimMethod $MethodName"); throw 'blocked by the test' }
     Mock Invoke-PowerShellChild { [void]$script:blocked.Add('Invoke-PowerShellChild'); throw 'blocked by the test' }
+    Mock Get-RegistryValue { [void]$script:blocked.Add("Get-RegistryValue $Path $Name"); throw 'blocked by the test' }
+    Mock Set-RegistryDword { [void]$script:blocked.Add("Set-RegistryDword $Path $Name"); throw 'blocked by the test' }
   }
 }
 
@@ -231,9 +237,12 @@ Describe 'Format-SetupReport content' {
   }
   It 'starts with the title and lists the header lines in order' {
     $expected = 'BenTech Windows Setup - Report', 'Tool version : ', 'Result       : ', 'Started      : ', 'Finished     : ', 'Duration     : ',
-      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : ', 'ScreenConnect: '
+      'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : ', 'ScreenConnect: ',
+      'Profile      : ', 'Tweaks       : ', 'Restore point: '
     for ($i = 0; $i -lt $expected.Count; $i++) { $green[$i] | Should -BeLike ($expected[$i] + '*') }
     $green | Should -Contain 'ScreenConnect: not chosen'   # the state has Choices without Remote: AnyDesk only (spec 4.1)
+    # ... and without Profile, Tweaks and RestorePoint (an older state: toolbox spec 5.2)
+    $green | Should -Contain 'Profile      : none'; $green | Should -Contain 'Tweaks       : none'; $green | Should -Contain 'Restore point: not chosen'
   }
   It 'shows Smart App Control as given, and Unknown when it was not passed (M8)' {
     $green | Should -Contain 'Smart App Control : Unknown'
@@ -1348,4 +1357,85 @@ Describe 'Windows activation attempt (spec 9.5)' {
     $script:restoreCalls | Should -Be 1
     $ctx.State.Notes | Should -Contain 'Windows not activated'
   }
+}
+
+Describe 'restore point at the end (toolbox spec 5.4)' {
+  BeforeEach { Initialize-FinalizeMocks
+    $script:sr = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'; $script:fn = 'SystemRestorePointCreationFrequency'
+    $script:dwords = New-Object Collections.ArrayList; $script:freqStuck = $false; $script:saveThrows = $false; $script:savedTried = $null
+    $script:child = @{ ExitCode = 0; TimedOut = $false; Output = '' }; $script:childSeen = $null
+    # The frequency value lives in $script:regPresent, so Remove-RegistryValueIfPresent (Get-ItemProperty / Remove-ItemProperty mocks) sees it too.
+    Mock Get-RegistryValue { $v = $script:regPresent[$Path]
+      if ($null -ne $v -and $v.ContainsKey($Name)) { @{ Exists = $true; Value = $v[$Name]; Kind = 'DWord' } } else { @{ Exists = $false; Value = $null; Kind = '' } } }
+    Mock Set-RegistryDword { [void]$script:dwords.Add(@{ Path = $Path; Name = $Name; Value = [int]$Value })
+      if (-not ($script:freqStuck -and [int]$Value -ne 0)) { if ($null -eq $script:regPresent[$Path]) { $script:regPresent[$Path] = @{} }; $script:regPresent[$Path][$Name] = [int]$Value }
+      $true }
+    Mock Save-RunState { if ($script:saveThrows) { throw 'disk full' }; $script:savedTried = [bool]$State.RestorePointTried }
+    Mock Invoke-PowerShellChild {
+      $script:childSeen = @{ Command = $Command; Timeout = $TimeoutMinutes; Tried = $script:ctx.State.RestorePointTried; Saved = $script:savedTried
+        Freq = $(if ($script:regPresent[$script:sr]) { $script:regPresent[$script:sr][$script:fn] }); SetupGone = -not (Test-Path (Join-Path $script:ctx.Root 'setup.ps1'))
+        EndedAt = $script:ctx.State.EndedAt }
+      if ($script:child -is [scriptblock]) { & $script:child } else { $script:child } }
+    $script:ctx = New-FinalizeContext -PhaseB; $script:ctx.State.Choices.RestorePoint = $true
+    $script:ctx.Config | Add-Member -NotePropertyName timeoutsMinutes -NotePropertyValue ([pscustomobject]@{ restorePoint = 10 }) }
+  AfterEach { $script:blocked -join "; " | Should -BeNullOrEmpty }
+  It 'runs one bounded child after the setup files are gone, with the frequency at 0 and the attempt saved first' {
+    $null = Complete-SetupFinalization -Context $ctx
+    $childSeen.Timeout | Should -Be 10; $childSeen.Command | Should -Match "Checkpoint-Computer -Description 'BenTech setup' -RestorePointType MODIFY_SETTINGS"
+    $childSeen.Tried | Should -BeTrue; $childSeen.Saved | Should -BeTrue; $childSeen.Freq | Should -Be 0
+    $childSeen.SetupGone | Should -BeTrue; $childSeen.EndedAt | Should -BeNullOrEmpty
+    $ctx.State.RestorePointCreated | Should -BeTrue
+    Get-ReportLines -Context $ctx | Should -Contain 'Restore point: created (System Protection is now on and reserves a few percent of the disk)' }
+  It 'the frequency value is put back whatever the child does (Review Focus 5): <Why>' -ForEach @(
+    @{ Why = 'confirmed, absent before';  Before = $null; Child = @{ ExitCode = 0; TimedOut = $false } }
+    @{ Why = 'timed out, 1440 before';    Before = 1440;  Child = @{ ExitCode = $null; TimedOut = $true } }
+    @{ Why = 'no new point (exit 3)';     Before = 0;     Child = @{ ExitCode = 3; TimedOut = $false } }
+    @{ Why = 'the child could not start'; Before = $null; Child = { throw 'cannot start powershell.exe' } }
+  ) {
+    $script:child = $Child; if ($null -ne $Before) { $script:regPresent[$sr] = @{ $fn = $Before } }
+    $null = Complete-SetupFinalization -Context $ctx
+    $script:dwords[0].Value | Should -Be 0; $childSeen | Should -Not -BeNullOrEmpty
+    if ($null -eq $Before) { @($script:regRemoved.Name) | Should -Contain $fn; $script:regPresent[$sr].ContainsKey($fn) | Should -BeFalse }
+    else { $script:dwords[-1].Value | Should -Be $Before; $script:regPresent[$sr][$fn] | Should -Be $Before }
+    $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back'
+    if ($Child -is [hashtable] -and $Child.ExitCode -eq 0) { $ctx.State.Notes | Should -Not -Contain 'Restore point could not be confirmed' }
+    else { $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'; Get-ReportLines -Context $ctx | Should -Contain 'Restore point: could not be confirmed' } }
+  It 'a frequency that cannot be put back is its own Note' {
+    $script:regPresent[$sr] = @{ $fn = 1440 }; $script:freqStuck = $true   # the restore write "succeeds", the read-back still says 0
+    $null = Complete-SetupFinalization -Context $ctx; $ctx.State.Notes | Should -Contain 'Restore point frequency value could not be put back' }
+  It 'never tries twice: a repeated finalize reads the result' {
+    $ctx.State.RestorePointTried = $true; $ctx.State.RestorePointCreated = $true
+    $null = Complete-SetupFinalization -Context $ctx; Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; @($script:dwords).Count | Should -Be 0
+    Get-ReportLines -Context $ctx | Should -Contain 'Restore point: created (System Protection is now on and reserves a few percent of the disk)' }
+  It 'a state that cannot be saved first: no attempt, frequency untouched, the Note' {
+    $script:saveThrows = $true; $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; @($script:dwords).Count | Should -Be 0; $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed' }
+  It 'not chosen (or an older state without the key): no child, no registry read' {
+    $ctx.State.Choices.Remove('RestorePoint'); $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; Should -Invoke Get-RegistryValue -Times 0 -Exactly
+    Get-ReportLines -Context $ctx | Should -Contain 'Restore point: not chosen' }
+  It 'a missing timeoutsMinutes.restorePoint is 10' { $ctx.Config.timeoutsMinutes.PSObject.Properties.Remove('restorePoint'); $null = Complete-SetupFinalization -Context $ctx; $childSeen.Timeout | Should -Be 10 }
+}
+
+Describe 'Format-SetupReport: profile, tweaks, restore point (toolbox spec 5.5)' {
+  BeforeAll { $script:rcfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
+    function Get-ToolboxReport([hashtable]$Choices, $TweaksStep, [bool]$Created) {
+      $s = New-RunState -Machine $script:fm -Choices $Choices -Plan @('chrome') -Version '2026.10.21.1'; $s.RestorePointCreated = $Created
+      if ($TweaksStep) { $s.Steps['tweaks'] = $TweaksStep }
+      @(Format-SetupReport -State $s -Verdict (Get-RunVerdict -State $s) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{} -Config $script:rcfg) } }
+  It 'the three lines follow ScreenConnect, in order' {
+    $c = New-DefaultChoices -Machine $script:fm -Config $rcfg; $c.Tweaks = @('accessKeys', 'startClean', 'noAds', 'taskbarLeft'); $c.Remove('RestorePoint')
+    $l = Get-ToolboxReport $c @{ Status = 'Done'; Data = @{ Applied = @('accessKeys', 'startClean', 'noAds'); Refused = @('taskbarLeft'); Skipped = @() } } $false
+    $at = [array]::IndexOf($l, 'ScreenConnect: not chosen')
+    $l[$at + 1] | Should -BeExactly 'Profile      : Home PC (home) (changed)'
+    $l[$at + 2] | Should -BeExactly 'Tweaks       : 3 applied: accessKeys, startClean, noAds  (refused: taskbarLeft)'
+    $l[$at + 3] | Should -BeExactly 'Restore point: not chosen' }
+  It '<Why>' -ForEach @(
+    @{ Why = 'the untouched profile, skipped tweaks'; Mutate = { }; Step = @{ Status = 'Done'; Data = @{ Applied = @('numLock'); Refused = @(); Skipped = @('accessKeys') } }
+       P = 'Profile      : Home PC (home)'; T = 'Tweaks       : 1 applied: numLock  (skipped, Administrator protection: accessKeys)' }
+    @{ Why = 'an unknown profile id, a failed step'; Mutate = { param($c) $c.Profile = 'gone' }; Step = @{ Status = 'Failed'; Data = @{} }
+       P = 'Profile      : gone'; T = 'Tweaks       : not applied' }
+    @{ Why = 'no profile, no tweaks step'; Mutate = { param($c) $c.Profile = '' }; Step = $null; P = 'Profile      : none'; T = 'Tweaks       : none' }
+  ) { $c = New-DefaultChoices -Machine $script:fm -Config $rcfg; & $Mutate $c; $l = Get-ToolboxReport $c $Step $true
+      $l | Should -Contain $P; $l | Should -Contain $T }
 }

@@ -4,6 +4,9 @@
 # nothing), turns Fast Startup off, silences first-logon nag screens and stops Windows from rebooting
 # on its own. Restore-FinalPowerSettings and Unregister-ResumeTask are used later by Finalize and the
 # entry point. Needs StepResult.ps1, Logging.ps1 and Process.ps1.
+# The registry helpers Set-RegistryDword, Set-RegistryString and Get-RegistryValue are shared with other steps
+# (Desktop, BitLocker, Tweaks, the restore point in Finalize). The two toolbox ones log exception text through
+# ConvertTo-ScreenText (StartScreen.ps1; the bundle holds every file), so nothing Hebrew reaches setup.log.
 #
 # Nothing here reads localized text. The one exception is Get-PowerIndexFromQueryOutput, which takes
 # only the hex values out of a `powercfg /query` listing and ignores every label around them.
@@ -549,6 +552,67 @@ function Set-RegistryDword {
   } catch {
     Write-SetupLog -Message 'Registry value could not be written' -Level WARN -Data @{ path = $Path; name = $Name; error = $_.Exception.Message }
     return $false
+  }
+}
+
+function Set-RegistryString {
+  # Private. Set-RegistryDword's REG_SZ twin (toolbox spec 5.3): creates the key only when it is missing, then
+  # writes the string. An empty -Name writes the key's default value: the registry provider's name for it is
+  # '(default)' (the classic right-click menu tweak needs it as a real empty string). The tweaks step's
+  # read-back checks it on every run; a VM still has to prove it (docs/testing.md). Never throws: returns
+  # $false (and logs a WARN) when the write is refused.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+  )
+
+  $valueName = if ($Name -eq '') { '(default)' } else { $Name }
+  try {
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+    New-ItemProperty -LiteralPath $Path -Name $valueName -Value $Value -PropertyType String -Force -ErrorAction Stop | Out-Null
+    return $true
+  } catch {
+    Write-SetupLog -Message 'Registry value could not be written' -Level WARN -Data @{ path = $Path; name = $valueName; error = (ConvertTo-ScreenText $_.Exception.Message) }
+    return $false
+  }
+}
+
+function Get-RegistryValue {
+  <#
+  .SYNOPSIS
+    Reads one registry value as @{ Exists; Value; Kind }. Never throws.
+  .DESCRIPTION
+    Value is the raw data (REG_EXPAND_SZ not expanded); Kind is the RegistryValueKind name ('String', 'DWord',
+    ...). An empty -Name is the key's default value. A missing key or value is @{ Exists = $false; Value = $null;
+    Kind = '' }; any other failure is the same answer and a WARN in the log.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Name
+  )
+
+  $missing = @{ Exists = $false; Value = $null; Kind = '' }
+  $key = $null
+  try {
+    $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if (@($key.GetValueNames()) -notcontains $Name) { return $missing }
+    return @{
+      Exists = $true
+      Value  = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      Kind   = [string]$key.GetValueKind($Name)
+    }
+  } catch {
+    if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
+      Write-SetupLog -Message 'Registry value could not be read' -Level WARN -Data @{ path = $Path; name = $Name; error = (ConvertTo-ScreenText $_.Exception.Message) }
+    }
+    return $missing
+  } finally {
+    if ($null -ne $key -and $null -ne $key.PSObject.Methods['Dispose']) { $key.Dispose() }
   }
 }
 

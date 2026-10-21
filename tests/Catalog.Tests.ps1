@@ -3,20 +3,22 @@ BeforeAll {
   . "$PSScriptRoot\..\src\Common\Config.ps1"; . "$PSScriptRoot\..\src\State\State.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
   . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # New-DefaultChoices, for the default-plan test
+  . "$PSScriptRoot\..\src\Toolbox\SetupPlanner.ps1"   # New-DefaultChoices reads the default profile
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
-  # The fifth parameter adds Choices.Remote only when given: the plans built without it prove "exactly as today".
-  function P($brand, $mode, $z = $true, $o = 'BUSINESS', $r = $null) {
-    $c = @{Mode=$mode;SevenZip=$z;Office=$o}; if ($null -ne $r) { $c.Remote = $r }
+  # The fifth and sixth parameters add Choices.Remote and Choices.Tweaks only when given: the plans built without them prove "exactly as today".
+  function P($brand, $mode, $z = $true, $o = 'BUSINESS', $r = $null, $t = $null) {
+    $c = @{Mode=$mode;SevenZip=$z;Office=$o}; if ($null -ne $r) { $c.Remote = $r }; if ($null -ne $t) { $c.Tweaks = $t }
     Get-StepPlan -Machine @{Brand=$brand} -Choices $c -Config $cfg }
 }
 Describe 'StepCatalog' {
-  It 'lists the 21 steps in spec order with their titles and functions' {
+  It 'lists the 22 steps in spec order with their titles and functions' {
     $rows = @($script:StepCatalog | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Title, $_.Function })
     $rows | Should -Be @(
       'prepare|Prepare machine|Invoke-StepPrepare'
       'bitlocker|Turn off BitLocker|Invoke-StepBitLocker'
       'region|Time zone + Hebrew keyboard|Invoke-StepRegion'
       'desktop-icons|Desktop icons|Invoke-StepDesktopIcons'
+      'tweaks|System tweaks|Invoke-StepTweaks'
       'bloatware|Remove bloatware|Invoke-StepBloatware'
       'rename|Rename PC|Invoke-StepRename'
       'winget|Prepare winget|Invoke-StepWinget'
@@ -40,7 +42,7 @@ Describe 'StepCatalog' {
   It 'every step has a Short title of at most 20 characters' { foreach ($s in $script:StepCatalog) { $s.Short | Should -Not -BeNullOrEmpty; $s.Short.Length | Should -BeLessOrEqual 20 } }
   It 'has the progress screen''s Short titles (v2 spec 4.2)' {
     @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
-      'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons'
+      'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons', 'tweaks|Tweaks'
       'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', 'screenconnect|ScreenConnect', '7zip|7-Zip', 'craft-apps|Craft apps'
       'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'office|Microsoft 365', 'windows-update|Windows Update'
       'office-finish|Microsoft 365', 'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
@@ -136,6 +138,29 @@ Describe 'Get-StepPlan' {
   It 'the default choices plan AnyDesk only' {
     $d = New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg; $p = Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $d -Config $cfg
     $p | Should -Contain 'anydesk'; $p | Should -Not -Contain 'screenconnect' }
+  It 'tweaks right after desktop-icons when the effective list is not empty' {
+    $p = @(P DELL LAPTOP $true 'BUSINESS' $null @('noAds')); $p.IndexOf('tweaks') | Should -Be ($p.IndexOf('desktop-icons') + 1) }
+  It 'no tweaks step when every chosen tweak is ruled out (NumLock on a laptop)' { P DELL LAPTOP $true 'CRAFT' $null @('numLock') | Should -Not -Contain 'tweaks' }
+  It 'the default choices (home profile) plan the tweaks step' {
+    $d = New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg; Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $d -Config $cfg | Should -Contain 'tweaks' }
+}
+Describe 'Get-EffectiveTweaks (toolbox spec 5.3)' {
+  BeforeAll { $script:home5 = @('accessKeys', 'numLock', 'startClean', 'noAds', 'classicOutlook') }
+  It '<Why>' -ForEach @(
+    @{ Why = 'laptop with Craft: no NumLock, no classic Outlook'; C = @{ Mode = 'LAPTOP'; Office = 'CRAFT' }; B = 26200; E = 'accessKeys,startClean,noAds' }
+    @{ Why = 'desktop with Craft: NumLock'; C = @{ Mode = 'DESKTOP'; Office = 'CRAFT' }; B = 26200; E = 'accessKeys,numLock,startClean,noAds' }
+    @{ Why = 'desktop with 365 Business: both'; C = @{ Mode = 'DESKTOP'; Office = 'BUSINESS' }; B = 26200; E = 'accessKeys,numLock,startClean,noAds,classicOutlook' }
+    @{ Why = 'laptop with a lower-case home'; C = @{ Mode = 'LAPTOP'; Office = 'home' }; B = 26200; E = 'accessKeys,startClean,noAds,classicOutlook' }
+  ) { $C.Tweaks = $home5; (@(Get-EffectiveTweaks -Choices $C -Config $cfg -Machine @{ OsBuild = $B }) -join ',') | Should -BeExactly $E }
+  It 'Windows 10 leaves out the minBuild 22000 tweaks; an unknown build keeps them' {
+    $c = @{ Mode = 'DESKTOP'; Office = 'OFF'; Tweaks = @('endTask', 'fileExtensions', 'classicMenu', 'taskbarLeft') }
+    @(Get-EffectiveTweaks -Choices $c -Config $cfg -Machine @{ OsBuild = 19045 }) | Should -Be @('fileExtensions')
+    @(Get-EffectiveTweaks -Choices $c -Config $cfg -Machine @{}) | Should -Be @('fileExtensions', 'taskbarLeft', 'classicMenu', 'endTask') }
+  It 'drops unknown, empty and repeated ids, and keeps catalog order' {
+    @(Get-EffectiveTweaks -Choices @{ Mode = 'LAPTOP'; Office = 'OFF'; Tweaks = @('noAds', 'widgets', '', $null, 'accessKeys', 'noAds') } -Config $cfg) | Should -Be @('accessKeys', 'noAds') }
+  It 'no Tweaks key, no choices or no config means none (an older state.json)' {
+    @(Get-EffectiveTweaks -Choices @{ Mode = 'DESKTOP' } -Config $cfg).Count | Should -Be 0
+    @(Get-EffectiveTweaks -Choices $null -Config $cfg).Count | Should -Be 0; @(Get-EffectiveTweaks -Choices @{ Tweaks = @('noAds') } -Config $null).Count | Should -Be 0 }
 }
 Describe 'Get-RunVerdict' {
   BeforeEach { $script:s = New-RunState -Machine @{} -Choices @{} -Plan @('chrome','office') -Version 'v'

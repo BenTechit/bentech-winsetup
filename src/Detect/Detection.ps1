@@ -1,8 +1,9 @@
 ﻿# src/Detect/Detection.ps1
-# Machine facts: laptop or desktop, VM, vendor brand, OS, AC power, and the fresh-install check.
+# Machine facts: laptop or desktop, VM, vendor brand, OS, AC power, the fresh-install check, and whether
+# Windows Administrator protection runs this setup as another account (Test-AdminProtection).
 # Pure decision functions come first (unit-tested); the system readers at the bottom are not.
-# Everything reads CIM or the registry. Nothing here parses localized command output, because the
-# target machines may run Hebrew Windows.
+# Everything reads CIM, the registry or the process token. Nothing here parses localized command output,
+# because the target machines may run Hebrew Windows: account names are compared, never interpreted.
 
 function Test-IsVirtualMachine {
   <#
@@ -193,6 +194,51 @@ function Test-OnACPower {
   Add-Type -AssemblyName System.Windows.Forms
   $status = [System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus
   return ($status -eq 'Online') -or ($status -eq 'Unknown')
+}
+
+function Get-ProcessUserName {
+  # The account this process runs as, DOMAIN\user (the elevated token's user). Read-only.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  return [string][Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+
+function Get-SignedInUserName {
+  # The account signed in at the console, DOMAIN\user (Win32_ComputerSystem.UserName): empty in an RDP
+  # session or early in a logon. Read-only; throws when CIM cannot be read.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  return [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName
+}
+
+function Test-AdminProtection {
+  <#
+  .SYNOPSIS
+    Whether setup runs as another account than the one signed in: 'On', 'Off' or 'Unknown' (toolbox spec 5.3).
+  .DESCRIPTION
+    Windows Administrator protection (KB5120998) runs elevated programs as a hidden admin account, so HKCU
+    and the resume task would belong to that account; an admin password typed for another account does the
+    same. The process user (Get-ProcessUserName) is compared with the signed-in user (Get-SignedInUserName),
+    ignoring case: equal is 'Off', different is 'On'. An empty signed-in name (RDP, an early logon) or a read
+    that fails is 'Unknown'. Never throws and logs nothing: the callers decide and log.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param()
+
+  try {
+    $processUser = [string](Get-ProcessUserName)
+    $signedInUser = [string](Get-SignedInUserName)
+  } catch {
+    return 'Unknown'
+  }
+  if ([string]::IsNullOrWhiteSpace($signedInUser)) { return 'Unknown' }
+  if ([string]::Equals($processUser, $signedInUser, [StringComparison]::OrdinalIgnoreCase)) { return 'Off' }
+  return 'On'
 }
 
 function Get-UserDataBytes {

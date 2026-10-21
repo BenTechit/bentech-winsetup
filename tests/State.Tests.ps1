@@ -122,6 +122,8 @@ Describe 'run state persistence' {
       $st.StartedAt | Should -BeNullOrEmpty; $st.EndedAt | Should -BeNullOrEmpty; $st.Data | Should -BeOfType [hashtable]
     }
     $s.RebootCount | Should -Be 0; $s.RebootCapHit | Should -BeFalse; $s.FinalRebootDone | Should -BeFalse
+    $s.RestorePointTried | Should -BeFalse; $s.RestorePointCreated | Should -BeFalse
+    foreach ($k in 'RestorePointTried', 'RestorePointCreated') { $s.ContainsKey($k) | Should -BeTrue -Because "$k is a State key (toolbox spec 5.4)" }
     $s.WuFailureCounts | Should -BeOfType [hashtable]; $s.Power.Original | Should -BeOfType [hashtable]
     foreach ($k in 'HiddenUpdateIds', 'PreviousHiddenUpdateIds', 'Notes', 'Errors') { ($s[$k] -is [array]) | Should -BeTrue; $s[$k].Count | Should -Be 0 }
   }

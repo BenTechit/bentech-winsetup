@@ -11,6 +11,7 @@ BeforeAll {
   # The real commands the screens call in production, so Pester can mock them.
   . "$PSScriptRoot\..\src\Common\Logging.ps1"; . "$PSScriptRoot\..\src\Common\Activity.ps1"; . "$PSScriptRoot\..\src\Common\Config.ps1"
   . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; . "$PSScriptRoot\..\src\Engine\Verdict.ps1"
+  . "$PSScriptRoot\..\src\Toolbox\SetupPlanner.ps1"   # New-DefaultChoices reads the default profile
   . "$PSScriptRoot\..\src\Detect\Detection.ps1"
   . "$PSScriptRoot\..\src\Steps\Apps.ps1"; . "$PSScriptRoot\..\src\Steps\DefaultBrowser.ps1"
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
@@ -194,6 +195,21 @@ Describe 'New-DefaultChoices' {
     $bad = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'PLATINUM' } }
     (New-DefaultChoices -Machine $m -Config $bad).Office | Should -Be 'OFF'
   }
+  It 'opens on the default profile: home, its tweak selection and the restore point (toolbox spec 5.2)' {
+    $r = New-DefaultChoices -Machine $m -Config $cfg
+    $r.Profile | Should -BeExactly 'home'; $r.Office | Should -Be 'CRAFT'; $r.Remote | Should -Be 'ANYDESK'; $r.RestorePoint | Should -BeTrue
+    @($r.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds', 'classicOutlook') }
+  It 'without profiles: no profile, the catalog defaults, a restore point' {
+    $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT' } }
+    $r = New-DefaultChoices -Machine $m -Config $x; $r.Profile | Should -BeExactly ''; @($r.Tweaks).Count | Should -Be 0; $r.RestorePoint | Should -BeTrue }
+  It 'the console fallback keeps the profile''s tweaks and follows L, D and O (Review Focus 3)' {
+    $c = New-DefaultChoices -Machine $m -Config $cfg   # a laptop
+    $eff = { param($x) (@(Get-EffectiveTweaks -Choices $x -Config $cfg -Machine $m) -join ',') }
+    & $eff $c | Should -BeExactly 'accessKeys,startClean,noAds'
+    $d = (Update-StartChoices -Choices $c -Key 'D').Choices; & $eff $d | Should -BeExactly 'accessKeys,numLock,startClean,noAds'
+    & $eff ((Update-StartChoices -Choices $d -Key 'L').Choices) | Should -BeExactly 'accessKeys,startClean,noAds'
+    & $eff ((Update-StartChoices -Choices $c -Key 'O').Choices) | Should -BeExactly 'accessKeys,startClean,noAds,classicOutlook'   # CRAFT -> BUSINESS
+    @((Update-StartChoices -Choices $c -Key 'Z').Choices.Tweaks) | Should -Be @($c.Tweaks) }
 }
 
 Describe 'Format-StartScreen (v2)' {

@@ -5,10 +5,12 @@
 # calls them. Get-InstalledAppVersions also reports the Craft apps (apps.craft.items of the config it is
 # given) and reads the per-user Uninstall view, where the ArtCraft Launcher registers. With the same
 # Config it reports ScreenConnect by apps.screenconnect.serviceName, and Format-SetupReport shows the
-# remote tools (AnyDesk ID, ScreenConnect) by Choices.Remote.
+# remote tools (AnyDesk ID, ScreenConnect) by Choices.Remote. With the Config, Format-SetupReport also names
+# the run's profile (toolbox spec 5.5); the tweaks and restore point lines come from the State.
 # Needs Catalog.ps1 (Get-RemoteChoice) + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
-# ConvertFrom-StateTime, Format-HoursMinutes), DefaultBrowser.ps1 (Read-RegistryStringValue),
-# Office.ps1 ($script:OfficeReleaseKey) and Logging.ps1; the bundle holds every file.
+# ConvertFrom-StateTime, Format-HoursMinutes), Toolbox\SetupPlanner.ps1 (Get-SetupProfiles,
+# Test-ProfileChanged), DefaultBrowser.ps1 (Read-RegistryStringValue), Office.ps1 ($script:OfficeReleaseKey)
+# and Logging.ps1; the bundle holds every file.
 #
 # The report is plain ASCII. Every free-text value (model names, step messages, update titles) goes
 # through ConvertTo-ScreenText, which turns anything outside printable ASCII (Hebrew) into '?'. Dates
@@ -197,11 +199,21 @@ function Format-SetupReport {
       PC name (old -> new) / Mode (chosen, and detected LAPTOP|DESKTOP|VM) / Windows / Activation /
       BitLocker / Smart App Control (Off|On|Evaluation|Unknown; -SmartAppControl, 'Unknown' when not
       given) / AnyDesk ID ('not available' when there is none; 'not chosen' when Choices.Remote is
-      SCREENCONNECT) / ScreenConnect
+      SCREENCONNECT) / ScreenConnect / Profile / Tweaks / Restore point
     Choices.Remote is read with Get-RemoteChoice (a missing or invalid one is ANYDESK; ScreenConnect spec
     4.1). The ScreenConnect line reads 'not chosen' (ANYDESK), 'installed (service running)' (the
     screenconnect step is Done and its Data.Service is Running), 'installed (service not running)' (Done
     with any other service state) or 'not installed' (the step failed or has no entry).
+    Toolbox spec 5.5:
+      Profile: '<name.en> (<id>)' for a profile of -Config, plus ' (changed)' when Test-ProfileChanged says
+        so (spec 10b.6); an id the config does not know (or no -Config) shows the id alone; an empty or
+        missing Choices.Profile (an older state) is 'none'.
+      Tweaks: from the tweaks step's Data: '<n> applied', then ': <ids>' when n > 0, then
+        '  (refused: <ids>)' and '  (skipped, Administrator protection: <ids>)' when those lists are not
+        empty. 'none' when the State has no tweaks step; 'not applied' when that step is not Done.
+      Restore point: 'created (System Protection is now on and reserves a few percent of the disk)' when
+        State.RestorePointCreated; 'not chosen' when Choices.RestorePoint is not $true; else
+        'could not be confirmed'.
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, failed repeatedly (left to Windows Update):
@@ -225,7 +237,8 @@ function Format-SetupReport {
     [Parameter(Mandatory)][AllowEmptyString()][string]$Activation,
     [Parameter(Mandatory)][AllowEmptyString()][string]$BitLockerText,
     [Parameter(Mandatory)][AllowNull()][hashtable]$AppVersions,
-    [AllowNull()][AllowEmptyString()][string]$SmartAppControl = 'Unknown'
+    [AllowNull()][AllowEmptyString()][string]$SmartAppControl = 'Unknown',
+    [AllowNull()]$Config
   )
 
   $machine = if ($State['Machine'] -is [System.Collections.IDictionary]) { $State['Machine'] } else { @{} }
@@ -252,6 +265,39 @@ function Format-SetupReport {
     }
   }
 
+  # Toolbox spec 5.5: the profile, the tweaks and the restore point. Every free text through ConvertTo-ScreenText.
+  $profileText = 'none'
+  $profileId = [string]$choices['Profile']
+  if ($profileId -ne '') {
+    $profileText = ConvertTo-ScreenText $profileId
+    $known = @(Get-SetupProfiles -Config $Config | Where-Object { $_.Id -ceq $profileId })
+    if ($known.Count -gt 0) {
+      $profileText = '{0} ({1})' -f (ConvertTo-ScreenText $known[0].Name.en), $known[0].Id
+      if (Test-ProfileChanged -Choices $choices -Config $Config -Machine $machine) { $profileText += ' (changed)' }
+    }
+  }
+
+  $tweaksText = 'none'
+  $tweaksStep = $steps['tweaks']
+  if ($tweaksStep -is [System.Collections.IDictionary]) {
+    $tweaksText = 'not applied'
+    if ([string]$tweaksStep['Status'] -eq 'Done') {
+      $tweaksData = if ($tweaksStep['Data'] -is [System.Collections.IDictionary]) { $tweaksStep['Data'] } else { @{} }
+      $idsOf = { param($list) @(foreach ($item in @($list)) { $text = ConvertTo-ScreenText $item; if ($text -ne '') { $text } }) }
+      $appliedIds = @(& $idsOf $tweaksData['Applied'])
+      $refusedIds = @(& $idsOf $tweaksData['Refused'])
+      $skippedIds = @(& $idsOf $tweaksData['Skipped'])
+      $tweaksText = '{0} applied' -f $appliedIds.Count
+      if ($appliedIds.Count -gt 0) { $tweaksText += ': ' + ($appliedIds -join ', ') }
+      if ($refusedIds.Count -gt 0) { $tweaksText += '  (refused: ' + ($refusedIds -join ', ') + ')' }
+      if ($skippedIds.Count -gt 0) { $tweaksText += '  (skipped, Administrator protection: ' + ($skippedIds -join ', ') + ')' }
+    }
+  }
+
+  $restorePointText = 'could not be confirmed'
+  if ($State['RestorePointCreated'] -eq $true) { $restorePointText = 'created (System Protection is now on and reserves a few percent of the disk)' }
+  elseif (-not (($choices['RestorePoint'] -is [bool]) -and $choices['RestorePoint'])) { $restorePointText = 'not chosen' }
+
   $lines = New-Object 'System.Collections.Generic.List[string]'
   $lines.Add('BenTech Windows Setup - Report')
   $lines.Add('Tool version : ' + (ConvertTo-ScreenText $State['Version']))
@@ -270,6 +316,9 @@ function Format-SetupReport {
   $lines.Add('Smart App Control : ' + $smartAppControlText)
   $lines.Add('AnyDesk ID   : ' + $anyDesk)
   $lines.Add('ScreenConnect: ' + $screenConnect)
+  $lines.Add('Profile      : ' + $profileText)
+  $lines.Add('Tweaks       : ' + $tweaksText)
+  $lines.Add('Restore point: ' + $restorePointText)
 
   $lines.Add('')
   $lines.Add('Apps:')

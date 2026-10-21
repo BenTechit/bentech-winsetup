@@ -56,6 +56,8 @@ function New-RunState {
     PreviousRun stays $null: the entry point (Task 17) fills it from the previous run's verdict.
     PreviousHiddenRestored ($true once a Windows Update round un-hid PreviousHiddenUpdateIds) and
     HiddenUpdatesRestored ($true once Finalize un-hid what the run hid) start $false (final review C1).
+    RestorePointTried ($true, saved, before the one attempt) and RestorePointCreated ($true once a new restore
+    point was confirmed) start $false too (toolbox spec 5.4); an older state without them reads as $false.
     From -Previous (the earlier run's state, if any):
       - PreviousHiddenUpdateIds = the union of its HiddenUpdateIds and its own PreviousHiddenUpdateIds,
         without duplicates (compared without regard to case, first spelling kept), so Windows Update
@@ -118,6 +120,8 @@ function New-RunState {
     PreviousHiddenUpdateIds = $previousHidden
     PreviousHiddenRestored  = $false
     HiddenUpdatesRestored   = $false
+    RestorePointTried       = $false
+    RestorePointCreated     = $false
     Notes                   = @()
     Errors                  = @()
     AnyDeskId               = $null

@@ -10,14 +10,16 @@
 #   Phase B (after that restart, or at once when none is needed or possible): the default-browser
 #     check (waiting up to 120 s for Chrome when someone has signed in since its policy was set,
 #     spec 9.4), the temporary policies and files removed, activation and BitLocker checked, the
-#     resume task removed, the downloads and the pinned script deleted, EndedAt, and the report. This is
+#     resume task removed, the downloads and the pinned script deleted, the restore point (toolbox spec
+#     5.4: a snapshot of the finished PC, when Choices.RestorePoint), EndedAt, and the report. This is
 #     Complete-SetupFinalization, which the entry point (Task 17) also calls on its own when a run
 #     ends with finalize not Done (the final restart failed), so no run is left without a report or
 #     with the resume task still registered (ruling R26). The entry point then shows the final screen.
-# Needs StepResult.ps1, Logging.ps1, State.ps1, Catalog.ps1 + Verdict.ps1, Reboot.ps1, Prepare.ps1,
-# Apps.ps1, DefaultBrowser.ps1, BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild), Office.ps1
-# (Wait-OfficeBackground), WindowsUpdate.ps1 (Restore-WuHiddenUpdates) and Report.ps1; the bundle holds
-# every file.
+# Needs StepResult.ps1, Logging.ps1, Activity.ps1 (Set-SetupNow, Add-SetupActivity), State.ps1, Catalog.ps1 +
+# Verdict.ps1, Reboot.ps1, Prepare.ps1 (Set-RegistryDword, Get-RegistryValue), Apps.ps1, DefaultBrowser.ps1,
+# BitLocker.ps1, Vendor.ps1, Winget.ps1 (Invoke-PowerShellChild, Get-OutputTail), Office.ps1
+# (Wait-OfficeBackground), WindowsUpdate.ps1 (Restore-WuHiddenUpdates), StartScreen.ps1 (ConvertTo-ScreenText),
+# Report.ps1 and Toolbox\SetupPlanner.ps1 (the report's profile line); the bundle holds every file.
 #
 # Notes and errors: Finalize writes its own straight into State.Notes / State.Errors
 # (Add-FinalizeMessage), and its results never carry any. Phase B must have them in the State before
@@ -39,6 +41,24 @@ $ErrorActionPreference = 'Stop'; $f = "ApplicationID='55c92734-d682-4d71-983e-d6
 foreach ($p in @(Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $f)) { $r = Invoke-CimMethod -InputObject $p -MethodName Activate; if ($r.ReturnValue -ne 0) { exit 2 } }
 '@
 $script:WindowsActivationTimeoutMinutes = 3
+
+# Toolbox spec 5.4: the restore point at the very end of the run. Windows silently skips a second restore point
+# within SystemRestorePointCreationFrequency minutes (24 hours when the value is absent), so the main process
+# sets it to 0 for the attempt and always puts it back (or removes it again) afterwards.
+$script:SystemRestoreKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+$script:RestorePointFrequencyName = 'SystemRestorePointCreationFrequency'
+$script:RestorePointTimeoutMinutes = 10
+# The child (Invoke-PowerShellChild prepends $ProgressPreference): System Protection on for the system drive,
+# the newest restore point's sequence number, one checkpoint, the number again. Exit 0 = a new point is
+# confirmed; 1 = an error stopped it; 3 = no new point. Decided by numbers and the exit code, never by text.
+$script:RestorePointCommand = @'
+$ErrorActionPreference = 'Stop'; $d = $env:SystemDrive + '\'
+Enable-ComputerRestore -Drive $d
+$b = [long](@(@(Get-ComputerRestorePoint | ForEach-Object { [long]$_.SequenceNumber }) + 0) | Measure-Object -Maximum).Maximum
+Checkpoint-Computer -Description 'BenTech setup' -RestorePointType MODIFY_SETTINGS
+$a = [long](@(@(Get-ComputerRestorePoint | ForEach-Object { [long]$_.SequenceNumber }) + 0) | Measure-Object -Maximum).Maximum
+if ($a -gt $b) { exit 0 } else { exit 3 }
+'@
 
 function Add-FinalizeMessage {
   # Private. Appends Text to State.Notes or State.Errors (kept an array), unless it is already there:
@@ -374,6 +394,102 @@ function Invoke-WindowsActivation {
   return 'Activated'
 }
 
+function Invoke-SetupRestorePoint {
+  <#
+  .SYNOPSIS
+    The restore point at the very end of the run (toolbox spec 5.4). Returns 'NotChosen', 'Created' or
+    'NotConfirmed'. Never throws.
+  .DESCRIPTION
+    - Choices.RestorePoint not $true (not chosen, or an older state without it): 'NotChosen'; nothing is read.
+    - State.RestorePointTried already $true (a repeated finalize): never a second attempt. 'Created' when
+      State.RestorePointCreated is $true, else 'NotConfirmed' with the Note.
+    - Otherwise RestorePointTried = $true (RestorePointCreated $false) is saved FIRST. A save that throws is
+      'NotConfirmed' with the Note, and nothing else happens: no child, the frequency value untouched.
+    Then, in order:
+      1. the original SystemRestorePointCreationFrequency is recorded (logged: its value, or absent);
+      2. it is set to 0 (a refusal is a WARN: the child still runs and its sequence check decides);
+      3. the NOW sub-title 'Creating a restore point';
+      4. $script:RestorePointCommand in one child (Invoke-PowerShellChild) limited to
+         Config.timeoutsMinutes.restorePoint minutes (10 when missing or not above 0);
+      5. whatever the child did (finally): an original that existed is written back, an absent one is removed
+         again (Remove-RegistryValueIfPresent), and it is read back. A value that is not back is its own Note,
+         'Restore point frequency value could not be put back', so a value stuck at 0 is never silent. The
+         sub-title is cleared.
+    Exit 0 without a timeout is 'Created' (RestorePointCreated = $true, activity 'Restore point created').
+    A timeout, another or no exit code, or a child that cannot start is 'NotConfirmed' with the Note
+    'Restore point could not be confirmed'. Notes go straight into State.Notes (Add-FinalizeMessage).
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][hashtable]$Context)
+
+  $runState = $Context.State
+  $notConfirmed = 'Restore point could not be confirmed'
+  $choices = if ($runState.Choices -is [System.Collections.IDictionary]) { $runState.Choices } else { @{} }
+  if (-not (($choices['RestorePoint'] -is [bool]) -and $choices['RestorePoint'])) { return 'NotChosen' }
+
+  if ($runState.RestorePointTried -eq $true) {
+    if ($runState.RestorePointCreated -eq $true) { return 'Created' }
+    Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
+    return 'NotConfirmed'
+  }
+
+  $runState.RestorePointTried = $true
+  $runState.RestorePointCreated = $false
+  try {
+    Save-RunState -State $runState -Root $Context.Root
+  } catch {
+    Write-SetupLog -Message 'No restore point: the attempt could not be saved first' -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
+    Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
+    return 'NotConfirmed'
+  }
+
+  $timeout = $script:RestorePointTimeoutMinutes
+  $configured = 0.0
+  if ([double]::TryParse([string]$Context.Config.timeoutsMinutes.restorePoint, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$configured) -and $configured -gt 0) {
+    $timeout = $configured
+  }
+
+  $original = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
+  $originalText = if ($original.Exists) { ConvertTo-ScreenText ([string]$original.Value) } else { 'absent' }
+  Write-SetupLog -Message 'Restore point: creation frequency recorded' -Data @{ original = $originalText; timeoutMinutes = $timeout }
+  if ((Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value 0) -ne $true) {
+    Write-SetupLog -Message 'Restore point: the creation frequency could not be set to 0; trying anyway' -Level WARN
+  }
+
+  $created = $false
+  Set-SetupNow -SubTitle 'Creating a restore point'
+  try {
+    $run = Invoke-PowerShellChild -Command $script:RestorePointCommand -TimeoutMinutes $timeout
+    $created = (-not $run.TimedOut) -and ($null -ne $run.ExitCode) -and ([int]$run.ExitCode -eq 0)
+    if (-not $created) {
+      Write-SetupLog -Message 'Restore point could not be confirmed' -Level WARN -Data @{ exitCode = $run.ExitCode; timedOut = [bool]$run.TimedOut; tail = (ConvertTo-ScreenText (Get-OutputTail -Output $run.Output)) }
+    }
+  } catch {
+    Write-SetupLog -Message 'Restore point child could not run' -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
+  } finally {
+    # The value must never stay at 0 on the customer's PC, whatever the child did.
+    if ($original.Exists) {
+      $null = Set-RegistryDword -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName -Value $original.Value
+    } else {
+      Remove-RegistryValueIfPresent -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
+    }
+    $after = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
+    $back = if ($original.Exists) { $after.Exists -and ([string]$after.Value -ceq [string]$original.Value) } else { -not $after.Exists }
+    if (-not $back) { Add-FinalizeMessage -State $runState -Field Notes -Text 'Restore point frequency value could not be put back' }
+    Set-SetupNow -SubTitle ''
+  }
+
+  $runState.RestorePointCreated = $created
+  if ($created) {
+    Write-SetupLog -Message 'Restore point created'
+    Add-SetupActivity -Text 'Restore point created'
+    return 'Created'
+  }
+  Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
+  return 'NotConfirmed'
+}
+
 function Restore-PostSetupSettings {
   <#
   .SYNOPSIS
@@ -488,6 +604,9 @@ function Complete-SetupFinalization {
       7. The resume task removed; a removal that fails -> Note 'Resume task could not be removed'.
       8. Downloads\, <Root>\setup.ps1 and <Root>\config.json deleted (best effort); state.json and
          Logs\ stay.
+      8b. The restore point (Invoke-SetupRestorePoint, toolbox spec 5.4), when Choices.RestorePoint: one
+         bounded child, at most once per run, after everything above so the snapshot is the finished PC.
+         A point that is not confirmed is the Note 'Restore point could not be confirmed'.
       9. State.EndedAt = now.
      10. Steps['finalize'] marked Done('Finalized') first, so the verdict cannot call this step "did
          not finish"; then the verdict, and the report in <LogDir>\Setup-Report.txt (with the Smart
@@ -560,13 +679,16 @@ function Complete-SetupFinalization {
   Remove-SetupItem -Path (Join-Path $Context.Root 'setup.ps1')
   Remove-SetupItem -Path (Join-Path $Context.Root 'config.json')
 
+  # Toolbox spec 5.4: the snapshot is the finished PC, without the setup's files, policies or resume task.
+  $null = Invoke-SetupRestorePoint -Context $Context
+
   $runState.EndedAt = Get-StateTimestamp
 
   if ($hasFinalizeStep) { Set-StepState -State $runState -StepId $script:FinalizeStepId -Status Done -Message 'Finalized' }
   $verdict = Get-RunVerdict -State $runState
   $reportPath = Join-Path $Context.LogDir $script:SetupReportFileName
   try {
-    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions -Config $Context.Config) -SmartAppControl (Get-SmartAppControlState)
+    $lines = Format-SetupReport -State $runState -Verdict $verdict -Activation $activation -BitLockerText $finding.Text -AppVersions (Get-InstalledAppVersions -Config $Context.Config) -SmartAppControl (Get-SmartAppControlState) -Config $Context.Config
     Write-SetupReport -Path $reportPath -Lines $lines
     Write-SetupLog -Message 'Setup report written' -Data @{ path = $reportPath; result = $verdict.Color }
     $result = New-StepResult -Status Done -Message 'Finalized'

@@ -1,8 +1,9 @@
 ﻿# src/UI/StartScreen.ps1
 # The start screen (spec 8.1, v2 Q1): what was detected, what will happen, the L / D / Z / O / R toggles
 # and a 30-second countdown that any key restarts. Needs ConsoleFrame.ps1 (the screen is drawn through a
-# console writer, never Write-Host or Clear-Host) and Catalog.ps1 (Test-HasDriverTool, Get-RemoteChoice
-# and $script:RemoteChoices, which the R key cycles).
+# console writer, never Write-Host or Clear-Host), Catalog.ps1 (Test-HasDriverTool, Get-RemoteChoice
+# and $script:RemoteChoices, which the R key cycles; Get-TweakCatalog) and Toolbox\SetupPlanner.ps1
+# (Get-DefaultProfileId and Get-ProfileChoices: New-DefaultChoices opens on the default profile).
 #
 # Split in two on purpose:
 #   * Format-StartScreen, Get-StartScreenSegments, Update-StartChoices and New-DefaultChoices are pure
@@ -85,14 +86,22 @@ function Format-HoursMinutes {
 function New-DefaultChoices {
   <#
   .SYNOPSIS
-    The choices the start screen opens with: mode from the detected machine, 7-Zip, Office and the
-    remote tool from config.defaults.
+    The choices the start screen (and the toolbox window) opens with: Mode, SevenZip, Office, Remote, Profile,
+    Tweaks and RestorePoint.
   .DESCRIPTION
-    LAPTOP only for a laptop that is not a virtual machine. An Office default that is not CRAFT,
-    BUSINESS, HOME or OFF becomes OFF (nothing gets installed that nobody asked for). The default
-    in config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365. A remote
-    default (defaults.remote) that is not ANYDESK, SCREENCONNECT or BOTH, or is missing, becomes
-    ANYDESK (Get-RemoteChoice), the tool every run installed before this choice existed.
+    First config.defaults, as before the toolbox: mode from the detected machine (LAPTOP only for a laptop
+    that is not a virtual machine), 7-Zip, Office and the remote tool. An Office default that is not CRAFT,
+    BUSINESS, HOME or OFF becomes OFF (nothing gets installed that nobody asked for). The default in
+    config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365. A remote default
+    (defaults.remote) that is not ANYDESK, SCREENCONNECT or BOTH, or is missing, becomes ANYDESK
+    (Get-RemoteChoice), the tool every run installed before this choice existed. With them: Profile = '' (no
+    profile), Tweaks = the catalog entries marked default (Get-TweakCatalog) and RestorePoint = $true.
+    Then, when defaults.profile names a valid profile (Get-DefaultProfileId, SetupPlanner.ps1), that profile's
+    Office, Remote, SevenZip, RestorePoint, Tweaks and Profile replace those values (toolbox spec 10b.5: the
+    default profile wins). Mode always stays detected: the Type is never part of a profile.
+    Tweaks is the selection, not yet filtered by the Type, Office and build rules (Get-EffectiveTweaks does
+    that), so the console's L, D and O keys bring NumLock and classic Outlook back or drop them. The console
+    start screen shows none of the new keys: the run takes the default profile's tweaks and restore point.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -106,8 +115,16 @@ function New-DefaultChoices {
   if ($script:OfficeChoices -notcontains $office) { $office = 'OFF' }
 
   $remote = Get-RemoteChoice -Choices @{ Remote = [string]$Config.defaults.remote }
+  $tweaks = [string[]]@(Get-TweakCatalog -Config $Config | Where-Object { $_.Default } | ForEach-Object { $_.Id })
 
-  return @{ Mode = $mode; SevenZip = [bool]$Config.defaults.sevenZip; Office = $office; Remote = $remote }
+  $choices = @{ Mode = $mode; SevenZip = [bool]$Config.defaults.sevenZip; Office = $office; Remote = $remote
+                Profile = ''; Tweaks = $tweaks; RestorePoint = $true }
+
+  $profileChoices = Get-ProfileChoices -Config $Config -ProfileId (Get-DefaultProfileId -Config $Config)
+  if ($null -ne $profileChoices) {
+    foreach ($key in 'Office', 'Remote', 'SevenZip', 'RestorePoint', 'Tweaks', 'Profile') { $choices[$key] = $profileChoices[$key] }
+  }
+  return $choices
 }
 
 function Update-StartChoices {

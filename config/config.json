@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "defaults": { "sevenZip": true, "office": "CRAFT", "remote": "ANYDESK" },
+  "defaults": { "sevenZip": true, "office": "CRAFT", "remote": "ANYDESK", "profile": "home" },
   "caps": { "maxReboots": 12, "maxWuRounds": 6, "maxStepAttempts": 3, "wuFailuresBeforeHide": 2 },
   "timeoutsMinutes": { "default": 30, "msi": 20, "office": 60, "vendor": 60, "wuRound": 90,
                        "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2,
-                       "screenconnect": 10, "screenconnectService": 3 },
+                       "screenconnect": 10, "screenconnectService": 3, "restorePoint": 10 },
   "power": { "finalAcMonitorMinutes": 15 },
   "windowsUpdate": { "installMode": "OneAtATime" },
   "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },
@@ -87,5 +87,79 @@
       "name": "ScoobeSystemSettingEnabled", "value": 0 },
     { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
       "name": "SubscribedContent-310093Enabled", "value": 0 }
+  ],
+  "toolbox": { "language": "en" },
+  "profiles": [
+    { "id": "home", "name": { "en": "Home PC", "he": "מחשב ביתי" },
+      "office": "CRAFT", "remote": "ANYDESK", "sevenZip": true, "restorePoint": true },
+    { "id": "business", "name": { "en": "Business PC", "he": "מחשב עסקי" },
+      "office": "BUSINESS", "remote": "BOTH", "sevenZip": true, "restorePoint": true },
+    { "id": "clean", "name": { "en": "Clean Windows", "he": "Windows נקי" },
+      "office": "OFF", "remote": "ANYDESK", "sevenZip": false, "restorePoint": true, "tweaks": [] }
+  ],
+  "tweaks": [
+    { "id": "accessKeys", "default": true, "icon": "E765",
+      "title": { "en": "Accessibility shortcuts off", "he": "ביטול קיצורי הנגישות" },
+      "description": { "en": "Sticky Keys (Shift x5) and Filter Keys (hold right Shift) stop popping up. Both stay available in Settings.",
+                       "he": "מקשים דביקים (Shift חמש פעמים) ומקשי סינון (החזקת Shift הימני) לא יקפצו יותר. שניהם נשארים זמינים בהגדרות." },
+      "values": [
+        { "path": "HKCU:\\Control Panel\\Accessibility\\StickyKeys", "name": "Flags", "type": "String", "op": "clearBit", "bit": 4, "value": "506" },
+        { "path": "HKCU:\\Control Panel\\Accessibility\\Keyboard Response", "name": "Flags", "type": "String", "op": "clearBit", "bit": 4, "value": "122" } ] },
+    { "id": "numLock", "default": true, "desktopOnly": true, "icon": "E8EF",
+      "title": { "en": "NumLock on at sign-in", "he": "NumLock דלוק בכניסה למחשב" },
+      "description": { "en": "Desktops only: the number pad works at the sign-in screen. Laptops with a number pad inside the letter keys would type digits.",
+                       "he": "למחשבים נייחים בלבד: המקלדת הנומרית עובדת כבר במסך הכניסה. במחשב נייד עם מקשי מספרים בתוך האותיות היו מוקלדות ספרות." },
+      "values": [
+        { "path": "Registry::HKEY_USERS\\.DEFAULT\\Control Panel\\Keyboard", "name": "InitialKeyboardIndicators", "type": "String", "op": "set", "value": "2147483650" },
+        { "path": "HKCU:\\Control Panel\\Keyboard", "name": "InitialKeyboardIndicators", "type": "String", "op": "set", "value": "2" } ] },
+    { "id": "startClean", "default": true, "icon": "ECA5",
+      "title": { "en": "Start menu: no recommended tips and apps, no account nags", "he": "תפריט התחל: בלי טיפים ואפליקציות מומלצות, בלי הודעות חשבון" },
+      "description": { "en": "Turns off the recommendations in Start (tips, shortcuts, new apps) and the account notifications on Start.",
+                       "he": "מכבה את ההמלצות בתפריט התחל (טיפים, קיצורי דרך, אפליקציות חדשות) ואת הודעות החשבון בתפריט." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_IrisRecommendations", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_AccountNotifications", "type": "DWord", "op": "set", "value": 0 } ] },
+    { "id": "noAds", "default": true, "icon": "ED1A",
+      "title": { "en": "No tips, suggestions and ads in Windows", "he": "בלי טיפים, הצעות ופרסומות ב-Windows" },
+      "description": { "en": "No tips notifications, suggested content in Settings, lock-screen fun facts, or OneDrive and Microsoft 365 banners in File Explorer.",
+                       "he": "בלי התראות טיפים, תוכן מוצע בהגדרות, עובדות במסך הנעילה, ובאנרים של OneDrive ו-Microsoft 365 בסייר הקבצים." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338389Enabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338393Enabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-353694Enabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-353696Enabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338387Enabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "RotatingLockScreenOverlayEnabled", "type": "DWord", "op": "set", "value": 0 },
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "ShowSyncProviderNotifications", "type": "DWord", "op": "set", "value": 0 } ] },
+    { "id": "classicOutlook", "default": true, "office365Only": true, "icon": "E715",
+      "title": { "en": "Keep classic Outlook (hide Try the new Outlook)", "he": "השארת Outlook הקלאסי (הסתרת המעבר ל-Outlook החדש)" },
+      "description": { "en": "Only with Microsoft 365: hides the switch that moves the customer to the new Outlook by accident.",
+                       "he": "רק עם Microsoft 365: מסתיר את המתג שמעביר את הלקוח בטעות ל-Outlook החדש." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Office\\16.0\\Outlook\\Options\\General", "name": "HideNewOutlookToggle", "type": "DWord", "op": "set", "value": 1 } ] },
+    { "id": "fileExtensions", "default": false, "icon": "E8A5",
+      "title": { "en": "Show file extensions", "he": "הצגת סיומות קבצים" },
+      "description": { "en": "Shows invoice.pdf.exe as what it is: a program. A security benefit.",
+                       "he": "מציג את invoice.pdf.exe כמו שהוא: תוכנה. יתרון אבטחה." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "HideFileExt", "type": "DWord", "op": "set", "value": 0 } ] },
+    { "id": "taskbarLeft", "default": false, "minBuild": 22000, "icon": "E8E4",
+      "title": { "en": "Taskbar icons on the left", "he": "סמלי שורת המשימות בצד, לא במרכז" },
+      "description": { "en": "The Windows 10 layout, for customers coming from Windows 10.",
+                       "he": "המבנה של Windows 10, ללקוחות שמגיעים מ-Windows 10." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "TaskbarAl", "type": "DWord", "op": "set", "value": 0 } ] },
+    { "id": "classicMenu", "default": false, "minBuild": 22000, "icon": "E712",
+      "title": { "en": "Classic right-click menu", "he": "תפריט קליק ימני קלאסי" },
+      "description": { "en": "The full right-click menu in one click, as on Windows 10.",
+                       "he": "תפריט הקליק הימני המלא בלחיצה אחת, כמו ב-Windows 10." },
+      "values": [
+        { "path": "HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32", "name": "", "type": "String", "op": "set", "value": "" } ] },
+    { "id": "endTask", "default": false, "minBuild": 22000, "icon": "E711",
+      "title": { "en": "End task in the taskbar right-click menu", "he": "סיום משימה בתפריט הקליק הימני של שורת המשימות" },
+      "description": { "en": "Closes a frozen app from the taskbar. It closes without asking to save.",
+                       "he": "סוגר אפליקציה תקועה משורת המשימות. היא נסגרת בלי לשאול אם לשמור." },
+      "values": [
+        { "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings", "name": "TaskbarEndTask", "type": "DWord", "op": "set", "value": 1 } ] }
   ]
 }
