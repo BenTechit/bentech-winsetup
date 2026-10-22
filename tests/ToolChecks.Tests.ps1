@@ -222,7 +222,13 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
         'finding.volumeScanNeeded'   = 'Disk scan could not finish online: a full scan is needed'
         'finding.volumeUnknown'      = 'Disk scan gave no result ({0})'
         'finding.volumeFixedOnline'  = 'Disk scan found errors and fixed them online'
-        'finding.volumeDirty'        = 'The system volume is marked dirty: Windows checks it at the next start'
+        # The read-only disk state (Health check, volumeState) has its own words: it reads what Windows recorded and
+        # scans nothing (RD-R12; Task 2 re-review N1).
+        'finding.volumeStateScan'       = 'Windows reports this disk needs a scan: Standard repair runs one'
+        'finding.volumeStateSpotFix'    = 'Windows reports this disk needs a spot fix: run Disk check at restart'
+        'finding.volumeStateFullRepair' = 'Windows reports this disk needs a full repair: back up first, then run Disk check at restart'
+        'finding.volumeStateUnknown'    = 'The disk state could not be read ({0})'
+        'finding.volumeDirty'        = 'The disk is marked dirty: a check will run at the next start'
         'finding.imageRepairable'    = 'The Windows image is corrupt but repairable: run Standard repair'
         'finding.imageNonRepairable' = 'The Windows image is corrupt and cannot be repaired online'
         'finding.imageUnknown'       = 'The Windows image check gave no result ({0})'
@@ -246,6 +252,12 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
         ([regex]::Matches($script:ToolboxStrings.he[$k], '\{\d\}') | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ',' |
           Should -Be (([regex]::Matches($expected[$k], '\{\d\}') | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ',') -Because $k
       }
+    }
+    It 'the disk state''s findings never read like a scan, in either language (Task 2 re-review N1)' {
+      foreach ($code in 'volumeStateScan', 'volumeStateSpotFix', 'volumeStateFullRepair', 'volumeStateUnknown', 'volumeDirty') {
+        $script:ToolboxStrings.en["finding.$code"] | Should -Not -Match '(?i)disk scan' -Because $code
+        $script:ToolboxStrings.he["finding.$code"] | Should -Not -Match 'סריקת הדיסק' -Because $code
+        $script:ToolboxStrings.he["finding.$code"] | Should -Not -BeExactly $script:ToolboxStrings.he['finding.volumeSpotFix'] -Because $code }
     }
   }
 
@@ -699,7 +711,7 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       $script:reagent = 'Off'    # the BCD says on, ReAgent.xml off: a clone
       Mock Read-ToolSfcResult { $x = ConvertFrom-CbsSrText -Text ([IO.File]::ReadAllText("$script:fixtures\cbs-verify-corrupt.log")) -Since ([datetime]'2026-10-22 10:00'); $x['Settled'] = $true; $x }
       $r = New-HealthRun; $null = Invoke-ToolSteps -Run $r
-      @($r.Findings | ForEach-Object { '{0}|{1}' -f $_.Level, $_.Code }) | Should -Be @('CRIT|volumeSpotFix', 'WARN|imageRepairable', 'WARN|sfcCorrupt', 'WARN|winreUnknown', 'WARN|devicesProblem', 'WARN|notActivated')
+      @($r.Findings | ForEach-Object { '{0}|{1}' -f $_.Level, $_.Code }) | Should -Be @('CRIT|volumeStateSpotFix', 'WARN|imageRepairable', 'WARN|sfcCorrupt', 'WARN|winreUnknown', 'WARN|devicesProblem', 'WARN|notActivated')
       $r.Offers.DiskCheck | Should -BeTrue
       ($r.Findings | Where-Object { $_.Code -eq 'sfcCorrupt' }).Text | Should -BeExactly 'System files: 4 integrity problems found (nothing repaired yet)'
       ($r.Findings | Where-Object { $_.Code -eq 'devicesProblem' }).Text | Should -BeExactly '1 devices have a problem (codes 28)'
@@ -720,13 +732,13 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
     }
     It 'the disk state (Get-Volume, read-only): <Why> gives <Finding>' -ForEach @(
       @{ Why = 'Healthy and OK'; State = @{ HealthStatus = 0; OperationalStatus = @(2); Dirty = $false }; Finding = @(); Offer = $false; Status = 'done'; V = 'Healthy' }
-      @{ Why = 'Spot Fix Needed'; State = @{ HealthStatus = 1; OperationalStatus = @(2, 53262); Dirty = $false }; Finding = @('CRIT|volumeSpotFix'); Offer = $true; Status = 'warn'; V = 'SpotFixNeeded' }
-      @{ Why = 'Full Repair Needed (with the offer, RD-R10)'; State = @{ HealthStatus = 2; OperationalStatus = @(53263); Dirty = $false }; Finding = @('CRIT|volumeFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
-      @{ Why = 'Full and Spot both set (the more serious wins)'; State = @{ HealthStatus = 2; OperationalStatus = @(53262, 53263); Dirty = $false }; Finding = @('CRIT|volumeFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
-      @{ Why = 'Scan Needed'; State = @{ HealthStatus = 1; OperationalStatus = @(53261); Dirty = $false }; Finding = @('WARN|volumeScanNeeded'); Offer = $false; Status = 'warn'; V = 'ScanNeeded' }
-      @{ Why = 'health Warning without a repair code'; State = @{ HealthStatus = 1; OperationalStatus = @(2); Dirty = $false }; Finding = @('WARN|volumeScanNeeded'); Offer = $false; Status = 'warn'; V = 'ScanNeeded' }
-      @{ Why = 'health Unhealthy without a repair code'; State = @{ HealthStatus = 2; OperationalStatus = @(2); Dirty = $false }; Finding = @('CRIT|volumeFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
-      @{ Why = 'no health'; State = @{ HealthStatus = $null; OperationalStatus = @(); Dirty = $null }; Finding = @('WARN|volumeUnknown'); Offer = $false; Status = 'warn'; V = 'Unknown' }
+      @{ Why = 'Spot Fix Needed'; State = @{ HealthStatus = 1; OperationalStatus = @(2, 53262); Dirty = $false }; Finding = @('CRIT|volumeStateSpotFix'); Offer = $true; Status = 'warn'; V = 'SpotFixNeeded' }
+      @{ Why = 'Full Repair Needed (with the offer, RD-R10)'; State = @{ HealthStatus = 2; OperationalStatus = @(53263); Dirty = $false }; Finding = @('CRIT|volumeStateFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
+      @{ Why = 'Full and Spot both set (the more serious wins)'; State = @{ HealthStatus = 2; OperationalStatus = @(53262, 53263); Dirty = $false }; Finding = @('CRIT|volumeStateFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
+      @{ Why = 'Scan Needed'; State = @{ HealthStatus = 1; OperationalStatus = @(53261); Dirty = $false }; Finding = @('WARN|volumeStateScan'); Offer = $false; Status = 'warn'; V = 'ScanNeeded' }
+      @{ Why = 'health Warning without a repair code'; State = @{ HealthStatus = 1; OperationalStatus = @(2); Dirty = $false }; Finding = @('WARN|volumeStateScan'); Offer = $false; Status = 'warn'; V = 'ScanNeeded' }
+      @{ Why = 'health Unhealthy without a repair code'; State = @{ HealthStatus = 2; OperationalStatus = @(2); Dirty = $false }; Finding = @('CRIT|volumeStateFullRepair'); Offer = $true; Status = 'warn'; V = 'FullRepairNeeded' }
+      @{ Why = 'no health'; State = @{ HealthStatus = $null; OperationalStatus = @(); Dirty = $null }; Finding = @('WARN|volumeStateUnknown'); Offer = $false; Status = 'warn'; V = 'Unknown' }
       @{ Why = 'a healthy volume marked dirty'; State = @{ HealthStatus = 0; OperationalStatus = @(2); Dirty = $true }; Finding = @('WARN|volumeDirty'); Offer = $false; Status = 'warn'; V = 'Healthy' }) {
       $script:gc['volumeState'] = $State
       $r = New-TestRun 'volumeState'; Invoke-ToolSteps -Run $r | Should -Be 'Done'
@@ -742,10 +754,11 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       $c.Command | Should -Not -Match '(?i)Repair-Volume|-Scan\b|SpotFix|chkdsk'
       $errors = $null; $null = [Management.Automation.Language.Parser]::ParseInput($c.Command, [ref]$null, [ref]$errors); @($errors).Count | Should -Be 0
     }
-    It 'the disk state that timed out is volumeUnknown (timed out): yellow, never a generic red' {
+    It 'the disk state that timed out is volumeStateUnknown (timed out): yellow, never a generic red' {
       $script:gcFail['volumeState'] = 'timed out'
       $r = New-TestRun 'volumeState'; Invoke-ToolSteps -Run $r | Should -Be 'Done'
-      Get-FindingRows $r | Should -Be @('WARN|volumeUnknown'); @($r.Findings[0].Args) | Should -Be @('timed out')
+      Get-FindingRows $r | Should -Be @('WARN|volumeStateUnknown'); @($r.Findings[0].Args) | Should -Be @('timed out')
+      $r.Findings[0].Text | Should -BeExactly 'The disk state could not be read (timed out)'
       @($r.Steps.Status) | Should -Be @('timedout'); Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'YELLOW'
     }
     It 'Standard repair''s disk scan: <Status> gives <Finding> (RD-R12 Volume.RepairStatus)' -ForEach @(

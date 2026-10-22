@@ -652,10 +652,11 @@ function Invoke-ToolStepVolumeState {
     Step volumeState (Health check, read-only; ruling RD-R12): the system volume's state from Get-Volume and its dirty
     bit (Get-ToolVolumeState). $Run.Data.VolumeState = @{ Verdict; Health; Operational; Dirty }. Nothing is scanned.
   .DESCRIPTION
-    Healthy: done. SpotFixNeeded: CRIT volumeSpotFix. FullRepairNeeded: CRIT volumeFullRepair. Both offer "Disk check
-    at restart" ($Run.Offers.DiskCheck; spec 6.2, ruling RD-R10). ScanNeeded: WARN volumeScanNeeded. Unknown: WARN
-    volumeUnknown with the reason ('timedout' when the read timed out). A volume marked dirty adds WARN volumeDirty
-    (Windows checks it at the next start).
+    The findings are the state's own (volumeState*), never the scan's: this step reads what Windows recorded and scans
+    nothing (ruling RD-R12; Task 2 re-review N1). Healthy: done. SpotFixNeeded: CRIT volumeStateSpotFix.
+    FullRepairNeeded: CRIT volumeStateFullRepair. Both offer "Disk check at restart" ($Run.Offers.DiskCheck; spec 6.2,
+    ruling RD-R10). ScanNeeded: WARN volumeStateScan. Unknown: WARN volumeStateUnknown with the reason ('timedout'
+    when the read timed out). A volume marked dirty adds WARN volumeDirty (Windows checks it at the next start).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -669,21 +670,21 @@ function Invoke-ToolStepVolumeState {
   switch -CaseSensitive ($state.Verdict) {
     'Healthy' { }
     'SpotFixNeeded' {
-      Add-ToolFinding -Run $Run -Level CRIT -Code 'volumeSpotFix'
+      Add-ToolFinding -Run $Run -Level CRIT -Code 'volumeStateSpotFix'
       $Run.Offers['DiskCheck'] = $true
       $status = 'warn'
     }
     'FullRepairNeeded' {
-      Add-ToolFinding -Run $Run -Level CRIT -Code 'volumeFullRepair'
+      Add-ToolFinding -Run $Run -Level CRIT -Code 'volumeStateFullRepair'
       $Run.Offers['DiskCheck'] = $true
       $status = 'warn'
     }
     'ScanNeeded' {
-      Add-ToolFinding -Run $Run -Level WARN -Code 'volumeScanNeeded'
+      Add-ToolFinding -Run $Run -Level WARN -Code 'volumeStateScan'
       $status = 'warn'
     }
     default {
-      Add-ToolFinding -Run $Run -Level WARN -Code 'volumeUnknown' -Arguments @(Get-ToolCheckError -Run $Run -Name 'volumeState')
+      Add-ToolFinding -Run $Run -Level WARN -Code 'volumeStateUnknown' -Arguments @(Get-ToolCheckError -Run $Run -Name 'volumeState')
       $status = 'warn'
       if (Test-ToolCheckTimedOut -Run $Run -Name 'volumeState') { $status = 'timedout' }
     }

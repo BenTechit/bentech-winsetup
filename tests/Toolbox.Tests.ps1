@@ -10,8 +10,8 @@
 # into $TestDrive.
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Engine\Catalog', 'UI\StartScreen',
-                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
+                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   # The Dell sample machine of tools\Preview-Toolbox.ps1.
   $script:m = @{ Manufacturer = 'Dell Inc.'; Model = 'Latitude 5440'; FriendlyModel = 'Latitude 5440'; Serial = '7HX2K93'; NewName = 'DELL-7HX2K93'
@@ -359,7 +359,7 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
     foreach ($sample in 'Add_KeyDown(', 'Add_PreviewKeyDown(', 'Add_KeyUp(', '$w.AddHandler([Windows.UIElement]::KeyDownEvent, $h)', 'KeyDown="OnKey"',
                         'PreviewKeyUp="OnKey"', '$w.InputBindings.Add($b)', '<KeyBinding Key="Enter"/>', 'IsDefault="True"', 'IsCancel="true"') {
       $sample | Should -Match $keyWiring -Because 'the guard must catch every kind of key wiring' }
-    foreach ($file in 'Toolbox', 'Xaml') {
+    foreach ($file in 'Toolbox', 'Xaml', 'RepairPlanner', 'RepairPage') {
       Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match "$keyWiring|GetNewClosure" -Because $file }
     $script:ToolboxXaml | Should -Not -Match 'IsCancel|IsDefault="True"' }
 }
@@ -527,9 +527,10 @@ Describe 'every test passes the WPF seams (final review M5)' {
     $script:callsSeen | Should -BeGreaterOrEqual 5 }   # not vacuous: it sees the real calls in Toolbox.Tests and Entry.Tests
 }
 Describe 'tools\Preview-Toolbox.ps1' {
-  It 'renders the four PNGs at 1000x680 without showing a window' {
-    $out = Join-Path $TestDrive 'preview'; & "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out | Out-Null
-    foreach ($f in 'toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png') {
+  It 'renders the eleven PNGs (the four setup views, the seven repair views) at 1000x680 without showing a window' {
+    $out = Join-Path $TestDrive 'preview'; $paths = @(& "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out); $paths.Count | Should -Be 11
+    foreach ($f in 'toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png', 'repair-en.png', 'repair-he.png', 'repair-en-blocked.png',
+                   'repair-en-confirm.png', 'repair-en-running.png', 'repair-he-running.png', 'repair-en-result.png') {
       $s = [IO.File]::OpenRead((Join-Path $out $f))
       try { $frame = [Windows.Media.Imaging.BitmapDecoder]::Create($s, 'None', 'OnLoad').Frames[0]; $frame.PixelWidth | Should -Be 1000; $frame.PixelHeight | Should -Be 680 }
       finally { $s.Dispose() } } }

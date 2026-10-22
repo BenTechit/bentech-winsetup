@@ -41,8 +41,9 @@
 #
 # Needs: Toolbox\Strings.ps1 ($script:ToolboxStrings), Toolbox\Xaml.ps1 ($script:ToolboxXaml),
 # Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, New-ToolboxModel, Update-ToolboxModel, ConvertTo-ValidChoices,
-# Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog, Test-TweakAllowed, Get-RemoteChoice,
-# $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and Show-StartScreen:
+# Get-ToolboxPlanLines), Toolbox\RepairPlanner.ps1 and Toolbox\RepairPage.ps1 (the Repair & diagnostics page:
+# New-RepairModel through New-ToolboxModel, Update-RepairView), Engine\Catalog.ps1 (Get-TweakCatalog,
+# Test-TweakAllowed, Get-RemoteChoice, $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and Show-StartScreen:
 # Get-SetupChoices' console fallback), Common\Logging.ps1
 # (Write-SetupLog), Detect\Detection.ps1 (Test-OnACPower, Test-AdminProtection: Show-ToolboxWindow's seam
 # defaults) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds
@@ -272,6 +273,7 @@ function New-ToolboxWindow {
   $window.FindName('MachineModel').Text = ('{0} {1}' -f $Machine['Manufacturer'], $friendly).Trim()
   $window.FindName('MachineSerial').Text = [string]$Machine['Serial']
   $window.FindName('MachineNewName').Text = [string]$Machine['NewName']
+  $window.FindName('MachinePcName').Text = [string]$Machine['ComputerName']
   $window.FindName('MachineGlyph').Text = $(if ($Machine['IsLaptop'] -eq $true) { [string][char]0xE7F8 } else { [string][char]0xE7F4 })
   $window.FindName('VersionText').Text = $(if ($Version -match '^[vV]' -or $Version -eq '') { $Version } else { 'v' + $Version })
 
@@ -281,6 +283,7 @@ function New-ToolboxWindow {
     ProfileTiles = $tiles; TweakRows = $rows
     ReadOnAC = $ReadOnAC; Timer = $null; PowerWarned = $false
     Outcome = $null; Choices = $null; Error = $null; Closing = $false
+    RepairConfirmKey = ''
   }
   Update-ToolboxView -Window $window
   return $window
@@ -356,7 +359,8 @@ function Update-ToolboxView {
     the fallback words in the window's language, on battery), collapsed when there is none; the red
     Administrator-protection banner and Start (disabled when protection is On); the power chip; the plan column,
     rebuilt from Get-ToolboxPlanLines with the language's step names, its rows in the language's direction. The
-    machine values are New-ToolboxWindow's, set once.
+    machine values are New-ToolboxWindow's, set once. Last, the page the model names and the Repair & diagnostics
+    page (Update-RepairView, RepairPage.ps1).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -438,6 +442,9 @@ function Update-ToolboxView {
     $null = $block.TextEffects.Add($number)
     $null = $plan.Children.Add($block)
   }
+
+  # The page the model names, and the Repair & diagnostics page itself (RepairPage.ps1).
+  Update-RepairView -Window $Window
 }
 
 function Register-ToolboxHandlers {
@@ -445,8 +452,9 @@ function Register-ToolboxHandlers {
   .SYNOPSIS
     Wires the window's handlers (spec 5.1). Each is one line that calls Invoke-ToolboxAction. Returns nothing.
   .DESCRIPTION
-    - Click on every element whose Tag starts 'a:': the tiles, the switches, EN | HE, Start, Cancel and the X,
-      the generated profile tiles and tweak switches too;
+    - Click on every button whose Tag starts 'a:' (a ButtonBase: the tiles, the switches, EN | HE, the nav, Start,
+      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons). The
+      repair page's text boxes carry an 'a:' tag as well but have no Click; they are left alone;
     - MouseLeftButtonDown on the title bar (Drag; a button in the bar handles its own press first);
     - PreviewMouseWheel on the plan's scroller (Wheel: the wheel passes on to the body when the plan cannot
       scroll, TB-R7);
@@ -461,7 +469,8 @@ function Register-ToolboxHandlers {
   $pending.Push($Window)
   while ($pending.Count -gt 0) {
     $node = $pending.Pop()
-    if ($node -is [System.Windows.FrameworkElement] -and $node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal)) {
+    # Click exists on buttons only: the repair page's text boxes (a:Complaint:, a:YesText:) are tagged too.
+    if ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal)) {
       $node.Add_Click({ Invoke-ToolboxAction -Sender $this })
     }
     foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($node)) {
