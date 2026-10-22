@@ -96,9 +96,9 @@ It uses the same window, look (Q29), languages (Q21) and machine card as "New PC
 |---|---|---|
 | **Restart pending** | **Only the signals that break servicing:** CBS `RebootPending`, `PackagesPending` and `pending.xml`, and Windows Update `RebootRequired`. A pending file rename or computer rename is a grey note only (it is set on most PCs). | **Red blocks** Standard repair, Post-clone, Windows Update reset and Disk check at restart; DISM and SFC on a pending servicing restart give wrong results. The chip offers "Restart PC". Read-only actions, Network reset and Ghost devices still run. **Checked again between steps:** if DISM itself leaves a servicing restart pending, the action stops before the next servicing step with "Restart, then run it again" (yellow). |
 | **Power** (laptops) | The window's existing AC check | **On battery blocks** Standard repair and Post-clone (an hour of DISM/SFC must not die with the battery). |
-| **Disk health** | `Get-PhysicalDisk` HealthStatus; `Get-StorageReliabilityCounter` (wear, uncorrected read/write errors, temperature); System events 7, 51, 153 and NTFS 55 in the last 30 days (by provider and ID) | **Red (failing or errors found) blocks Standard and Post-clone repair and Disk check at restart.** They unlock only after the technician ticks "The customer's data is backed up / imaged" (shop rule: image first). Yellow warns. |
+| **Disk health** | **Only the physical disk(s) holding the system volume** (ruling RD-R10; other disks, the stick included, are reported in the report only): `Get-PhysicalDisk` HealthStatus (empty or unreadable = unknown, yellow); `Get-StorageReliabilityCounter` (wear, uncorrected read/write errors, temperature); System events 7, 51 and 153 whose device path is that disk's `\Device\Harddisk<N>\`, and NTFS 55 for the system volume, in the last 30 days (by provider and ID) | **Red (failing or errors found) blocks Standard and Post-clone repair and Disk check at restart.** They unlock only after the technician ticks "The customer's data is backed up / imaged" (shop rule: image first). Yellow warns. |
 | **BitLocker** | `Get-BitLockerVolume` or CIM `Win32_EncryptableVolume` (protection status and protector types, never keys) | When on, a reminder: "Have the recovery key before BIOS or board work". Informative only. |
-| **Internet** | A bounded check, run in the safety child: TCP 443 to `www.msftconnecttest.com`, then an HTTPS request to `https://www.msftconnecttest.com/connecttest.txt` (5 s each) | Red disables Windows Update reset's rescan. |
+| **Internet** | A bounded check, run in the safety child (ruling RD-R11): TCP 443 to `www.microsoft.com`, then an HTTPS `HEAD https://www.microsoft.com/`, whose `Date` header also measures the clock offset. Then Windows' own captive-portal probe over plain HTTP, `http://www.msftconnecttest.com/connecttest.txt`, expecting `Microsoft Connect Test`. 5 s each. (The msftconnecttest host has no valid HTTPS certificate of its own.) | Red disables Windows Update reset's rescan. A wrong captive-portal answer is yellow: "captive portal or proxy". |
 
 **The whole strip is computed in a bounded child process,** never on the window's thread, because `Get-PhysicalDisk` and similar calls can hang on exactly the failing disks this targets. The child returns JSON. A timeout makes the affected chip "unknown" (yellow), and that blocks nothing.
 | **Free space C:** | Volume size and free bytes | Under 10% or under 15 GB is red. DISM needs room, so Standard and Post-clone warn. |
@@ -122,7 +122,7 @@ Every action runs in a **hidden child process** of the same signed `setup.ps1` (
 - **RestoreHealth** runs as `dism.exe /Online /Cleanup-Image /RestoreHealth [/Source:... /LimitAccess]`, for the live percent and the exit code.
 
 ### 6.1 Health check (read-only)
-1. **Disk scan:** `Repair-Volume -DriveLetter <system> -Scan` gives NoErrorsFound, ScanNeeded, SpotFixNeeded or FullRepairNeeded.
+1. **Disk state (read-only, ruling RD-R12):** `Get-Volume` on the system volume gives HealthStatus, plus an OperationalStatus of `Scan Needed`, `Spot Fix Needed` or `Full Repair Needed`. `Win32_Volume.DirtyBitSet` adds whether the volume is marked dirty. `Repair-Volume -Scan` is **not** used here, because it can fix errors online.
 2. **Windows image health:** `Repair-WindowsImage -Online -CheckHealth`, then `-ScanHealth`. The `ImageHealthState` enum is Healthy, Repairable or NonRepairable.
 3. **System files:** `sfc /verifyonly`, judged from the CBS.log `[SR]` lines (CBS.log is always English).
 4. **WinRE** (builder check 7):
@@ -135,7 +135,11 @@ Every action runs in a **hidden child process** of the same signed `setup.ps1` (
 ### 6.2 Standard repair
 The kit's order is kept, with its reasons:
 1. **Time sync,** verified: `w32tm /resync`, then the clock offset measured. A clock still more than 2 minutes off is a WARN, with "downloads may fail".
-2. **Disk scan** as in 6.1. SpotFixNeeded or FullRepairNeeded is CRIT, with the "Disk check at restart" offer (6.5).
+2. **Disk scan:** `Repair-Volume -DriveLetter <system> -Scan` (ruling RD-R12). It may fix errors online. Its `Volume.RepairStatus` result is mapped:
+   - `NoErrorsFound` or `ScanNoErrorsFound` = OK;
+   - `ScanErrorsFoundAndFixedOnline` = INFO, "fixed online";
+   - `ScanErrorsFoundNeedSpotFix` or `NeedOfflineScanAndFix` = CRIT, with the "Disk check at restart" offer (6.5);
+   - anything else = unknown (yellow).
 3. **DISM RestoreHealth** (`dism.exe`, with live percent).
    - On a source failure (a 0x800f081f-class exit code), the window **offers** a retry with `/Source:` and `/LimitAccess`.
    - The source is an `install.wim` / `install.esd` found in `<stick>\sources\` or a mounted ISO.
