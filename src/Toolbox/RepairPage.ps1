@@ -20,9 +20,13 @@
 # logged once (review M4). Confirm.Lines entries are @{ Key = '<string key>'; Args = @(...) } (a text of the window's
 # language) or @{ Ltr = '<machine value>' } (a left-to-right value line; review M2).
 #
-# Task 4: it also runs the actions (the section "Running actions" at the end): each in a hidden child process started
+# Task 4: it also runs the actions (the section "Running actions"): each in a hidden child process started
 # without waiting, polled every 500 ms, killed at its deadline on its own Stopwatch, stopped between steps on request,
 # and every child it started killed before the window closes (Stop-ToolboxChildren).
+# Task 5 (the section "The page at work" at the end): the action the model asks for (Start-ToolboxPendingRun), the
+# info child an open confirmation waits for and its answer (Start-ToolboxInfoRun, Complete-ToolboxInfoRun), the stick
+# re-checked on the page (Get-ToolboxStickPresence, Update-ToolboxStick; ruling RD-R3) and Open folder
+# (Open-ToolboxFolder).
 #
 # Needs Toolbox.ps1 (Get-ToolboxString, New-ToolboxTextBlock, Write-ToolboxWarningOnce, Invoke-ToolboxAction),
 # RepairPlanner.ps1 (Get-RepairGate, Get-RepairChips, Test-RepairConfirmReady, Format-RepairElapsed, the run in the
@@ -301,14 +305,20 @@ function Set-RepairConfirmPanel {
     Confirm.Lines (review M2), each entry one of:
       @{ Key = '<string key>'; Args = @(...) }  a text of the window's language, its Args filled in (machine values
                                                 left-to-right, Format-RepairText): a tile's change list (bullets under
-                                                "This will change:"), a warning (warn.*, confirm.noStickLog: yellow), an
-                                                adapter's settings (confirm.static: a left-to-right value line in
+                                                "This will change:"), a warning (warn.*, confirm.noStickLog and the DISM
+                                                file's result.buildDiffers / result.languageDiffers: yellow), a line of
+                                                machine values (confirm.static, an adapter's settings, and
+                                                result.offerDism, the DISM file: a left-to-right value line in
                                                 ConfirmItems) or a plain line (confirm.ghostCount, confirm.noStatic ...);
       @{ Ltr = '<machine value>' }              a value line in ConfirmItems, left-to-right.
     An entry that is neither, or whose Key the string table lacks, is skipped and logged once (WARN 'Toolbox repair
-    row skipped'). Confirm.Items (Ghost devices) are switches, all left-to-right. Network reset always shows the at-PC
-    switch (ruling RD-R2) and the warning that the reset cuts remote sessions, red when an RDP session was detected
-    (Confirm.Remote.Rdp).
+    row skipped'). Confirm.Items (Ghost devices) are switches, all left-to-right, each clicking GhostTick <index>
+    (repair Task 5: they are made here, after Register-ToolboxHandlers, so each gets its one-line Click handler
+    here). Network reset always shows the at-PC switch (ruling RD-R2) and the warning that the reset cuts remote
+    sessions, red when an RDP session was detected (Confirm.Remote.Rdp); so does any confirmation with a Remote.
+    ConfirmItems is rebuilt only when what it shows changed (Tag.RepairItemsShape: the language, the action, its value
+    lines and its devices; not the ticks): the run timer renders every 500 ms while a strip read runs, and a switch
+    replaced under the mouse would lose its click and its scroll position. A tick sets the switches in place.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -323,7 +333,6 @@ function Set-RepairConfirmPanel {
   $lines = $Window.FindName('ConfirmLines')
   $items = $Window.FindName('ConfirmItems')
   $lines.Children.Clear()
-  $items.Children.Clear()
 
   $Window.FindName('ConfirmTitle').Text = $(if ($action -ceq 'restart') { Get-ToolboxString -Table $state.Strings -Language $language -Key 'confirm.restart' } else { Get-RepairActionTitle -State $state -Id $action })
   $Window.FindName('ConfirmGoText').Text = Get-ToolboxString -Table $state.Strings -Language $language -Key $(if ($action -ceq 'restart') { 'confirm.restartGo' } else { 'confirm.go' })
@@ -331,21 +340,22 @@ function Set-RepairConfirmPanel {
   if ($confirm['Loading'] -eq $true) {
     $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text (Get-ToolboxString -Table $state.Strings -Language $language -Key 'confirm.loading') -Brush 'SubtleTextBrush' -Glyph 0xE895))
   }
+  $values = New-Object System.Collections.Generic.List[string]   # the value lines of ConfirmItems, in order
   foreach ($line in @(ConvertTo-RepairRows -Rows $confirm['Lines'] -List 'lines')) {
     $key = [string]$line['Key']
     $ltr = [string]$line['Ltr']
     $lineArgs = @(@($line['Args']) | Where-Object { $null -ne $_ })
     if ($key -eq '' -and $ltr -ne '') {
-      $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text $ltr))
+      $values.Add($ltr)
       continue
     }
     if ($key -eq '' -or -not $state.Strings['en'].ContainsKey($key)) {
       Write-ToolboxWarningOnce -Id 'repairRow:lines' -Message 'Toolbox repair row skipped' -Data @{ list = 'lines'; key = (ConvertTo-ScreenText -Text $key) }
       continue
     }
-    if ($key -ceq 'confirm.static') {
-      # An adapter's settings: machine values only, the whole line left-to-right.
-      $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text (Get-ToolboxString -Table $state.Strings -Language 'en' -Key $key -Arguments $lineArgs)))
+    if ($key -cin 'confirm.static', 'result.offerDism') {
+      # Machine values only (an adapter's settings, the DISM file): the whole line left-to-right.
+      $values.Add((Get-ToolboxString -Table $state.Strings -Language 'en' -Key $key -Arguments $lineArgs))
       continue
     }
     $text = Format-RepairText -State $state -Key $key -Arguments $lineArgs
@@ -355,7 +365,7 @@ function Set-RepairConfirmPanel {
       $header.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
       $null = $lines.Children.Add($header)
       foreach ($part in ($text -split "`n")) { $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $part)) }
-    } elseif ($key -like 'warn.*' -or $key -ceq 'confirm.noStickLog') {
+    } elseif ($key -like 'warn.*' -or $key -cin 'confirm.noStickLog', 'result.buildDiffers', 'result.languageDiffers') {
       $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $text -Brush 'WarnBrush' -Glyph 0xE7BA))
     } else {
       $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $text))
@@ -374,19 +384,36 @@ function Set-RepairConfirmPanel {
   $switch.Visibility = $(if ($atPc) { $visible } else { $collapsed })
   $switch.IsChecked = ($confirm['AtPc'] -eq $true)
 
-  $index = 0
-  foreach ($item in @(ConvertTo-RepairRows -Rows $confirm['Items'] -List 'items')) {
-    $box = New-Object System.Windows.Controls.CheckBox
-    $box.Style = $Window.FindResource('SwitchStyle')
-    $box.Tag = "a:GhostTick:$index"
-    $box.IsChecked = ($item['Ticked'] -eq $true)
-    $box.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
-    $box.FlowDirection = [System.Windows.FlowDirection]::LeftToRight
-    $label = New-ToolboxTextBlock -Window $Window -Style 'PanelSmallTextStyle'
-    $label.Text = ('{0} ({1})' -f [string]$item['Name'], [string]$item['Class'])
-    $box.Content = $label
-    $null = $items.Children.Add($box)
-    $index++
+  $devices = @(ConvertTo-RepairRows -Rows $confirm['Items'] -List 'items')
+  $shape = New-Object System.Text.StringBuilder
+  $null = $shape.Append($language).Append([char]0x1F).Append($action)
+  foreach ($value in $values) { $null = $shape.Append([char]0x1E).Append($value) }
+  foreach ($item in $devices) { $null = $shape.Append([char]0x1D).Append([string]$item['InstanceId']).Append([char]0x1F).Append([string]$item['Name']).Append([char]0x1F).Append([string]$item['Class']) }
+  if ($shape.ToString() -cne [string]$state['RepairItemsShape']) {
+    $items.Children.Clear()
+    foreach ($value in $values) { $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text $value)) }
+    $index = 0
+    foreach ($item in $devices) {
+      $box = New-Object System.Windows.Controls.CheckBox
+      $box.Style = $Window.FindResource('SwitchStyle')
+      $box.Tag = "a:GhostTick:$index"
+      $box.IsChecked = ($item['Ticked'] -eq $true)
+      $box.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+      $box.FlowDirection = [System.Windows.FlowDirection]::LeftToRight
+      $label = New-ToolboxTextBlock -Window $Window -Style 'PanelSmallTextStyle'
+      $label.Text = ('{0} ({1})' -f [string]$item['Name'], [string]$item['Class'])
+      $box.Content = $label
+      $box.Add_Click({ Invoke-ToolboxAction -Sender $this })
+      $null = $items.Children.Add($box)
+      $index++
+    }
+    $state['RepairItemsShape'] = $shape.ToString()
+  } else {
+    # The same devices: only their ticks, on the switches already there.
+    foreach ($box in @($items.Children | Where-Object { $_ -is [System.Windows.Controls.CheckBox] })) {
+      $at = [int]([string]$box.Tag).Substring('a:GhostTick:'.Length)
+      $box.IsChecked = ($at -lt $devices.Count -and $devices[$at]['Ticked'] -eq $true)
+    }
   }
 
   $Window.FindName('YesPanel').Visibility = $(if ([string]$confirm['Kind'] -ceq 'yes') { $visible } else { $collapsed })
@@ -599,8 +626,11 @@ function Update-RepairView {
   $confirmKey = ''
   $openConfirm = ConvertTo-RepairEntry -Entry $repair['Confirm']
   if ($null -ne $openConfirm) { $confirmKey = [string]$openConfirm['Action'] }
-  if ($confirmKey -ne '' -and $confirmKey -cne [string]$state['RepairConfirmKey']) { $Window.FindName('YesBox').Text = '' }
+  # The key first: emptying the YES box raises its TextChanged (Task 5), which must find this confirmation known.
+  $newConfirm = ($confirmKey -ne '' -and $confirmKey -cne [string]$state['RepairConfirmKey'])
   $state['RepairConfirmKey'] = $confirmKey
+  if ($newConfirm) { $Window.FindName('YesBox').Text = '' }
+  if ($panel -cne 'ConfirmPanel') { $state['RepairItemsShape'] = '' }   # a confirmation opened again is drawn afresh
 
   switch -CaseSensitive ($panel) {
     'WhatPanel' { Set-RepairWhatPanel -Window $Window }
@@ -817,7 +847,8 @@ function Complete-ToolboxActionRun {
   # the visit's list, the strip loading), the one INFO line 'Toolbox action finished' (ASCII), and the strip read again
   # by a new safety child (Start-ToolboxSafetyRun). When a safety child still runs (it began before or during the
   # action), its reading is from before the action ended: it is marked Reread, its chips are no longer shown, and a
-  # fresh one starts when it ends (Task 4 review M7).
+  # fresh one starts when it ends (Task 4 review M7). An info child's end (netInfo, ghostList: what an open
+  # confirmation waits for) is Complete-ToolboxInfoRun's instead (repair Task 5).
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
@@ -827,6 +858,10 @@ function Complete-ToolboxActionRun {
     [double]$Seconds = 0
   )
 
+  if ($script:RepairInfoData.Contains($ActionId)) {
+    Complete-ToolboxInfoRun -Window $Window -Result $Result -ActionId $ActionId -RunId $RunId
+    return
+  }
   $state = $Window.Tag
   $state.Model['Repair'] = Complete-RepairRunModel -Repair $state.Model['Repair'] -Result $Result
   $codes = @(foreach ($finding in @(Get-RepairEntry -From $Result -Name 'Findings')) {
@@ -976,8 +1011,9 @@ function Update-ToolboxRuns {
         Stopwatch seconds); the Safety slot's Partial.Chips (an object) into the strip, still loading
         (ConvertTo-RepairStrip), unless that safety child is marked Reread;
       - its process has exited: the slot is cleared and the process leaves $script:ToolboxChildren; result.json is the
-        result (Action: Complete-ToolboxActionRun; Safety: the strip from Data.Chips, ready). A result whose Outcome is
-        none of the child's is no result (WARN 'Toolbox action result is not valid'); an unknown Color is RED. Without
+        result (Action: Complete-ToolboxActionRun, which hands an info child's answer to its open confirmation, Task 5;
+        Safety: the strip from Data.Chips, ready). A result whose Outcome is none of the child's, or an info child's
+        Done without its data, is no result (WARN 'Toolbox action result is not valid'); an unknown Color is RED. Without
         one: WARN 'Toolbox action ended without a result' with the exit code; Action: Failed, red, childNoResult with
         the exit code; Safety: the last partial chips, the others unknown;
       - still running past its budget + 3 minutes on the run's own Stopwatch (Get-ToolboxRunSeconds; RD-R8, RD-R9):
@@ -1025,7 +1061,11 @@ function Update-ToolboxRuns {
       $result = Read-ToolJsonFile -Path ([IO.Path]::Combine([string]$run['Dir'], 'result.json'))
       if ($null -ne $result) {
         # A result whose Outcome is none of the child's is no result; an unknown colour is red (review M1, M6).
-        if ([string](Get-RepairEntry -From $result -Name 'Outcome') -cnotin 'Done', 'Stopped', 'TimedOut', 'NeedsRestart', 'Failed') {
+        $outcome = [string](Get-RepairEntry -From $result -Name 'Outcome')
+        if ($outcome -cnotin 'Done', 'Stopped', 'TimedOut', 'NeedsRestart', 'Failed' -or
+            ($slot -ceq 'Action' -and $outcome -ceq 'Done' -and $script:RepairInfoData.Contains([string]$run['ActionId']) -and
+             -not (Get-ToolboxInfoAnswer -ActionId ([string]$run['ActionId']) -Result $result).Ok)) {
+          # An info child that says Done without its data (Task 5) is no result either.
           Write-SetupLog -Level WARN -Message 'Toolbox action result is not valid' -Data @{ action = $action; runId = $runId }
           $result = $null
         } elseif ([string](Get-RepairEntry -From $result -Name 'Color') -cnotin 'GREEN', 'YELLOW', 'RED') {
@@ -1153,4 +1193,284 @@ function New-ToolboxRunTimer {
   $timer.Tag = $Window
   $timer.Add_Tick({ Invoke-ToolboxAction -Sender $this -Action 'RunTick' })
   return $timer
+}
+
+# --- The page at work (repair Task 5; repair spec 4.2, 5, 6.6, 6.7, 8) -----------------------------------------------
+# What the window starts when the model asks (Repair.Pending, after Update-RepairModel), the info children an open
+# Network reset or Ghost devices confirmation waits for, the stick re-checked on the page (ruling RD-R3), and Open
+# folder. Every start re-checks its gate at that moment (a disabled button still raises its Click in code).
+
+# The info children (plan "Actions and steps": Kind info, run in the Action slot): the result's Data key that holds
+# their answer, and the Update-RepairModel action that hands it to the open confirmation.
+$script:RepairInfoData = @{
+  netInfo   = @{ Data = 'NetInfo'; Model = 'NetInfo' }
+  ghostList = @{ Data = 'Ghosts'; Model = 'GhostItems' }
+}
+
+function Get-ToolboxInfoAnswer {
+  # Private. An info child's answer in its result: @{ Ok; Value }. Ok when the result's Data holds its key (netInfo:
+  # Data.NetInfo, an object; ghostList: Data.Ghosts, a list, also an empty one). Value is that entry, as read (an
+  # empty list survives: it is returned inside the table, never unrolled).
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([Parameter(Mandatory)][string]$ActionId, [AllowNull()]$Result)
+
+  $answer = @{ Ok = $false; Value = $null }
+  $info = $script:RepairInfoData[$ActionId]
+  $data = Get-RepairEntry -From $Result -Name 'Data'
+  if ($null -eq $info -or -not (Test-RepairObject -Value $data)) { return $answer }
+  $key = [string]$info['Data']
+  $has = $false
+  $value = $null
+  if ($data -is [System.Collections.IDictionary]) {
+    $has = $data.Contains($key)
+    if ($has) { $value = $data[$key] }
+  } else {
+    $property = $data.PSObject.Properties[$key]
+    $has = ($null -ne $property)
+    if ($has) { $value = $property.Value }
+  }
+  if (-not $has) { return $answer }
+  if ($ActionId -ceq 'netInfo' -and -not (Test-RepairObject -Value $value)) { return $answer }
+  if ($ActionId -ceq 'ghostList' -and $null -eq $value) { return $answer }
+  $answer['Ok'] = $true
+  $answer['Value'] = $value
+  return $answer
+}
+
+function Complete-ToolboxInfoRun {
+  <#
+  .SYNOPSIS
+    Private. An info child's end (netInfo, ghostList; repair Task 5): its answer goes to the open confirmation, not to
+    the result panel.
+  .DESCRIPTION
+    Repair.Run is $null again either way (the gates open). No 'Toolbox action finished' line, no entry in the visit's
+    list, no strip read: it changed nothing.
+      - Done with its data (Get-ToolboxInfoAnswer): Update-RepairModel -Action NetInfo | GhostItems -Value <the data>;
+        a confirmation that was closed meanwhile just does not take it.
+      - Anything else: the confirmation closes and the result shows, WARN 'Toolbox info action failed' with
+        @{ action; runId; outcome; findings } in ASCII. Failed and TimedOut are red (the child's colour rule, or the
+        window's own result); a Done without its data becomes the window's own childNoResult (red); Stopped (Stop
+        pressed after the confirmation was cancelled) shows as the child gave it.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [AllowNull()]$Result,
+    [Parameter(Mandatory)][string]$ActionId,
+    [AllowEmptyString()][string]$RunId = ''
+  )
+
+  $state = $Window.Tag
+  $outcome = [string](Get-RepairEntry -From $Result -Name 'Outcome')
+  $answer = Get-ToolboxInfoAnswer -ActionId $ActionId -Result $Result
+  if ($outcome -ceq 'Done' -and $answer['Ok']) {
+    Set-ToolboxRepair -State $state -Values @{ Run = $null; CloseRefused = $false }
+    $state.Model = Update-RepairModel -Model $state.Model -Action ([string]$script:RepairInfoData[$ActionId]['Model']) -Value $answer['Value']
+    return
+  }
+  if ($outcome -ceq 'Done' -or $outcome -eq '') {
+    $Result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'Failed' -Code 'childNoResult' -Arguments @('unknown') -EndedAt (Format-ToolTime -Value (Get-Date))
+  }
+  $codes = @(foreach ($finding in @(Get-RepairEntry -From $Result -Name 'Findings')) {
+      if (Test-RepairObject -Value $finding) { ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $finding -Name 'Code')) } })
+  Set-ToolboxRepair -State $state -Values @{ Run = $null; Confirm = $null; Result = $Result; CloseRefused = $false }
+  Write-SetupLog -Level WARN -Message 'Toolbox info action failed' -Data @{ action = (ConvertTo-ScreenText -Text $ActionId); runId = (ConvertTo-ScreenText -Text $RunId)
+    outcome = (ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $Result -Name 'Outcome'))); findings = $codes }
+}
+
+function Start-ToolboxPendingRun {
+  <#
+  .SYNOPSIS
+    Starts the action the model asks for (Repair.Pending, set by Update-RepairModel's Tile or Confirm), with the
+    confirmation's Options (ghostRemove: Ids; netRestore: File, Sha256; dismSource: Path, Type, Index). Never waits.
+  .DESCRIPTION
+    Pending and the confirmation are cleared first (Pending is one-shot). Then the gate of the tile is checked again at
+    this moment (Get-RepairGate; every caller of Start-ToolboxRun does: Task 4 review): a closed gate, or an action
+    already running, starts nothing (WARN 'Toolbox action refused: the gate is closed' with @{ action; reason }).
+    Nothing pending: nothing happens.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $repair = $state.Model['Repair']
+  $pending = [string]$repair['Pending']
+  if ($pending -eq '') { return }
+  $confirm = $repair['Confirm']
+  $tile = $pending
+  $options = @{}
+  if ($confirm -is [System.Collections.IDictionary]) {
+    $tile = [string]$confirm['Action']
+    if ($confirm['Options'] -is [System.Collections.IDictionary]) { foreach ($key in @($confirm['Options'].Keys)) { $options[$key] = $confirm['Options'][$key] } }
+  }
+  Set-ToolboxRepair -State $state -Values @{ Pending = $null; Confirm = $null }
+  $gate = Get-RepairGate -Model $state.Model -ActionId $tile
+  if ((Test-ToolboxActionRunning -State $state) -or -not $gate.Enabled) {
+    $reason = if ($gate.Reason -ne '') { $gate.Reason } else { 'reason.running' }
+    Write-SetupLog -Level WARN -Message 'Toolbox action refused: the gate is closed' -Data @{ action = (ConvertTo-ScreenText -Text $pending); reason = $reason }
+    return
+  }
+  $null = Start-ToolboxRun -Window $Window -ActionId $pending -Options $options
+}
+
+function Start-ToolboxInfoRun {
+  <#
+  .SYNOPSIS
+    Starts the info child an open, loading confirmation waits for (Network reset: netInfo; Ghost devices: ghostList),
+    in the Action slot. Never waits.
+  .DESCRIPTION
+    Nothing without a loading confirmation of such a tile, or while an action runs (its child is already asked). The
+    tile's gate is checked again first. A start that is refused, or a closed gate, closes the confirmation (it would
+    wait for nothing); a child that cannot start ends as a failed info child (Complete-ToolboxInfoRun: the
+    confirmation closes, the red result shows).
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $confirm = $state.Model['Repair']['Confirm']
+  if ($confirm -isnot [System.Collections.IDictionary] -or $confirm['Loading'] -ne $true -or (Test-ToolboxActionRunning -State $state)) { return }
+  $tile = [string]$confirm['Action']
+  $info = Get-RepairInfoAction -Id $tile
+  if ($info -eq '') { return }
+  $started = $false
+  $gate = Get-RepairGate -Model $state.Model -ActionId $tile
+  if ($gate.Enabled) {
+    $started = Start-ToolboxRun -Window $Window -ActionId $info
+  } else {
+    Write-SetupLog -Level WARN -Message 'Toolbox action refused: the gate is closed' -Data @{ action = (ConvertTo-ScreenText -Text $info); reason = $gate.Reason }
+  }
+  $now = $state.Model['Repair']['Confirm']
+  if (-not $started -and $now -is [System.Collections.IDictionary] -and [string]$now['Action'] -ceq $tile -and $now['Loading'] -eq $true) {
+    Set-ToolboxRepair -State $state -Values @{ Confirm = $null }
+  }
+}
+
+function Get-ToolboxStickPresence {
+  <#
+  .SYNOPSIS
+    The cheap stick presence check of the 5-second tick (ruling RD-R3): a text that changes when a BenTech stick is
+    plugged in, pulled or swapped. No CIM, no WMI. Never throws.
+  .DESCRIPTION
+    [IO.DriveInfo]::GetDrives(): each ready Removable or Fixed drive other than the system drive that holds
+    BenTechSetup.cmd in its root, or is the launcher's own drive (-Launcher.Drive: the stick it ran from, under any file
+    name), as '<root>|<volume label>|<size>'; sorted, joined with ';'. Network, CD-ROM and other drives are skipped. A
+    drive that cannot be read is skipped. The full search (Find-SetupStick, by volume serial) runs only when this text
+    changes (Update-ToolboxStick).
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [AllowNull()][hashtable]$Launcher,
+    [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive
+  )
+
+  $parts = New-Object System.Collections.Generic.List[string]
+  try {
+    $system = ([string]$SystemDrive).TrimEnd('\').ToUpperInvariant()
+    $launcherDrive = if ($null -ne $Launcher) { ([string]$Launcher['Drive']).TrimEnd('\').ToUpperInvariant() } else { '' }
+    foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+      try {
+        if ($drive.DriveType -ne [IO.DriveType]::Removable -and $drive.DriveType -ne [IO.DriveType]::Fixed) { continue }
+        $letter = $drive.Name.TrimEnd('\').ToUpperInvariant()
+        if ($letter -eq $system -or -not $drive.IsReady) { continue }
+        if ($letter -ne $launcherDrive -and -not [IO.File]::Exists([IO.Path]::Combine($drive.Name, 'BenTechSetup.cmd'))) { continue }
+        $parts.Add(('{0}|{1}|{2}' -f $drive.Name.ToUpperInvariant(), $drive.VolumeLabel, $drive.TotalSize))
+      } catch {
+        continue
+      }
+    }
+  } catch {
+    return ''
+  }
+  $parts.Sort([StringComparer]::Ordinal)
+  return ($parts.ToArray() -join ';')
+}
+
+function Update-ToolboxStick {
+  <#
+  .SYNOPSIS
+    The stick, checked again (spec 8, ruling RD-R3): on the power timer's 5-second tick and when the page opens. Only
+    on the repair page, and never while an action runs. Returns nothing; never throws. Does not render.
+  .DESCRIPTION
+    Tag.StickPresent (Get-ToolboxStickPresence: [IO.DriveInfo], no CIM) answers first; only when its answer differs
+    from the last one, or on the first check, Tag.FindStick (Find-SetupStick: the full search by the launcher's volume
+    serial, one bounded CIM query) runs. A stick it finds on another root than the model's replaces Repair.Stick, and
+    the change is logged once: INFO 'Toolbox stick changed' with @{ drive } ('none' when it is gone; ASCII). A presence
+    check or a search that throws changes nothing and is logged once per window (WARN 'Could not check for the stick',
+    'Could not look for the stick').
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  if ([string]$state.Model['Page'] -cne 'repair' -or (Test-ToolboxActionRunning -State $state)) { return }
+  $presence = ''
+  try {
+    $presence = [string](& $state['StickPresent'] $state['Launcher'])
+  } catch {
+    if ($state['StickWarned'] -ne $true) {
+      $state['StickWarned'] = $true
+      Write-SetupLog -Level WARN -Message 'Could not check for the stick' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+    return
+  }
+  if ($state['StickChecked'] -eq $true -and $presence -ceq [string]$state['StickPresence']) { return }
+  $state['StickChecked'] = $true
+  $state['StickPresence'] = $presence
+
+  $found = $null
+  try {
+    $outputs = @(& $state['FindStick'] $state['Launcher'])
+    if ($outputs.Count -eq 1 -and $outputs[0] -is [System.Collections.IDictionary]) { $found = $outputs[0] }
+  } catch {
+    if ($state['StickSearchWarned'] -ne $true) {
+      $state['StickSearchWarned'] = $true
+      Write-SetupLog -Level WARN -Message 'Could not look for the stick' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+    return
+  }
+  $root = ''
+  $drive = ''
+  if ($null -ne $found -and -not [string]::IsNullOrEmpty([string]$found['Root'])) { $root = [string]$found['Root']; $drive = [string]$found['Drive'] }
+  $before = $state.Model['Repair']['Stick']
+  $beforeRoot = if ($before -is [System.Collections.IDictionary]) { [string]$before['Root'] } else { '' }
+  if ($root -ceq $beforeRoot) { return }
+  $stick = if ($root -ne '') { @{ Root = $root; Drive = $drive } } else { @{ Root = $null; Drive = $null } }
+  Set-ToolboxRepair -State $state -Values @{ Stick = $stick }
+  Write-SetupLog -Level INFO -Message 'Toolbox stick changed' -Data @{ drive = $(if ($drive -ne '') { ConvertTo-ScreenText -Text $drive } else { 'none' }) }
+}
+
+function Open-ToolboxFolder {
+  <#
+  .SYNOPSIS
+    Open folder (spec 4.1): the shown result's folder (Result.Files.Folder) in Explorer. Returns nothing; never throws.
+  .DESCRIPTION
+    & Tag.StartChild "%windir%\explorer.exe" '"<folder>"' (Start-BackgroundExternal: no wait). Its process is never
+    added to $script:ToolboxChildren: nobody waits for it, and it must hold neither the close guard nor the cleanup
+    (Task 4 review); its Process object is disposed at once (that releases the handle, it does not end Explorer).
+    Nothing without a folder; a folder that is not a full local path, holds a quote, or is not there
+    (the stick was pulled) opens nothing. Those, and a start that throws, are WARN 'Could not open the folder' with
+    the reason in ASCII.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $folder = [string](Get-RepairEntry -From (Get-RepairEntry -From $state.Model['Repair']['Result'] -Name 'Files') -Name 'Folder')
+  if ($folder -eq '') { return }
+  $problem = ''
+  if ($folder -notmatch '^[A-Za-z]:\\' -or $folder.Contains('"')) { $problem = 'not a local folder path' }
+  elseif (-not [IO.Directory]::Exists($folder)) { $problem = 'the folder is not there' }
+  if ($problem -eq '') {
+    try {
+      foreach ($output in @(& $state['StartChild'] "$env:windir\explorer.exe" ('"{0}"' -f $folder))) {
+        if ($output -is [System.Diagnostics.Process]) { $output.Dispose() }
+      }
+    } catch {
+      $problem = ConvertTo-ScreenText -Text $_.Exception.Message
+    }
+  }
+  if ($problem -ne '') { Write-SetupLog -Level WARN -Message 'Could not open the folder' -Data @{ folder = (ConvertTo-ScreenText -Text $folder); error = $problem } }
 }

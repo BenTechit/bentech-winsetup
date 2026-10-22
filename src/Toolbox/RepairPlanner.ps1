@@ -7,6 +7,10 @@
 # Task 4: the run in the model: a run started (New-RepairRunModel), brought up to date from the child's progress
 # (Update-RepairRunModel), ended on its result (Complete-RepairRunModel), and the result the window writes itself
 # when the child gave none (New-RepairWindowResult).
+# Task 5: the page at work (Update-RepairModel): a tile clicked (an action to start now, or a confirmation of the
+# catalog's kind), YES typed, the at-PC and backed-up ticks, the ghost ticks, the complaint, the hovered tile, the DISM
+# offer, and the answers of the info children (netInfo, ghostList) that the Network reset and Ghost devices
+# confirmations wait for.
 #
 # Pure: no logging, no I/O, no window, no clock. Values in, values out. Needs Repair\ToolEngine.ps1's
 # $script:ToolActionCatalog for the actions this version has and Get-ToolText for a finding's English text, and
@@ -90,7 +94,8 @@ function New-RepairModel {
     The repair page's model (plan "The repair model"): what the page shows, as plain values. Pure.
   .DESCRIPTION
     @{ Available (Get-RepairAvailable of the action catalog); CanRun (the setup files are there to start a child from);
-       IsLaptop; SessionStamp ('yyyy-MM-dd_HHmm', the visit's folder stamp); Strip (loading, no chip yet);
+       IsLaptop; OsBuild (the PC's build, for the DISM offer's warning); SessionStamp ('yyyy-MM-dd_HHmm', the visit's
+       folder stamp); Strip (loading, no chip yet);
        Stick = @{ Root; Drive } (none until the window finds it); DiskCheck = @{ Dirty; Excluded }; NetBackup ($null);
        HasEarlierReport; BackedUp; Complaint; Selected; CloseRefused; Done; Pending; Confirm; Run; Result }.
   #>
@@ -106,6 +111,7 @@ function New-RepairModel {
     Available        = [string[]]@(Get-RepairAvailable -Catalog $script:ToolActionCatalog)
     CanRun           = $CanRun
     IsLaptop         = ($Machine['IsLaptop'] -eq $true)
+    OsBuild          = [string]$Machine['OsBuild']
     SessionStamp     = $SessionStamp
     Strip            = (ConvertTo-RepairStrip -Chips $null)
     Stick            = @{ Root = $null; Drive = $null }
@@ -347,8 +353,9 @@ function Test-RepairConfirmReady {
     $false with no confirmation, or while it is loading (Network reset and Ghost devices wait for their info child).
     Otherwise all of these: the action's gate still allows it (Get-RepairGate; 'restart' for Restart PC); a 'yes'
     confirmation holds YES (Test-RepairYes); Network reset has the at-PC tick, always (ruling RD-R2: AnyDesk and
-    ScreenConnect run on every PC Ben sets up, so the tick is asked whatever is detected); a confirmation with device
-    items has at least one ticked.
+    ScreenConnect run on every PC Ben sets up, so the tick is asked whatever is detected), and so does any confirmation
+    whose Remote reports a session; a confirmation with device items has at least one ticked, and Ghost devices always
+    need one (a list with nothing to remove has nothing to confirm).
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -359,9 +366,11 @@ function Test-RepairConfirmReady {
   $action = [string]$confirm['Action']
   if (-not (Get-RepairGate -Model $Model -ActionId $action).Enabled) { return $false }
   if ([string]$confirm['Kind'] -ceq 'yes' -and -not (Test-RepairYes -Text ([string]$confirm['Typed']))) { return $false }
-  if ($action -ceq 'netReset' -and $confirm['AtPc'] -ne $true) { return $false }
+  $session = @((ConvertTo-RepairFlags -Value $confirm['Remote']).Values) -contains $true
+  if (($action -ceq 'netReset' -or $session) -and $confirm['AtPc'] -ne $true) { return $false }
   $items = @($confirm['Items'] | Where-Object { $null -ne $_ })
-  if ($items.Count -gt 0 -and @($items | Where-Object { $_['Ticked'] -eq $true }).Count -eq 0) { return $false }
+  $ticked = @($items | Where-Object { (Get-RepairEntry -From $_ -Name 'Ticked') -eq $true }).Count
+  if (($items.Count -gt 0 -or $action -ceq 'ghosts') -and $ticked -eq 0) { return $false }
   return $true
 }
 
@@ -600,4 +609,350 @@ function New-RepairWindowResult {
     StartedAt       = ''
     EndedAt         = $EndedAt
   }
+}
+
+# --- The page at work (repair Task 5) ------------------------------------------------------------------------------
+# What a click, a tick or a key does to the page's model (Update-RepairModel). The window (Toolbox.ps1,
+# RepairPage.ps1) starts what the model asks for (Repair.Pending, an action id, one-shot) and the info child an open
+# Network reset or Ghost devices confirmation waits for. Pure, like the rest of this file: each call returns a copy.
+
+function ConvertTo-RepairFlags {
+  # Private. A Remote reading (a hashtable or an object read from JSON) as @{ <name> = <bool> }: each value counts only
+  # when it is $true. Anything else is an empty table.
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([AllowNull()]$Value)
+
+  $flags = @{}
+  if ($Value -is [System.Collections.IDictionary]) {
+    foreach ($key in @($Value.Keys)) { $flags[[string]$key] = ($Value[$key] -eq $true) }
+  } elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+    foreach ($property in $Value.PSObject.Properties) { $flags[$property.Name] = ($property.Value -eq $true) }
+  }
+  return $flags
+}
+
+function Copy-RepairEntry {
+  # Private. A one-level copy of a hashtable (an open confirmation, a device item), so the model is replaced, never
+  # changed in place.
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([Parameter(Mandatory)][System.Collections.IDictionary]$Entry)
+
+  $copy = @{}
+  foreach ($key in @($Entry.Keys)) { $copy[$key] = $Entry[$key] }
+  return $copy
+}
+
+function Get-RepairStartAction {
+  # Private. The catalog action a tile starts once it is confirmed: Ghost devices removes (ghostRemove), Network reset
+  # resets (netReset; the last action of $script:RepairTileActions); every other tile is its own action.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowEmptyString()][string]$Id)
+
+  if ($script:RepairTileActions.Contains($Id)) { return [string](@($script:RepairTileActions[$Id])[-1]) }
+  return $Id
+}
+
+function Get-RepairInfoAction {
+  # Private. The read-only child a tile's confirmation waits for before it can be confirmed: netInfo (Network reset),
+  # ghostList (Ghost devices); the first action of $script:RepairTileActions. '' for every other tile.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowEmptyString()][string]$Id)
+
+  if ($script:RepairTileActions.Contains($Id)) { return [string](@($script:RepairTileActions[$Id])[0]) }
+  return ''
+}
+
+function Get-RepairConfirmKind {
+  # Private. How the action catalog says -ActionId is confirmed: 'none', 'confirm' or 'yes'. An action without a row,
+  # or a value this page does not know, is 'yes', the strictest (such a tile is not available anyway: its gate says
+  # reason.unavailable).
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowEmptyString()][string]$ActionId)
+
+  $kind = ''
+  if ($null -ne $script:ToolActionCatalog -and $script:ToolActionCatalog.Contains($ActionId)) {
+    $entry = $script:ToolActionCatalog[$ActionId]
+    if ($entry -is [System.Collections.IDictionary]) { $kind = [string]$entry['Confirm'] }
+  }
+  if ($kind -cin 'none', 'confirm', 'yes') { return $kind }
+  return 'yes'
+}
+
+function ConvertTo-RepairValues {
+  # Private. The text values of a list read from a file (gateways, DNS servers, languages): every entry that is not
+  # empty and not an object, as a string. Emitted one by one: wrap the call in @().
+  [CmdletBinding()]
+  param([AllowNull()]$Value)
+
+  foreach ($entry in @($Value)) {
+    if ($null -eq $entry -or (Test-RepairObject -Value $entry)) { continue }
+    $text = [string]$entry
+    if ($text -ne '') { $text }
+  }
+}
+
+function ConvertTo-RepairAdapterLine {
+  <#
+  .SYNOPSIS
+    Private. One adapter's static settings as a confirmation line (spec 6.6: every value shown), or $null when it has
+    none: @{ Key = 'confirm.static'; Args = @(<alias>, '<ip>/<prefix>, ..., gateway <ip>, ..., DNS <ip>, ...') }.
+  .DESCRIPTION
+    -Adapter is a row of netInfo's Data.NetInfo.Adapters or of a saved backup (plan Task 7: @{ Alias; Guid; Mac;
+    Addresses = @( @{ Ip; Prefix } ); Gateways = [string[]]; Dns = [string[]] }), a hashtable or an object read from
+    JSON. The values are machine values: the view shows the line left-to-right. The alias names the adapter (its MAC
+    when it has none).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([AllowNull()]$Adapter)
+
+  if (-not (Test-RepairObject -Value $Adapter)) { return $null }
+  $addresses = @(foreach ($row in @(Get-RepairEntry -From $Adapter -Name 'Addresses')) {
+      if (-not (Test-RepairObject -Value $row)) { continue }
+      $ip = [string](Get-RepairEntry -From $row -Name 'Ip')
+      if ($ip -eq '') { continue }
+      $prefix = [string](Get-RepairEntry -From $row -Name 'Prefix')
+      if ($prefix -ne '') { '{0}/{1}' -f $ip, $prefix } else { $ip }
+    })
+  $gateways = @(ConvertTo-RepairValues -Value (Get-RepairEntry -From $Adapter -Name 'Gateways'))
+  $dns = @(ConvertTo-RepairValues -Value (Get-RepairEntry -From $Adapter -Name 'Dns'))
+  $parts = New-Object System.Collections.Generic.List[string]
+  if ($addresses.Count -gt 0) { $parts.Add(($addresses -join ', ')) }
+  if ($gateways.Count -gt 0) { $parts.Add('gateway ' + ($gateways -join ', ')) }
+  if ($dns.Count -gt 0) { $parts.Add('DNS ' + ($dns -join ', ')) }
+  if ($parts.Count -eq 0) { return $null }
+  $alias = [string](Get-RepairEntry -From $Adapter -Name 'Alias')
+  if ($alias -eq '') { $alias = [string](Get-RepairEntry -From $Adapter -Name 'Mac') }
+  if ($alias -eq '') { $alias = '?' }
+  return @{ Key = 'confirm.static'; Args = @($alias, ($parts.ToArray() -join ', ')) }
+}
+
+function Limit-RepairText {
+  # Private. -Text cut to -Length characters, never between the two halves of a surrogate pair.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][int]$Length)
+
+  $value = [string]$Text
+  if ($value.Length -le $Length) { return $value }
+  $cut = $Length
+  if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }
+  return $value.Substring(0, $cut)
+}
+
+function New-RepairConfirm {
+  # Private. An open confirmation (plan "The repair model": Confirm), its Typed and AtPc empty.
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][string]$Action,
+    [Parameter(Mandatory)][string]$Kind,
+    [AllowNull()][object[]]$Lines,
+    [bool]$Loading = $false,
+    [AllowNull()][hashtable]$Options
+  )
+
+  return @{ Action = $Action; Kind = $Kind; Typed = ''; AtPc = $false; Loading = $Loading; Lines = @($Lines | Where-Object { $null -ne $_ })
+            Remote = $null; Items = @(); Options = $(if ($null -ne $Options) { $Options } else { @{} }) }
+}
+
+function Update-RepairModel {
+  <#
+  .SYNOPSIS
+    One page action applied to the toolbox model (-Model, its Repair): the new model. Pure; returns a copy, the input
+    is never changed.
+  .DESCRIPTION
+    Repair.Pending, the action the window must start now, is one-shot: every call starts with it $null, and only Tile
+    and Confirm set it. -Value is a string for the clicks and keys, the info child's Data for NetInfo and GhostItems.
+      - Tile <id>: nothing unless the tile's gate allows it (Get-RepairGate: a disabled tile's click, raised in code,
+        changes nothing), and nothing when its own confirmation is already open (what was typed and ticked stays).
+        A tile of the rows becomes Selected. Its action (Get-RepairStartAction: ghosts removes with ghostRemove) is
+        confirmed as the catalog says (Get-RepairConfirmKind): 'none' with a stick is Pending at once (any open
+        confirmation closes); otherwise a confirmation (Kind 'confirm' for a read-only action without a stick, spec
+        8), its Lines @{ Key; Args }: tile.<id>.changes (not for a read-only action), then the gate's warnings.
+        Network reset and Ghost devices open Loading until their info child answers (NetInfo, GhostItems). Restore
+        network settings lists every value it will put back (spec 6.6: one confirm.static line per adapter of
+        Repair.NetBackup.Adapters with a static value, else confirm.noStatic), Options = @{ File; Sha256 } (the child
+        refuses a file that changed since). Tile dismSource is the DISM offer.
+      - Offer dismSource: the confirmation of the DISM retry (spec 6.2) from Result.Offers.DismSource: the change
+        list, the file's details (result.offerDism: path, edition, architecture, languages, build), result.buildDiffers
+        (this PC's build) and result.languageDiffers (the file's languages, the PC's) when set, the gate's warnings;
+        Options = @{ Path; Type; Index }. No offer, no confirmation.
+      - YesText <text> (the first 8 characters, the YES box's length), AtPc (toggled), GhostTick <index> (toggled; the
+        confirm.ghostCount line follows): the open confirmation's; nothing without one.
+      - BackedUp (toggled), Complaint <text> (cut to 2000 characters), Hover <id> (Selected, a tile of the rows only),
+        ConfirmCancel (Confirm $null).
+      - NetInfo <Data.NetInfo>: an open Network reset confirmation that is loading stops loading, takes Remote
+        (each reported session a flag) and one confirm.static line per adapter with a static value (or
+        confirm.noStatic). GhostItems <Data.Ghosts>: an open Ghost devices confirmation that is loading gets one
+        item @{ InstanceId; Class; Name; Ticked = $true } per device that is not excluded (Excluded empty or $false;
+        a row without an InstanceId is skipped) and the line confirm.ghostCount @(<ticked>, <devices>, <left out>).
+        An answer with no such confirmation open, a second answer, or a NetInfo that is no object, changes nothing.
+      - Confirm: only when Test-RepairConfirmReady allows it now (the gate re-checked at this moment, YES for a 'yes'
+        kind, the at-PC tick, a ticked device): Pending = the tile's action, the confirmation kept with its Options
+        (Ghost devices: Ids = the ticked InstanceIds only) for the window to start it with. A Restart PC question is
+        Toolbox.ps1's.
+    Any other action changes nothing (but Pending).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Model,
+    [Parameter(Mandatory)][string]$Action,
+    [AllowNull()]$Value
+  )
+
+  $next = $Model.Clone()
+  $repair = $Model['Repair'].Clone()
+  $repair['Pending'] = $null
+  $next['Repair'] = $repair
+  $confirm = $repair['Confirm']
+  $open = ($confirm -is [System.Collections.IDictionary])
+  $text = if ($null -eq $Value -or (Test-RepairObject -Value $Value)) { '' } else { [string]$Value }
+  $tileIds = @($script:RepairTileRows.Values | ForEach-Object { $_ })
+
+  switch -CaseSensitive ($Action) {
+    { $_ -ceq 'Tile' -and $text -cne 'dismSource' } {
+      $gate = Get-RepairGate -Model $next -ActionId $text
+      if (-not $gate.Enabled) { break }
+      if ($open -and [string]$confirm['Action'] -ceq $text) { break }
+      if ($tileIds -ccontains $text) { $repair['Selected'] = $text }
+      $start = Get-RepairStartAction -Id $text
+      $kind = Get-RepairConfirmKind -ActionId $start
+      if ($kind -ceq 'none' -and (Test-RepairStick -Repair $repair)) {
+        $repair['Confirm'] = $null
+        $repair['Pending'] = $start
+        break
+      }
+      $lines = New-Object System.Collections.Generic.List[object]
+      $options = @{}
+      if ($kind -cne 'none') { $lines.Add(@{ Key = "tile.$text.changes"; Args = @() }) }
+      if ($text -ceq 'netRestore') {
+        $backup = $repair['NetBackup']
+        $shown = 0
+        foreach ($adapter in @(Get-RepairEntry -From $backup -Name 'Adapters')) {
+          $line = ConvertTo-RepairAdapterLine -Adapter $adapter
+          if ($null -ne $line) { $lines.Add($line); $shown++ }
+        }
+        if ($shown -eq 0) { $lines.Add(@{ Key = 'confirm.noStatic'; Args = @() }) }
+        $options = @{ File = [string](Get-RepairEntry -From $backup -Name 'Path'); Sha256 = [string](Get-RepairEntry -From $backup -Name 'Sha256') }
+      }
+      foreach ($warn in @($gate.Warns)) { $lines.Add(@{ Key = $warn; Args = @() }) }
+      $repair['Confirm'] = New-RepairConfirm -Action $text -Kind $(if ($kind -ceq 'none') { 'confirm' } else { $kind }) -Lines $lines.ToArray() `
+        -Loading ((Get-RepairInfoAction -Id $text) -ne '') -Options $options
+    }
+    { $_ -ceq 'Offer' -or ($_ -ceq 'Tile' -and $text -ceq 'dismSource') } {
+      if ($text -cne 'dismSource') { break }
+      $gate = Get-RepairGate -Model $next -ActionId 'dismSource'
+      if (-not $gate.Enabled) { break }
+      if ($open -and [string]$confirm['Action'] -ceq 'dismSource') { break }
+      $offer = Get-RepairEntry -From (Get-RepairEntry -From $repair['Result'] -Name 'Offers') -Name 'DismSource'
+      if (-not (Test-RepairObject -Value $offer)) { break }
+      $languages = @(ConvertTo-RepairValues -Value (Get-RepairEntry -From $offer -Name 'Languages')) -join ', '
+      $lines = New-Object System.Collections.Generic.List[object]
+      $lines.Add(@{ Key = 'tile.dismSource.changes'; Args = @() })
+      $lines.Add(@{ Key = 'result.offerDism'; Args = @([string](Get-RepairEntry -From $offer -Name 'Path'), [string](Get-RepairEntry -From $offer -Name 'Edition'),
+                                                        [string](Get-RepairEntry -From $offer -Name 'Arch'), $languages, [string](Get-RepairEntry -From $offer -Name 'Build')) })
+      if ((Get-RepairEntry -From $offer -Name 'BuildDiffers') -eq $true) { $lines.Add(@{ Key = 'result.buildDiffers'; Args = @([string]$repair['OsBuild']) }) }
+      if ((Get-RepairEntry -From $offer -Name 'LanguageDiffers') -eq $true) {
+        $lines.Add(@{ Key = 'result.languageDiffers'; Args = @($languages, [string](Get-RepairEntry -From $offer -Name 'PcLanguage')) })
+      }
+      foreach ($warn in @($gate.Warns)) { $lines.Add(@{ Key = $warn; Args = @() }) }
+      $options = @{ Path = [string](Get-RepairEntry -From $offer -Name 'Path'); Type = [string](Get-RepairEntry -From $offer -Name 'Type')
+                    Index = (Get-RepairEntry -From $offer -Name 'Index') }
+      $repair['Confirm'] = New-RepairConfirm -Action 'dismSource' -Kind (Get-RepairConfirmKind -ActionId 'dismSource') -Lines $lines.ToArray() -Options $options
+    }
+    'YesText' {
+      if (-not $open) { break }
+      $c = Copy-RepairEntry -Entry $confirm
+      $c['Typed'] = Limit-RepairText -Text $text -Length 8
+      $repair['Confirm'] = $c
+    }
+    'AtPc' {
+      if (-not $open) { break }
+      $c = Copy-RepairEntry -Entry $confirm
+      $c['AtPc'] = -not ($confirm['AtPc'] -eq $true)
+      $repair['Confirm'] = $c
+    }
+    'GhostTick' {
+      $index = 0
+      if (-not $open -or -not [int]::TryParse($text, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$index)) { break }
+      $items = @(foreach ($item in @($confirm['Items'])) { if ($item -is [System.Collections.IDictionary]) { Copy-RepairEntry -Entry $item } })
+      if ($index -ge $items.Count) { break }
+      $items[$index]['Ticked'] = -not ($items[$index]['Ticked'] -eq $true)
+      $ticked = @($items | Where-Object { $_['Ticked'] -eq $true }).Count
+      $c = Copy-RepairEntry -Entry $confirm
+      $c['Items'] = $items
+      $c['Lines'] = @(foreach ($line in @($confirm['Lines'])) {
+          if ($line -is [System.Collections.IDictionary] -and [string]$line['Key'] -ceq 'confirm.ghostCount') {
+            $counts = @($line['Args'])
+            @{ Key = 'confirm.ghostCount'; Args = @($ticked, $(if ($counts.Count -gt 1) { $counts[1] } else { $items.Count }), $(if ($counts.Count -gt 2) { $counts[2] } else { 0 })) }
+          } else { $line }
+        })
+      $repair['Confirm'] = $c
+    }
+    'BackedUp' { $repair['BackedUp'] = -not ($repair['BackedUp'] -eq $true) }
+    'Complaint' { $repair['Complaint'] = Limit-RepairText -Text $text -Length 2000 }
+    'Hover' { if ($tileIds -ccontains $text) { $repair['Selected'] = $text } }
+    'ConfirmCancel' { $repair['Confirm'] = $null }
+    'NetInfo' {
+      if (-not $open -or [string]$confirm['Action'] -cne 'netReset' -or $confirm['Loading'] -ne $true -or -not (Test-RepairObject -Value $Value)) { break }
+      $lines = New-Object System.Collections.Generic.List[object]
+      foreach ($line in @($confirm['Lines'])) { if ($null -ne $line) { $lines.Add($line) } }
+      $shown = 0
+      foreach ($adapter in @(Get-RepairEntry -From $Value -Name 'Adapters')) {
+        $line = ConvertTo-RepairAdapterLine -Adapter $adapter
+        if ($null -ne $line) { $lines.Add($line); $shown++ }
+      }
+      if ($shown -eq 0) { $lines.Add(@{ Key = 'confirm.noStatic'; Args = @() }) }
+      $c = Copy-RepairEntry -Entry $confirm
+      $c['Loading'] = $false
+      $c['Remote'] = ConvertTo-RepairFlags -Value (Get-RepairEntry -From $Value -Name 'Remote')
+      $c['Lines'] = $lines.ToArray()
+      $repair['Confirm'] = $c
+    }
+    'GhostItems' {
+      if (-not $open -or [string]$confirm['Action'] -cne 'ghosts' -or $confirm['Loading'] -ne $true) { break }
+      $items = New-Object System.Collections.Generic.List[object]
+      $devices = 0
+      $leftOut = 0
+      foreach ($device in @($Value)) {
+        if (-not (Test-RepairObject -Value $device)) { continue }
+        $id = [string](Get-RepairEntry -From $device -Name 'InstanceId')
+        if ($id -eq '') { continue }
+        $devices++
+        # Spec 6.7: a device the child left out (a reason, or any value but empty and $false) is never an item.
+        $excluded = Get-RepairEntry -From $device -Name 'Excluded'
+        $kept = ($null -eq $excluded) -or ($excluded -is [bool] -and -not $excluded) -or ($excluded -isnot [bool] -and [string]$excluded -eq '')
+        if (-not $kept) { $leftOut++; continue }
+        $items.Add(@{ InstanceId = $id; Class = [string](Get-RepairEntry -From $device -Name 'Class'); Name = [string](Get-RepairEntry -From $device -Name 'Name'); Ticked = $true })
+      }
+      $lines = New-Object System.Collections.Generic.List[object]
+      foreach ($line in @($confirm['Lines'])) { if ($null -ne $line) { $lines.Add($line) } }
+      $lines.Add(@{ Key = 'confirm.ghostCount'; Args = @($items.Count, $devices, $leftOut) })
+      $c = Copy-RepairEntry -Entry $confirm
+      $c['Loading'] = $false
+      $c['Items'] = $items.ToArray()
+      $c['Lines'] = $lines.ToArray()
+      $repair['Confirm'] = $c
+    }
+    'Confirm' {
+      if (-not $open -or [string]$confirm['Kind'] -ceq 'restart' -or -not (Test-RepairConfirmReady -Model $next)) { break }
+      $tile = [string]$confirm['Action']
+      $c = Copy-RepairEntry -Entry $confirm
+      if ($tile -ceq 'ghosts') {
+        $c['Options'] = @{ Ids = [string[]]@(foreach ($item in @($confirm['Items'])) { if ($null -ne $item -and (Get-RepairEntry -From $item -Name 'Ticked') -eq $true) { [string](Get-RepairEntry -From $item -Name 'InstanceId') } }) }
+      } elseif ($c['Options'] -isnot [System.Collections.IDictionary]) {
+        $c['Options'] = @{}
+      }
+      $repair['Confirm'] = $c
+      $repair['Pending'] = Get-RepairStartAction -Id $tile
+    }
+  }
+  return $next
 }

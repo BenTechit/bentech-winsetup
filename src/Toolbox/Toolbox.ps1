@@ -285,6 +285,10 @@ function New-ToolboxWindow {
     (starts a child without waiting) and FindStick (the full stick search), Runs = @{ Action; Safety } (the children
     running, RepairPage.ps1) and RunTimer (Show-ToolboxWindow's 500 ms timer; $null until it makes one). The seams'
     defaults are Show-ToolboxWindow's.
+    Repair Task 5: the seam StickPresent (the cheap 5-second stick presence check, ruling RD-R3) with its last answer
+    (StickPresence; StickChecked $false until the first check, StickWarned / StickSearchWarned once a failure is
+    logged), SafetyStarted ($false until the page's first visit starts the strip's child) and RepairItemsShape (what
+    the confirmation's items show, so they are rebuilt only when it changes).
   #>
   [CmdletBinding()]
   [OutputType([System.Windows.Window])]
@@ -298,7 +302,8 @@ function New-ToolboxWindow {
     [AllowEmptyString()][string]$ScriptPath = '',
     [AllowNull()][hashtable]$Launcher = $null,
     [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
-    [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l }
+    [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
+    [scriptblock]$StickPresent = { param($l) Get-ToolboxStickPresence -Launcher $l }
   )
 
   $window = [System.Windows.Markup.XamlReader]::Parse($script:ToolboxXaml, (New-ToolboxParserContext))
@@ -337,9 +342,11 @@ function New-ToolboxWindow {
     ProfileTiles = $tiles; TweakRows = $rows
     ReadOnAC = $ReadOnAC; Timer = $null; PowerWarned = $false
     Outcome = $null; Choices = $null; Error = $null; Closing = $false
-    RepairConfirmKey = ''
+    RepairConfirmKey = ''; RepairItemsShape = ''
     Root = $Root; ScriptPath = $ScriptPath; Launcher = $Launcher; StartChild = $StartChild; FindStick = $FindStick
     Runs = @{ Action = $null; Safety = $null }; RunTimer = $null
+    StickPresent = $StickPresent; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false
+    SafetyStarted = $false
   }
   Update-ToolboxView -Window $window
   return $window
@@ -509,8 +516,11 @@ function Register-ToolboxHandlers {
     Wires the window's handlers (spec 5.1). Each is one line that calls Invoke-ToolboxAction. Returns nothing.
   .DESCRIPTION
     - Click on every button whose Tag starts 'a:' (a ButtonBase: the tiles, the switches, EN | HE, the nav, Start,
-      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons). The
-      repair page's text boxes carry an 'a:' tag as well but have no Click; they are left alone;
+      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons; the
+      Ghost devices switches are made later, by the view, which wires their Click the same way);
+    - TextChanged on every TextBox whose Tag starts 'a:' (Text: the repair page's complaint and YES boxes, repair
+      Task 5);
+    - MouseEnter on the repair page's ten tiles (Hover: what the tile does, spec 4.1);
     - MouseLeftButtonDown on the title bar (Drag; a button in the bar handles its own press first);
     - PreviewMouseWheel on the plan's scroller (Wheel: the wheel passes on to the body when the plan cannot
       scroll, TB-R7);
@@ -526,13 +536,20 @@ function Register-ToolboxHandlers {
   $pending.Push($Window)
   while ($pending.Count -gt 0) {
     $node = $pending.Pop()
-    # Click exists on buttons only: the repair page's text boxes (a:Complaint:, a:YesText:) are tagged too.
-    if ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal)) {
+    $tagged = ($node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal))
+    # Click exists on buttons only; the repair page's text boxes (a:Complaint:, a:YesText:) report their text instead.
+    if ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $tagged) {
       $node.Add_Click({ Invoke-ToolboxAction -Sender $this })
+    } elseif ($node -is [System.Windows.Controls.TextBox] -and $tagged) {
+      $node.Add_TextChanged({ Invoke-ToolboxAction -Sender $this -Action 'Text' })
     }
     foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($node)) {
       if ($child -is [System.Windows.DependencyObject]) { $pending.Push($child) }
     }
+  }
+  foreach ($id in @($script:RepairTileRows.Values | ForEach-Object { $_ })) {
+    $tile = $Window.FindName((Get-RepairElementName -Id $id))
+    if ($null -ne $tile) { $tile.Add_MouseEnter({ Invoke-ToolboxAction -Sender $this -Action 'Hover' }) }
   }
   $Window.FindName('TitleBar').Add_MouseLeftButtonDown({ Invoke-ToolboxAction -Sender $this -Action 'Drag' })
   $Window.FindName('PlanScroll').Add_PreviewMouseWheel({ Invoke-ToolboxAction -Sender $this -Action 'Wheel' -EventArgs $_ })
@@ -560,19 +577,31 @@ function Invoke-ToolboxAction {
         always closes (its children are killed before anything else: Show-ToolboxWindow, Get-SetupChoices).
         Otherwise Tag.Closing = $true; a window that closes without an outcome (Alt+F4) is Cancel.
       - Page: refused while an action runs, with WARN 'Page change refused: an action is running' (the nav is
-        locked, spec 4.4); otherwise as below.
+        locked, spec 4.4); otherwise as below. On the repair page (repair Task 5) the stick is checked
+        (Update-ToolboxStick: the full search on the first visit) and the first visit starts the safety child that
+        reads the strip (Start-ToolboxSafetyRun; once per window).
       - RunTick: the run timer's tick (Update-ToolboxRuns, RepairPage.ps1). Stop: Request-ToolboxStop.
       - Restart (Restart PC): refused while an action runs (WARN 'Restart refused: an action is running');
         otherwise the restart question opens (Model.Repair.Confirm, Kind 'restart', spec 6.9: it always asks).
-        Confirm on it closes the window as Restart when Test-RepairConfirmReady still allows it (nothing runs);
-        ConfirmCancel closes the question. (Repair Task 5 adds the other confirmations.)
+        Confirm on it closes the window as Restart when Test-RepairConfirmReady still allows it (nothing runs).
+      - Repair Task 5, through Update-RepairModel (RepairPlanner.ps1), then the repair page is rendered:
+          Tile <id>, Offer dismSource: then Start-ToolboxPendingRun (the action the model asks for, with the
+            confirmation's Options; the gate checked again) and Start-ToolboxInfoRun (the info child an opened
+            Network reset or Ghost devices confirmation waits for);
+          Confirm (any other confirmation): Pending only when it may be confirmed now, then Start-ToolboxPendingRun;
+          AtPc, GhostTick <index>, ConfirmCancel; BackedUp (also INFO 'Toolbox backed-up tick changed' @{ ticked });
+          Text (a TextChanged): the sender's text into Complaint or YesText, as its a: tag names; text the model
+            already holds changes nothing; the complaint renders nothing;
+          Hover (a tile's MouseEnter): the tile id of the sender's a:Tile:<id> tag becomes Selected.
+        OpenFolder: Open-ToolboxFolder (explorer.exe, never tracked as a child).
       - Rendered: the window is activated, then no longer Topmost (it opens Topmost so it never opens behind the
         console after UAC; spec 5.1).
       - Drag: DragMove(). Its InvalidOperationException (the button is already up) is ignored: the one benign
         exception.
       - Power: Tag.ReadOnAC. A read that throws keeps the last value and logs WARN 'Could not read the power
         state for the toolbox', once per window (Tag.PowerWarned; review M2: not on every 5-second tick);
-        otherwise the model (Update-ToolboxModel -Action Power), then the view.
+        otherwise the model (Update-ToolboxModel -Action Power). Then the stick (Update-ToolboxStick: on the repair
+        page while nothing runs, ruling RD-R3), and the view when the power was read or the stick changed.
       - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
         handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
       - Any other action (Profile, Mode, Office, Remote, SevenZip, RestorePoint, Tweak, Language):
@@ -642,11 +671,63 @@ function Invoke-ToolboxAction {
           Update-RepairView -Window $window
         } else {
           $state.Model = Update-ToolboxModel -Model $state.Model -Action $Action -Value $Value -Config $state.Config
+          if ([string]$state.Model.Page -ceq 'repair') {
+            # Repair Task 5: the stick (the full search on the first visit, RD-R3), and the strip's child once.
+            Update-ToolboxStick -Window $window
+            if ($state['SafetyStarted'] -ne $true) {
+              $state['SafetyStarted'] = $true
+              Start-ToolboxSafetyRun -Window $window
+            }
+          }
           Update-ToolboxView -Window $window
         }
       }
       'RunTick' { Update-ToolboxRuns -Window $window }
       'Stop' { Request-ToolboxStop -Window $window }
+      'Text' {
+        # Repair Task 5: the complaint or the YES box (its a:Complaint: / a:YesText: tag). Text the model already
+        # holds changes nothing (the view emptying the YES box for a new confirmation raises this too).
+        $parts = ([string]$Sender.Tag).Split([char]':', 3)
+        $target = if ($parts.Count -eq 3) { $parts[1] } else { '' }
+        $text = [string]$Sender.Text
+        $repair = $state.Model['Repair']
+        if ($target -ceq 'Complaint') {
+          if ($text -cne [string]$repair['Complaint']) { $state.Model = Update-RepairModel -Model $state.Model -Action 'Complaint' -Value $text }
+        } elseif ($target -ceq 'YesText') {
+          $confirm = $repair['Confirm']
+          if ($confirm -is [System.Collections.IDictionary] -and $text -cne [string]$confirm['Typed']) {
+            $state.Model = Update-RepairModel -Model $state.Model -Action 'YesText' -Value $text
+            Update-RepairView -Window $window
+          }
+        }
+      }
+      'Hover' {
+        # Repair Task 5: the tile the mouse is on (its a:Tile:<id> tag) is what the right column explains.
+        $parts = ([string]$Sender.Tag).Split([char]':', 3)
+        if ($parts.Count -eq 3 -and $parts[1] -ceq 'Tile' -and $parts[2] -cne [string]$state.Model['Repair']['Selected']) {
+          $state.Model = Update-RepairModel -Model $state.Model -Action 'Hover' -Value $parts[2]
+          Update-RepairView -Window $window
+        }
+      }
+      { $_ -cin 'Tile', 'Offer' } {
+        # Repair Task 5: start at once (Pending), or open the confirmation and, for Network reset and Ghost devices,
+        # the info child it waits for. Every start re-checks its gate (RepairPage.ps1).
+        $state.Model = Update-RepairModel -Model $state.Model -Action $Action -Value $Value
+        Start-ToolboxPendingRun -Window $window
+        Start-ToolboxInfoRun -Window $window
+        Update-RepairView -Window $window
+      }
+      { $_ -cin 'AtPc', 'GhostTick' } {
+        $state.Model = Update-RepairModel -Model $state.Model -Action $Action -Value $Value
+        Update-RepairView -Window $window
+      }
+      'BackedUp' {
+        $state.Model = Update-RepairModel -Model $state.Model -Action 'BackedUp'
+        # Shop rule (spec 5): the tick unlocks repairs on a failing disk, so it is on record.
+        Write-SetupLog -Level INFO -Message 'Toolbox backed-up tick changed' -Data @{ ticked = ($state.Model['Repair']['BackedUp'] -eq $true) }
+        Update-RepairView -Window $window
+      }
+      'OpenFolder' { Open-ToolboxFolder -Window $window }
       'Restart' {
         if ((Test-ToolboxActionRunning -State $state) -or -not (Get-RepairGate -Model $state.Model -ActionId 'restart').Enabled) {
           Write-SetupLog -Level WARN -Message 'Restart refused: an action is running'
@@ -667,11 +748,15 @@ function Invoke-ToolboxAction {
             Update-RepairView -Window $window
           }
         } else {
-          Update-RepairView -Window $window   # the other confirmations start their actions in repair Task 5
+          # Repair Task 5: the model sets Pending only when the confirmation may be confirmed now (its gate at this
+          # moment, YES, the at-PC tick, a ticked device); the start checks the gate once more.
+          $state.Model = Update-RepairModel -Model $state.Model -Action 'Confirm'
+          Start-ToolboxPendingRun -Window $window
+          Update-RepairView -Window $window
         }
       }
       'ConfirmCancel' {
-        Set-ToolboxRepair -State $state -Values @{ Confirm = $null }
+        $state.Model = Update-RepairModel -Model $state.Model -Action 'ConfirmCancel'
         Update-RepairView -Window $window
       }
       'Rendered' {
@@ -692,10 +777,11 @@ function Invoke-ToolboxAction {
             Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
           }
         }
-        if ($null -ne $onAC) {
-          $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config
-          Update-ToolboxView -Window $window
-        }
+        if ($null -ne $onAC) { $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config }
+        # Repair Task 5 (ruling RD-R3): the stick, on the repair page while nothing runs.
+        $stickBefore = $state.Model['Repair']['Stick']
+        Update-ToolboxStick -Window $window
+        if ($null -ne $onAC -or -not [object]::ReferenceEquals($stickBefore, $state.Model['Repair']['Stick'])) { Update-ToolboxView -Window $window }
       }
       'Wheel' {
         $wheel = [System.Windows.Input.MouseWheelEventArgs]$EventArgs
@@ -867,8 +953,11 @@ function Show-ToolboxWindow {
       -AdminProtection  'On', 'Off' or 'Unknown'
       -WorkArea         the screen's work area, in device-independent pixels
       -Launcher         Get-LauncherInfo of the launcher ($env:BT_SELF), kept in Tag.Launcher
-      -FindStick        Find-SetupStick, the full stick search (repair Task 5 calls it)
-      -StartChild       starts an action's child without waiting: Start-BackgroundExternal
+      -FindStick        Find-SetupStick, the full stick search (when the repair page opens, and when the presence
+                        check's answer changes: ruling RD-R3)
+      -StartChild       starts an action's child without waiting: Start-BackgroundExternal (also Open folder's
+                        explorer.exe, which is never tracked)
+      -StickPresent     Get-ToolboxStickPresence, the cheap stick presence check of the 5-second tick (no CIM, RD-R3)
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -886,7 +975,8 @@ function Show-ToolboxWindow {
     [AllowEmptyString()][string]$ScriptPath = '',
     [scriptblock]$Launcher = { Get-LauncherInfo -Path $env:BT_SELF },
     [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
-    [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments }
+    [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
+    [scriptblock]$StickPresent = { param($l) Get-ToolboxStickPresence -Launcher $l }
   )
 
   try {
@@ -914,7 +1004,7 @@ function Show-ToolboxWindow {
     }
 
     $window = New-ToolboxWindow -Model $model -Machine $Machine -Config $Config -Version $Version -ReadOnAC $OnAC -Root $Root -ScriptPath $ScriptPath `
-      -Launcher $launcherInfo -StartChild $StartChild -FindStick $FindStick
+      -Launcher $launcherInfo -StartChild $StartChild -FindStick $FindStick -StickPresent $StickPresent
     $window.Tag.PowerWarned = $powerWarned
     $timer = $null
     $runTimer = $null

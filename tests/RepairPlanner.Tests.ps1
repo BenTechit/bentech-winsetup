@@ -211,3 +211,161 @@ Describe 'the run in the model (repair Task 4: New-RepairRunModel, Update-Repair
     @($res.Steps.Status | Select-Object -Unique) | Should -Be @('skipped'); $res.Findings[0].Text | Should -BeExactly 'The action could not start: no powershell ?'
     @($res.Findings[0].Args) | Should -Be @('no powershell ?') }
 }
+
+Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint; spec 4.2, 6.6, 6.7)' {
+  BeforeAll {
+    # The catalog rows Tasks 6 to 9 add (plan "Actions and steps"), so every tile has its confirmation kind here; this
+    # Describe's AfterAll removes them again.
+    $script:laterRows = [ordered]@{
+      standard    = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix') }
+      postClone   = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix') }
+      dismSource  = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('dismSource', 'sfc') }
+      wuReset     = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('wuServicesStop', 'wuRename', 'wuBits', 'wuServicesStart', 'wuScan') }
+      diskCheck   = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('diskCheckSchedule') }
+      netInfo     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true; Steps = [string[]]@('netInfo') }
+      netReset    = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('netBackup', 'winsockReset', 'ipReset', 'ipv6Reset', 'dnsFlush') }
+      netRestore  = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('netRestore') }
+      ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true; Steps = [string[]]@('ghostList') }
+      ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('ghostCsv', 'ghostRemove') }
+      quickReport = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('reportWrite') }
+      fullReport  = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('reportWrite') }
+      compare     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('compare') }
+    }
+    foreach ($k in $script:laterRows.Keys) { $script:ToolActionCatalog[$k] = $script:laterRows[$k] }
+    # ghostList's Data.Ghosts (plan Task 7): an old network adapter, a Bluetooth headset (left out) and an old USB stick.
+    $script:threeGhosts = @(
+      @{ InstanceId = 'PCI\VEN_8086&DEV_15BC\3&11583659&0&FE'; Class = 'Net'; Name = 'Intel(R) Ethernet Connection'; Excluded = '' }
+      @{ InstanceId = 'BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002\7&1'; Class = 'Bluetooth'; Name = 'אוזניות של דנה'; Excluded = 'bluetooth' }
+      @{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'SanDisk Cruzer'; Excluded = '' }
+    )
+    function Set-NoStick($mo) { $mo.Repair.Stick = @{ Root = $null; Drive = $null }; $mo }
+    # A saved backup found on the stick (plan Task 7, Find-ToolNetBackup): one static adapter and one on DHCP.
+    function Set-NetBackup($mo) {
+      $mo.Repair.NetBackup = @{ Path = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json'; Sha256 = ('AB' * 32)
+        CreatedAt = '2026-10-20T09:05:00'
+        Adapters = @(@{ Alias = 'Ethernet'; Guid = '{4D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-56'; Ipv4Dhcp = $false; Ipv6Dhcp = $true
+                        Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8', '8.8.4.4') }
+                     @{ Alias = 'Wi-Fi'; Guid = '{5D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-57'; Ipv4Dhcp = $true; Ipv6Dhcp = $true
+                        Addresses = @(); Gateways = @(); Dns = @() }) }
+      $mo
+    }
+    function Get-LineKeys($n) { @($n.Repair.Confirm.Lines | ForEach-Object { [string]$_.Key }) }
+    function Get-LineText($n) { (@($n.Repair.Confirm.Lines | ForEach-Object { '{0} {1}' -f $_.Key, (@($_.Args) -join ' ') }) -join "`n") }
+  }
+  AfterAll { foreach ($k in $script:laterRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  BeforeEach { $script:mo = New-TestModel @{} }
+
+  It 'a read-only tile with a stick starts at once; without a stick it asks first' {
+    $s = Update-RepairModel -Model $mo -Action Tile -Value health; $s.Repair.Pending | Should -Be 'health'; $s.Repair.Confirm | Should -BeNullOrEmpty
+    $s.Repair.Selected | Should -Be 'health'
+    $n = Update-RepairModel -Model (Set-NoStick $mo) -Action Tile -Value health; $n.Repair.Pending | Should -BeNullOrEmpty
+    Get-LineKeys $n | Should -Contain 'confirm.noStickLog'; $n.Repair.Confirm.Kind | Should -Be 'confirm'; $n.Repair.Confirm.Loading | Should -BeFalse
+    (Update-RepairModel -Model $n -Action Confirm).Repair.Pending | Should -Be 'health'
+    $n.Repair.Pending | Should -BeNullOrEmpty; $s.Repair.Confirm | Should -BeNullOrEmpty }   # pure: each call returns a copy
+  It 'a destructive tile needs YES, and a raised Confirm without it starts nothing' {
+    $n = Update-RepairModel -Model $mo -Action Tile -Value wuReset; $n.Repair.Confirm.Kind | Should -Be 'yes'; Get-LineKeys $n | Should -Be @('tile.wuReset.changes')
+    (Update-RepairModel -Model $n -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    $y = Update-RepairModel -Model $n -Action YesText -Value 'yes'; $y.Repair.Confirm.Typed | Should -BeExactly 'yes'; (Update-RepairModel -Model $y -Action Confirm).Repair.Pending | Should -Be 'wuReset'
+    $h = Update-RepairModel -Model $n -Action YesText -Value ([string][char]0x05D8 + [char]0x05E7 + [char]0x05D3)   # the same keys on a Hebrew layout
+    (Update-RepairModel -Model $h -Action Confirm).Repair.Pending | Should -Be 'wuReset'
+    (Update-RepairModel -Model (Update-RepairModel -Model $n -Action YesText -Value 'YE') -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    $n.Repair.Confirm.Typed | Should -BeExactly '' }   # the input is not changed
+  It 'a pending start is one-shot: the next change clears it' {
+    $s = Update-RepairModel -Model $mo -Action Tile -Value health; (Update-RepairModel -Model $s -Action Hover -Value 'standard').Repair.Pending | Should -BeNullOrEmpty }
+  It 'Network reset always demands the at-PC tick, with or without RDP (RD-R2)' {
+    $o = Update-RepairModel -Model $mo -Action Tile -Value netReset; $o.Repair.Confirm.Loading | Should -BeTrue; $o.Repair.Pending | Should -BeNullOrEmpty
+    (Update-RepairModel -Model (Update-RepairModel -Model $o -Action YesText -Value 'YES') -Action Confirm).Repair.Pending | Should -BeNullOrEmpty   # still loading
+    $n = Update-RepairModel -Model $o -Action NetInfo -Value @{ Adapters = @(); Remote = @{ Rdp = $false } }
+    $n.Repair.Confirm.Loading | Should -BeFalse; $n.Repair.Confirm.Remote.Rdp | Should -BeFalse; Get-LineKeys $n | Should -Contain 'confirm.noStatic'
+    $n = Update-RepairModel -Model $n -Action YesText -Value 'YES'; (Update-RepairModel -Model $n -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    (Update-RepairModel -Model (Update-RepairModel -Model $n -Action AtPc) -Action Confirm).Repair.Pending | Should -Be 'netReset'
+    $r = Update-RepairModel -Model $o -Action NetInfo -Value @{ Adapters = @(); Remote = @{ Rdp = $true } }; $r.Repair.Confirm.Remote.Rdp | Should -BeTrue
+    $r = Update-RepairModel -Model (Update-RepairModel -Model $r -Action YesText -Value 'YES') -Action AtPc; (Update-RepairModel -Model $r -Action Confirm).Repair.Pending | Should -Be 'netReset'
+    (Update-RepairModel -Model (Update-RepairModel -Model $r -Action AtPc) -Action Confirm).Repair.Pending | Should -BeNullOrEmpty }   # untick: refused again
+  It 'Network reset shows each static adapter''s values as one line, alias first' {
+    $info = @{ Remote = @{ Rdp = $false }; Adapters = @(@{ Alias = 'Ethernet'; Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }, @{ Ip = 'fd00::10'; Prefix = 64 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8', '8.8.4.4') }
+                                                   @{ Alias = 'Wi-Fi'; Addresses = @(); Gateways = @(); Dns = @('1.1.1.1') }
+                                                   @{ Alias = 'Bluetooth'; Addresses = @(); Gateways = @(); Dns = @() }, 'junk') }
+    $n = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value netReset) -Action NetInfo -Value $info
+    $static = @($n.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.static' }); $static.Count | Should -Be 2
+    @($static[0].Args) | Should -Be @('Ethernet', '192.168.1.10/24, fd00::10/64, gateway 192.168.1.1, DNS 8.8.8.8, 8.8.4.4')
+    @($static[1].Args) | Should -Be @('Wi-Fi', 'DNS 1.1.1.1'); Get-LineKeys $n | Should -Not -Contain 'confirm.noStatic'
+    # Read from JSON as objects, it is the same; an answer for no open Network reset confirmation, or a second one, is dropped.
+    $j = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value netReset) -Action NetInfo -Value ($info | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+    @(@($j.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.static' })[0].Args) | Should -Be @($static[0].Args)
+    (Update-RepairModel -Model $mo -Action NetInfo -Value $info).Repair.Confirm | Should -BeNullOrEmpty
+    @((Update-RepairModel -Model $n -Action NetInfo -Value $info).Repair.Confirm.Lines).Count | Should -Be @($n.Repair.Confirm.Lines).Count
+    (Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value netReset) -Action NetInfo -Value 'not an object').Repair.Confirm.Loading | Should -BeTrue }
+  It 'ghosts: every item ticked, untick one, the options carry the ticked ids only; none ticked cannot confirm' {
+    $o = Update-RepairModel -Model $mo -Action Tile -Value ghosts; $o.Repair.Confirm.Loading | Should -BeTrue
+    $n = Update-RepairModel -Model $o -Action GhostItems -Value $threeGhosts   # 3 devices, one excluded (BTHENUM)
+    @($n.Repair.Confirm.Items).Count | Should -Be 2; @($n.Repair.Confirm.Items.Ticked) | Should -Be @($true, $true); $n.Repair.Confirm.Loading | Should -BeFalse
+    @($n.Repair.Confirm.Items.InstanceId) | Should -Not -Contain $threeGhosts[1].InstanceId
+    @(@($n.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.ghostCount' })[0].Args) | Should -Be @(2, 3, 1)
+    $n = Update-RepairModel -Model (Update-RepairModel -Model $n -Action GhostTick -Value 0) -Action YesText -Value 'yes'
+    @(@($n.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.ghostCount' })[0].Args) | Should -Be @(1, 3, 1)
+    $c = Update-RepairModel -Model $n -Action Confirm; $c.Repair.Pending | Should -Be 'ghostRemove'
+    $c.Repair.Confirm.Options.Ids | Should -Be @('USB\VID_0781&PID_5567\4C53')
+    (Update-RepairModel -Model (Update-RepairModel -Model $n -Action GhostTick -Value 1) -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    @((Update-RepairModel -Model $n -Action GhostTick -Value 7).Repair.Confirm.Items.Ticked) | Should -Be @($false, $true)   # no such item: nothing changes
+    @($o.Repair.Confirm.Items).Count | Should -Be 0 }   # the input is not changed
+  It 'ghosts: a list with nothing to remove cannot confirm; a device flagged excluded in any way is never an item' {
+    $n = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value ghosts) -Action GhostItems -Value @($threeGhosts[1], @{ InstanceId = 'SWD\MMDEVAPI\{0.0.1.00000000}'; Class = 'AudioEndpoint'; Name = 'Speakers'; Excluded = $true }, @{ Name = 'no id' })
+    @($n.Repair.Confirm.Items).Count | Should -Be 0; @(@($n.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.ghostCount' })[0].Args) | Should -Be @(0, 2, 2)
+    (Update-RepairModel -Model (Update-RepairModel -Model $n -Action YesText -Value 'YES') -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    $e = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value ghosts) -Action GhostItems -Value @()
+    $e.Repair.Confirm.Loading | Should -BeFalse; @($e.Repair.Confirm.Items).Count | Should -Be 0 }
+  It 'Restore network settings lists every value it will apply and needs YES' {
+    $n = Update-RepairModel -Model (Set-NetBackup $mo) -Action Tile -Value netRestore
+    (Get-LineText $n) | Should -Match '192\.168\.1\.10/24.*192\.168\.1\.1.*8\.8\.8\.8'; $n.Repair.Confirm.Kind | Should -Be 'yes'; $n.Repair.Confirm.Loading | Should -BeFalse
+    @($n.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.static' }).Count | Should -Be 1   # the DHCP adapter has nothing to put back
+    $n.Repair.Confirm.Options.File | Should -BeExactly $mo.Repair.NetBackup.Path; $n.Repair.Confirm.Options.Sha256 | Should -BeExactly ('AB' * 32)
+    (Update-RepairModel -Model $n -Action Confirm).Repair.Pending | Should -BeNullOrEmpty
+    (Update-RepairModel -Model (Update-RepairModel -Model $n -Action YesText -Value 'YES') -Action Confirm).Repair.Pending | Should -Be 'netRestore'
+    (Update-RepairModel -Model (New-TestModel @{}) -Action Tile -Value netRestore).Repair.Confirm | Should -BeNullOrEmpty }   # hidden without a backup: nothing opens
+  It 'a gate that closed after the panel opened refuses the Confirm' {
+    $n = Update-RepairModel -Model $mo -Action Tile -Value standard; $n.Repair.Confirm.Kind | Should -Be 'confirm'; $n.Repair.Strip.Restart = @{ Level = 'crit' }
+    (Update-RepairModel -Model $n -Action Confirm).Repair.Pending | Should -BeNullOrEmpty }
+  It 'a disabled tile changes nothing; the same tile again keeps its confirmation and what was typed' {
+    $x = Update-RepairModel -Model (New-TestModel @{ Restart = 'crit' }) -Action Tile -Value standard; $x.Repair.Confirm | Should -BeNullOrEmpty; $x.Repair.Pending | Should -BeNullOrEmpty
+    (Update-RepairModel -Model (New-TestModel @{ Running = $true }) -Action Tile -Value health).Repair.Pending | Should -BeNullOrEmpty
+    $n = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value wuReset) -Action YesText -Value 'YES'
+    (Update-RepairModel -Model $n -Action Tile -Value wuReset).Repair.Confirm.Typed | Should -BeExactly 'YES'
+    $d = Update-RepairModel -Model $n -Action Tile -Value diskCheck; $d.Repair.Confirm.Action | Should -Be 'diskCheck'; $d.Repair.Confirm.Typed | Should -BeExactly '' }
+  It 'the confirmation carries the gate''s warnings after the change list' {
+    $n = Update-RepairModel -Model (Set-NoStick (New-TestModel @{ Free = 'crit' })) -Action Tile -Value standard
+    Get-LineKeys $n | Should -Be @('tile.standard.changes', 'warn.lowSpace', 'confirm.noStickLog') }
+  It 'the DISM offer opens a confirmation with the file''s details, the build and language warnings, and its options' {
+    $offer = @{ Path = 'E:\sources\install.wim'; Type = 'wim'; Index = 6; Edition = 'Professional'; Arch = 'x64'; Languages = @('he-IL', 'en-US'); Build = '26100'
+                BuildDiffers = $true; LanguageDiffers = $true; PcLanguage = 'ru-RU' }
+    $withOffer = New-TestModel @{ Result = @{ Action = 'standard'; Outcome = 'Done'; Color = 'RED'; Offers = @{ DiskCheck = $false; DismSource = $offer } } }
+    $n = Update-RepairModel -Model $withOffer -Action Offer -Value dismSource
+    $n.Repair.Confirm.Action | Should -Be 'dismSource'; $n.Repair.Confirm.Kind | Should -Be 'confirm'
+    Get-LineKeys $n | Should -Be @('tile.dismSource.changes', 'result.offerDism', 'result.buildDiffers', 'result.languageDiffers')
+    @($n.Repair.Confirm.Lines[1].Args) | Should -Be @('E:\sources\install.wim', 'Professional', 'x64', 'he-IL, en-US', '26100')
+    @($n.Repair.Confirm.Lines[2].Args) | Should -Be @('26200'); @($n.Repair.Confirm.Lines[3].Args) | Should -Be @('he-IL, en-US', 'ru-RU')
+    $c = Update-RepairModel -Model $n -Action Confirm; $c.Repair.Pending | Should -Be 'dismSource'
+    $c.Repair.Confirm.Options.Path | Should -BeExactly 'E:\sources\install.wim'; $c.Repair.Confirm.Options.Type | Should -Be 'wim'; $c.Repair.Confirm.Options.Index | Should -Be 6
+    (Update-RepairModel -Model $mo -Action Offer -Value dismSource).Repair.Confirm | Should -BeNullOrEmpty }   # no offer, no confirmation
+  It 'hover selects a tile; AtPc and BackedUp toggle; ConfirmCancel closes; YES keeps its 8 characters' {
+    (Update-RepairModel -Model $mo -Action Hover -Value 'wuReset').Repair.Selected | Should -Be 'wuReset'
+    (Update-RepairModel -Model $mo -Action Hover -Value 'noSuchTile').Repair.Selected | Should -BeExactly ''
+    $b = Update-RepairModel -Model $mo -Action BackedUp; $b.Repair.BackedUp | Should -BeTrue; (Update-RepairModel -Model $b -Action BackedUp).Repair.BackedUp | Should -BeFalse
+    $n = Update-RepairModel -Model $mo -Action Tile -Value wuReset
+    (Update-RepairModel -Model $n -Action AtPc).Repair.Confirm.AtPc | Should -BeTrue; (Update-RepairModel -Model $mo -Action AtPc).Repair.Confirm | Should -BeNullOrEmpty
+    (Update-RepairModel -Model $n -Action YesText -Value 'YES YES YES').Repair.Confirm.Typed | Should -BeExactly 'YES YES '
+    (Update-RepairModel -Model $n -Action ConfirmCancel).Repair.Confirm | Should -BeNullOrEmpty; $n.Repair.Confirm | Should -Not -BeNullOrEmpty
+    (Update-RepairModel -Model $mo -Action YesText -Value 'YES').Repair.Confirm | Should -BeNullOrEmpty }   # no confirmation: nothing to type into
+  It 'the complaint is kept to 2000 characters, Hebrew and all' {
+    $t = ('ק' * 2100); $c = (Update-RepairModel -Model $mo -Action Complaint -Value $t).Repair.Complaint
+    $c.Length | Should -Be 2000; $c[0] | Should -Be 'ק'
+    $pair = ('a' * 1999) + [char]::ConvertFromUtf32(0x1F600) + 'b'   # never half a surrogate pair at the cut
+    (Update-RepairModel -Model $mo -Action Complaint -Value $pair).Repair.Complaint | Should -BeExactly ('a' * 1999) }
+  It 'Test-RepairConfirmReady: a remote session reported needs the at-PC tick for any confirmation; Ghost devices need a ticked device' {
+    $c = @{ Action = 'wuReset'; Kind = 'yes'; Typed = 'YES'; AtPc = $false; Loading = $false; Lines = @(); Remote = @{ Rdp = $true }; Items = @(); Options = @{} }
+    Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $c }) | Should -BeFalse
+    $c.AtPc = $true; Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $c }) | Should -BeTrue
+    $c.AtPc = $false; $c.Remote = @{ Rdp = $false }; Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $c }) | Should -BeTrue
+    $g = @{ Action = 'ghosts'; Kind = 'yes'; Typed = 'YES'; AtPc = $false; Loading = $false; Lines = @(); Remote = $null; Items = @(); Options = @{} }
+    Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $g }) | Should -BeFalse }
+}

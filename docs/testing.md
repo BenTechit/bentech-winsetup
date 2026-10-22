@@ -365,6 +365,16 @@ The window's runs (repair Task 4) are tested with a fake child process (`tests\R
 - [ ] **The deadline kill (RD-R8, RD-R9).** With a release whose `timeoutsMinutes.tool.health` is 1: the window kills the child at about 4 minutes on its own clock, the result is Timed out (red), and Task Manager shows no `powershell.exe` child or grandchild (DISM, a grandchild PowerShell) left. Change the clock by an hour during a run: nothing is killed early. Record how long the window freezes while `Stop-ProcessTree` walks the tree (a CIM query per process).
 - [ ] **Restart PC (spec 6.9).** On a fresh run: Restart PC, then Restart in the question: the transcript closes, `C:\BenTech` is gone (no earlier run) and the PC restarts within a few seconds with no countdown. After an unfinished earlier run: the folder stays and the PC still restarts. Record whether `Restart-Computer -Force` or the `shutdown.exe` fallback did it.
 
+The page at work (repair Task 5) is tested with fake children, a fake stick and events raised in code (`tests\RepairPage.Tests.ps1`); on the VM, with the mouse and the keyboard:
+
+- [ ] **The first visit.** Click Repair & diagnostics: the chips fill in one by one ("Checking..." first), the stick chip names the stick at once. Back to New PC setup and here again: the strip is not read again.
+- [ ] **The stick on the page (RD-R3).** With the page open and nothing running: pull the stick, then plug it in again, then plug it in under another letter: each time the chip follows within about 5 seconds, and `setup.log` has one `Toolbox stick changed` line per change. Record how long the window stalls when the full search (`Find-SetupStick`, one CIM query) runs. With a stick whose launcher has another file name (`BenTechSetup (2).cmd`), the launcher's own drive still counts.
+- [ ] **YES on the Hebrew layout (spec 4.2).** In Windows Update reset's confirmation, switch the keyboard to Hebrew and type the keys Y, E, S: the box shows the three Hebrew letters and Confirm turns on. Backspace one letter: it turns off.
+- [ ] **Hover.** Moving the mouse over the tiles changes "What it does" and outlines the tile; a disabled tile shows its reason as a tooltip.
+- [ ] **Open folder.** After a Health check, Open folder opens the visit's folder in front of the toolbox. `Start-BackgroundExternal` starts `explorer.exe` with a hidden window style: record whether the folder window shows (if not, Open folder needs a normal window style). With the stick pulled: nothing opens and `setup.log` has `Could not open the folder`.
+- [ ] **Network reset's confirmation.** On a VM with a static IP: the confirmation says "Checking..." while `netInfo` reads the settings, then shows the adapter's IP/prefix, gateway and DNS left-to-right (also in Hebrew), with the at-PC tick. Known gap: pressing X while it says "Checking..." is refused without a visible message (the message lives in the run panel); record how long the check takes.
+- [ ] **Ghost devices with a long list.** On a PC with 150 or more ghost devices: the switches tick and untick at once, the list keeps its scroll position while the strip reloads after an action, and the count line follows the ticks. A paired Bluetooth headset that is off is not in the list.
+
 ---
 
 ## 2. Per VM type

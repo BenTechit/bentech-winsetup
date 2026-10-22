@@ -5,6 +5,11 @@
 # Repair Task 4: the window runs actions (repair spec 4.3, 4.4, 6.9, 7): the background child, the 500 ms run timer,
 # the deadline kill on the run's own Stopwatch (RD-R8, RD-R9), Stop, the close guard and Restart PC.
 #
+# Repair Task 5: the page at work: the safety strip on the first visit, the stick re-checked (RD-R3: a presence seam,
+# the full search only on a change), the tiles and their confirmations (YES, the at-PC tick, the ghost ticks), the
+# info children (netInfo, ghostList) feeding the open confirmation, the complaint, the hover text, Open folder and the
+# Health check end to end. The actions Tasks 6 and 7 add get temporary catalog rows; nothing runs (the fake child).
+#
 # SAFETY: as Toolbox.Tests, the window is only parsed, never shown. No ShowDialog, no Dispatcher.InvokeShutdown, no
 # registry, no CIM, no child process: the model is built from plain sample values (tests\fixtures\RepairSamples.ps1),
 # setup.log goes to $script:logs and the power state is never read for real. Clicks are raised in code (RaiseEvent).
@@ -73,6 +78,11 @@ BeforeAll {
     Mock Invoke-External { throw 'blocked by the test: Invoke-External' }
     Mock Start-Process { throw 'blocked by the test: Start-Process' }
     Mock Restart-Computer { throw 'blocked by the test: Restart-Computer' }
+    # Task 5: a window made with the default stick seams never reads this PC's drives (CIM or DriveInfo); the answer
+    # is the sample's stick, so nothing changes.
+    $script:realStickReads = 0
+    Mock Find-SetupStick { $script:realStickReads++; @{ Root = 'E:\'; Drive = 'E:' } }
+    Mock Get-ToolboxStickPresence { $script:realStickReads++; 'E:\|BENTECH|32010928128' }
     $script:w = New-RepairWindow @{}
   }
 
@@ -125,11 +135,12 @@ BeforeAll {
     $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; State = 'running'; Current = 1; Steps = $steps
       Log = @('Disk state: started', 'Disk state: done', 'Windows image check: started'); Partial = @{}; UpdatedAt = '2026-10-22T10:16:00' }
   }
-  function Write-TestResult($w, [string]$Outcome = 'Done', [string]$Color = 'GREEN', [string]$Slot = 'Action', [hashtable]$Data = @{}) {
+  function Write-TestResult($w, [string]$Outcome = 'Done', [string]$Color = 'GREEN', [string]$Slot = 'Action', [hashtable]$Data = @{},
+                            [string]$Folder = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015') {
     $run = $w.Tag.Runs[$Slot]
     $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'result.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; Outcome = $Outcome; Color = $Color
       Steps = @(@{ Id = 'volumeState'; Status = 'done'; Percent = $null }); Findings = @(@{ Level = 'WARN'; Code = 'sfcCorrupt'; Text = 'System files: 3 integrity problems found (nothing repaired yet)'; Args = @('3') })
-      RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }; Files = @{ Folder = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015' }
+      RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }; Files = @{ Folder = $Folder }
       Data = $Data; StartedAt = '2026-10-22T10:15:00'; EndedAt = '2026-10-22T10:20:00' }
   }
 }
@@ -194,7 +205,11 @@ Describe 'the repair page view (Update-RepairView)' {
     $s.Tag.Model.Page | Should -Be 'repair'; $s.FindName('NavRepair').IsChecked | Should -BeTrue; $s.FindName('NavSetup').IsChecked | Should -BeFalse
     $s.FindName('NavRepairGlyph').Foreground | Should -Be $s.FindResource('AccentBrush'); $s.FindName('NavSetupGlyph').Foreground | Should -Be $s.FindResource('SubtleTextBrush')
     foreach ($n in 'SetupOptions', 'SetupRight', 'WarnPanel', 'AdminBanner') { $s.FindName($n).Visibility | Should -Be 'Collapsed' -Because $n }
-    $s.FindName('RepairRight').Visibility | Should -Be 'Visible'; $s.Tag.Outcome | Should -BeNullOrEmpty }
+    $s.FindName('RepairRight').Visibility | Should -Be 'Visible'; $s.Tag.Outcome | Should -BeNullOrEmpty
+    # Task 5: the first visit reached the default stick seams (mocked here: the presence check and one full search);
+    # without setup files the strip's child cannot start, so the strip is ready with every chip unknown.
+    $script:realStickReads | Should -Be 2; $s.FindName('ChipStickText').Text | Should -Be 'Stick E:'
+    $s.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $s.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'unknown' }
   It 'the machine card names the PC as it is on the repair page, its new name on the setup page; the strip has the power chip' {
     $w.FindName('MachinePcName').Text | Should -BeExactly 'DESKTOP-4F7K2LQ'; $w.FindName('MachinePcName').FlowDirection | Should -Be 'LeftToRight'
     $w.FindName('MachinePcNamePart').Visibility | Should -Be 'Visible'; $w.FindName('MachineNewNamePart').Visibility | Should -Be 'Collapsed'
@@ -695,4 +710,195 @@ Describe 'run hardening (Task 4 review, ruling RD-R16)' {
     $ok = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
     Write-TestResult $w -Slot Safety -Data @{ Chips = $ok }; $script:fake.HasExited = $true; Send-RunTick $w
     $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $w.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'ok'; $w.Tag.Runs.Safety | Should -BeNullOrEmpty }
+}
+
+Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, complaint, Health check end to end)' {
+  BeforeAll {
+    # The catalog rows of the actions Tasks 6 and 7 add (plan "Actions and steps"), so their tiles can start here; this
+    # Describe's AfterAll removes them again. The fake StartChild never runs anything.
+    $script:workRows = [ordered]@{
+      dismSource  = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('dismSource', 'sfc') }
+      diskCheck   = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('diskCheckSchedule') }
+      netInfo     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true; Steps = [string[]]@('netInfo') }
+      netReset    = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('netBackup', 'winsockReset', 'ipReset', 'ipv6Reset', 'dnsFlush') }
+      ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true; Steps = [string[]]@('ghostList') }
+      ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('ghostCsv', 'ghostRemove') }
+    }
+    foreach ($k in $script:workRows.Keys) { $script:ToolActionCatalog[$k] = $script:workRows[$k] }
+    # A run window whose 5-second stick presence check answers $script:presence (ruling RD-R3: never this PC's drives).
+    function New-WorkWindow([string]$Page = 'repair', [hashtable]$Set = @{}) { $w = New-RunWindow -Page $Page -Set $Set; $w.Tag.StickPresent = { param($l) $script:presence }; $w }
+    # An info child's result.json (netInfo, ghostList): its Data is what the open confirmation waits for.
+    function Write-InfoResult($w, [hashtable]$Data, [string]$Outcome = 'Done', [string]$Color = 'GREEN') {
+      $run = $w.Tag.Runs.Action
+      $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'result.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; Outcome = $Outcome; Color = $Color
+        Steps = @(@{ Id = $run.ActionId; Status = 'done'; Percent = $null }); Findings = @(); RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }
+        Files = @{}; Data = $Data; StartedAt = '2026-10-22T10:15:00'; EndedAt = '2026-10-22T10:15:20' }
+    }
+    $script:pageGhosts = @(
+      @{ InstanceId = 'PCI\VEN_8086&DEV_15BC\3&11583659&0&FE'; Class = 'Net'; Name = 'Intel(R) Ethernet Connection'; Excluded = '' }
+      @{ InstanceId = 'BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002\7&1'; Class = 'Bluetooth'; Name = 'אוזניות של דנה'; Excluded = 'bluetooth' }
+      @{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'SanDisk Cruzer'; Excluded = '' }
+    )
+    $script:loadingStrip = @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+    function Get-GhostSwitches($w) { @($w.FindName('ConfirmItems').Children | Where-Object { $_ -is [Windows.Controls.CheckBox] }) }
+    function Send-Click($element) { $element.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }
+    # A mouse click's own path (ToggleButton.OnClick): WPF flips IsChecked first, then raises Click.
+    function Send-RealClick($toggle) { $null = [Windows.Controls.Primitives.ToggleButton].GetMethod('OnClick', [Reflection.BindingFlags]'NonPublic, Instance').Invoke($toggle, @()) }
+  }
+  AfterAll { foreach ($k in $script:workRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  BeforeEach { Set-RunTestMocks; $script:presence = 'E:\|BENTECH|32010928128'; $script:sticks = 0 }
+
+  It 'the first visit to the page starts the safety child and finds the stick once; the strip loads chip by chip' {
+    $set = $script:loadingStrip.Clone(); $set.Stick = $null
+    $w = New-WorkWindow -Page 'setup' -Set $set; $w.Tag.FindStick = { param($l) $script:sticks++; @{ Root = 'E:\'; Drive = 'E:' } }
+    Click $w 'NavRepair'
+    @($script:started).Count | Should -Be 1; $script:started[0].Args | Should -Match '-ToolAction safety'; $w.Tag.Runs.Safety.ActionId | Should -Be 'safety'
+    $script:sticks | Should -Be 1; $w.FindName('ChipStickText').Text | Should -Be 'Stick E:'; $w.FindName('ChipDiskText').Text | Should -Be 'Checking...'
+    $run = $w.Tag.Runs.Safety
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $run.RunId; State = 'running'; Current = 1; Steps = @(); Log = @()
+      Partial = @{ Chips = @{ Restart = @{ Level = 'ok'; Args = @(); Detail = @{} } } } }
+    Send-RunTick $w; $w.FindName('ChipRestartText').Text | Should -Be 'No restart pending'; $w.FindName('ChipDiskText').Text | Should -Be 'Checking...'
+    # Back to New PC setup and here again: no second strip read and no second full stick search (the presence is the same).
+    Click $w 'NavSetup'; Click $w 'NavRepair'; @($script:started).Count | Should -Be 1; $script:sticks | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox stick changed' }).Count | Should -Be 1 }
+  It 'a safety child that never finishes is killed at its deadline; its missing chips are unknown and block nothing (Review Focus 1)' {
+    $w = New-WorkWindow -Page 'setup' -Set $script:loadingStrip; Click $w 'NavRepair'; $run = $w.Tag.Runs.Safety
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $run.RunId; State = 'running'; Current = 1; Steps = @(); Log = @()
+      Partial = @{ Chips = @{ Restart = @{ Level = 'ok'; Args = @(); Detail = @{} } } } }
+    Send-RunTick $w
+    Mock Get-ToolboxRunSeconds { 3 * 60 + 181 }   # the safety budget (3 min) + 3 min on the run's own Stopwatch (RD-R9)
+    Send-RunTick $w
+    $script:killed | Should -Be @(4242); $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $w.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'unknown'
+    $w.Tag.Model.Repair.Strip.Restart.Level | Should -Be 'ok'; $w.FindName('ChipDisk').Background | Should -Be $w.FindResource('WarnBackBrush')
+    $w.FindName('TileStandard').IsEnabled | Should -BeTrue; $w.Tag.Runs.Safety | Should -BeNullOrEmpty }
+  It 'Network reset and Ghost devices are disabled without a stick (Review Focus 3)' {
+    $w = New-WorkWindow; $w.Tag.FindStick = { param($l) $script:sticks++; @{ Root = $null; Drive = $null } }
+    Invoke-ToolboxAction -Sender (New-ToolboxPowerTimer -Window $w) -Action 'Power'
+    $script:sticks | Should -Be 1; $w.FindName('ChipStickText').Text | Should -Be 'No stick'
+    $w.FindName('TileNetReset').IsEnabled | Should -BeFalse; $w.FindName('TileGhosts').IsEnabled | Should -BeFalse; $w.FindName('TileHealth').IsEnabled | Should -BeTrue
+    $before = @($script:started).Count; ClickTag $w 'a:Tile:netReset'; ClickTag $w 'a:Tile:ghosts'
+    @($script:started).Count | Should -Be $before; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty }   # nothing starts, not even netInfo
+  It 'the stick is re-checked every 5 s on the page: the full search only when the presence answer changes, never during an action (RD-R3)' {
+    $w = New-WorkWindow; $w.Tag.FindStick = { param($l) $script:sticks++; @{ Root = 'F:\'; Drive = 'F:' } }; $tick = New-ToolboxPowerTimer -Window $w
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 1; $w.FindName('ChipStickText').Text | Should -Be 'Stick F:'
+    foreach ($i in 1..3) { Invoke-ToolboxAction -Sender $tick -Action 'Power' }; $script:sticks | Should -Be 1   # the same presence: no full search
+    $script:presence = 'F:\|BENTECH|32010928128'; Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 2
+    $null = Start-ToolboxRun -Window $w -ActionId 'health'; $script:presence = ''
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 2   # not while an action runs
+    $s = New-WorkWindow -Page 'setup'; $s.Tag.FindStick = { param($l) $script:sticks++; @{ Root = 'F:\'; Drive = 'F:' } }
+    Invoke-ToolboxAction -Sender (New-ToolboxPowerTimer -Window $s) -Action 'Power'; $script:sticks | Should -Be 2   # nor on New PC setup
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox stick changed' }).Count | Should -Be 1   # E: to F:, logged once
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox stick changed' })[0].Data.drive | Should -Be 'F:'
+    # A presence check that throws changes nothing and is logged once.
+    $x = New-WorkWindow; $x.Tag.StickPresent = { param($l) throw ('drive gone ' + [char]0x05D0) }; $x.Tag.FindStick = { param($l) $script:sticks++; @{ Root = $null; Drive = $null } }
+    foreach ($i in 1..2) { Invoke-ToolboxAction -Sender (New-ToolboxPowerTimer -Window $x) -Action 'Power' }
+    $script:sticks | Should -Be 2; $x.Tag.Outcome | Should -BeNullOrEmpty; $x.FindName('ChipStickText').Text | Should -Be 'Stick E:'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not check for the stick' }).Count | Should -Be 1
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'typing YES (or the Hebrew-layout YES) enables Confirm; Confirm starts the action' {
+    $w = New-WorkWindow; ClickTag $w 'a:Tile:diskCheck'
+    $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'; $w.FindName('YesPanel').Visibility | Should -Be 'Visible'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse
+    $w.FindName('YesBox').Text = 'yes'; $w.Tag.Model.Repair.Confirm.Typed | Should -BeExactly 'yes'; $w.FindName('ConfirmButton').IsEnabled | Should -BeTrue
+    $w.FindName('YesBox').Text = 'ye'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse
+    $w.FindName('YesBox').Text = ([string][char]0x05D8 + [char]0x05E7 + [char]0x05D3); $w.FindName('ConfirmButton').IsEnabled | Should -BeTrue
+    @($script:started).Count | Should -Be 0
+    Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction diskCheck'
+    $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Pending | Should -BeNullOrEmpty; $w.FindName('RunPanel').Visibility | Should -Be 'Visible' }
+  It 'a Confirm raised in code while the gate is closed starts nothing (a disabled button still runs its Click)' {
+    $w = New-WorkWindow; ClickTag $w 'a:Tile:diskCheck'; $w.FindName('YesBox').Text = 'YES'
+    $w.Tag.Model.Repair.Strip.Restart = @{ Level = 'crit'; Args = @(); Detail = @{} }
+    Click $w 'ConfirmButton'; @($script:started).Count | Should -Be 0; $w.Tag.Model.Repair.Confirm.Action | Should -Be 'diskCheck' }
+  It 'Health check end to end: tile, live steps, findings in colour, files, Open folder, Restart PC' {
+    $folder = Join-Path $TestDrive 'Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015'; $null = New-Item -ItemType Directory -Path $folder -Force
+    $w = New-WorkWindow; ClickTag $w 'a:Tile:health'
+    $script:started[-1].Args | Should -Match '-ToolAction health'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; $proc = $script:fake
+    $run = $w.Tag.Runs.Action
+    $steps = @(foreach ($id in $script:ToolActionCatalog['health'].Steps) { @{ Id = $id; Status = $(if ($id -eq 'volumeState') { 'done' } elseif ($id -eq 'imageCheck') { 'running' } else { 'pending' }); Percent = $null } })
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'health'; RunId = $run.RunId; State = 'running'; Current = 1; Steps = $steps; Log = @('Disk state: done'); Partial = @{} }
+    Send-RunTick $w; $w.FindName('RunSteps').Children.Count | Should -Be 7
+    Write-TestResult $w -Color 'YELLOW' -Folder $folder; $proc.HasExited = $true; Send-RunTick $w
+    $w.FindName('ResultPanel').Visibility | Should -Be 'Visible'; $w.FindName('ResultFindings').Children[0].Foreground | Should -Be $w.FindResource('WarnBrush')
+    $w.FindName('ResultFiles').Text | Should -BeExactly $folder
+    Click $w 'OpenFolderButton'
+    $script:started[-1].File | Should -BeLike '*\explorer.exe'; $script:started[-1].File | Should -BeExactly "$env:windir\explorer.exe"
+    $script:started[-1].Args | Should -BeExactly ('"{0}"' -f $folder); $script:ToolboxChildren | Should -Not -Contain $script:started[-1].Process
+    Click $w 'RestartButton'; Click $w 'ConfirmButton'; $w.Tag.Outcome | Should -Be 'Restart' }
+  It 'Open folder: a folder that is not there, or a start that throws, is only a WARN; nothing is tracked' {
+    $w = New-WorkWindow -Set @{ Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = (Join-Path $TestDrive 'gone') } } }
+    Click $w 'OpenFolderButton'; @($script:started).Count | Should -Be 0
+    $dir = Join-Path $TestDrive 'there'; $null = New-Item -ItemType Directory -Path $dir -Force
+    $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = $dir } }
+    $w.Tag.StartChild = { param($file, $arguments) throw ('no explorer ' + [char]0x05D0) }
+    Click $w 'OpenFolderButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $script:ToolboxChildren.Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not open the folder' }).Count | Should -Be 2
+    @($script:logs | Where-Object { $_.Message -eq 'Could not open the folder' })[-1].Data.error | Should -BeExactly 'no explorer ?' }
+  It 'the complaint reaches the child''s args (UTF-8) and never setup.log' {
+    $w = New-WorkWindow; $w.FindName('ComplaintBox').Text = 'המחשב נכבה'; $w.Tag.Model.Repair.Complaint | Should -BeExactly 'המחשב נכבה'
+    ClickTag $w 'a:Tile:health'
+    $argsPath = ($script:started[-1].Args -replace '.*-ToolArgs "([^"]+)".*', '$1'); (Read-ToolJsonFile $argsPath).Complaint | Should -BeExactly 'המחשב נכבה'
+    [IO.File]::ReadAllText($argsPath, (New-Object Text.UTF8Encoding $false)) | Should -Match 'המחשב נכבה'
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'hovering a tile shows what it does (its MouseEnter is wired)' {
+    $w = New-WorkWindow; Invoke-ToolboxAction -Sender $w.FindName('TileWuReset') -Action 'Hover'
+    $w.FindName('WhatText').Text | Should -Match 'SoftwareDistribution'; $w.FindName('TileWuReset').BorderBrush | Should -Be $w.FindResource('AccentBrush')
+    $e = New-Object Windows.Input.MouseEventArgs([Windows.Input.Mouse]::PrimaryDevice, 0); $e.RoutedEvent = [Windows.Input.Mouse]::MouseEnterEvent
+    $w.FindName('TileHealth').RaiseEvent($e); $w.Tag.Model.Repair.Selected | Should -Be 'health' }
+  It 'the backed-up tick unlocks the repairs on a failing disk, and is logged' {
+    $w = New-WorkWindow -Set @{ Disk = 'crit' }; $w.FindName('TileStandard').IsEnabled | Should -BeFalse
+    Click $w 'BackedUpSwitch'; $w.Tag.Model.Repair.BackedUp | Should -BeTrue; $w.FindName('BackedUpSwitch').IsChecked | Should -BeTrue; $w.FindName('TileStandard').IsEnabled | Should -BeTrue
+    @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox backed-up tick changed' -and $_.Data.ticked -eq $true }).Count | Should -Be 1 }
+  It 'Network reset reads the settings first; the answer fills the open confirmation (no result, no finished line, no strip read); YES and the at-PC tick start the reset' {
+    $w = New-WorkWindow; ClickTag $w 'a:Tile:netReset'; $info = $script:fake
+    $script:started[-1].Args | Should -Match '-ToolAction netInfo'; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'; $w.Tag.Model.Repair.Confirm.Loading | Should -BeTrue
+    (Get-AllText $w.FindName('ConfirmLines')) | Should -Match 'Checking\.\.\.'
+    Write-InfoResult $w @{ NetInfo = @{ Remote = @{ Rdp = $false }; Adapters = @(@{ Alias = 'Ethernet'; Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8') }) } }
+    $info.HasExited = $true; Send-RunTick $w
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty
+    $w.Tag.Model.Repair.Confirm.Loading | Should -BeFalse; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'
+    (Get-AllText $w.FindName('ConfirmItems')) | Should -Match '192\.168\.1\.10/24, gateway 192\.168\.1\.1, DNS 8\.8\.8\.8'
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox action finished' }).Count | Should -Be 0; @($script:started).Count | Should -Be 1   # no strip read either
+    $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; @($w.Tag.Model.Repair.Done).Count | Should -Be 0; $script:ToolboxChildren.Count | Should -Be 0
+    $w.FindName('AtPcSwitch').Visibility | Should -Be 'Visible'
+    $w.FindName('YesBox').Text = 'YES'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse   # RD-R2: the tick, always
+    Click $w 'AtPcSwitch'; $w.Tag.Model.Repair.Confirm.AtPc | Should -BeTrue; $w.FindName('AtPcSwitch').IsChecked | Should -BeTrue; $w.FindName('ConfirmButton').IsEnabled | Should -BeTrue
+    Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction netReset'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty }
+  It 'Ghost devices: the list fills ticked switches; a click unticks one in place (no rebuild, also on a run tick); Confirm removes the ticked ids only' {
+    $w = New-WorkWindow; ClickTag $w 'a:Tile:ghosts'; $script:started[-1].Args | Should -Match '-ToolAction ghostList'
+    Write-InfoResult $w @{ Ghosts = $script:pageGhosts }; $script:fake.HasExited = $true; Send-RunTick $w
+    $boxes = Get-GhostSwitches $w; $boxes.Count | Should -Be 2; @($boxes | Where-Object { $_.IsChecked -ne $true }).Count | Should -Be 0
+    (Get-AllText $w.FindName('ConfirmItems')) | Should -Not -Match 'BTHENUM'
+    (Get-AllText $w.FindName('ConfirmLines')) | Should -Match '2 of 3 devices will be removed \(1 left out'
+    Send-RealClick $boxes[0]; $w.Tag.Model.Repair.Confirm.Items[0].Ticked | Should -BeFalse   # the box and the model agree
+    [object]::ReferenceEquals((Get-GhostSwitches $w)[0], $boxes[0]) | Should -BeTrue; $boxes[0].IsChecked | Should -BeFalse
+    Send-Click $boxes[0]; $w.Tag.Model.Repair.Confirm.Items[0].Ticked | Should -BeTrue; $boxes[0].IsChecked | Should -BeTrue   # a click raised in code
+    Send-RealClick $boxes[0]; $w.Tag.Model.Repair.Confirm.Items[0].Ticked | Should -BeFalse; $boxes[0].IsChecked | Should -BeFalse
+    (Get-AllText $w.FindName('ConfirmLines')) | Should -Match '1 of 3 devices will be removed'
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; Send-RunTick $w   # a strip read renders every 500 ms
+    [object]::ReferenceEquals((Get-GhostSwitches $w)[1], $boxes[1]) | Should -BeTrue
+    $w.FindName('YesBox').Text = 'YES'; Click $w 'ConfirmButton'
+    $script:started[-1].Args | Should -Match '-ToolAction ghostRemove'
+    $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json'); @($a.Options.Ids) | Should -Be @('USB\VID_0781&PID_5567\4C53') }
+  It 'an info child that fails, times out or answers without its data closes the confirmation and shows its result (red)' {
+    foreach ($case in 'failed', 'timeout', 'noData') {
+      $w = New-WorkWindow; ClickTag $w 'a:Tile:ghosts'; $p = $script:fake
+      switch ($case) {
+        'failed' { Write-InfoResult $w @{} -Outcome 'Failed' -Color 'RED'; $p.HasExited = $true }
+        'timeout' { Mock Get-ToolboxRunSeconds { 10 * 60 + 181 } }
+        'noData' { Write-InfoResult $w @{}; $p.HasExited = $true }
+      }
+      Send-RunTick $w; Mock Get-ToolboxRunSeconds { 0 }
+      $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty -Because $case; $w.Tag.Model.Repair.Result.Color | Should -Be 'RED' -Because $case
+      $w.FindName('ResultPanel').Visibility | Should -Be 'Visible' -Because $case; $w.Tag.Runs.Action | Should -BeNullOrEmpty -Because $case
+      $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty -Because $case; $w.Tag.Outcome | Should -BeNullOrEmpty -Because $case }
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox action finished' }).Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox info action failed' }).Count | Should -Be 3
+    @($script:started | Where-Object { $_.Args -match '-ToolAction safety' }).Count | Should -Be 0 }
+  It 'the DISM offer: the result''s button opens its confirmation, and Confirm starts it with the file''s path, type and index' {
+    $r = $resultSample.Clone(); $r.Offers = @{ DiskCheck = $false; DismSource = $dismOffer }
+    $w = New-WorkWindow -Set @{ Result = $r }; Click $w 'OfferDismButton'
+    $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'; $w.FindName('YesPanel').Visibility | Should -Be 'Collapsed'
+    (Get-AllText $w.FindName('ConfirmItems')) | Should -Match 'install\.wim \(Professional, x64, he-IL, build 26100\)'
+    (Get-AllText $w.FindName('ConfirmLines')) | Should -Match 'Its build differs from this PC \(build 26200\)'
+    Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction dismSource'
+    $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json'); $a.Options.Path | Should -BeExactly 'E:\sources\install.wim'; $a.Options.Type | Should -Be 'wim'; $a.Options.Index | Should -Be 6 }
 }
