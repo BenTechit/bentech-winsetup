@@ -12,8 +12,10 @@ BeforeAll {
   $script:srcRoot = (Resolve-Path "$PSScriptRoot\..\src").Path
   $script:repairFiles = @(Get-ChildItem -LiteralPath (Join-Path $script:srcRoot 'Repair') -Recurse -File -Filter *.ps1)
   # Task 2 adds the CBS.log reader (SFC's verdict, always English) and the ReAgent.xml reader (WinRE's supporting
-  # evidence, read by attribute); Task 8 adds Read-ToolLogErrors.
-  $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs', 'Read-ToolCbsLog', 'Get-ToolReAgentState')
+  # evidence, read by attribute); Task 7 the ghost CSV's own read-back (Invoke-ToolStepGhostCsv) and the network
+  # backup's reader, which hashes and parses the same bytes (Read-ToolNetBackupFile); Task 8 adds Read-ToolLogErrors.
+  $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs', 'Read-ToolCbsLog', 'Get-ToolReAgentState', 'Invoke-ToolStepGhostCsv',
+                           'Read-ToolNetBackupFile')
   # A key protector's password (review M3). No repair file names the WMI method that returns it, the BitLocker
   # module's cmdlet whose protector objects carry it, or manage-bde; and the word RecoveryPassword appears only as the
   # one string constant 'RecoveryPassword' inside $script:ToolKeyProtectorTypes (the protector TYPE's name, which the
@@ -145,6 +147,17 @@ $e = Invoke-CimMethod -InputObject $v -MethodName 'GetKeyProtectorNumericalPassw
     # The guard itself finds a banned call and a wait.
     $probe = [Management.Automation.Language.Parser]::ParseInput('function F { Get-PhysicalDisk; $p.WaitForExit() }', [ref]$null, [ref]$null)
     @($probe.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $banned -contains $_ }) | Should -Be @('Get-PhysicalDisk')
+  }
+  It 'the ghost exclusion lists hold every enumerator of spec 6.7 (repair Task 7)' {
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $script:srcRoot 'Repair\ToolAdvanced.ps1'), [ref]$null, [ref]$null)
+    $values = @{}
+    foreach ($name in '$script:GhostExcludedPrefixes', '$script:GhostExcludedClasses') {
+      $assignment = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $name }, $true)
+      $assignment | Should -Not -BeNullOrEmpty -Because $name
+      $values[$name] = @($assignment.Right.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+    }
+    $values['$script:GhostExcludedPrefixes'] | Should -Be @('BTHENUM\', 'BTHLE\', 'BTHLEDEVICE\', 'BTHHFENUM\', 'SWD\MMDEVAPI\', 'SWD\PRINTENUM\', 'WSDPRINT\')
+    $values['$script:GhostExcludedClasses'] | Should -Be @('Bluetooth', 'Printer', 'PrintQueue', 'AudioEndpoint')
   }
   It 'no src file calls the disk-check exclusion tool (ruling RD-R1)' {
     $tool = 'chk' + 'ntfs'

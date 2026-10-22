@@ -193,10 +193,10 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
   }
 
   Describe 'the catalog rows (repair plan, Actions and steps)' {
-    It 'safety is an info action that logs locally, with its six steps in order' {
+    It 'safety is an info action that logs locally, with its seven steps in order (Task 7 adds the saved network backup)' {
       $a = $script:ToolActionCatalog['safety']
       $a.Kind | Should -Be 'info'; $a.Confirm | Should -Be 'none'; $a.NeedsStick | Should -BeFalse; $a.LogLocal | Should -BeTrue
-      @($a.Steps) | Should -Be @('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck')
+      @($a.Steps) | Should -Be @('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup')
     }
     It 'health is a read-only action that logs to the session, with its seven steps in order (the disk state, not the scan: RD-R12)' {
       $a = $script:ToolActionCatalog['health']
@@ -658,7 +658,7 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       @($r.Data.Chips.Keys | Sort-Object) | Should -Be @('BitLocker', 'Disk', 'Free', 'Internet', 'Restart')
       $r.Data.DiskCheck.Excluded | Should -BeFalse
       Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly -ParameterFilter { $Name -eq 'reliability' }
-      @($r.Steps.Status) | Should -Be @('done', 'done', 'done', 'done', 'warn', 'done')
+      @($r.Steps.Status) | Should -Be @('done', 'done', 'done', 'done', 'warn', 'done', 'done')   # no stick: no saved network backup
       $r.Findings.Count | Should -Be 0
     }
     It 'the safety result carries every chip and the disk check state, deep enough for the window' {

@@ -22,7 +22,9 @@
 #   standard, postClone,  reason.checking (the strip is loading); reason.restart (Restart crit); reason.battery (a
 #   dismSource            laptop on battery); reason.diskFailing (Disk crit, not ticked backed up)
 #                         warns: warn.lowSpace (Free crit), warn.diskFailing (Disk crit, ticked), confirm.noStickLog
-#   wuReset               reason.checking; reason.restart; warns: warn.noRescan (Internet crit), confirm.noStickLog
+#   wuReset               reason.checking; reason.restart; warns: warn.noRescan (Internet crit), warn.clockNoRescan
+#                         (Internet warn with Detail.Clock: the rescan fails until the clock is fixed; RD-R20),
+#                         confirm.noStickLog
 #   diskCheck             reason.checking; reason.restart; reason.diskFailing; warns: confirm.noStickLog
 #   netReset, ghosts      reason.noStickBackup (the backup must survive the restart)
 #   netRestore            hidden without a saved backup (Repair.NetBackup); reason.noStickBackup
@@ -176,6 +178,34 @@ function ConvertTo-RepairStrip {
   return $strip
 }
 
+function ConvertTo-RepairNetBackup {
+  <#
+  .SYNOPSIS
+    The saved network backup the safety child named (its Data.NetBackup, from Find-ToolNetBackup: repair Task 7) as
+    Repair.NetBackup = @{ Path; Sha256; CreatedAt; Adapters }, or $null. Pure.
+  .DESCRIPTION
+    Usable only with a Path, a Sha256 of 64 hex digits and Adapters as a list (the rows the child validated from the
+    very bytes that Sha256 covers; the Restore confirmation shows them and the child applies exactly those). Anything
+    else, $null included, is no backup: the Restore network settings button hides.
+  #>
+  [CmdletBinding()]
+  param([AllowNull()]$Value)
+
+  if (-not (Test-RepairObject -Value $Value)) { return $null }
+  $path = Get-RepairEntry -From $Value -Name 'Path'
+  $sha = Get-RepairEntry -From $Value -Name 'Sha256'
+  # Read in place, not through Get-RepairEntry: its return would unroll a one-adapter list into the adapter itself.
+  $adapters = $null
+  if ($Value -is [System.Collections.IDictionary]) {
+    if ($Value.Contains('Adapters')) { $adapters = $Value['Adapters'] }
+  } elseif ($null -ne $Value.PSObject.Properties['Adapters']) {
+    $adapters = $Value.PSObject.Properties['Adapters'].Value
+  }
+  if ($path -isnot [string] -or $path -eq '' -or $sha -isnot [string] -or $sha -notmatch '^[0-9A-Fa-f]{64}\z') { return $null }
+  if ($null -eq $adapters -or $adapters -is [string] -or (Test-RepairObject -Value $adapters) -or $adapters -isnot [System.Collections.IEnumerable]) { return $null }
+  return @{ Path = $path; Sha256 = $sha; CreatedAt = [string](Get-RepairEntry -From $Value -Name 'CreatedAt'); Adapters = @(foreach ($a in $adapters) { $a }) }
+}
+
 function Get-RepairChipLevel {
   # Private. A strip chip's level, or '' when the strip has no such chip (yet).
   [CmdletBinding()]
@@ -241,7 +271,9 @@ function Get-RepairGate {
     }
     'wuReset' {
       $rules.Add(@($loading, 'reason.checking')); $rules.Add(@($restart, 'reason.restart'))
-      if ((Get-RepairChipLevel -Repair $repair -Name 'Internet') -ceq 'crit') { $warns.Add('warn.noRescan') }
+      $internet = Get-RepairChipLevel -Repair $repair -Name 'Internet'
+      if ($internet -ceq 'crit') { $warns.Add('warn.noRescan') }
+      elseif ($internet -ceq 'warn' -and (Get-RepairEntry -From $repair['Strip']['Internet']['Detail'] -Name 'Clock') -eq $true) { $warns.Add('warn.clockNoRescan') }
       if (-not $stick) { $warns.Add('confirm.noStickLog') }
     }
     'diskCheck' {

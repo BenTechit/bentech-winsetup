@@ -37,13 +37,16 @@ BeforeAll {
   function Invoke-ToolStepFakeA { param($Run) Invoke-FakeStep -Id 'fakeA' -Run $Run }
   function Invoke-ToolStepFakeB { param($Run) Invoke-FakeStep -Id 'fakeB' -Run $Run }
   function Invoke-ToolStepFakeS { param($Run) Invoke-FakeStep -Id 'fakeS' -Run $Run }
+  function Invoke-ToolStepFakeR { param($Run) Invoke-FakeStep -Id 'fakeR' -Run $Run }
 
-  # Registers the fake steps (fakeS is a servicing step) and the fake action 'test' (readonly, logs to the session).
+  # Registers the fake steps (fakeS is a servicing step, fakeR always runs: repair Task 7) and the fake action 'test'
+  # (readonly, logs to the session).
   function Register-TestAction {
     param([string[]]$Steps, [bool]$LogLocal = $false)
     $script:ToolSteps['fakeA'] = @{ Function = 'Invoke-ToolStepFakeA'; Servicing = $false }
     $script:ToolSteps['fakeB'] = @{ Function = 'Invoke-ToolStepFakeB'; Servicing = $false }
     $script:ToolSteps['fakeS'] = @{ Function = 'Invoke-ToolStepFakeS'; Servicing = $true }
+    $script:ToolSteps['fakeR'] = @{ Function = 'Invoke-ToolStepFakeR'; Servicing = $false; AlwaysRun = $true }
     $script:ToolActionCatalog['test'] = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $LogLocal; Steps = [string[]]$Steps }
   }
 
@@ -403,6 +406,48 @@ Describe 'ToolEngine (repair Task 1)' {
       Invoke-ToolSteps -Run $r | Should -Be 'Done'
       @($r.Findings.Code) | Should -Be @('restartFirst')
       Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'YELLOW'
+    }
+    It 'a step that sets Data.Abort ends the action like a Stop: the rest skipped, the outcome Done, red by its own CRIT (repair Task 7)' {
+      $script:stepResults = @{ fakeA = 'failed' }
+      $r = New-TestRun 'fakeA', 'fakeB', 'fakeR', 'fakeB'
+      $script:onCall = { if ($args[0] -eq 'fakeA') { $r.Data['Abort'] = $true; Add-ToolFinding -Run $r -Level CRIT -Code 'stepFailed' -Arguments @('fakeA', 'no backup') } }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'
+      $script:calls | Should -Be @('fakeA', 'fakeR')   # the always-run step still runs
+      @($r.Steps.Status) | Should -Be @('failed', 'skipped', 'done', 'skipped')
+      @($r.Findings.Code) | Should -Be @('stepFailed')
+      Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'RED'
+      # Abort is read after a step only: an Abort already set before the run ends it after its first step.
+      $script:calls.Clear(); $script:onCall = $null; $script:stepResults = @{}
+      $q = New-TestRun 'fakeA', 'fakeB'; $q.Data['Abort'] = $true
+      Invoke-ToolSteps -Run $q | Should -Be 'Done'; $script:calls | Should -Be @('fakeA'); @($q.Steps.Status) | Should -Be @('done', 'skipped')
+    }
+    It 'an always-run step still runs after a Stop, and the outcome stays Stopped (repair Task 7)' {
+      $r = New-TestRun 'fakeA', 'fakeB', 'fakeR'; $script:onCall = { if ($args[0] -eq 'fakeA') { 'x' | Set-Content $r.StopPath } }
+      Invoke-ToolSteps -Run $r | Should -Be 'Stopped'; $script:calls | Should -Be @('fakeA', 'fakeR'); @($r.Steps.Status) | Should -Be @('done', 'skipped', 'done')
+      ($r.Findings | Where-Object { $_.Code -eq 'stopped' }).Args | Should -Be @('fakeA')
+      # A stop before the first step: it still runs.
+      $script:calls.Clear(); $script:onCall = $null
+      $q = New-TestRun 'fakeA', 'fakeR'; 'x' | Set-Content $q.StopPath
+      Invoke-ToolSteps -Run $q | Should -Be 'Stopped'; $script:calls | Should -Be @('fakeR'); @($q.Steps.Status) | Should -Be @('skipped', 'done')
+    }
+    It 'an always-run step still runs after the deadline, its timeout at the 0.25-minute floor, and the outcome stays TimedOut' {
+      $script:fakeElapsed = 0.0
+      Mock Get-ToolElapsedSeconds { $script:fakeElapsed }
+      $r = New-TestRun 'fakeA', 'fakeB', 'fakeR' -BudgetMinutes 30
+      $script:seenTimeout = $null
+      $script:onCall = { if ($args[0] -eq 'fakeA') { $script:fakeElapsed = 30 * 60 + 5 }; if ($args[0] -eq 'fakeR') { $script:seenTimeout = Get-ToolStepTimeout -Run $r -Name 'native' } }
+      Invoke-ToolSteps -Run $r | Should -Be 'TimedOut'; $script:calls | Should -Be @('fakeA', 'fakeR'); @($r.Steps.Status) | Should -Be @('done', 'skipped', 'done')
+      $script:seenTimeout | Should -Be 0.25
+      @($r.Findings | Where-Object { $_.Code -eq 'actionTimedOut' }).Count | Should -Be 1
+    }
+    It 'an always-run step still runs after a pending servicing restart stopped the action (NeedsRestart)' {
+      Mock Get-ServicingRebootSignals { @{ CbsRebootPending = $true; CbsPackagesPending = $false; PendingXml = $false; WuRebootRequired = $false; PendingFileRename = $false; ComputerRenamePending = $false } }
+      $r = New-TestRun 'fakeA', 'fakeS', 'fakeB', 'fakeR'
+      Invoke-ToolSteps -Run $r | Should -Be 'NeedsRestart'; $script:calls | Should -Be @('fakeA', 'fakeR'); @($r.Steps.Status) | Should -Be @('done', 'skipped', 'skipped', 'done')
+    }
+    It 'in a run that nothing ends, an always-run step runs once, in its place' {
+      $r = New-TestRun 'fakeR', 'fakeA', 'fakeR'
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; $script:calls | Should -Be @('fakeR', 'fakeA', 'fakeR'); @($r.Steps.Status) | Should -Be @('done', 'done', 'done')
     }
     It 'a break in a step stays inside that step' {
       $script:onCall = { if ($args[0] -eq 'fakeA') { break } }

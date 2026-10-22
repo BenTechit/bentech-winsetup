@@ -39,9 +39,11 @@
 #   $script:ToolActionCatalog['<id>'] = @{ Kind = 'info'|'readonly'|'repair'|'destructive'; Confirm = 'none'|'confirm'|'yes';
 #                                          NeedsStick = <bool>; LogLocal = <bool>; Steps = [string[]] }
 #   $script:ToolSteps['<stepId>'] = @{ Function = 'Invoke-ToolStep<StepId with its first letter upper-cased>';
-#                                      Servicing = <bool: re-checked for a pending servicing restart first> }
+#                                      Servicing = <bool: re-checked for a pending servicing restart first>;
+#                                      AlwaysRun = <bool, optional: runs even after a Stop, an Abort or the deadline> }
 # A step function takes -Run <hashtable> and returns exactly one of 'done', 'warn', 'failed', 'skipped' (or
-# 'timedout'); findings go through Add-ToolFinding, shared data into $Run.Data.
+# 'timedout'); findings go through Add-ToolFinding, shared data into $Run.Data. A step that sets $Run.Data.Abort to
+# $true ends its action after it, like a Stop (Task 7: no verified backup, no reset).
 #
 # Task 2: safety (the strip, computed in this child: spec 5; ToolSafety.ps1) and health (the read-only Health check:
 # spec 6.1; ToolChecks.ps1). Neither has a servicing step: read-only actions run with a restart pending (spec 5).
@@ -52,9 +54,16 @@
 # and activation are the Health check's own steps) and dismSource (the DISM retry with the local source the technician
 # picked from the offer, then SFC; builder check 6), in ToolRepairs.ps1. Their servicing steps (dism, sfc,
 # componentCleanup, dismSource) are re-checked for a pending servicing restart first (spec 5).
+#
+# Task 7: the advanced tools in ToolAdvanced.ps1 (spec 6.4 to 6.7): wuReset (its wuServicesStart always runs, so the
+# update services never stay stopped: review I-2; then Task 6's wuScan), diskCheck (the dirty bit; ruling RD-R1: no
+# cancel), netInfo and ghostList (the info children the Network reset and Ghost devices confirmations wait for: they
+# log locally), netReset (netBackup first: no verified backup on the stick, no reset), netRestore and ghostRemove
+# (ghostCsv first: no saved list, nothing removed). The safety child also names this PC's newest saved network
+# backup on the stick (safetyNetBackup), for the Restore network settings button.
 $script:ToolActionCatalog = [ordered]@{
   safety     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
-                  Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck') }
+                  Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup') }
   health     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
                   Steps = [string[]]@('volumeState', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
   standard   = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
@@ -64,6 +73,20 @@ $script:ToolActionCatalog = [ordered]@{
                                       'activation', 'componentCleanup', 'wuScan') }
   dismSource = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
                   Steps = [string[]]@('dismSource', 'sfc') }
+  wuReset     = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false
+                   Steps = [string[]]@('wuServicesStop', 'wuRename', 'wuBits', 'wuServicesStart', 'wuScan') }
+  diskCheck   = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false
+                   Steps = [string[]]@('diskCheckSchedule') }
+  netInfo     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
+                   Steps = [string[]]@('netInfo') }
+  netReset    = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('netBackup', 'winsockReset', 'ipReset', 'ipv6Reset', 'dnsFlush') }
+  netRestore  = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('netRestore') }
+  ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true
+                   Steps = [string[]]@('ghostList') }
+  ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('ghostCsv', 'ghostRemove') }
 }
 $script:ToolSteps = @{
   safetyRestart    = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
@@ -91,6 +114,22 @@ $script:ToolSteps = @{
   componentCleanup = @{ Function = 'Invoke-ToolStepComponentCleanup'; Servicing = $true }
   wuScan           = @{ Function = 'Invoke-ToolStepWuScan'; Servicing = $false }
   dismSource       = @{ Function = 'Invoke-ToolStepDismSource'; Servicing = $true }
+  safetyNetBackup   = @{ Function = 'Invoke-ToolStepSafetyNetBackup'; Servicing = $false }
+  wuServicesStop    = @{ Function = 'Invoke-ToolStepWuServicesStop'; Servicing = $false }
+  wuRename          = @{ Function = 'Invoke-ToolStepWuRename'; Servicing = $false }
+  wuBits            = @{ Function = 'Invoke-ToolStepWuBits'; Servicing = $false }
+  wuServicesStart   = @{ Function = 'Invoke-ToolStepWuServicesStart'; Servicing = $false; AlwaysRun = $true }
+  diskCheckSchedule = @{ Function = 'Invoke-ToolStepDiskCheckSchedule'; Servicing = $false }
+  netInfo           = @{ Function = 'Invoke-ToolStepNetInfo'; Servicing = $false }
+  netBackup         = @{ Function = 'Invoke-ToolStepNetBackup'; Servicing = $false }
+  winsockReset      = @{ Function = 'Invoke-ToolStepWinsockReset'; Servicing = $false }
+  ipReset           = @{ Function = 'Invoke-ToolStepIpReset'; Servicing = $false }
+  ipv6Reset         = @{ Function = 'Invoke-ToolStepIpv6Reset'; Servicing = $false }
+  dnsFlush          = @{ Function = 'Invoke-ToolStepDnsFlush'; Servicing = $false }
+  netRestore        = @{ Function = 'Invoke-ToolStepNetRestore'; Servicing = $false }
+  ghostList         = @{ Function = 'Invoke-ToolStepGhostList'; Servicing = $false }
+  ghostCsv          = @{ Function = 'Invoke-ToolStepGhostCsv'; Servicing = $false }
+  ghostRemove       = @{ Function = 'Invoke-ToolStepGhostRemove'; Servicing = $false }
 }
 
 # A failed progress write, or a failed tick, is logged once per run (New-ToolRun resets both).
@@ -813,17 +852,26 @@ function Invoke-ToolSteps {
     Before every servicing step, the first too (spec 5): a pending servicing restart (Get-ServicingRebootSignals,
     Test-ServicingRebootPending, or $Run.Data.DismPending: DISM itself answered 0x800F082F, which the registry may not
     show; review M1) is the WARN finding restartFirst (once: not again when a step already added it) and
-    'NeedsRestart'. A file or computer rename alone never blocks. On any of these the steps not run are 'skipped'. A step that fails does not stop the next one (DISM
-    failing must not stop SFC). Current is -1 at the end, and the progress is written.
+    'NeedsRestart'. A file or computer rename alone never blocks. A step that fails does not stop the next one (DISM
+    failing must not stop SFC).
+    After every step, $Run.Data.Abort -eq $true (the step's own CRIT says why; Task 7: no verified backup, no reset)
+    ends the action like a Stop, but the outcome stays 'Done' (red through that CRIT).
+    Once any of these ended the action, the steps not run are 'skipped', except a step whose $script:ToolSteps row has
+    AlwaysRun = $true (Task 7: the update services start again): it still runs, in its place, its waits shrunk to the
+    0.25-minute floor of Get-ToolStepTimeout once the budget is spent, and the outcome stays the one that ended the
+    others. Current is -1 at the end, and the progress is written.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param([Parameter(Mandatory)][hashtable]$Run)
 
   $outcome = 'Done'
+  $ended = $false
   for ($index = 0; $index -lt $Run.Steps.Count; $index++) {
     $id = [string]$Run.Steps[$index]['Id']
-    if (Test-ToolStopRequested -Run $Run) {
+    $definition = $script:ToolSteps[$id]
+    $always = ($null -ne $definition -and $definition['AlwaysRun'] -eq $true)
+    if (-not $ended -and (Test-ToolStopRequested -Run $Run)) {
       if ($index -eq 0) {
         Add-ToolFinding -Run $Run -Level INFO -Code 'stoppedBeforeStart'
       } else {
@@ -831,18 +879,15 @@ function Invoke-ToolSteps {
       }
       Add-ToolLog -Run $Run -Text 'Stopped by the technician'
       $outcome = 'Stopped'
-      break
+      $ended = $true
     }
-    if ($index -gt 0) {
-      if ((Get-ToolRemainingSeconds -Run $Run) -le 0) {
-        Add-ToolFinding -Run $Run -Level CRIT -Code 'actionTimedOut' -Arguments @(Get-ToolActionMinutes -Run $Run)
-        Add-ToolLog -Run $Run -Text 'The action reached its deadline'
-        $outcome = 'TimedOut'
-        break
-      }
+    if (-not $ended -and $index -gt 0 -and (Get-ToolRemainingSeconds -Run $Run) -le 0) {
+      Add-ToolFinding -Run $Run -Level CRIT -Code 'actionTimedOut' -Arguments @(Get-ToolActionMinutes -Run $Run)
+      Add-ToolLog -Run $Run -Text 'The action reached its deadline'
+      $outcome = 'TimedOut'
+      $ended = $true
     }
-    $definition = $script:ToolSteps[$id]
-    if ($null -ne $definition -and $definition['Servicing'] -eq $true) {
+    if (-not $ended -and $null -ne $definition -and $definition['Servicing'] -eq $true) {
       $signals = Get-ServicingRebootSignals
       $byDism = ($Run.Data['DismPending'] -eq $true)
       if ($byDism -or (Test-ServicingRebootPending -Signals $signals)) {
@@ -850,13 +895,25 @@ function Invoke-ToolSteps {
         if (-not (Test-ToolFindingCode -Run $Run -Code 'restartFirst')) { Add-ToolFinding -Run $Run -Level WARN -Code 'restartFirst' }
         Add-ToolLog -Run $Run -Text 'A Windows servicing restart is pending'
         $outcome = 'NeedsRestart'
-        break
+        $ended = $true
       }
     }
+    if ($ended) {
+      if ($always) {
+        Add-ToolLog -Run $Run -Text ('{0}: runs although the action ended' -f (Get-ToolStepName -Id $id))
+        Invoke-ToolStep -Run $Run -Index $index
+      }
+      continue
+    }
     Invoke-ToolStep -Run $Run -Index $index
+    if ($Run.Data['Abort'] -eq $true) {
+      Write-SetupLog -Level WARN -Message 'A step ended the action' -Data @{ step = $id }
+      Add-ToolLog -Run $Run -Text ('The action ended after {0}' -f (Get-ToolStepName -Id $id))
+      $ended = $true
+    }
   }
-  for ($rest = $index; $rest -lt $Run.Steps.Count; $rest++) {
-    if ($Run.Steps[$rest]['Status'] -eq 'pending') { $Run.Steps[$rest]['Status'] = 'skipped' }
+  foreach ($step in $Run.Steps) {
+    if ($step['Status'] -eq 'pending') { $step['Status'] = 'skipped' }
   }
   $Run.Current = -1
   Write-ToolProgress -Run $Run

@@ -886,12 +886,16 @@ function Complete-ToolboxActionRun {
 function Complete-ToolboxSafetyRun {
   # Private. The safety child's end: the strip from -Chips (its result's Data.Chips, else the last partial ones), every
   # chip it did not read unknown, and ready (spec 5: unknown is yellow and blocks nothing); -DiskCheck (Data.DiskCheck)
-  # into the model. Chips or a DiskCheck that are no object are not read.
+  # into the model. Chips or a DiskCheck that are no object are not read. -Data (the result's Data) that holds the key
+  # NetBackup (repair Task 7: this PC's newest saved network backup on the stick, or none) sets Repair.NetBackup
+  # (ConvertTo-RepairNetBackup: $null when none or unusable, which hides Restore network settings); a result without
+  # the key (none at all: killed, or no result) leaves it as it was.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
     [AllowNull()]$Chips,
-    [AllowNull()]$DiskCheck
+    [AllowNull()]$DiskCheck,
+    [AllowNull()]$Data
   )
 
   if (-not (Test-RepairObject -Value $Chips)) { $Chips = $null }
@@ -899,6 +903,9 @@ function Complete-ToolboxSafetyRun {
   if (Test-RepairObject -Value $DiskCheck) {
     $values['DiskCheck'] = @{ Dirty = (Get-RepairEntry -From $DiskCheck -Name 'Dirty'); Excluded = ((Get-RepairEntry -From $DiskCheck -Name 'Excluded') -eq $true) }
   }
+  $hasBackup = ($Data -is [System.Collections.IDictionary] -and $Data.Contains('NetBackup')) -or
+    ($Data -is [System.Management.Automation.PSCustomObject] -and $null -ne $Data.PSObject.Properties['NetBackup'])
+  if ($hasBackup) { $values['NetBackup'] = ConvertTo-RepairNetBackup -Value (Get-RepairEntry -From $Data -Name 'NetBackup') }
   Set-ToolboxRepair -State $Window.Tag -Values $values
 }
 
@@ -1094,7 +1101,7 @@ function Update-ToolboxRuns {
         $data = Get-RepairEntry -From $result -Name 'Data'
         $finalChips = Get-RepairEntry -From $data -Name 'Chips'
         if (-not (Test-RepairObject -Value $finalChips)) { $finalChips = $run['Chips'] }
-        Complete-ToolboxSafetyRun -Window $Window -Chips $finalChips -DiskCheck (Get-RepairEntry -From $data -Name 'DiskCheck')
+        Complete-ToolboxSafetyRun -Window $Window -Chips $finalChips -DiskCheck (Get-RepairEntry -From $data -Name 'DiskCheck') -Data $data
       }
     } elseif ($seconds -gt ([double]$run['BudgetSeconds'] + $script:ToolboxKillGraceSeconds)) {
       # One the kill does not end stays tracked (Stop-ToolboxChild): the slot is free and the result timed out, but

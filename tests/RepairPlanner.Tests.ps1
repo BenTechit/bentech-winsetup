@@ -17,7 +17,8 @@ Describe 'New-RepairModel (repair plan, The repair model)' {
   It 'opens loading, with the catalog''s ids, the machine''s type, no stick and nothing selected' {
     $r = New-RepairModel -Machine $m -SessionStamp '2026-10-22_1015'
     $r.Strip.State | Should -Be 'loading'; foreach ($c in 'Restart', 'Free', 'BitLocker', 'Internet', 'Disk') { $r.Strip[$c] | Should -BeNullOrEmpty -Because $c }
-    @($r.Available) | Should -Contain 'health'; @($r.Available) | Should -Contain 'safety'; @($r.Available) | Should -Not -Contain 'ghosts'
+    @($r.Available) | Should -Contain 'health'; @($r.Available) | Should -Contain 'safety'; @($r.Available) | Should -Not -Contain 'compare'
+    foreach ($t in 'wuReset', 'diskCheck', 'netReset', 'ghosts', 'netRestore') { @($r.Available) | Should -Contain $t -Because "Task 7 adds $t" }
     $r.CanRun | Should -BeFalse; $r.IsLaptop | Should -BeTrue; $r.SessionStamp | Should -Be '2026-10-22_1015'
     $r.Stick.Root | Should -BeNullOrEmpty; $r.Selected | Should -BeExactly ''; $r.Complaint | Should -BeExactly ''; $r.BackedUp | Should -BeFalse
     foreach ($k in 'Confirm', 'Run', 'Result', 'Pending', 'NetBackup') { $r[$k] | Should -BeNullOrEmpty -Because $k }
@@ -50,6 +51,15 @@ Describe 'Get-RepairGate (spec 5, 6.6, 6.7, 8)' {
   ) { $g = Get-RepairGate -Model (New-TestModel $Set) -ActionId $A; $g.Reason | Should -BeExactly $E; $g.Enabled | Should -Be ($E -eq '') }
   It 'low space and an internet outage only warn' { (Get-RepairGate -Model (New-TestModel @{ Free = 'crit'; Internet = 'crit' }) -ActionId 'standard').Warns | Should -Contain 'warn.lowSpace'
     (Get-RepairGate -Model (New-TestModel @{ Internet = 'crit' }) -ActionId 'wuReset').Warns | Should -Contain 'warn.noRescan' }
+  It 'a dead clock warns that Windows Update reset''s rescan will fail; the captive portal does not (RD-R20, repair Task 7)' {
+    $clock = New-TestModel @{}; $clock.Repair.Strip.Internet = @{ Level = 'warn'; Args = [string[]]@(); Detail = @{ Clock = $true; ClockOffsetSeconds = -63072000 } }
+    $g = Get-RepairGate -Model $clock -ActionId 'wuReset'; $g.Enabled | Should -BeTrue; @($g.Warns) | Should -Be @('warn.clockNoRescan')
+    @((Get-RepairGate -Model (New-TestModel @{ Internet = 'warn' }) -ActionId 'wuReset').Warns) | Should -Not -Contain 'warn.clockNoRescan'
+    @((Get-RepairGate -Model (New-TestModel @{ Internet = 'crit' }) -ActionId 'wuReset').Warns) | Should -Not -Contain 'warn.clockNoRescan'
+    # The confirmation lists it, and the window has its text in both languages.
+    $n = Update-RepairModel -Model $clock -Action Tile -Value wuReset
+    @($n.Repair.Confirm.Lines | ForEach-Object { [string]$_.Key }) | Should -Be @('tile.wuReset.changes', 'warn.clockNoRescan')
+    foreach ($l in 'en', 'he') { $script:ToolboxStrings[$l].ContainsKey('warn.clockNoRescan') | Should -BeTrue -Because $l } }
   It 'a dead clock never blocks the time sync: Standard repair and Post-clone stay open with the clock chip or no internet (review M3)' {
     $clock = New-TestModel @{}; $clock.Repair.Strip.Internet = @{ Level = 'warn'; Args = [string[]]@(); Detail = @{ Clock = $true; ClockOffsetSeconds = -63072000 } }
     foreach ($a in 'standard', 'postClone') {
@@ -246,10 +256,29 @@ Describe 'the action catalog''s confirmations (Task 5 review M3, ruling RD-R19)'
   It 'an action without a catalog row is confirmed with YES' { Get-RepairConfirmKind -ActionId 'noSuchRow' | Should -BeExactly 'yes' }
 }
 
+Describe 'ConvertTo-RepairNetBackup (repair Task 7: the safety child''s saved network backup)' {
+  It 'keeps a usable backup, with one adapter or more, from a hashtable or from JSON; anything else is none' {
+    $one = @{ Path = 'E:\BenTech-Reports\PC1_X_2026-10-20_0900\network-backup-20261020-090500.json'; Sha256 = ('ab' * 32); CreatedAt = '2026-10-20T09:05:00'
+              Adapters = @(@{ Alias = 'Ethernet' }) }
+    $n = ConvertTo-RepairNetBackup -Value $one
+    $n.Path | Should -BeExactly $one.Path; $n.Sha256 | Should -BeExactly ('ab' * 32); $n.CreatedAt | Should -Be '2026-10-20T09:05:00'
+    @($n.Adapters).Count | Should -Be 1; $n.Adapters[0].Alias | Should -Be 'Ethernet'
+    $json = ConvertTo-Json -InputObject $one -Depth 5 | ConvertFrom-Json
+    @((ConvertTo-RepairNetBackup -Value $json).Adapters).Count | Should -Be 1
+    $two = $one.Clone(); $two.Adapters = @(@{ Alias = 'a' }, @{ Alias = 'b' }); @((ConvertTo-RepairNetBackup -Value $two).Adapters).Count | Should -Be 2
+    $none = $one.Clone(); $none.Adapters = @(); (ConvertTo-RepairNetBackup -Value $none).Path | Should -BeExactly $one.Path
+    foreach ($bad in @($null, 'x', @{ Path = 'p' }, @{ Path = 'p'; Sha256 = 'zz'; Adapters = @() }, @{ Path = ''; Sha256 = ('ab' * 32); Adapters = @() },
+                       @{ Path = 'p'; Sha256 = ('ab' * 32); Adapters = 3 }, @{ Path = 'p'; Sha256 = ('ab' * 32); Adapters = 'x' },
+                       @{ Path = 'p'; Sha256 = ('ab' * 32); Adapters = @{ Alias = 'a' } }, @{ Path = 'p'; Sha256 = ('ab' * 32) })) {
+      ConvertTo-RepairNetBackup -Value $bad | Should -BeNullOrEmpty
+    }
+  }
+}
+
 Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint; spec 4.2, 6.6, 6.7)' {
   BeforeAll {
     # The catalog rows Tasks 6 to 9 add (plan "Actions and steps"), so every tile has its confirmation kind here; this
-    # Describe's AfterAll removes them again.
+    # Describe's AfterAll puts the catalog back as it was (the rows a task already added stay; repair Task 7).
     $script:laterRows = [ordered]@{
       standard    = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix') }
       postClone   = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix') }
@@ -265,7 +294,8 @@ Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint
       fullReport  = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('reportWrite') }
       compare     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('compare') }
     }
-    foreach ($k in $script:laterRows.Keys) { $script:ToolActionCatalog[$k] = $script:laterRows[$k] }
+    $script:savedRows = @{}
+    foreach ($k in $script:laterRows.Keys) { $script:savedRows[$k] = $script:ToolActionCatalog[$k]; $script:ToolActionCatalog[$k] = $script:laterRows[$k] }
     # ghostList's Data.Ghosts (plan Task 7): an old network adapter, a Bluetooth headset (left out) and an old USB stick.
     $script:threeGhosts = @(
       @{ InstanceId = 'PCI\VEN_8086&DEV_15BC\3&11583659&0&FE'; Class = 'Net'; Name = 'Intel(R) Ethernet Connection'; Excluded = '' }
@@ -286,7 +316,7 @@ Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint
     function Get-LineKeys($n) { @($n.Repair.Confirm.Lines | ForEach-Object { [string]$_.Key }) }
     function Get-LineText($n) { (@($n.Repair.Confirm.Lines | ForEach-Object { '{0} {1}' -f $_.Key, (@($_.Args) -join ' ') }) -join "`n") }
   }
-  AfterAll { foreach ($k in $script:laterRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  AfterAll { foreach ($k in $script:laterRows.Keys) { if ($null -ne $script:savedRows[$k]) { $script:ToolActionCatalog[$k] = $script:savedRows[$k] } else { $script:ToolActionCatalog.Remove($k) } } }
   BeforeEach { $script:mo = New-TestModel @{} }
 
   It 'a read-only tile with a stick starts at once; without a stick it asks first' {

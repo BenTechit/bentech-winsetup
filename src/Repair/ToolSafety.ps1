@@ -21,6 +21,8 @@
 #               disk (\Device\Harddisk<N>\) and NTFS 55 of the system volume, in the last diskEventDays. Other disks
 #               (the BenTech stick among them) are only recorded in Detail, for the report.
 # Plus the disk check state: the system volume's dirty bit, and whether BootExecute excludes the drive (/k:).
+# Plus (repair Task 7) the saved network backup: this PC's newest valid one on the stick (Find-ToolNetBackup,
+# ToolAdvanced.ps1), for the Restore network settings button.
 #
 # Every threshold comes from config.json's repair section; a missing key falls back to the values the spec pins
 # (repair is not a required config key). Needs ToolEngine (Invoke-ToolJsonChild, Add-ToolLog, Write-ToolProgress),
@@ -803,6 +805,42 @@ function Invoke-ToolStepSafetyDiskCheck {
   $Run.Data['DiskCheck'] = $state
   $Run.Partial['DiskCheck'] = $state
   Add-ToolLog -Run $Run -Text ('Disk check: dirty {0}, excluded {1}' -f $(if ($null -eq $state['Dirty']) { 'unknown' } else { $state['Dirty'] }), $state['Excluded'])
+  Write-ToolProgress -Run $Run
+  return 'done'
+}
+
+function Invoke-ToolStepSafetyNetBackup {
+  <#
+  .SYNOPSIS
+    Step safetyNetBackup (repair Task 7, spec 6.6): this PC's newest valid network backup on the stick
+    (Find-ToolNetBackup, ToolAdvanced.ps1, under Args.StickRoot for Args.Identity.Key) in $Run.Data.NetBackup =
+    @{ Path; Sha256; CreatedAt; Adapters }, or $null (no stick, no identity key, no backup, or a read that failed: a
+    WARN in the log). The window shows Restore network settings only with one. Always 'done': the safety action never
+    ends red because of it.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  $backup = $null
+  $stickRoot = [string]$Run.Args['StickRoot']
+  $identity = $Run.Args['Identity']
+  $key = ''
+  if ($identity -is [System.Collections.IDictionary]) { $key = [string]$identity['Key'] }
+  if ($stickRoot -ne '' -and $key -ne '') {
+    try {
+      $backup = Find-ToolNetBackup -StickRoot $stickRoot -IdentityKey $key
+    } catch {
+      $backup = $null
+      Write-SetupLog -Level WARN -Message 'The saved network settings could not be looked for' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+  }
+  $Run.Data['NetBackup'] = $backup
+  if ($null -eq $backup) {
+    Add-ToolLog -Run $Run -Text 'Saved network settings: none'
+  } else {
+    Add-ToolLog -Run $Run -Text ('Saved network settings: {0}' -f $backup['Path'])
+  }
   Write-ToolProgress -Run $Run
   return 'done'
 }

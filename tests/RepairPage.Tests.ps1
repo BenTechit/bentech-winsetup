@@ -571,6 +571,28 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $w.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'warn'; $w.FindName('ChipDiskText').Text | Should -Be 'Disk: check'
     $w.Tag.Model.Repair.DiskCheck.Dirty | Should -BeFalse; $w.Tag.Runs.Safety | Should -BeNullOrEmpty; $script:ToolboxChildren.Count | Should -Be 0
     $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty; @($script:logs | Where-Object Message -eq 'Toolbox action finished').Count | Should -Be 0 }
+  It 'the safety child''s saved network backup (Data.NetBackup) shows Restore network settings; none hides it; no answer keeps it (repair Task 7)' {
+    $backup = @{ Path = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json'; Sha256 = ('AB' * 32); CreatedAt = '2026-10-20T09:05:00'
+                 Adapters = @(@{ Alias = 'Ethernet'; Guid = '{4D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-56'; Ipv4Dhcp = $false; Ipv6Dhcp = $true
+                                 Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8') }) }
+    $chips = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
+    $w = New-RunWindow -Set @{ State = 'loading' }; $w.FindName('NetRestoreButton').Visibility | Should -Be 'Collapsed'
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; DiskCheck = @{ Dirty = $false; Excluded = $false }; NetBackup = $backup }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.NetBackup.Path | Should -BeExactly $backup.Path; $w.Tag.Model.Repair.NetBackup.Sha256 | Should -BeExactly ('AB' * 32)
+    @($w.Tag.Model.Repair.NetBackup.Adapters).Count | Should -Be 1; $w.Tag.Model.Repair.NetBackup.Adapters[0].Addresses[0].Ip | Should -Be '192.168.1.10'
+    $w.FindName('NetRestoreButton').Visibility | Should -Be 'Visible'
+    # A safety child that ends without an answer (killed, or no result) keeps what the last one found.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.NetBackup.Path | Should -BeExactly $backup.Path
+    # The next read finds none (the stick has no backup of this PC any more): hidden again.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; DiskCheck = @{ Dirty = $false; Excluded = $false }; NetBackup = $null }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.NetBackup | Should -BeNullOrEmpty; $w.FindName('NetRestoreButton').Visibility | Should -Be 'Collapsed'
+    # One that is no usable backup (no hash, no adapter list) is none.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; NetBackup = @{ Path = 'E:\x.json'; Adapters = 3 } }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.NetBackup | Should -BeNullOrEmpty }
   It 'a safety child killed at its deadline, or gone without a result, keeps the chips it read and leaves the rest unknown (spec 5)' {
     foreach ($case in 'deadline', 'noResult') {
       $script:killed.Clear()
@@ -720,7 +742,7 @@ Describe 'run hardening (Task 4 review, ruling RD-R16)' {
 Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, complaint, Health check end to end)' {
   BeforeAll {
     # The catalog rows of the actions Tasks 6 and 7 add (plan "Actions and steps"), so their tiles can start here; this
-    # Describe's AfterAll removes them again. The fake StartChild never runs anything.
+    # Describe's AfterAll puts the catalog back as it was (the real rows stay). The fake StartChild never runs anything.
     $script:workRows = [ordered]@{
       dismSource  = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('dismSource', 'sfc') }
       diskCheck   = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('diskCheckSchedule') }
@@ -729,7 +751,8 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
       ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true; Steps = [string[]]@('ghostList') }
       ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('ghostCsv', 'ghostRemove') }
     }
-    foreach ($k in $script:workRows.Keys) { $script:ToolActionCatalog[$k] = $script:workRows[$k] }
+    $script:savedWorkRows = @{}
+    foreach ($k in $script:workRows.Keys) { $script:savedWorkRows[$k] = $script:ToolActionCatalog[$k]; $script:ToolActionCatalog[$k] = $script:workRows[$k] }
     # A run window whose 5-second stick presence check answers $script:presence (ruling RD-R3: never this PC's drives).
     function New-WorkWindow([string]$Page = 'repair', [hashtable]$Set = @{}) { $w = New-RunWindow -Page $Page -Set $Set; $w.Tag.StickPresent = { param($l) $script:presence }; $w }
     # An info child's result.json (netInfo, ghostList): its Data is what the open confirmation waits for.
@@ -750,7 +773,7 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     # A mouse click's own path (ToggleButton.OnClick): WPF flips IsChecked first, then raises Click.
     function Send-RealClick($toggle) { $null = [Windows.Controls.Primitives.ToggleButton].GetMethod('OnClick', [Reflection.BindingFlags]'NonPublic, Instance').Invoke($toggle, @()) }
   }
-  AfterAll { foreach ($k in $script:workRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  AfterAll { foreach ($k in $script:workRows.Keys) { if ($null -ne $script:savedWorkRows[$k]) { $script:ToolActionCatalog[$k] = $script:savedWorkRows[$k] } else { $script:ToolActionCatalog.Remove($k) } } }
   BeforeEach { Set-RunTestMocks; $script:presence = 'E:\|BENTECH|32010928128'; $script:sticks = 0 }
 
   It 'the first visit to the page starts the safety child and finds the stick once; the strip loads chip by chip' {
@@ -959,7 +982,8 @@ Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling R
       ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true; Steps = [string[]]@('ghostList') }
       ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('ghostCsv', 'ghostRemove') }
     }
-    foreach ($k in $script:fixRows.Keys) { $script:ToolActionCatalog[$k] = $script:fixRows[$k] }
+    $script:savedFixRows = @{}
+    foreach ($k in $script:fixRows.Keys) { $script:savedFixRows[$k] = $script:ToolActionCatalog[$k]; $script:ToolActionCatalog[$k] = $script:fixRows[$k] }
     function New-FixWindow([hashtable]$Set = @{}) { $w = New-RunWindow -Set $Set; $w.Tag.StickPresent = { param($l) $script:presence }; $w }
     function Write-GhostAnswer($w, [object[]]$Ghosts) {
       $run = $w.Tag.Runs.Action
@@ -971,7 +995,7 @@ Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling R
     function Get-FolderWarns { @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not open the folder' }) }
     function Set-ResultFolder($w, [string]$Folder) { $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = $Folder } } }
   }
-  AfterAll { foreach ($k in $script:fixRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  AfterAll { foreach ($k in $script:fixRows.Keys) { if ($null -ne $script:savedFixRows[$k]) { $script:ToolActionCatalog[$k] = $script:savedFixRows[$k] } else { $script:ToolActionCatalog.Remove($k) } } }
   BeforeEach { Set-RunTestMocks; $script:presence = 'E:\|BENTECH|32010928128'; $script:sticks = 0 }
 
   It 'Open folder shows only for a result folder on the stick; a local folder keeps its path without the button, and a click raised on it opens nothing (I1)' {
