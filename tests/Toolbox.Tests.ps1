@@ -113,6 +113,9 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
       $script:ToolboxStrings.en["step.$($s.Id)"] | Should -BeExactly $s.Title -Because $s.Id
       [string]$script:ToolboxStrings.he["step.$($s.Id)"] | Should -Match '\S' -Because $s.Id }
     $script:ToolboxStrings.he['step.prepare'] | Should -Match '[א-ת]' }
+  # Pre-PR code review: the planner's English fallback for the drivers-only plan line is the string table's.
+  It 'the planner''s drivers-only title is the English string table''s (code review)' {
+    $script:WindowsUpdateDriversTitle | Should -BeExactly $script:ToolboxStrings.en['step.windows-update.drivers'] }
   It 'shows the warnings, the ScreenConnect reminder and the Administrator-protection banner' {
     $w = New-TestWindow @{ Remote = 'BOTH' }
     $w.FindName('WarnText').Text | Should -Match 'older than 14 days'; $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'

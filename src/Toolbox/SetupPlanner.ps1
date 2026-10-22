@@ -30,8 +30,9 @@ function Get-SetupProfiles {
       - Office is upper-cased; outside $script:OfficeChoices it is defaults.office, or OFF when that is no
         better (nothing gets installed that nobody asked for);
       - Remote goes through Get-RemoteChoice (missing or unknown is ANYDESK);
-      - WindowsUpdate (wu spec 3.1) is '' when the entry has no windowsUpdate or it is $null (the profile does
-        not set it); otherwise it goes through Get-WindowsUpdateChoice (an invalid value is FULL);
+      - WindowsUpdate (wu spec 3.1) is '' when the entry has no windowsUpdate or it is $null, empty or
+        whitespace (the profile does not set it); otherwise it goes through Get-WindowsUpdateChoice (an invalid
+        value is FULL);
       - sevenZip and restorePoint must be bools; otherwise defaults.sevenZip and $true (spec 10b.5);
       - Tweaks: the profile's tweaks when it has that property (an empty list is a choice), else every catalog
         entry with Default; plus tweaksAdd. Only catalog ids, in catalog order, each once. This is the
@@ -72,7 +73,7 @@ function Get-SetupProfiles {
 
     $windowsUpdate = ''
     $wuProperty = $entry.PSObject.Properties['windowsUpdate']
-    if ($null -ne $wuProperty -and $null -ne $wuProperty.Value) { $windowsUpdate = Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$wuProperty.Value } }
+    if ($null -ne $wuProperty -and -not [string]::IsNullOrWhiteSpace([string]$wuProperty.Value)) { $windowsUpdate = Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$wuProperty.Value } }
 
     @{
       Id            = $id

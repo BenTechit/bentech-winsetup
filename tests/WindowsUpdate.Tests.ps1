@@ -675,6 +675,31 @@ Describe 'Windows Update round and step (mocked COM)' {
       # Never in the result: the child's JSON keeps exactly its v2 fields.
       @($r.PSObject.Properties.Name) | Should -Be @('Installed', 'Failed', 'Hidden', 'HideFailed', 'OnlyDefinitions', 'RebootRequired', 'Error', 'ErrorCode', 'FirmwareDeferred', 'Found', 'PreviousUnhideDone')
     }
+    # Ruling WU-R5: the round's result is written before the count, so a count that hangs into the round's deadline
+    # leaves a result the parent can still book. The count only logs: working or throwing, the result stays the same.
+    It 'writes the round''s result before it counts the optional drivers, and the count leaves it as it was (<Why>; WU-R5)' -ForEach @(
+      @{ Why = 'a count that works'; Fails = $false; Log = 'Optional driver updates skipped' }
+      @{ Why = 'a count that throws'; Fails = $true; Log = 'Optional driver updates could not be counted' }) {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'), (New-FakeUpdate -Id 'd2'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $script:installReboot = $true
+      $script:countFails = $Fails; $script:resultAtCount = $null; $script:logsAtCount = $null
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria)
+        if ($Criteria -like '*BrowseOnly=1*') {
+          if (Test-Path -LiteralPath $script:roundResultPath) { $script:resultAtCount = [IO.File]::ReadAllText($script:roundResultPath) }
+          $script:logsAtCount = @($script:logs | ForEach-Object { $_.Message })
+          if ($script:countFails) { throw 'search failed' } }
+        if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      @($script:searches) | Should -Be @($script:DriverCriteria, $script:OptionalDriverCriteria)
+      $script:resultAtCount | Should -Not -BeNullOrEmpty                                        # the file was there when the count started
+      @($script:logsAtCount) | Should -Contain 'Windows Update round result written'
+      [IO.File]::ReadAllText($script:roundResultPath) | Should -BeExactly $script:resultAtCount  # the count never rewrites it
+      @($r.Installed.Id) | Should -Be @('d1', 'd2'); $r.RebootRequired | Should -BeTrue; $r.Error | Should -BeNullOrEmpty; $r.ErrorCode | Should -BeNullOrEmpty; $r.Found | Should -Be 2
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round result written' }).Count | Should -Be 1
+      @($script:logs | Where-Object { $_.Message -eq $Log }).Count | Should -Be 1
+      ([IO.File]::ReadAllText((Get-WuProgressPath -ResultPath $script:roundResultPath)) | ConvertFrom-Json).Phase | Should -Be 'done'
+    }
     It 'a DRIVERS round 1 that ended in an exception does not count (the agent just failed; WU-R3)' {
       $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
       $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
@@ -916,6 +941,8 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:childResult = New-ChildResult
       $script:childJson = $null
       $script:childTimedOut = $false
+      # Ruling WU-R5: a child that wrote its result (or $script:childJson), then ran into the round's deadline.
+      $script:childTimedOutAfterWrite = $false
       $script:roundsSeenByChild = $null
       $script:logs = New-Object System.Collections.ArrayList
       $script:sleeps = New-Object System.Collections.ArrayList
@@ -933,6 +960,7 @@ Describe 'Windows Update round and step (mocked COM)' {
         } elseif ($null -ne $script:childResult) {
           Write-WuRoundResult -Path $path -Result $script:childResult
         }
+        if ($script:childTimedOutAfterWrite) { return @{ ExitCode = $null; TimedOut = $true; Output = '' } }
         return @{ ExitCode = 0; TimedOut = $false; Output = '' }
       }
     }
@@ -980,6 +1008,42 @@ Describe 'Windows Update round and step (mocked COM)' {
       $r = Invoke-StepWindowsUpdate -Context $script:ctx
       $r.Status | Should -Be 'Failed'
       $r.Message | Should -Be 'Windows Update round timed out'
+    }
+    # Ruling WU-R5: the child writes its result only at the end of its round (in DRIVERS round 1 before the optional-
+    # driver count), and the parent deletes an old result file before it starts the child, so a readable result after
+    # a timeout is this round's: it is booked as for a round that ended normally, plus one WARN. Both scopes.
+    It 'a round that timed out after writing its result goes on like a finished round, with a WARN (<Scope>; WU-R5)' -ForEach @(
+      @{ Scope = 'DRIVERS' }, @{ Scope = 'FULL' }) {
+      $script:ctx = New-WuContext -Choices @{ WindowsUpdate = $Scope }
+      $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'a'; Title = 'A'; Kb = 'KB5000001' }) -RebootRequired $true
+      $script:childTimedOutAfterWrite = $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Continue'; $r.Reboot | Should -Be 'Now'; $r.Message | Should -Be 'Windows Update round 1: 1 installed, 0 failed'
+      $r.Data.Rounds | Should -Be 1; $r.Data.Installed | Should -Be 1; @($r.Data.InstalledIds) | Should -Be @('a')
+      $w = @($script:logs | Where-Object { $_.Message -eq 'Windows Update round timed out after its result was written' })
+      $w.Count | Should -Be 1; $w[0].Level | Should -Be 'WARN'
+      $w[0].Data.round | Should -Be 1; $w[0].Data.path | Should -BeExactly (Join-Path $script:ctx.LogDir 'wu-round1.json')
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round finished' }).Count | Should -Be 1
+    }
+    It 'a round that timed out after writing a result with nothing left is Done, with the same notes (WU-R5)' {
+      $script:ctx = New-WuContext -Data @{ Rounds = 1; Installed = 3 } -Choices @{ WindowsUpdate = 'DRIVERS' }
+      $script:childResult = New-ChildResult; $script:childResult['FirmwareDeferred'] = 1
+      $script:childTimedOutAfterWrite = $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'; $r.Message | Should -Be 'Drivers only: installed 3 updates in 2 rounds'; $r.Reboot | Should -Be 'None'
+      @($r.Notes) | Should -Be @('On battery: BIOS/firmware updates skipped')
+    }
+    It 'a round that timed out with <Why> still fails as timed out, and books nothing (WU-R5)' -ForEach @(
+      @{ Why = 'no result'; Json = $null }
+      @{ Why = 'a result that is not JSON'; Json = '{"Installed": [' }
+      @{ Why = 'a result without its lists'; Json = '{"Error": null}' }) {
+      $script:ctx = New-WuContext
+      $script:childResult = $null; $script:childJson = $Json; $script:childTimedOutAfterWrite = $true
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Windows Update round timed out'
+      $r.Data.Rounds | Should -Be 1; [int]$r.Data.Installed | Should -Be 0
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round timed out after its result was written' }).Count | Should -Be 0
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round finished' }).Count | Should -Be 0
     }
     It 'fails when the round wrote no result' {
       $script:ctx = New-WuContext

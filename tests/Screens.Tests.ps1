@@ -1284,4 +1284,14 @@ Describe 'Show-FinalScreen' {
   It 'a B or R that cannot start logs the error text as ASCII' {
     Invoke-FinalScreen -Keys 'R', 'Enter' -Launch { param($t, $a) throw ('no notepad ' + $script:Hebrew) }
     Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open the report from the final screen' -and $Data.error -ceq 'no notepad ?????' } }
+  # Pre-PR code review: the launch and its WARN exist once ($open); U reads $open's answer instead of its own try/catch.
+  It 'B, R and U all launch through one place, with one could-not WARN (code review)' {
+    $statements = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.EndBlock.Statements
+    $code = ($statements | ForEach-Object { $_.Extent.Text }) -join "`n"
+    ([regex]::Matches($code, '&\s*\$Launch\b')).Count | Should -Be 1
+    ([regex]::Matches($code, 'Could not open')).Count | Should -Be 1 }
+  It 'B, R and U return nothing to the caller, whether the launch works or not (code review)' -ForEach @(
+    @{ Why = 'works'; L = $null }, @{ Why = 'fails'; L = { param($t, $a) throw 'refused' } }) {
+    @(Invoke-FinalScreen -Keys 'B', 'R', 'U', 'Enter' -Choices @{ WindowsUpdate = 'DRIVERS' } -Launch $L).Count | Should -Be 0
+    $launched.Count | Should -Be 3 }
 }

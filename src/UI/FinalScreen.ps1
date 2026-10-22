@@ -317,10 +317,16 @@ function Show-FinalScreen {
     try { $null = & $SetColor $colors.Background $colors.Foreground }
     catch { Write-SetupLog -Message 'Could not set the console colour for the final screen' -Level WARN -Data @{ error = $_.Exception.Message } }
   }
+  # The one launch for B, R and U: $true when it started, $false (and the WARN, with $what in its message) when not.
   $open = {
     param($what, $target, $arguments)
-    try { $null = & $Launch $target $arguments }
-    catch { Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) } }
+    try {
+      $null = & $Launch $target $arguments
+      return $true
+    } catch {
+      Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
+      return $false
+    }
   }
   $readStick = {
     try {
@@ -364,22 +370,21 @@ function Show-FinalScreen {
       $key = [string](& $ReadKey)
       if ($key -eq 'Enter') { return }
       if ($key -eq 'B') {
-        & $open 'Default Apps' ('ms-settings:defaultapps?registeredAppMachine=' + [Uri]::EscapeDataString((Get-ChromeRegisteredAppName))) $null
+        $null = & $open 'Default Apps' ('ms-settings:defaultapps?registeredAppMachine=' + [Uri]::EscapeDataString((Get-ChromeRegisteredAppName))) $null
         continue
       }
       if ($key -eq 'R') {
-        & $open 'the report' 'notepad.exe' ('"{0}"' -f $ReportPath)
+        $null = & $open 'the report' 'notepad.exe' ('"{0}"' -f $ReportPath)
         continue
       }
       if ($key -eq 'U' -and $isDrivers) {
-        # Hand the remaining updates to Windows; the redraw shows the outcome at once.
-        try {
-          $null = & $Launch $script:WindowsUpdateSettingsUri $null
+        # Hand the remaining updates to Windows; the redraw shows the outcome at once. A failed launch gets $open's
+        # WARN, with 'Windows Update' in its message.
+        if (& $open 'Windows Update' $script:WindowsUpdateSettingsUri $null) {
           $wuStatus = 'Started'
           Write-SetupLog -Message 'Windows Update handed to Windows' -Data @{ uri = $script:WindowsUpdateSettingsUri }
-        } catch {
+        } else {
           $wuStatus = 'Failed'
-          Write-SetupLog -Level WARN -Message 'Could not open Windows Update from the final screen' -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
         }
         . $draw
         continue

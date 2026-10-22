@@ -39,6 +39,14 @@ Describe 'profiles (toolbox spec 5.2)' {
     (Get-ProfileChoices -Config $x -ProfileId 'home').Contains('WindowsUpdate') | Should -BeFalse
     (Get-ProfileChoices -Config $x -ProfileId 'business').WindowsUpdate | Should -BeExactly 'DRIVERS'
     (Get-ProfileChoices -Config $x -ProfileId 'clean').WindowsUpdate | Should -BeExactly 'FULL' }
+  # Pre-PR code review: an empty or blank windowsUpdate is "not set", like a missing or $null one, never FULL.
+  It 'a profile whose windowsUpdate is <Why> does not set it (code review)' -ForEach @(
+    @{ Why = 'empty'; V = '' }, @{ Why = 'whitespace'; V = " `t " }, @{ Why = '$null'; V = $null }) {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate $V
+    @(Get-SetupProfiles -Config $x)[0].WindowsUpdate | Should -BeExactly ''
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Contains('WindowsUpdate') | Should -BeFalse
+    $c = New-DefaultChoices -Machine $m -Config $x; $c.WindowsUpdate = 'DRIVERS'
+    Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
 }
 Describe 'ConvertTo-ValidChoices (toolbox spec 5.2)' {
   It 'repairs every key from the defaults and reports unknown tweak ids' {
