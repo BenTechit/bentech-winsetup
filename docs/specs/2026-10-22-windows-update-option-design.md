@@ -34,7 +34,7 @@ A full setup takes a long time, and most of it is Windows Update: the big cumula
 - **FULL:** exactly as today. It searches `Software` then `Driver` updates, installs them one at a time and restarts as needed.
 - **DRIVERS:** the same step, rounds and restarts, but the search covers **`Driver` only**.
   - Every existing rule still applies: one at a time, firmware only on AC power, the round and restart caps, hide and un-hide.
-  - **Optional updates (`BrowseOnly=1`) stay skipped, as in FULL** *(my call)*. On Windows 11 many OEM drivers are offered as optional, so DRIVERS may install few drivers through Windows Update; the vendor tools cover the rest. Each DRIVERS round logs how many optional drivers it skipped. Ben decides after the first real runs whether DRIVERS should also take them.
+  - **Optional updates (`BrowseOnly=1`) stay skipped, as in FULL** *(my call)*. On Windows 11 many OEM drivers are offered as optional, so DRIVERS may install few drivers through Windows Update; the vendor tools cover the rest. The first DRIVERS round logs how many optional drivers it skipped (ruling WU-R1: once per run, answered from the catalog the driver search has just downloaded). Ben decides after the first real runs whether DRIVERS should also take them.
   - The step's message says `Drivers only`. Its activity line reads `Windows Update: drivers only (other updates left to Windows)`.
 - **Nothing else changes:** the vendor passes, Office, the Microsoft Update opt-in and the policies the run sets and removes.
 
