@@ -23,8 +23,12 @@ Describe 'New-RepairModel (repair plan, The repair model)' {
     foreach ($k in 'Confirm', 'Run', 'Result', 'Pending', 'NetBackup') { $r[$k] | Should -BeNullOrEmpty -Because $k }
     (New-RepairModel -Machine @{ IsLaptop = $false } -SessionStamp 'x' -CanRun $true).CanRun | Should -BeTrue }
   It 'a tile is available when every action it starts is in the catalog (Ghost devices, Network reset)' {
-    @(Get-RepairAvailable -Catalog ([ordered]@{ health = @{}; ghostList = @{}; ghostRemove = @{}; netReset = @{} })) | Should -Be @('health', 'ghostList', 'ghostRemove', 'netReset', 'ghosts')
+    @(Get-RepairAvailable -Catalog ([ordered]@{ health = @{}; ghostList = @{}; ghostRemove = @{}; netInfo = @{}; netReset = @{} })) | Should -Be @('health', 'ghostList', 'ghostRemove', 'netInfo', 'netReset', 'ghosts')
     @(Get-RepairAvailable -Catalog $null).Count | Should -Be 0 }
+  It 'a tile whose own id is a catalog id still needs every action it starts: no Network reset without netInfo (review M1)' {
+    $a = @(Get-RepairAvailable -Catalog ([ordered]@{ health = @{}; netReset = @{}; ghostList = @{} }))
+    $a | Should -Be @('health', 'ghostList'); $a | Should -Not -Contain 'netReset'; $a | Should -Not -Contain 'ghosts'
+    @(Get-RepairAvailable -Catalog ([ordered]@{ netReset = @{}; netInfo = @{} }) | Where-Object { $_ -ceq 'netReset' }).Count | Should -Be 1 }
 }
 
 Describe 'Get-RepairGate (spec 5, 6.6, 6.7, 8)' {
@@ -97,7 +101,7 @@ Describe 'Get-RepairChips (spec 5: the strip as the window shows it)' {
     $c.Level | Should -Be $Level; $c.TextKey | Should -Be $Key; @($c.Tips) | Should -Contain $Tip }
   It 'the free chip and the stick chip carry their values; a pending rename is a note on a green chip; power is for laptops only' {
     $c = @(Get-RepairChips -Model (New-TestModel @{}))
-    @(($c | Where-Object Name -eq 'Free').Args) | Should -Be @('C:', '41'); @(($c | Where-Object Name -eq 'Stick').Args) | Should -Be @('E:')
+    @(($c | Where-Object Name -eq 'Free').Args) | Should -Be @('C:', '41', 'C'); @(($c | Where-Object Name -eq 'Stick').Args) | Should -Be @('E:', 'E')   # the letter alone for Hebrew (RD-R14)
     $n = New-TestModel @{}; $n.Repair.Strip.Restart = @{ Level = 'ok'; Args = @(); Detail = @{ Signals = @(); Notes = @('PendingFileRename') } }
     $r = Get-RepairChips -Model $n | Where-Object Name -eq 'Restart'; $r.Level | Should -Be 'ok'; @($r.Tips) | Should -Be @('tip.restart.note')
     (Get-RepairChips -Model (New-TestModel @{ IsLaptop = $false }) | Where-Object Name -eq 'Power').Visible | Should -BeFalse
@@ -114,7 +118,7 @@ Describe 'Test-RepairYes and Test-RepairConfirmReady (spec 4.2, RD-R2)' {
     $c.AtPc = $true; Test-RepairConfirmReady -Model $m1 | Should -BeTrue
     $c.Loading = $true; Test-RepairConfirmReady -Model $m1 | Should -BeFalse }
   It 'a repair confirms at once; a gate that closed refuses; ghosts need one ticked device' {
-    $std = @{ Action = 'standard'; Kind = 'confirm'; Typed = ''; AtPc = $false; Loading = $false; Lines = @('tile.standard.changes'); Remote = $null; Items = @(); Options = @{} }
+    $std = @{ Action = 'standard'; Kind = 'confirm'; Typed = ''; AtPc = $false; Loading = $false; Lines = @(@{ Key = 'tile.standard.changes' }); Remote = $null; Items = @(); Options = @{} }
     Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $std }) | Should -BeTrue
     Test-RepairConfirmReady -Model (New-TestModel @{ Confirm = $std; Restart = 'crit' }) | Should -BeFalse
     $g = @{ Action = 'ghosts'; Kind = 'yes'; Typed = 'YES'; AtPc = $false; Loading = $false; Lines = @(); Remote = $null; Options = @{}

@@ -10,7 +10,7 @@
 # into $TestDrive.
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
+  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'State\State', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
                  'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   # The Dell sample machine of tools\Preview-Toolbox.ps1.

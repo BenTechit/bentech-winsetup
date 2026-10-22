@@ -32,10 +32,11 @@ $script:resultSample = @{
   Files = @{ Folder = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015' }
 }
 
-# Network reset's confirmation: its change list (a string-table key) and one static adapter (a machine-value line).
+# Network reset's confirmation: its change list and one static adapter (confirm.static: a left-to-right value line).
+# Confirm.Lines entries are @{ Key; Args } or @{ Ltr } (RepairPage.ps1, review M2).
 $script:confirmSample = @{
   Action = 'netReset'; Kind = 'yes'; Typed = ''; AtPc = $false; Loading = $false
-  Lines = @('tile.netReset.changes', 'Ethernet: 192.168.1.10/24, gateway 192.168.1.1, DNS 8.8.8.8')
+  Lines = @(@{ Key = 'tile.netReset.changes' }, @{ Key = 'confirm.static'; Args = @('Ethernet', '192.168.1.10/24, gateway 192.168.1.1, DNS 8.8.8.8') })
   Remote = @{ Rdp = $false }; Items = @(); Options = @{}
 }
 

@@ -7,7 +7,7 @@
 # setup.log goes to $script:logs and the power state is never read for real. Clicks are raised in code (RaiseEvent).
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
+  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'State\State', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
                  'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   # The Dell sample machine of tools\Preview-Toolbox.ps1.
@@ -150,7 +150,7 @@ Describe 'the repair page view (Update-RepairView)' {
     $s = New-RepairWindow @{ Selected = 'standard'; NetBackup = @{ Path = 'E:\x\network.json'; Sha256 = 'AB'; CreatedAt = '2026-10-20T09:05:00'; Adapters = 1 } }
     $s.FindName('TileStandard').BorderBrush | Should -Be $s.FindResource('AccentBrush'); $s.FindName('TileHealth').BorderBrush | Should -Be $s.FindResource('LineBrush')
     $s.FindName('NetRestoreButton').Visibility | Should -Be 'Visible'
-    $n = New-RepairWindow @{ Stick = $null }; $n.FindName('TileNetReset').ToolTip.Text | Should -Be 'Plug in the BenTech stick: the backup must survive the restart'
+    $n = New-RepairWindow @{ Stick = $null }; $n.FindName('TileNetReset').ToolTip.Text | Should -Be 'Plug in the BenTech stick: the network and device backups are kept there'
     $n.FindName('TileGhosts').IsEnabled | Should -BeFalse; $n.FindName('TileHealth').IsEnabled | Should -BeTrue }
   It 'what it does: the selected tile''s title, text and change list; a hint without one' {
     $s = New-RepairWindow @{ Selected = 'wuReset' }
@@ -165,7 +165,7 @@ Describe 'the repair page view (Update-RepairView)' {
     $x.FindName('AtPcSwitch').Visibility | Should -Be 'Visible'; $x.FindName('YesPanel').Visibility | Should -Be 'Visible'; $x.FindName('ConfirmButton').IsEnabled | Should -BeFalse
     $c.Typed = 'YES'; $c.AtPc = $true; Update-ToolboxView -Window $x
     $x.FindName('ConfirmButton').IsEnabled | Should -BeTrue; $x.FindName('AtPcSwitch').IsChecked | Should -BeTrue
-    $std = New-RepairWindow @{ Confirm = @{ Action = 'standard'; Kind = 'confirm'; Typed = ''; AtPc = $false; Loading = $false; Lines = @('tile.standard.changes', 'warn.lowSpace'); Remote = $null; Items = @(); Options = @{} } }
+    $std = New-RepairWindow @{ Confirm = @{ Action = 'standard'; Kind = 'confirm'; Typed = ''; AtPc = $false; Loading = $false; Lines = @(@{ Key = 'tile.standard.changes' }, @{ Key = 'warn.lowSpace' }); Remote = $null; Items = @(); Options = @{} } }
     $std.FindName('YesPanel').Visibility | Should -Be 'Collapsed'; $std.FindName('AtPcSwitch').Visibility | Should -Be 'Collapsed'; $std.FindName('ConfirmButton').IsEnabled | Should -BeTrue
     (Get-AllText $std.FindName('ConfirmLines')) | Should -Match 'Low free space'
     $rdp = $confirmSample.Clone(); $rdp.Remote = @{ Rdp = $true }; (Get-AllText (New-RepairWindow @{ Confirm = $rdp }).FindName('ConfirmLines')) | Should -Match 'Remote Desktop session' }
@@ -174,7 +174,7 @@ Describe 'the repair page view (Update-RepairView)' {
     $x.FindName('YesBox').Text = 'YES'; $x.FindName('ComplaintBox').Text = 'Slow since the update'; Update-ToolboxView -Window $x
     $x.FindName('YesBox').Text | Should -BeExactly 'YES'; $x.FindName('ComplaintBox').Text | Should -BeExactly 'Slow since the update'
     $x.Tag.Model.Repair.Confirm = $null; Update-ToolboxView -Window $x; $x.FindName('YesBox').Text | Should -BeExactly 'YES'
-    $x.Tag.Model.Repair.Confirm = @{ Action = 'wuReset'; Kind = 'yes'; Typed = ''; AtPc = $false; Loading = $false; Lines = @('tile.wuReset.changes'); Remote = $null; Items = @(); Options = @{} }
+    $x.Tag.Model.Repair.Confirm = @{ Action = 'wuReset'; Kind = 'yes'; Typed = ''; AtPc = $false; Loading = $false; Lines = @(@{ Key = 'tile.wuReset.changes' }); Remote = $null; Items = @(); Options = @{} }
     Update-ToolboxView -Window $x; $x.FindName('YesBox').Text | Should -BeExactly ''; $x.FindName('ComplaintBox').Text | Should -BeExactly 'Slow since the update' }
   It 'the result: the banner''s colour, the restart line, the offers, the files left-to-right and Open folder' {
     $x = New-RepairWindow @{ Result = $resultSample }
@@ -196,4 +196,107 @@ Describe 'the repair page view (Update-RepairView)' {
     Set-TestLayout $w 1000 680; $w.FindName('ContentScroll').ScrollableHeight | Should -Be 0
     $b = New-RepairWindow @{ Restart = 'crit'; Disk = 'crit'; OnAC = $false; Stick = $null; BitLocker = 'warn' }
     Set-TestLayout $b 1000 680; $b.FindName('ContentScroll').ScrollableHeight | Should -Be 0 }
+}
+
+Describe 'the repair page review fixes (ruling RD-R14)' {
+  BeforeAll {
+    # Where each character of a TextBlock's text is drawn (its rectangle), in logical order (the window laid out
+    # first). In a right-to-left element WPF measures from the element's right edge.
+    function Get-CharacterRects($tb) {
+      $rects = New-Object Collections.Generic.List[object]; $p = $tb.ContentStart
+      while ($null -ne $p) {
+        if ($p.GetPointerContext('Forward') -eq 'Text') {
+          $run = $p.GetTextInRun('Forward')
+          for ($i = 0; $i -lt $run.Length; $i++) { $rects.Add($p.GetPositionAtOffset($i).GetCharacterRect('Forward')) }
+          $p = $p.GetPositionAtOffset($run.Length)
+        } else { $p = $p.GetNextContextPosition('Forward') }
+      }
+      , $rects.ToArray()
+    }
+    # $true when -Value, inside the block's text, is drawn left-to-right: on each line, each character to the right of
+    # the one before (a wrapped value starts again on the next line).
+    function Test-ReadsLeftToRight($tb, [string]$Value) {
+      $at = $tb.Text.IndexOf($Value); if ($at -lt 0) { return $false }
+      $rects = Get-CharacterRects $tb; $sign = if ($tb.FlowDirection -eq 'RightToLeft') { -1 } else { 1 }; $pairs = 0
+      for ($k = $at + 1; $k -lt $at + $Value.Length; $k++) {
+        if ([math]::Abs($rects[$k].Y - $rects[$k - 1].Y) -gt 1) { continue }
+        $pairs++; if ($sign * ($rects[$k].X - $rects[$k - 1].X) -le 0) { return $false } }
+      ($pairs -gt 0)
+    }
+  }
+  BeforeEach { Set-RepairTestMocks; $script:ToolboxWarned.Clear() }
+
+  It 'Hebrew: drives, percentages, paths, codes and times read left-to-right inside the right-to-left lines (item 1)' {
+    $r = $resultSample.Clone()
+    $r.Findings = @(@{ Level = 'WARN'; Code = 'sessionLink'; Text = 'x'; Args = @('E:\BenTech-Reports') }
+                    @{ Level = 'WARN'; Code = 'sessionCreateFailed'; Text = 'x'; Args = @('access denied', 'C:\BenTech\Setup\Logs\Repair\v1') }
+                    @{ Level = 'CRIT'; Code = 'dismFailed'; Text = 'DISM RestoreHealth failed (0x800F081F)'; Args = @('0x800F081F') })
+    $x = New-RepairWindow @{ Language = 'he'; Result = $r }; Set-TestLayout $x 1000 680
+    $free = $x.FindName('ChipFreeText'); Test-ReadsLeftToRight $free '41%' | Should -BeTrue; $free.Text | Should -Not -Match 'C:'; $free.Text | Should -Match 'C'
+    $stick = $x.FindName('ChipStickText'); $stick.Text | Should -Match 'E'; $stick.Text | Should -Not -Match ':'   # the letter alone: no colon met first
+    $rows = @($x.FindName('ResultFindings').Children)
+    Test-ReadsLeftToRight $rows[0] 'E:\BenTech-Reports' | Should -BeTrue
+    Test-ReadsLeftToRight $rows[1] 'C:\BenTech\Setup\Logs\Repair\v1' | Should -BeTrue; Test-ReadsLeftToRight $rows[1] 'access denied' | Should -BeTrue
+    Test-ReadsLeftToRight $rows[2] 'DISM RestoreHealth failed (0x800F081F)' | Should -BeTrue   # a code the table lacks: the child's text, left-to-right
+    $y = New-RepairWindow @{ Language = 'he'; Run = $runSample }; Set-TestLayout $y 1000 680
+    Test-ReadsLeftToRight $y.FindName('RunElapsed') '12:34' | Should -BeTrue
+    # The mark is what keeps it so: the same Hebrew line without marks draws the drive's colon on the wrong side.
+    $plain = New-Object Windows.Controls.TextBlock; $plain.FlowDirection = 'RightToLeft'; $plain.Text = ($script:ToolboxStrings.he['finding.sessionLink'] -f 'E:')
+    $plain.Measure((New-Object Windows.Size 600, 100)); $plain.Arrange((New-Object Windows.Rect 0, 0, 600, 100)); Test-ReadsLeftToRight $plain 'E:' | Should -BeFalse
+    # English is untouched by marks; a plain number and a Hebrew value never get one.
+    (New-RepairWindow @{ Result = $r }).FindName('ResultFindings').Children[0].Text | Should -BeExactly 'BenTech-Reports on the stick is a link: the files were kept in E:\BenTech-Reports'
+    Format-RepairText -State $x.Tag -Key 'finding.sfcCorrupt' -Arguments @('3') | Should -BeExactly ($script:ToolboxStrings.he['finding.sfcCorrupt'] -f '3')
+    $hebrewStep = $script:ToolboxStrings.he['tool.step.dism']
+    Format-RepairText -State $x.Tag -Key 'run.stopping' -Arguments @($hebrewStep) | Should -BeExactly ($script:ToolboxStrings.he['run.stopping'] -f $hebrewStep) }
+  It 'Confirm.Lines: @{ Key; Args } in the window''s language, @{ Ltr } left-to-right, anything else skipped and logged once (item 3, M2)' {
+    $c = @{ Action = 'ghosts'; Kind = 'yes'; Typed = ''; AtPc = $false; Loading = $false; Remote = $null; Options = @{}
+            Items = @(@{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'SanDisk Cruzer'; Ticked = $true })
+            Lines = @(@{ Key = 'tile.ghosts.changes' }, @{ Key = 'confirm.ghostCount'; Args = @(1, 3, 2) }, @{ Ltr = 'USB\VID_0781&PID_5567\4C53' }, 'tile.ghosts.changes',
+                      @{ Key = 'no.such.key' }, @{ Key = 'confirm.static'; Args = @('Wi-Fi', '10.0.0.5/24, gateway 10.0.0.1, DNS 1.1.1.1') }) }
+    $x = New-RepairWindow @{ Language = 'he'; Confirm = $c }; Set-TestLayout $x 1000 680
+    (Get-AllText $x.FindName('ConfirmLines')) | Should -Match ([regex]::Escape(($script:ToolboxStrings.he['confirm.ghostCount'] -f 1, 3, 2)))
+    $boxes = @($x.FindName('ConfirmItems').Children | Where-Object { $_ -is [Windows.Controls.Border] })
+    $boxes.Count | Should -Be 2; @($boxes | Where-Object { $_.FlowDirection -ne 'LeftToRight' }).Count | Should -Be 0
+    $boxes[0].Child.Text | Should -BeExactly 'USB\VID_0781&PID_5567\4C53'; $boxes[1].Child.Text | Should -BeExactly 'Wi-Fi: 10.0.0.5/24, gateway 10.0.0.1, DNS 1.1.1.1'
+    Test-ReadsLeftToRight $boxes[1].Child '10.0.0.5/24' | Should -BeTrue
+    @($x.FindName('ConfirmItems').Children | Where-Object { $_ -is [Windows.Controls.CheckBox] }).Count | Should -Be 1   # the device switch
+    (Get-AllText $x.FindName('ConfirmLines')) | Should -Not -Match 'no\.such\.key'
+    Update-ToolboxView -Window $x
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox repair row skipped' -and $_.Data.list -eq 'lines' }).Count | Should -Be 1 }   # once, not per render
+  It 'step rows name the step, the panel title the tile: DISM from a local source, Restore network settings (item 4, M3)' {
+    $d = New-RepairWindow @{ Run = @{ Action = 'dismSource'; Current = 0; ElapsedSeconds = 5; Stopping = $false; Log = @()
+                                      Steps = @(@{ Id = 'dismSource'; Status = 'running'; Percent = $null }, @{ Id = 'sfc'; Status = 'pending'; Percent = $null }) } }
+    $d.FindName('RunTitle').Text | Should -BeExactly $script:ToolboxStrings.en['tile.dismSource.title']
+    (Get-AllText @($d.FindName('RunSteps').Children)[0]) | Should -Match ([regex]::Escape($script:ToolboxStrings.en['tool.step.dismSource']))
+    $n = New-RepairWindow @{ Run = @{ Action = 'netRestore'; Current = 0; ElapsedSeconds = 5; Stopping = $false; Log = @(); Steps = @(@{ Id = 'netRestore'; Status = 'running'; Percent = $null }) } }
+    $n.FindName('RunTitle').Text | Should -BeExactly 'Restore network settings'
+    (Get-AllText @($n.FindName('RunSteps').Children)[0]) | Should -Match 'Restore the network settings'
+    (Get-AllText @((New-RepairWindow @{ Run = @{ Action = 'x'; Steps = @(@{ Id = 'compare'; Status = 'done' }) } }).FindName('RunSteps').Children)[0]) | Should -Match 'Compare with last visit' }
+  It 'rows read from JSON render like hashtables; an unusable row is skipped and logged once (item 5, M4)' {
+    $fromJson = $resultSample | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $x = New-RepairWindow @{ Result = $fromJson }
+    $rows = @($x.FindName('ResultFindings').Children); $rows.Count | Should -Be 3; $rows[0].Foreground | Should -Be $x.FindResource('CritBrush')
+    $rows[1].Text | Should -BeExactly 'System files: 3 integrity problems found (nothing repaired yet)'
+    $x.FindName('OfferDiskCheckButton').Visibility | Should -Be 'Visible'; $x.FindName('ResultFiles').Text | Should -BeExactly $resultSample.Files.Folder
+    $run = $runSample | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $y = New-RepairWindow @{ Run = $run }; $y.FindName('RunSteps').Children.Count | Should -Be 6; $y.FindName('RunBar').Value | Should -Be 45
+    $mixed = $resultSample.Clone(); $mixed.Findings = @($resultSample.Findings[0], 'not a row', ($resultSample.Findings[1] | ConvertTo-Json | ConvertFrom-Json))
+    $z = New-RepairWindow @{ Result = $mixed }; @($z.FindName('ResultFindings').Children).Count | Should -Be 2; Update-ToolboxView -Window $z
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox repair row skipped' -and $_.Data.list -eq 'findings' -and $_.Data.type -eq 'System.String' }).Count | Should -Be 1 }
+  It 'an unchanged render keeps the very same tooltip objects; a changed text gets a new one (item 6, M5)' {
+    $x = New-RepairWindow @{ Restart = 'crit' }
+    $chipTip = $x.FindName('ChipRestart').ToolTip; $tileTip = $x.FindName('TileStandard').ToolTip
+    $chipTip | Should -Not -BeNullOrEmpty; $tileTip | Should -Not -BeNullOrEmpty
+    foreach ($i in 1, 2) { Invoke-ToolboxAction -Sender (New-ToolboxPowerTimer -Window $x) -Action 'Power' }   # the 5-second tick re-renders
+    [object]::ReferenceEquals($x.FindName('ChipRestart').ToolTip, $chipTip) | Should -BeTrue
+    [object]::ReferenceEquals($x.FindName('TileStandard').ToolTip, $tileTip) | Should -BeTrue
+    $x.Tag.Model.Language = 'he'; Update-ToolboxView -Window $x
+    [object]::ReferenceEquals($x.FindName('TileStandard').ToolTip, $tileTip) | Should -BeFalse
+    $x.FindName('TileStandard').ToolTip.Text | Should -BeExactly $script:ToolboxStrings.he['reason.restart']; $x.FindName('TileStandard').ToolTip.FlowDirection | Should -Be 'RightToLeft'
+    $x.Tag.Model.Repair.Strip.Restart = @{ Level = 'ok'; Args = @(); Detail = @{} }; Update-ToolboxView -Window $x
+    $x.FindName('ChipRestart').ToolTip | Should -BeNullOrEmpty; $x.FindName('TileStandard').ToolTip | Should -BeNullOrEmpty }
+  It 'Restore network settings without a stick says why in words that fit it (item 7, M11)' {
+    $x = New-RepairWindow @{ Stick = $null; NetBackup = @{ Path = 'E:\x\network.json'; Sha256 = 'AB'; CreatedAt = '2026-10-20T09:05:00'; Adapters = 1 } }
+    $x.FindName('NetRestoreButton').ToolTip.Text | Should -BeExactly 'Plug in the BenTech stick: the network and device backups are kept there'
+    $script:ToolboxStrings.he['reason.noStickBackup'] | Should -Not -Match 'לשרוד' }
 }

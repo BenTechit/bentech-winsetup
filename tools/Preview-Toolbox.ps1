@@ -44,7 +44,7 @@ if ([string]::IsNullOrEmpty($OutDir)) { $OutDir = Join-Path $repoRoot 'dist\tool
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-foreach ($file in 'Common\Config', 'Common\Logging', 'Engine\Catalog', 'UI\StartScreen', 'Detect\PcName', 'Repair\ToolEngine', 'Toolbox\Strings',
+foreach ($file in 'Common\Config', 'Common\Logging', 'Engine\Catalog', 'UI\StartScreen', 'Detect\PcName', 'State\State', 'Repair\ToolEngine', 'Toolbox\Strings',
                   'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') {
   . (Join-Path $repoRoot "src\$file.ps1")
 }
@@ -149,7 +149,7 @@ $standardResult = @{
 }
 $netResetConfirm = @{
   Action = 'netReset'; Kind = 'yes'; Typed = 'YES'; AtPc = $true; Loading = $false
-  Lines = @('tile.netReset.changes', 'Ethernet: 192.168.1.10/24, gateway 192.168.1.1, DNS 8.8.8.8, 8.8.4.4')
+  Lines = @(@{ Key = 'tile.netReset.changes' }, @{ Key = 'confirm.static'; Args = @('Ethernet', '192.168.1.10/24, gateway 192.168.1.1, DNS 8.8.8.8, 8.8.4.4') })
   Remote = @{ Rdp = $false }; Items = @(); Options = @{}
 }
 

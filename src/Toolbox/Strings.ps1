@@ -23,8 +23,11 @@
 #
 # Hebrew and bidi: a Hebrew line is shown right-to-left, so Latin words and numbers inside it are fine, but a Latin
 # word right before an opening bracket would split the brackets ("Windows (DISM)"): those lines put a Hebrew word
-# before the bracket instead. A trailing Latin value whose punctuation must stay on its right (a drive letter, "E:")
-# ends with a left-to-right mark (U+200E), as step.7zip does.
+# before the bracket instead. Machine values in a Hebrew line read left-to-right (ruling RD-R14): the repair page
+# puts a left-to-right mark (U+200E) on both sides of every {n} value that is not Hebrew and not a plain number
+# (Format-RepairText, RepairPage.ps1); a value written into a Hebrew string itself is wrapped the same way here, as
+# in chip.free.level and step.7zip. WPF does not honour the isolate marks (U+2066..U+2069), only U+200E. The Hebrew
+# chips name a drive by its letter alone ({2} / {1}): in a right-to-left line the colon of "E:" is met first.
 $script:ToolboxStrings = @{
   en = @{
     'app.title'             = 'BENTECH TOOLBOX'
@@ -255,7 +258,7 @@ $script:ToolboxStrings = @{
     'reason.battery'        = 'On battery: plug in the charger'
     'reason.diskFailing'    = 'The disk is failing: tick "backed up / imaged" first'
     'reason.noStickReport'  = 'Plug in the BenTech stick: reports are kept only there'
-    'reason.noStickBackup'  = 'Plug in the BenTech stick: the backup must survive the restart'
+    'reason.noStickBackup'  = 'Plug in the BenTech stick: the network and device backups are kept there'
     'reason.noEarlier'      = 'No earlier report for this PC on the stick'
     'reason.unavailable'    = 'Not available in this version'
     'reason.noScript'       = 'Not available: the setup files are missing'
@@ -474,7 +477,7 @@ $script:ToolboxStrings = @{
     'chip.restart.ok'       = 'אין הפעלה מחדש ממתינה'
     'chip.restart.crit'     = 'ממתינה הפעלה מחדש'
     'chip.restart.unknown'  = 'מצב ההפעלה מחדש לא ידוע'
-    'chip.free.level'       = '{0} {1}% פנוי'
+    'chip.free.level'       = ([string][char]0x200E + '{1}%' + [string][char]0x200E + ' פנוי בכונן {2}')
     'chip.free.unknown'     = 'המקום הפנוי לא ידוע'
     'chip.bitlocker.ok'     = 'BitLocker כבוי'
     'chip.bitlocker.warn'   = 'BitLocker פעיל'
@@ -489,7 +492,7 @@ $script:ToolboxStrings = @{
     'chip.disk.unknown'     = 'מצב הדיסק לא ידוע'
     'chip.power.ac'         = 'מחובר לחשמל'
     'chip.power.battery'    = 'על סוללה'
-    'chip.stick.ok'         = ('דיסק און קי {0}' + [string][char]0x200E)
+    'chip.stick.ok'         = 'דיסק און קי {1}'
     'chip.stick.none'       = 'אין דיסק און קי'
     'tip.restart.crit'      = 'ממתינה הפעלה מחדש להשלמת עדכוני Windows: DISM ו-SFC ייתנו תוצאות שגויות. יש להפעיל מחדש קודם.'
     'tip.restart.note'      = 'ממתין שינוי שם של קובץ או של המחשב: זה לא חוסם תיקונים.'
@@ -547,7 +550,7 @@ $script:ToolboxStrings = @{
     'reason.battery'        = 'על סוללה: יש לחבר מטען'
     'reason.diskFailing'    = 'הדיסק כושל: יש לסמן קודם "גובו או שוכפלו"'
     'reason.noStickReport'  = 'יש לחבר את הדיסק און קי של BenTech: הדוחות נשמרים רק בו'
-    'reason.noStickBackup'  = 'יש לחבר את הדיסק און קי של BenTech: הגיבוי צריך לשרוד את ההפעלה מחדש'
+    'reason.noStickBackup'  = 'יש לחבר את הדיסק און קי של BenTech: הגיבויים של הרשת וההתקנים נשמרים בו'
     'reason.noEarlier'      = 'אין בדיסק און קי דוח קודם של המחשב הזה'
     'reason.unavailable'    = 'לא זמין בגרסה הזו'
     'reason.noScript'       = 'לא זמין: קבצי ההתקנה חסרים'

@@ -54,7 +54,9 @@ function Get-RepairAvailable {
   <#
   .SYNOPSIS
     The action and tile ids this version can run: every id of -Catalog (the action catalog), then each tile of
-    $script:RepairTileActions whose actions are all in it. Pure; emitted one by one (wrap the call in @()).
+    $script:RepairTileActions whose actions are all in it, each id once. A tile of that table is available only when
+    every action it starts is in the catalog, also when its own id is a catalog id (Network reset without netInfo is
+    not available; review M1). Pure; emitted one by one (wrap the call in @()).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -62,12 +64,19 @@ function Get-RepairAvailable {
 
   if ($Catalog -isnot [System.Collections.IDictionary]) { return }
   $ids = @(foreach ($key in $Catalog.Keys) { [string]$key })
-  $ids
+  $complete = @{}
   foreach ($tile in $script:RepairTileActions.Keys) {
-    if ($ids -ccontains $tile) { continue }
     $all = $true
     foreach ($action in $script:RepairTileActions[$tile]) { if ($ids -cnotcontains $action) { $all = $false } }
-    if ($all) { $tile }
+    $complete[$tile] = $all
+  }
+  $emitted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($id in $ids) {
+    if ($complete.ContainsKey($id) -and -not $complete[$id]) { continue }
+    if ($emitted.Add($id)) { $id }
+  }
+  foreach ($tile in $script:RepairTileActions.Keys) {
+    if ($complete[$tile] -and $emitted.Add($tile)) { $tile }
   }
 }
 
@@ -240,6 +249,15 @@ function Get-RepairGate {
   return @{ Enabled = ($visible -and $reason -eq ''); Visible = $visible; Reason = $reason; Warns = [string[]]$warns.ToArray() }
 }
 
+function Get-RepairDriveLetter {
+  # Private. A drive's letter without its colon ('E:' -> 'E'); anything else as it is.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Drive)
+
+  return ([string]$Drive).TrimEnd(':', '\')
+}
+
 function Get-RepairChips {
   <#
   .SYNOPSIS
@@ -249,10 +267,12 @@ function Get-RepairChips {
     Each row: @{ Name; Level = 'ok'|'warn'|'crit'|'unknown'|'loading'; TextKey; Args = [string[]]; Glyph (a code
     point); Tips = [string[]] (string keys, joined in the tooltip; none for a plain green chip); Visible }.
       - The five read chips say chip.loading until the safety child has read them.
-      - Free shows '{0} {1}% free' with the drive and the percent (chip.free.level) at every known level.
+      - Free shows chip.free.level at every known level, with Args = @(<drive 'C:'>, <percent>, <letter 'C'>).
       - Restart ok with a pending file or computer rename (Detail.Notes) keeps its green and adds tip.restart.note.
       - Power (laptops only, the window's own reading): ok on charger, crit on battery.
-      - Stick: ok 'Stick E:', crit 'No stick' (spec 8: a red chip).
+      - Stick: ok chip.stick.ok with Args = @(<drive 'E:'>, <letter 'E'>), crit 'No stick' (spec 8: a red chip).
+    The letter without its colon is for the Hebrew texts (ruling RD-R14): in a right-to-left line the colon of 'E:'
+    is met before the letter, so the Hebrew chips name the drive by its letter alone.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -271,7 +291,13 @@ function Get-RepairChips {
     $row.Level = $level
     $part = $name.ToLowerInvariant()
     $row.TextKey = "chip.$part.$level"
-    if ($name -ceq 'Free' -and $level -cne 'unknown') { $row.TextKey = 'chip.free.level'; $row.Args = [string[]]@($chip['Args']) }
+    if ($name -ceq 'Free' -and $level -cne 'unknown') {
+      $values = [string[]]@($chip['Args'])
+      $drive = $(if ($values.Count -gt 0) { $values[0] } else { '' })
+      $percent = $(if ($values.Count -gt 1) { $values[1] } else { '' })
+      $row.TextKey = 'chip.free.level'
+      $row.Args = [string[]]@($drive, $percent, (Get-RepairDriveLetter -Drive $drive))
+    }
     $tips = New-Object System.Collections.Generic.List[string]
     if ($level -ceq 'unknown') { $tips.Add('tip.unknown') }
     elseif ($level -cne 'ok') { $tips.Add("tip.$part.$level") }
@@ -290,7 +316,8 @@ function Get-RepairChips {
 
   $stick = Test-RepairStick -Repair $repair
   @{ Name = 'Stick'; Level = $(if ($stick) { 'ok' } else { 'crit' }); TextKey = $(if ($stick) { 'chip.stick.ok' } else { 'chip.stick.none' })
-     Args = [string[]]@($(if ($stick) { [string]$repair['Stick']['Drive'] })); Glyph = $script:RepairChipGlyphs['Stick']
+     Args = [string[]]@($(if ($stick) { [string]$repair['Stick']['Drive']; Get-RepairDriveLetter -Drive ([string]$repair['Stick']['Drive']) }))
+     Glyph = $script:RepairChipGlyphs['Stick']
      Tips = [string[]]@($(if (-not $stick) { 'tip.stick.none' })); Visible = $true }
 }
 

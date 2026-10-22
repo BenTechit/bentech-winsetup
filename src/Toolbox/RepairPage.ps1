@@ -6,14 +6,22 @@
 # The rules of Toolbox.ps1 hold here too: the model decides every state (a control never decides its own); every
 # .NET call's output goes to $null, so each function returns exactly one value or nothing; no console, no sleep, no
 # closures, no handler; colours come from the window's one resource dictionary. Texts come from the string table in
-# the model's language (Get-ToolboxString); machine values, the log tail, file paths and adapter lines stay
-# left-to-right in Hebrew.
+# the model's language (Format-RepairText over Get-ToolboxString); machine values, the log tail, file paths and
+# adapter lines stay left-to-right in Hebrew (ruling RD-R14: a value inside a Hebrew line is wrapped in
+# left-to-right marks; a whole machine-value line is a left-to-right element).
 #
 # It never writes the complaint box or the YES box: a re-render must not move the caret (plan call). The one
-# exception: the YES box is emptied when a new confirmation opens.
+# exception: the YES box is emptied when a new confirmation opens. A tooltip is replaced only when its text changed
+# (the 5-second power tick re-renders, and must not close a tooltip being read: review M5).
 #
-# Needs Toolbox.ps1 (Get-ToolboxString, New-ToolboxTextBlock), RepairPlanner.ps1 (Get-RepairGate, Get-RepairChips,
-# Test-RepairConfirmReady, Format-RepairElapsed, $script:RepairTileRows) and WPF; the bundle holds every file.
+# The lists it renders (Run.Steps, Result.Findings, Confirm.Items, Confirm.Lines) may hold hashtables or objects
+# read from JSON; each row becomes a hashtable once (ConvertTo-RepairRows) and a row that is neither is skipped and
+# logged once (review M4). Confirm.Lines entries are @{ Key = '<string key>'; Args = @(...) } (a text of the window's
+# language) or @{ Ltr = '<machine value>' } (a left-to-right value line; review M2).
+#
+# Needs Toolbox.ps1 (Get-ToolboxString, New-ToolboxTextBlock, Write-ToolboxWarningOnce), RepairPlanner.ps1
+# (Get-RepairGate, Get-RepairChips, Test-RepairConfirmReady, Format-RepairElapsed, $script:RepairTileRows),
+# State.ps1 (ConvertTo-HashtableDeep), StartScreen.ps1 (ConvertTo-ScreenText) and WPF; the bundle holds every file.
 
 # The glyph and the colours of a run step's status (plan, Glyphs; pending is a ring, EA3A, rather than the plan's
 # filled E91F: an empty circle reads as "still to come" on the screenshots).
@@ -41,29 +49,97 @@ function Get-RepairElementName {
 }
 
 function Get-RepairActionTitle {
-  # Private. An action's name in the window's language: its tile's title, else its step name, else the id.
+  # Private. An action's name in the window's language: its tile's title, else its step name, else the id. With
+  # -Step (the run panel's step rows) the step name comes first and the tile's title is the fallback (review M3:
+  # dismSource and netRestore are both a tile and a step).
   [CmdletBinding()]
   [OutputType([string])]
-  param([Parameter(Mandatory)][hashtable]$State, [AllowEmptyString()][string]$Id)
+  param([Parameter(Mandatory)][hashtable]$State, [AllowEmptyString()][string]$Id, [switch]$Step)
 
   $language = [string]$State.Model.Language
-  foreach ($key in "tile.$Id.title", "tool.step.$Id") {
+  $keys = if ($Step) { "tool.step.$Id", "tile.$Id.title" } else { "tile.$Id.title", "tool.step.$Id" }
+  foreach ($key in $keys) {
     if ($State.Strings['en'].ContainsKey($key)) { return (Get-ToolboxString -Table $State.Strings -Language $language -Key $key) }
   }
   return $Id
 }
 
-function New-RepairTip {
-  # Private. A tooltip: a wrapping TextBlock (TipTextStyle) in the window's direction. The tooltip is outside the
-  # logical tree, so it does not inherit the window's direction.
+function Format-RepairText {
+  <#
+  .SYNOPSIS
+    Private. A text of the string table in the window's language, its -Arguments filled in. In Hebrew every value
+    that is a machine value (no Hebrew letter, and not a plain number) is wrapped in left-to-right marks (U+200E), so
+    a drive, a path, an IP or a code reads left-to-right inside the right-to-left line (ruling RD-R14; WPF ignores
+    the isolate marks U+2066..U+2069). A plain number needs no mark, and a Hebrew value (a step name) none either.
+  #>
   [CmdletBinding()]
-  [OutputType([System.Windows.Controls.TextBlock])]
-  param([Parameter(Mandatory)][System.Windows.Window]$Window, [Parameter(Mandatory)][string]$Text)
+  [OutputType([string])]
+  param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][string]$Key, [AllowNull()][object[]]$Arguments)
 
+  $language = [string]$State.Model.Language
+  $values = @(foreach ($a in @($Arguments)) { if ($null -ne $a) { [string]$a } })
+  if ($language -ceq 'he') {
+    $mark = [string][char]0x200E
+    $values = @(foreach ($v in $values) { if ($v -eq '' -or $v -match '^\d+$' -or $v -match '\p{IsHebrew}') { $v } else { $mark + $v + $mark } })
+  }
+  return (Get-ToolboxString -Table $State.Strings -Language $language -Key $Key -Arguments $values)
+}
+
+function Set-RepairTip {
+  # Private. -Owner's tooltip: a wrapping TextBlock (TipTextStyle) holding -Text in the window's direction, or none
+  # for an empty -Text. The tooltip is replaced only when its text changed, so a re-render (the 5-second power tick)
+  # never closes a tooltip that is open (review M5); a changed direction (EN | HE) is set on the same tooltip. The
+  # tooltip is outside the logical tree, so it does not inherit the window's direction.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [Parameter(Mandatory)][System.Windows.FrameworkElement]$Owner,
+    [AllowEmptyString()][string]$Text = ''
+  )
+
+  if ($Text -eq '') {
+    if ($null -ne $Owner.ToolTip) { $Owner.ToolTip = $null }
+    return
+  }
+  $tip = $Owner.ToolTip
+  if ($tip -is [System.Windows.Controls.TextBlock] -and $tip.Text -ceq $Text) {
+    if ($tip.FlowDirection -ne $Window.FlowDirection) { $tip.FlowDirection = $Window.FlowDirection }
+    return
+  }
   $tip = New-ToolboxTextBlock -Window $Window -Style 'TipTextStyle'
   $tip.Text = $Text
   $tip.FlowDirection = $Window.FlowDirection
-  return $tip
+  $Owner.ToolTip = $tip
+}
+
+function ConvertTo-RepairRows {
+  <#
+  .SYNOPSIS
+    Private. The rows of a list the view renders (-List names it: steps, findings, items, lines), each as a hashtable:
+    a hashtable as it is, an object read from JSON converted once (ConvertTo-HashtableDeep). Anything else is skipped
+    and logged once per list (WARN 'Toolbox repair row skipped' with @{ list; type }), never dropped silently (review
+    M4). Emitted one by one: wrap the call in @().
+  #>
+  [CmdletBinding()]
+  param([AllowNull()]$Rows, [Parameter(Mandatory)][string]$List)
+
+  foreach ($row in @($Rows)) {
+    if ($null -eq $row) { continue }
+    if ($row -is [System.Collections.IDictionary]) { $row; continue }
+    if ($row -is [System.Management.Automation.PSCustomObject]) { ConvertTo-HashtableDeep -InputObject $row; continue }
+    Write-ToolboxWarningOnce -Id "repairRow:$List" -Message 'Toolbox repair row skipped' -Data @{ list = $List; type = (ConvertTo-ScreenText -Text $row.GetType().FullName) }
+  }
+}
+
+function ConvertTo-RepairEntry {
+  # Private. A panel's object (Run, Result, Confirm) as hashtables all the way down (ConvertTo-HashtableDeep), once
+  # per render: a hashtable may hold objects read from JSON (Offers, Files, Remote, the rows). Anything that is neither
+  # a hashtable nor such an object is $null.
+  [CmdletBinding()]
+  param([AllowNull()]$Entry)
+
+  if ($Entry -is [System.Collections.IDictionary] -or $Entry -is [System.Management.Automation.PSCustomObject]) { return (ConvertTo-HashtableDeep -InputObject $Entry) }
+  return $null
 }
 
 function New-RepairLineRow {
@@ -143,9 +219,9 @@ function Set-RepairChips {
     $glyph = $Window.FindName('Chip' + $chip.Name + 'Glyph')
     $glyph.Text = [string][char]$chip.Glyph
     $glyph.Foreground = $Window.FindResource($script:RepairChipFores[$chip.Level])
-    $Window.FindName('Chip' + $chip.Name + 'Text').Text = Get-ToolboxString -Table $state.Strings -Language $language -Key $chip.TextKey -Arguments @($chip.Args)
+    $Window.FindName('Chip' + $chip.Name + 'Text').Text = Format-RepairText -State $state -Key $chip.TextKey -Arguments @($chip.Args)
     $tips = @(foreach ($key in @($chip.Tips)) { Get-ToolboxString -Table $state.Strings -Language $language -Key $key })
-    $border.ToolTip = $(if ($tips.Count -gt 0) { New-RepairTip -Window $Window -Text ($tips -join "`n") } else { $null })
+    Set-RepairTip -Window $Window -Owner $border -Text ($tips -join "`n")
     if ($chip.Name -ceq 'Restart') { $Window.FindName('ChipRestartButton').Visibility = $(if ($chip.Level -ceq 'crit') { $visible } else { $collapsed }) }
     if ($chip.Name -ceq 'Disk') { $Window.FindName('BackedUpSwitch').Visibility = $(if ($chip.Level -ceq 'crit') { $visible } else { $collapsed }) }
     if ($chip.Name -ceq 'Stick') { $Window.FindName('NoStickBanner').Visibility = $(if ($chip.Level -ceq 'crit') { $visible } else { $collapsed }) }
@@ -168,10 +244,9 @@ function Set-RepairGatedButton {
   $gate = Get-RepairGate -Model $state.Model -ActionId $ActionId
   $Button.Visibility = $(if ($Show -and $gate.Visible) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
   $Button.IsEnabled = $gate.Enabled
-  $Button.ToolTip = $null
-  if (-not $gate.Enabled -and $gate.Reason -ne '') {
-    $Button.ToolTip = New-RepairTip -Window $Window -Text (Get-ToolboxString -Table $state.Strings -Language ([string]$state.Model.Language) -Key $gate.Reason)
-  }
+  $reason = ''
+  if (-not $gate.Enabled -and $gate.Reason -ne '') { $reason = Get-ToolboxString -Table $state.Strings -Language ([string]$state.Model.Language) -Key $gate.Reason }
+  Set-RepairTip -Window $Window -Owner $Button -Text $reason
 }
 
 function Set-RepairWhatPanel {
@@ -215,11 +290,17 @@ function Set-RepairConfirmPanel {
   .SYNOPSIS
     Private. The confirmation (spec 4.2): its title, its lines, its items, the at-PC switch, YES and Confirm.
   .DESCRIPTION
-    Confirm.Lines: a string-table key is a text of the window's language: a tile's change list (bullets under "This
-    will change:"), a warning (warn.*, confirm.noStickLog: yellow) or a plain line; any other text is a machine value
-    (an adapter's settings, from the info child) and goes into ConfirmItems, left-to-right. Confirm.Items (Ghost
-    devices) are switches, all left-to-right. Network reset always shows the at-PC switch (ruling RD-R2) and the
-    warning that the reset cuts remote sessions, red when an RDP session was detected (Confirm.Remote.Rdp).
+    Confirm.Lines (review M2), each entry one of:
+      @{ Key = '<string key>'; Args = @(...) }  a text of the window's language, its Args filled in (machine values
+                                                left-to-right, Format-RepairText): a tile's change list (bullets under
+                                                "This will change:"), a warning (warn.*, confirm.noStickLog: yellow), an
+                                                adapter's settings (confirm.static: a left-to-right value line in
+                                                ConfirmItems) or a plain line (confirm.ghostCount, confirm.noStatic ...);
+      @{ Ltr = '<machine value>' }              a value line in ConfirmItems, left-to-right.
+    An entry that is neither, or whose Key the string table lacks, is skipped and logged once (WARN 'Toolbox repair
+    row skipped'). Confirm.Items (Ghost devices) are switches, all left-to-right. Network reset always shows the at-PC
+    switch (ruling RD-R2) and the warning that the reset cuts remote sessions, red when an RDP session was detected
+    (Confirm.Remote.Rdp).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -229,7 +310,7 @@ function Set-RepairConfirmPanel {
   $language = [string]$model.Language
   $visible = [System.Windows.Visibility]::Visible
   $collapsed = [System.Windows.Visibility]::Collapsed
-  $confirm = $model.Repair['Confirm']
+  $confirm = ConvertTo-RepairEntry -Entry $model.Repair['Confirm']
   $action = [string]$confirm['Action']
   $lines = $Window.FindName('ConfirmLines')
   $items = $Window.FindName('ConfirmItems')
@@ -242,21 +323,31 @@ function Set-RepairConfirmPanel {
   if ($confirm['Loading'] -eq $true) {
     $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text (Get-ToolboxString -Table $state.Strings -Language $language -Key 'confirm.loading') -Brush 'SubtleTextBrush' -Glyph 0xE895))
   }
-  foreach ($line in @($confirm['Lines'])) {
-    $value = [string]$line
-    if ($value -eq '') { continue }
-    if (-not $state.Strings['en'].ContainsKey($value)) {
-      $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text $value))
+  foreach ($line in @(ConvertTo-RepairRows -Rows $confirm['Lines'] -List 'lines')) {
+    $key = [string]$line['Key']
+    $ltr = [string]$line['Ltr']
+    $lineArgs = @(@($line['Args']) | Where-Object { $null -ne $_ })
+    if ($key -eq '' -and $ltr -ne '') {
+      $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text $ltr))
       continue
     }
-    $text = Get-ToolboxString -Table $state.Strings -Language $language -Key $value
-    if ($value -like 'tile.*.changes') {
+    if ($key -eq '' -or -not $state.Strings['en'].ContainsKey($key)) {
+      Write-ToolboxWarningOnce -Id 'repairRow:lines' -Message 'Toolbox repair row skipped' -Data @{ list = 'lines'; key = (ConvertTo-ScreenText -Text $key) }
+      continue
+    }
+    if ($key -ceq 'confirm.static') {
+      # An adapter's settings: machine values only, the whole line left-to-right.
+      $null = $items.Children.Add((New-RepairValueBox -Window $Window -Text (Get-ToolboxString -Table $state.Strings -Language 'en' -Key $key -Arguments $lineArgs)))
+      continue
+    }
+    $text = Format-RepairText -State $state -Key $key -Arguments $lineArgs
+    if ($key -like 'tile.*.changes') {
       $header = New-ToolboxTextBlock -Window $Window -Style 'SectionTitleStyle'
       $header.Text = Get-ToolboxString -Table $state.Strings -Language $language -Key 'confirm.changes'
       $header.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
       $null = $lines.Children.Add($header)
       foreach ($part in ($text -split "`n")) { $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $part)) }
-    } elseif ($value -like 'warn.*' -or $value -ceq 'confirm.noStickLog') {
+    } elseif ($key -like 'warn.*' -or $key -ceq 'confirm.noStickLog') {
       $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $text -Brush 'WarnBrush' -Glyph 0xE7BA))
     } else {
       $null = $lines.Children.Add((New-RepairLineRow -Window $Window -Text $text))
@@ -276,7 +367,7 @@ function Set-RepairConfirmPanel {
   $switch.IsChecked = ($confirm['AtPc'] -eq $true)
 
   $index = 0
-  foreach ($item in @($confirm['Items'] | Where-Object { $_ -is [System.Collections.IDictionary] })) {
+  foreach ($item in @(ConvertTo-RepairRows -Rows $confirm['Items'] -List 'items')) {
     $box = New-Object System.Windows.Controls.CheckBox
     $box.Style = $Window.FindResource('SwitchStyle')
     $box.Tag = "a:GhostTick:$index"
@@ -306,7 +397,7 @@ function Set-RepairRunPanel {
   $language = [string]$model.Language
   $visible = [System.Windows.Visibility]::Visible
   $collapsed = [System.Windows.Visibility]::Collapsed
-  $run = $model.Repair['Run']
+  $run = ConvertTo-RepairEntry -Entry $model.Repair['Run']
   $culture = [Globalization.CultureInfo]::InvariantCulture
 
   $Window.FindName('RunTitle').Text = Get-RepairActionTitle -State $state -Id ([string]$run['Action'])
@@ -314,7 +405,7 @@ function Set-RepairRunPanel {
   $barRow = $Window.FindName('RunBarRow')
   $steps.Children.Clear()
   $current = ''
-  foreach ($step in @($run['Steps'] | Where-Object { $_ -is [System.Collections.IDictionary] })) {
+  foreach ($step in @(ConvertTo-RepairRows -Rows $run['Steps'] -List 'steps')) {
     $id = [string]$step['Id']
     $status = [string]$step['Status']
     $look = $script:RepairStepLooks[$status]
@@ -331,7 +422,7 @@ function Set-RepairRunPanel {
     $glyph.Text = [string][char]$look.Glyph
     $glyph.Foreground = $Window.FindResource($look.Brush)
     $name = New-ToolboxTextBlock -Window $Window -Style 'PlanLineStyle'
-    $name.Text = Get-RepairActionTitle -State $state -Id $id
+    $name.Text = Get-RepairActionTitle -State $state -Id $id -Step
     $name.Foreground = $Window.FindResource($look.Text)
     if ($status -ceq 'running') { $name.FontWeight = [System.Windows.FontWeights]::SemiBold; $current = $name.Text }
     [System.Windows.Controls.Grid]::SetColumn($name, 1)
@@ -349,7 +440,7 @@ function Set-RepairRunPanel {
     }
   }
 
-  $Window.FindName('RunElapsed').Text = Get-ToolboxString -Table $state.Strings -Language $language -Key 'run.elapsed' -Arguments @(Format-RepairElapsed -Seconds ([int]$run['ElapsedSeconds']))
+  $Window.FindName('RunElapsed').Text = Format-RepairText -State $state -Key 'run.elapsed' -Arguments @(Format-RepairElapsed -Seconds ([int]$run['ElapsedSeconds']))
   $log = @($run['Log'] | ForEach-Object { [string]$_ })
   if ($log.Count -gt 8) { $log = $log[($log.Count - 8)..($log.Count - 1)] }
   $Window.FindName('RunLog').Text = ($log -join "`n")
@@ -374,7 +465,7 @@ function Set-RepairResultPanel {
   $language = [string]$model.Language
   $visible = [System.Windows.Visibility]::Visible
   $collapsed = [System.Windows.Visibility]::Collapsed
-  $result = $model.Repair['Result']
+  $result = ConvertTo-RepairEntry -Entry $model.Repair['Result']
 
   $color = [string]$result['Color']
   $look = switch -CaseSensitive ($color) {
@@ -393,12 +484,12 @@ function Set-RepairResultPanel {
   $findings = $Window.FindName('ResultFindings')
   $findings.Children.Clear()
   $levelBrush = @{ CRIT = 'CritBrush'; WARN = 'WarnBrush'; INFO = 'DimTextBrush' }
-  foreach ($finding in @($result['Findings'] | Where-Object { $_ -is [System.Collections.IDictionary] })) {
+  foreach ($finding in @(ConvertTo-RepairRows -Rows $result['Findings'] -List 'findings')) {
     $code = [string]$finding['Code']
     $row = New-ToolboxTextBlock -Window $Window -Style 'PanelTextStyle'
     $row.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
     if ($state.Strings['en'].ContainsKey("finding.$code")) {
-      $row.Text = Get-ToolboxString -Table $state.Strings -Language $language -Key "finding.$code" -Arguments @($finding['Args'] | ForEach-Object { [string]$_ })
+      $row.Text = Format-RepairText -State $state -Key "finding.$code" -Arguments @(@($finding['Args']) | Where-Object { $null -ne $_ })
     } else {
       # The child's English text: left-to-right, so its brackets and codes read right in a Hebrew window too.
       $row.Text = [string]$finding['Text']
@@ -427,9 +518,9 @@ function Set-RepairResultPanel {
     $Window.FindName('OfferDismText').Text = Get-ToolboxString -Table $state.Strings -Language $language -Key 'result.offerDism' `
       -Arguments @([string]$dism['Path'], [string]$dism['Edition'], [string]$dism['Arch'], (@($dism['Languages']) -join ', '), [string]$dism['Build'])
     $notes = New-Object System.Collections.Generic.List[string]
-    if ($dism['BuildDiffers'] -eq $true) { $notes.Add((Get-ToolboxString -Table $state.Strings -Language $language -Key 'result.buildDiffers' -Arguments @([string]$state.Machine['OsBuild']))) }
+    if ($dism['BuildDiffers'] -eq $true) { $notes.Add((Format-RepairText -State $state -Key 'result.buildDiffers' -Arguments @([string]$state.Machine['OsBuild']))) }
     if ($dism['LanguageDiffers'] -eq $true) {
-      $notes.Add((Get-ToolboxString -Table $state.Strings -Language $language -Key 'result.languageDiffers' -Arguments @((@($dism['Languages']) -join ', '), [string]$dism['PcLanguage'])))
+      $notes.Add((Format-RepairText -State $state -Key 'result.languageDiffers' -Arguments @((@($dism['Languages']) -join ', '), [string]$dism['PcLanguage'])))
     }
     $note = $Window.FindName('OfferDismNote')
     $note.Text = ($notes -join "`n")
@@ -498,7 +589,8 @@ function Update-RepairView {
   foreach ($name in 'WhatPanel', 'ConfirmPanel', 'RunPanel', 'ResultPanel') { $Window.FindName($name).Visibility = $(if ($name -ceq $panel) { $visible } else { $collapsed }) }
 
   $confirmKey = ''
-  if ($repair['Confirm'] -is [System.Collections.IDictionary]) { $confirmKey = [string]$repair['Confirm']['Action'] }
+  $openConfirm = ConvertTo-RepairEntry -Entry $repair['Confirm']
+  if ($null -ne $openConfirm) { $confirmKey = [string]$openConfirm['Action'] }
   if ($confirmKey -ne '' -and $confirmKey -cne [string]$state['RepairConfirmKey']) { $Window.FindName('YesBox').Text = '' }
   $state['RepairConfirmKey'] = $confirmKey
 
