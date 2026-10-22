@@ -197,7 +197,7 @@ Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
   It 'Start returns the validated Choices and closes; Cancel and Close return Cancel' {
     $w = New-LiveWindow; Click $w 'TypeDesktop'; Click $w 'StartButton'
     $w.Tag.Outcome | Should -Be 'Start'; $w.Tag.Closing | Should -BeTrue
-    @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks')
+    @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate')
     @($w.Tag.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds')
     foreach ($b in 'CancelButton', 'CloseButton') { $c = New-LiveWindow; Click $c $b; $c.Tag.Outcome | Should -Be 'Cancel'; $c.Tag.Choices | Should -BeNullOrEmpty }
     $x = New-LiveWindow; $x.Close(); $x.Tag.Outcome | Should -Be 'Cancel' }   # Alt+F4 and the window's X end in Closing

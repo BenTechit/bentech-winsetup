@@ -343,6 +343,15 @@ The toolbox window replaces the console start screen ([toolbox spec](specs/2026-
 - [ ] Start with no Choices, no result, more than one result or an unknown outcome is Failed and falls back to the console.
 - [ ] The UCPD refusal (above), the `(default)` token (above) and the frequency restore on a timeout (above): their real-machine checks are in the items of this section.
 
+### 1.20 Windows Update drivers only (wu spec 5)
+
+With `Choices.WindowsUpdate` DRIVERS ([wu spec](specs/2026-10-22-windows-update-option-design.md) 3.2), every Windows Update round searches `Type='Driver'` only; FULL is unchanged. The suite proves the search, the scope passed to the child, the step's message and activity line and the report line with mocks (`tests\WindowsUpdate.Tests.ps1`, `tests\Entry.Tests.ps1`, `tests\Finalize.Tests.ps1`). Like 1.18 and 1.19, this needs a real publish and VM checkpoints right after OOBE, or a shop laptop. **Never on the dev PC.** Where an item says "record", write the answer into the filled copy.
+
+- [ ] **The DRIVERS run.** Windows Update history (Settings, Windows Update, Update history) shows only driver updates installed by the run, and **no cumulative update**. On battery, firmware is still held (`Firmware update left for later: on battery` in `setup.log`, and the yellow battery note). The activity feed has `Windows Update: drivers only (other updates left to Windows)` once, before round 1's own line, and the step says `Drivers only: installed <n> updates in <r> rounds`. **Record the total run time** against a FULL run on a similar PC.
+- [ ] **Optional drivers.** Record the `count` (and the titles) of the `Optional driver updates skipped` line in `setup.log`. It is written in round 1 only (ruling WU-R1); Ben decides from these counts whether DRIVERS should also take the optional drivers.
+- [ ] **An old run state runs FULL.** Resume a run started by the previous version (its `state.json` has no `WindowsUpdate` in `Choices`) with the new version: every `Windows Update round starting` line has `scope` `FULL`, the round searches software and drivers, and the report reads `Updates      : full`.
+- [ ] **Proven by mocks only:** a failed optional-driver count (a WUA error on the `BrowseOnly=1` search) is one WARN, `Optional driver updates could not be counted`, and the round still installs its drivers.
+
 ---
 
 ## 2. Per VM type

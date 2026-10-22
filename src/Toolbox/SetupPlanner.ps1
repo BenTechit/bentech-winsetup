@@ -7,11 +7,12 @@
 #
 # Pure: no logging, no I/O, no console. Values in, values out; the callers log (ConvertTo-ValidChoices returns
 # the dropped tweak ids for that). Needs Catalog.ps1 (Get-TweakCatalog, Get-EffectiveTweaks, Get-RemoteChoice,
-# Get-StepPlan, $script:RemoteChoices, $script:StepCatalog) and StartScreen.ps1 (New-DefaultChoices,
-# $script:OfficeChoices); the bundle holds every file.
+# Get-WindowsUpdateChoice, Get-StepPlan, $script:RemoteChoices, $script:StepCatalog) and StartScreen.ps1
+# (New-DefaultChoices, $script:OfficeChoices); the bundle holds every file.
 #
 # A profile only fills in the options (spec 5.2): Office, Remote, 7-Zip, the tweak selection and the restore
-# point. The Type (laptop or desktop) is never part of a profile: it is detected. Choices keep ASCII ids only, so
+# point, and the Windows Update choice only when it sets windowsUpdate (wu spec 3.1). The Type (laptop or
+# desktop) is never part of a profile: it is detected. Choices keep ASCII ids only, so
 # nothing Hebrew reaches state.json or setup.log; the Hebrew names stay in the profile.
 
 function Get-SetupProfiles {
@@ -19,12 +20,14 @@ function Get-SetupProfiles {
   .SYNOPSIS
     The valid profiles of Config.profiles, in config order, one hashtable each. Never throws.
   .DESCRIPTION
-    Each: @{ Id; Name = @{ en; he }; Office; Remote; SevenZip; RestorePoint; Tweaks = [string[]] }.
+    Each: @{ Id; Name = @{ en; he }; Office; Remote; SevenZip; RestorePoint; Tweaks = [string[]]; WindowsUpdate }.
     Left out: an id that does not match ^[a-z][a-z0-9-]{0,31}$, an id an earlier profile already has, an empty
     name.en. A bad value is repaired, never a reason to drop the profile:
       - Office is upper-cased; outside $script:OfficeChoices it is defaults.office, or OFF when that is no
         better (nothing gets installed that nobody asked for);
       - Remote goes through Get-RemoteChoice (missing or unknown is ANYDESK);
+      - WindowsUpdate (wu spec 3.1) is '' when the entry has no windowsUpdate or it is $null (the profile does
+        not set it); otherwise it goes through Get-WindowsUpdateChoice (an invalid value is FULL);
       - sevenZip and restorePoint must be bools; otherwise defaults.sevenZip and $true (spec 10b.5);
       - Tweaks: the profile's tweaks when it has that property (an empty list is a choice), else every catalog
         entry with Default; plus tweaksAdd. Only catalog ids, in catalog order, each once. This is the
@@ -63,6 +66,10 @@ function Get-SetupProfiles {
     }
     foreach ($t in @($entry.tweaksAdd)) { if ($null -ne $t) { $null = $wanted.Add([string]$t) } }
 
+    $windowsUpdate = ''
+    $wuProperty = $entry.PSObject.Properties['windowsUpdate']
+    if ($null -ne $wuProperty -and $null -ne $wuProperty.Value) { $windowsUpdate = Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$wuProperty.Value } }
+
     @{
       Id           = $id
       Name         = @{ en = $nameEn; he = [string]$entry.name.he }
@@ -71,6 +78,7 @@ function Get-SetupProfiles {
       SevenZip     = $(if ($entry.sevenZip -is [bool]) { $entry.sevenZip } else { $defaultSevenZip })
       RestorePoint = $(if ($entry.restorePoint -is [bool]) { $entry.restorePoint } else { $true })
       Tweaks       = [string[]]@(foreach ($tweak in $catalog) { if ($wanted.Contains($tweak.Id)) { $tweak.Id } })
+      WindowsUpdate = $windowsUpdate
     }
   }
 }
@@ -97,8 +105,10 @@ function Get-DefaultProfileId {
 function Get-ProfileChoices {
   <#
   .SYNOPSIS
-    The choices a profile fills in: @{ Profile; Office; Remote; SevenZip; RestorePoint; Tweaks }, or $null for
-    an id that names no valid profile. Never throws. Mode is not among them: the Type is detected.
+    The choices a profile fills in: @{ Profile; Office; Remote; SevenZip; RestorePoint; Tweaks }, plus
+    WindowsUpdate only when the profile sets it (wu spec 3.1), or $null for an id that names no valid profile.
+    Never throws. Mode is not among them: the Type is detected. New-DefaultChoices copies every key returned,
+    so a profile without windowsUpdate leaves the choice as it is.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -110,7 +120,9 @@ function Get-ProfileChoices {
   if ([string]::IsNullOrEmpty($ProfileId)) { return $null }
   foreach ($p in @(Get-SetupProfiles -Config $Config)) {
     if ($p.Id -ceq $ProfileId) {
-      return @{ Profile = $p.Id; Office = $p.Office; Remote = $p.Remote; SevenZip = $p.SevenZip; RestorePoint = $p.RestorePoint; Tweaks = [string[]]@($p.Tweaks) }
+      $fill = @{ Profile = $p.Id; Office = $p.Office; Remote = $p.Remote; SevenZip = $p.SevenZip; RestorePoint = $p.RestorePoint; Tweaks = [string[]]@($p.Tweaks) }
+      if ($p.WindowsUpdate -ne '') { $fill['WindowsUpdate'] = $p.WindowsUpdate }
+      return $fill
     }
   }
   return $null
@@ -121,11 +133,13 @@ function ConvertTo-ValidChoices {
   .SYNOPSIS
     Checks every key of a Choices table against the whitelists (spec 5.2). Returns @{ Choices; Dropped }.
   .DESCRIPTION
-    Choices is a new table with exactly Mode, Office, Remote, SevenZip, RestorePoint, Profile and Tweaks. A bad
-    value takes New-DefaultChoices' value for that key:
+    Choices is a new table with exactly eight keys: Mode, Office, Remote, SevenZip, RestorePoint, Profile, Tweaks
+    and WindowsUpdate. A bad value takes New-DefaultChoices' value for that key:
       - Mode must be LAPTOP or DESKTOP (upper-cased);
       - Office must be in $script:OfficeChoices (upper-cased);
       - Remote goes through Get-RemoteChoice (missing or unknown is ANYDESK, as every reader decides);
+      - WindowsUpdate goes through Get-WindowsUpdateChoice (missing or unknown is FULL, not the default
+        profile's value: wu spec 3.1, as every reader decides);
       - SevenZip and RestorePoint must be [bool];
       - Profile must name a valid profile, else '' (no profile).
     Tweaks becomes the effective list (Get-EffectiveTweaks on the cleaned choices), so state.json records what
@@ -159,6 +173,7 @@ function ConvertTo-ValidChoices {
     RestorePoint = $(if ($given['RestorePoint'] -is [bool]) { $given['RestorePoint'] } else { $defaults.RestorePoint })
     Profile      = $profileId
     Tweaks       = $(if ($given.Contains('Tweaks')) { $given['Tweaks'] } else { $null })
+    WindowsUpdate = (Get-WindowsUpdateChoice -Choices $given)
   }
 
   $catalogIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
@@ -181,8 +196,10 @@ function Test-ProfileChanged {
   .DESCRIPTION
     $false when Choices.Profile names no valid profile (empty, unknown or gone). Otherwise $true when any of
     these differs from Get-ProfileChoices: Office (upper-cased), Get-RemoteChoice, [bool]SevenZip,
-    [bool]RestorePoint, or the effective tweak list, the profile's selection being evaluated with the run's Mode
-    (so a Desktop that brings NumLock in is no change). Mode never counts: the Type is not part of a profile.
+    [bool]RestorePoint, Get-WindowsUpdateChoice (only when the profile sets windowsUpdate: wu spec 3.1, so
+    DRIVERS is no change for a profile that leaves it alone), or the effective tweak list, the profile's
+    selection being evaluated with the run's Mode (so a Desktop that brings NumLock in is no change). Mode never
+    counts: the Type is not part of a profile.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -200,6 +217,7 @@ function Test-ProfileChanged {
   if ((Get-RemoteChoice -Choices $c) -cne $profileChoices.Remote) { return $true }
   if ([bool]$c['SevenZip'] -ne [bool]$profileChoices.SevenZip) { return $true }
   if ([bool]$c['RestorePoint'] -ne [bool]$profileChoices.RestorePoint) { return $true }
+  if ($profileChoices.Contains('WindowsUpdate') -and (Get-WindowsUpdateChoice -Choices $c) -cne $profileChoices.WindowsUpdate) { return $true }
 
   $run = @(Get-EffectiveTweaks -Choices $c -Config $Config -Machine $Machine) -join ','
   $fill = @(Get-EffectiveTweaks -Choices @{ Mode = $c['Mode']; Office = $profileChoices.Office; Tweaks = $profileChoices.Tweaks } -Config $Config -Machine $Machine) -join ','

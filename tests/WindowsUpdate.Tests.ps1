@@ -27,7 +27,8 @@ Describe 'Get-WuRoundOutcome' {
   It 'continue when something installed' { Get-WuRoundOutcome -Result ([pscustomobject]@{Installed=@(@{Id='a'});Failed=@();OnlyDefinitions=$false;Error=$null}) | Should -Be 'Continue' }
   It 'continue when something failed' { Get-WuRoundOutcome -Result ([pscustomobject]@{Installed=@();Failed=@(@{Id='a'});OnlyDefinitions=$false;Error=$null}) | Should -Be 'Continue' }
 }
-Describe 'criteria' { It 'drivers' { Get-WuSearchCriteria -Type Driver | Should -Be "IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and Type='Driver'" } }
+Describe 'criteria' { It 'drivers' { Get-WuSearchCriteria -Type Driver | Should -Be "IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and Type='Driver'" }
+  It 'optional drivers' { Get-WuSearchCriteria -Type Driver -Optional | Should -Be "IsInstalled=0 and IsHidden=0 and BrowseOnly=1 and Type='Driver'" } }
 
 # --- Task 14 additions: the child round, the parent step, COM-shaped input ---------------------
 # SAFETY: this runs on Ben's real PC. NOTHING here may search, download, install, hide or un-hide a
@@ -46,11 +47,13 @@ Describe 'Windows Update round and step (mocked COM)' {
     foreach ($f in 'StepResult', 'Logging', 'Activity', 'Process') { . "$PSScriptRoot\..\src\Common\$f.ps1" }
     . "$PSScriptRoot\..\src\State\State.ps1"
     . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText, for the NOW provider
+    . "$PSScriptRoot\..\src\Engine\Catalog.ps1"   # Get-WindowsUpdateChoice, for the parent step (wu spec 3.2)
 
     $script:WuConfigJson = [IO.File]::ReadAllText("$PSScriptRoot\..\config\config.json", [Text.Encoding]::UTF8)
     $script:MuId = '7971f918-a847-4430-9279-4a52d1efe18d'
     $script:SoftwareCriteria = "IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and Type='Software'"
     $script:DriverCriteria = "IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and Type='Driver'"
+    $script:OptionalDriverCriteria = "IsInstalled=0 and IsHidden=0 and BrowseOnly=1 and Type='Driver'"
     $script:PowerShellExe = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
     # Hebrew letters (and a space) built from code points, so the tests do not depend on how this file
     # is decoded: a folder name for the command-line quoting test (Review Focus #2) and a localized
@@ -109,17 +112,17 @@ Describe 'Windows Update round and step (mocked COM)' {
 
     # Runs the child round against a state file and returns its parsed result JSON.
     function Invoke-TestRound {
-      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly, [bool]$OnAC = $true, [string]$InstallMode = 'Batch')
+      param([string]$StatePath, [int]$FailuresBeforeHide = 2, [bool]$IsWindows10 = $false, [switch]$SearchOnly, [bool]$OnAC = $true, [string]$InstallMode = 'Batch', [string]$Scope = 'FULL')
       $script:roundResultPath = Join-Path (Split-Path -Parent $StatePath) 'Logs\wu-round.json'
-      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly -OnAC $OnAC -InstallMode $InstallMode
+      Invoke-WuRound -StatePath $StatePath -ResultPath $script:roundResultPath -FailuresBeforeHide $FailuresBeforeHide -IsWindows10 $IsWindows10 -SearchOnly:$SearchOnly -OnAC $OnAC -InstallMode $InstallMode -Scope $Scope
       return ([IO.File]::ReadAllText($script:roundResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
     }
 
     # A step Context whose state has the windows-update step; the folder name is configurable.
     function New-WuContext {
-      param([hashtable]$Data = @{}, [hashtable]$FailureCounts = @{}, [string[]]$Hidden = @(), [string]$Folder = 'Setup')
+      param([hashtable]$Data = @{}, [hashtable]$FailureCounts = @{}, [string[]]$Hidden = @(), [string]$Folder = 'Setup', [hashtable]$Choices = @{})
       $root = Join-Path (Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))) $Folder
-      $state = New-RunState -Machine @{ IsWindows10 = $false } -Choices @{} -Plan @('windows-update') -Version 'test'
+      $state = New-RunState -Machine @{ IsWindows10 = $false } -Choices $Choices -Plan @('windows-update') -Version 'test'
       $state.Steps['windows-update'].Data = $Data
       $state.WuFailureCounts = $FailureCounts
       $state.HiddenUpdateIds = [string[]]@($Hidden)
@@ -590,6 +593,50 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:searchResults[$script:SoftwareCriteria] = @($sw)
       $r = Invoke-TestRound -StatePath (New-WuStateFile) -OnAC $false
       @($r.Installed.Id) | Should -Be @('sw'); $r.FirmwareDeferred | Should -Be 0
+    }
+
+    # Wu spec 3.2: DRIVERS searches Type='Driver' only. Ruling WU-R1 (plan call 2): the optional drivers
+    # (BrowseOnly=1) are counted once per run, in DRIVERS round 1 only; they are never installed.
+    It 'DRIVERS searches drivers only, then counts the optional ones: logged, never installed (spec 3.2, Review Focus 3)' {
+      $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 's1'))
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'), (New-FakeUpdate -Id 'o2'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      @($script:searches) | Should -Be @($script:DriverCriteria, $script:OptionalDriverCriteria)
+      @($r.Installed.Id) | Should -Be @('d1'); $r.Found | Should -Be 1; @($script:installCalls | ForEach-Object { $_ }) | Should -Not -Contain 'o1'
+      $l = @($script:logs | Where-Object { $_.Message -eq 'Optional driver updates skipped' }); $l.Count | Should -Be 1; $l[0].Data.count | Should -Be 2
+    }
+    It 'a failed optional-driver count is one WARN; the DRIVERS round goes on (Review Focus 4)' {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria); if ($Criteria -like '*BrowseOnly=1*') { throw 'search failed' }; if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      $r.Error | Should -BeNullOrEmpty; @($r.Installed.Id) | Should -Be @('d1')
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Optional driver updates could not be counted' }).Count | Should -Be 1
+    }
+    It 'only DRIVERS round 1 counts the optional drivers: not round 2, never FULL (WU-R1, plan call 2)' {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 2) -Scope 'DRIVERS'
+      @($script:searches) | Should -Be @($script:DriverCriteria); @($r.Installed.Id) | Should -Be @('d1')
+      $script:searches.Clear()
+      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1)
+      @($script:searches) | Should -Be @($script:SoftwareCriteria, $script:DriverCriteria)
+      @($script:logs | Where-Object { $_.Message -like 'Optional driver updates*' }).Count | Should -Be 0
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round starting' } | ForEach-Object { $_.Data.scope }) | Should -Be @('DRIVERS', 'FULL')
+    }
+    It 'logs at most 20 optional titles, as ASCII; -SearchOnly counts them too' {
+      $script:searchResults[$script:OptionalDriverCriteria] = @(foreach ($i in 1..22) { New-FakeUpdate -Id "o$i" -Title $(if ($i -eq 1) { "Driver $script:HebrewText" } else { "Driver $i" }) })
+      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS' -SearchOnly
+      $l = @($script:logs | Where-Object { $_.Message -eq 'Optional driver updates skipped' }); $l.Count | Should -Be 1
+      $l[0].Data.count | Should -Be 22; $l[0].Data.round | Should -Be 1; @($l[0].Data.titles).Count | Should -Be 20
+      @($l[0].Data.titles)[0] | Should -BeExactly 'Driver ?????'; @($l[0].Data.titles)[19] | Should -BeExactly 'Driver 20'
+      $script:installCalls.Count | Should -Be 0; $script:hideCalls.Count | Should -Be 0
+    }
+    It 'DRIVERS keeps the firmware rule: on battery a Firmware driver is deferred' {
+      $fw = New-FakeUpdate -Id 'fw'; $fw | Add-Member NoteProperty DriverClass 'Firmware'
+      $script:searchResults[$script:DriverCriteria] = @($fw, (New-FakeUpdate -Id 'net'))
+      $r = Invoke-TestRound -StatePath (New-WuStateFile) -Scope 'DRIVERS' -OnAC $false
+      @($script:installCalls | ForEach-Object { $_ }) | Should -Be @('net'); $r.FirmwareDeferred | Should -Be 1
     }
 
     # Spec 4.5: one update at a time, so the parent can show "Installing 3 of 7". Inherits every COM mock
@@ -1118,6 +1165,21 @@ Describe 'Windows Update round and step (mocked COM)' {
       $script:childResult = New-ChildResult -ErrorText 'x' -ErrorCode '0x80070005'
       $null = Invoke-StepWindowsUpdate -Context $script:ctx
       @($act) | Should -Be @('Windows Update round 3: found 0, installed 0, failed 0')
+    }
+    It 'DRIVERS: round 1 says so once in the activity feed, and Done says Drivers only, with no note (spec 3.2, 3.3)' {
+      $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) }
+      $script:ctx = New-WuContext -Choices @{ WindowsUpdate = 'DRIVERS' }; $script:childResult = New-ChildResult -Installed @([ordered]@{ Id = 'd'; Title = 'D' })
+      $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($act) | Should -Be @('Windows Update: drivers only (other updates left to Windows)', 'Windows Update round 1: found 0, installed 1, failed 0')
+      $script:act.Clear(); $script:ctx = New-WuContext -Data @{ Rounds = 2; Installed = 5 } -Choices @{ WindowsUpdate = 'DRIVERS' }; $script:childResult = New-ChildResult
+      $r = Invoke-StepWindowsUpdate -Context $script:ctx
+      $r.Status | Should -Be 'Done'; $r.Message | Should -BeExactly 'Drivers only: installed 5 updates in 3 rounds'; @($r.Notes).Count | Should -Be 0
+      @($act) | Should -Be @('Windows Update round 3: found 0, installed 0, failed 0')
+    }
+    It 'logs the scope as a round starts: DRIVERS, and FULL for a state without the choice (Review Focus 1)' {
+      $script:ctx = New-WuContext -Choices @{ WindowsUpdate = 'drivers' }; $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      $script:ctx = New-WuContext; $null = Invoke-StepWindowsUpdate -Context $script:ctx
+      @($script:logs | Where-Object { $_.Message -eq 'Windows Update round starting' } | ForEach-Object { $_.Data.scope }) | Should -Be @('DRIVERS', 'FULL')
     }
     It 'writes no activity line when the round produced no result' {
       $script:act = New-Object System.Collections.ArrayList; Mock Add-SetupActivity { [void]$script:act.Add($Text) }

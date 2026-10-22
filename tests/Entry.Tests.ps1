@@ -437,6 +437,13 @@ Describe 'Start-BenTechSetup' {
       Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
       Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $InstallMode -eq 'Batch' }
     }
+    # Wu plan call 1: the child reads the choice from state.json; there is no new command-line switch.
+    It '-WuRound passes the state''s Windows Update choice; none, an invalid one or no state is FULL (Review Focus 1, 3)' -ForEach @(
+      @{ S = { $s = New-FakeState; $s.Choices = @{ WindowsUpdate = 'drivers' }; $s }; E = 'DRIVERS' }, @{ S = { New-FakeState }; E = 'FULL' }
+      @{ S = { $s = New-FakeState; $s.Choices = @{ WindowsUpdate = 'NONE' }; $s }; E = 'FULL' }, @{ S = { $null }; E = 'FULL' }) {
+      $script:wantScope = $E; Mock Read-RunState -MockWith $S; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $Scope -ceq $script:wantScope }
+    }
   }
 
   # Final review C1: the end-of-run un-hide child (WUA COM mocked: New-WuSession and Invoke-WuUnhide).

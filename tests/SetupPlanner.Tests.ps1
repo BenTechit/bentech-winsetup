@@ -33,14 +33,25 @@ Describe 'profiles (toolbox spec 5.2)' {
   It 'tweaksAdd adds catalog ids only' {
     $x = $cfg.PSObject.Copy(); $x.profiles = @([pscustomobject]@{ id = 'c'; name = [pscustomobject]@{ en = 'C' }; tweaks = @(); tweaksAdd = @('fileExtensions', 'widgets') })
     @((Get-ProfileChoices -Config $x -ProfileId 'c').Tweaks) | Should -Be @('fileExtensions') }
+  It 'a profile may set windowsUpdate (an invalid value is FULL); without it the key is not among its choices (wu spec 3.1)' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $x.profiles[1] | Add-Member NoteProperty windowsUpdate 'drivers'; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'never'
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Contains('WindowsUpdate') | Should -BeFalse
+    (Get-ProfileChoices -Config $x -ProfileId 'business').WindowsUpdate | Should -BeExactly 'DRIVERS'
+    (Get-ProfileChoices -Config $x -ProfileId 'clean').WindowsUpdate | Should -BeExactly 'FULL' }
 }
 Describe 'ConvertTo-ValidChoices (toolbox spec 5.2)' {
   It 'repairs every key from the defaults and reports unknown tweak ids' {
     $r = ConvertTo-ValidChoices -Choices @{ Mode = 'tablet'; Office = 'business'; Remote = 'TEAMVIEWER'; SevenZip = 'yes'; Profile = 'nope'; RestorePoint = 1
-                                            Tweaks = @('noAds', 'widgets', '', 'classicOutlook') } -Config $cfg -Machine $m
+                                            Tweaks = @('noAds', 'widgets', '', 'classicOutlook'); WindowsUpdate = 'everything' } -Config $cfg -Machine $m
     $r.Choices.Mode | Should -Be 'LAPTOP'; $r.Choices.Office | Should -Be 'BUSINESS'; $r.Choices.Remote | Should -Be 'ANYDESK'
     $r.Choices.SevenZip | Should -BeTrue; $r.Choices.Profile | Should -BeExactly ''; $r.Choices.RestorePoint | Should -BeTrue
+    $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'
     @($r.Choices.Tweaks) | Should -Be @('noAds', 'classicOutlook'); @($r.Dropped) | Should -Be @('widgets') }
+  It 'keeps DRIVERS in any case and returns exactly eight keys' {
+    $c = New-DefaultChoices -Machine $m -Config $cfg; $c.WindowsUpdate = 'drivers'
+    $r = ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m; $r.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'
+    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate') }
   It 'keeps only ASCII ids in the Choices (nothing Hebrew reaches state.json or setup.log)' {
     $r = ConvertTo-ValidChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Config $cfg -Machine $m
     ($r.Choices | ConvertTo-Json -Compress) | Should -Not -Match '[^\x00-\x7F]' }
@@ -53,6 +64,11 @@ Describe 'Test-ProfileChanged (spec 10b.6)' {
       @{ Why = 'no restore point'; K = 'RestorePoint'; V = $false }, @{ Why = 'another Remote'; K = 'Remote'; V = 'BOTH' }) {
     $c[$K] = $V; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeTrue }
   It 'an unknown or empty profile is never "changed"' { $c.Profile = 'gone'; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'DRIVERS is no change for a profile that does not set windowsUpdate (Review Focus 2)' { $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'a profile that sets windowsUpdate: another value is a change, its own is not' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'FULL'
+    $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.WindowsUpdate = 'FULL'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
 }
 Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
   It 'opens on the default profile in the configured language' {

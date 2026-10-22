@@ -22,6 +22,10 @@
 # Remote access (screenconnect spec 4.2): screenconnect runs right after anydesk. Choices.Remote, read through
 # Get-RemoteChoice, picks anydesk (ANYDESK or BOTH), screenconnect (SCREENCONNECT or BOTH) or both.
 #
+# Windows Update scope (wu spec 3.1, 3.2): Choices.WindowsUpdate, read through Get-WindowsUpdateChoice, is FULL
+# (software and drivers, as before) or DRIVERS (Type='Driver' only). It plans no step of its own: windows-update
+# runs in both, and its child round reads the choice from state.json.
+#
 # System tweaks (toolbox spec 5.3): tweaks runs right after desktop-icons, before the first restart, so Explorer
 # picks the values up at the next sign-in. It is planned only when Get-EffectiveTweaks (below) names at least one
 # tweak: Choices.Tweaks holds the selection, and the catalog's rules (desktopOnly, office365Only, minBuild) decide
@@ -79,6 +83,30 @@ function Get-RemoteChoice {
     if ($script:RemoteChoices -contains $value) { return $value }
   }
   return 'ANYDESK'
+}
+
+# The Windows Update choices (wu spec 3.1). FULL is the default and what a missing or invalid value means.
+$script:WindowsUpdateChoices = @('FULL', 'DRIVERS')
+
+function Get-WindowsUpdateChoice {
+  <#
+  .SYNOPSIS
+    The Windows Update choice in a Choices table: FULL or DRIVERS. Never anything else.
+  .DESCRIPTION
+    Missing, empty, unknown or null all mean FULL, which is what a run started by a version without this
+    choice did (wu spec 3.1). The value is matched case-insensitively and returned in upper case. Every
+    reader (the windows-update step and its child round, the report, the final screen and the toolbox)
+    decides through this function, so they cannot disagree. Never throws.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()]$Choices)
+
+  if ($Choices -is [System.Collections.IDictionary] -and $Choices.Contains('WindowsUpdate')) {
+    $value = ([string]$Choices['WindowsUpdate']).ToUpperInvariant()
+    if ($script:WindowsUpdateChoices -contains $value) { return $value }
+  }
+  return 'FULL'
 }
 
 function Test-HasConsumerApp {

@@ -210,6 +210,17 @@ Describe 'New-DefaultChoices' {
     & $eff ((Update-StartChoices -Choices $d -Key 'L').Choices) | Should -BeExactly 'accessKeys,startClean,noAds'
     & $eff ((Update-StartChoices -Choices $c -Key 'O').Choices) | Should -BeExactly 'accessKeys,startClean,noAds,classicOutlook'   # CRAFT -> BUSINESS
     @((Update-StartChoices -Choices $c -Key 'Z').Choices.Tweaks) | Should -Be @($c.Tweaks) }
+  It 'opens on FULL; defaults.windowsUpdate counts when the default profile does not set it; an invalid one is FULL (wu spec 3.1)' {
+    (New-DefaultChoices -Machine $m -Config $cfg).WindowsUpdate | Should -BeExactly 'FULL'
+    foreach ($case in @(@{ V = 'drivers'; E = 'DRIVERS' }, @{ V = 'SOMETIMES'; E = 'FULL' }, @{ V = $null; E = 'FULL' })) {
+      $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT'; windowsUpdate = $case.V } }
+      (New-DefaultChoices -Machine $m -Config $x).WindowsUpdate | Should -BeExactly $case.E } }
+  It 'a default profile that sets windowsUpdate wins over defaults.windowsUpdate' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'DRIVERS'
+    (New-DefaultChoices -Machine $m -Config $x).WindowsUpdate | Should -BeExactly 'DRIVERS' }
+  It 'the console fallback runs FULL: U is no key there (wu spec 3.1)' {
+    $r = Update-StartChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Key 'U'
+    $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'; $r.Action | Should -Be 'None' }
 }
 
 Describe 'Format-StartScreen (v2)' {
