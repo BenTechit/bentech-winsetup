@@ -71,6 +71,32 @@ function Get-ToolboxRestartRequest {
   return ($script:ToolboxRestartRequested -eq $true)
 }
 
+function Test-ToolboxChildrenRunning {
+  <#
+  .SYNOPSIS
+    $true while a process the toolbox window started still runs (one its kills could not end: Task 4 review M3).
+    Start-BenTechSetup removes no folder then: C:\BenTech is never deleted under a running child. Never throws.
+  .DESCRIPTION
+    Reads $script:ToolboxChildren (RepairPage.ps1; none when that file is not loaded). A process whose state cannot be
+    read counts as running.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  $children = $script:ToolboxChildren
+  if ($null -eq $children) { return $false }
+  foreach ($process in $children.ToArray()) {
+    if ($null -eq $process) { continue }
+    try {
+      if (-not [bool]$process.HasExited) { return $true }
+    } catch {
+      return $true
+    }
+  }
+  return $false
+}
+
 # Display problems already logged (TB-R7): the window redraws on every click and every power tick, so the same
 # problem is logged once, not on every redraw. Diagnostics only; no decision depends on it.
 $script:ToolboxWarned = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)

@@ -4,6 +4,7 @@ BeforeAll {
   . "$PSScriptRoot\..\src\Common\Activity.ps1"
   . "$PSScriptRoot\..\src\Common\Process.ps1"
   . "$PSScriptRoot\..\src\Common\Download.ps1"
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: the logged exception texts (Task 4 review M8)
 
   # Returns the ping.exe processes started by the tree-kill tests. The unique '-n <count>' marks them
   # (a stray ping from anywhere else will not carry it). CommandLine comes from CIM.
@@ -308,6 +309,27 @@ Describe 'Start-BackgroundExternal' {
     $log | Should -Match '\[INFO\] .*cmd\.exe'
     $log | Should -Match '/c exit 0'
     $log | Should -Match ('"processId":' + $p.Id)
+  }
+}
+
+Describe 'exception texts reach setup.log in ASCII (a Hebrew Windows localizes them: Task 4 review M8)' {
+  # SAFETY: nothing is killed or started for real: Get-CimInstance, Stop-Process and Get-Process are mocked; the one
+  # start is of a program that does not exist (as in the Start-BackgroundExternal tests above).
+  BeforeEach { $script:logs = New-Object Collections.ArrayList; Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) } }
+  It 'a process-tree query that fails' {
+    Mock Get-CimInstance { throw ('WMI ' + [char]0x05D0 + [char]0x05D1) } -ParameterFilter { $Filter -like 'ParentProcessId=*' }
+    @(Get-ProcessTreeId -RootId 999999) | Should -Be @(999999)
+    $script:logs.Count | Should -Be 1; $script:logs[0].Message | Should -BeExactly 'Could not enumerate children of 999999: WMI ??'
+  }
+  It 'a kill that fails while the process still runs' {
+    Mock Get-ProcessTreeId { @(999999) }; Mock Stop-Process { throw ('denied ' + [char]0x05D0) }; Mock Get-Process { [pscustomobject]@{ Id = 999999 } }
+    { Stop-ProcessTree -ProcessId 999999 } | Should -Not -Throw
+    $w = @($script:logs | Where-Object { $_.Message -eq 'Could not kill process' }); $w.Count | Should -Be 1; $w[0].Data.error | Should -BeExactly 'denied ?'
+  }
+  It 'a background start that fails logs its reason through ConvertTo-ScreenText' {
+    Mock ConvertTo-ScreenText { 'ascii:' + $Text }
+    { Start-BackgroundExternal -FilePath "$TestDrive\nope.exe" } | Should -Throw '*Cannot start*'
+    $w = @($script:logs | Where-Object { $_.Message -eq 'Background process failed to start' }); $w.Count | Should -Be 1; $w[0].Data.error | Should -BeLike 'ascii:*'
   }
 }
 

@@ -83,9 +83,14 @@ BeforeAll {
     $script:killed = New-Object Collections.ArrayList
     $script:order = New-Object Collections.Generic.List[string]   # Add returns nothing: a seam that records into it returns only its own value
     $script:shown = $null; $script:closingAtKill = $null
+    # The recorder ends the fake child it is asked to kill, unless a test sets $script:killWorks = $false (review M3).
+    $script:killWorks = $true
     Mock Stop-ProcessTree {
       [void]$script:killed.Add($ProcessId); [void]$script:order.Add("kill:$ProcessId")
-      if ($null -ne $script:shown) { $script:closingAtKill = $script:shown.Tag.Closing } }
+      if ($null -ne $script:shown) { $script:closingAtKill = $script:shown.Tag.Closing }
+      if ($script:killWorks) {
+        foreach ($p in @(@($script:started | ForEach-Object { $_.Process }) + @($script:fake))) {
+          if ($p -is [System.Management.Automation.PSCustomObject] -and $p.Id -eq $ProcessId) { $p.HasExited = $true } } } }
     $script:ToolboxChildren.Clear()
     $script:started = New-Object Collections.ArrayList
     $script:nextId = 4242; $script:fake = $null
@@ -608,4 +613,86 @@ Describe 'Show-ToolboxWindow and Get-SetupChoices with children' {
       -ShowConsole { param($p) $script:consoleArgs = $p; $null } -ShutdownDispatcher { }
     @($script:consoleArgs.Keys | Sort-Object) | Should -Be @('Config','IsFresh','Machine','NoAutoStart','Previous','Version'); $script:toolboxArgs.Root | Should -Be "$TestDrive\Root"
     $script:toolboxArgs.ScriptPath | Should -Be 'x'; $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse }
+}
+
+Describe 'run hardening (Task 4 review, ruling RD-R16)' {
+  BeforeEach { Set-RunTestMocks }
+  AfterEach { $script:ToolboxChildren.Clear() }   # a test may leave this test process's own Process object in the list (M5)
+
+  It 'a progress.json or result.json that is garbage, no object or of the wrong types never ends the window (M1, M6)' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $run = $w.Tag.Runs.Action; $proc = $script:fake
+    foreach ($text in 'not json {', '[1, 2, 3]', '"text"', ('{"Action":"health","RunId":"' + $run.RunId + '","Current":"x","Steps":"oops","Log":5}'),
+                      ('{"Action":"health","RunId":"' + $run.RunId + '","Current":1e12,"Steps":[{"Id":"volumeState","Status":"done"},"junk",{"Id":"imageCheck","Status":7}],"Log":[{"a":1},"kept"]}')) {
+      [IO.File]::WriteAllText((Join-Path $run.Dir 'progress.json'), $text); Send-RunTick $w
+      $w.Tag.Outcome | Should -BeNullOrEmpty -Because $text; $w.Tag.Runs.Action | Should -Not -BeNullOrEmpty -Because $text }
+    @($w.Tag.Model.Repair.Run.Steps.Status) | Should -Be @('done', 'pending'); $w.Tag.Model.Repair.Run.Current | Should -Be -1; @($w.Tag.Model.Repair.Run.Log) | Should -Be @('kept')
+    # A result whose Outcome is no outcome is no result: Failed, childNoResult.
+    [IO.File]::WriteAllText((Join-Path $run.Dir 'result.json'), '{"Outcome":5,"Color":["x"],"Findings":"x"}'); $proc.HasExited = $true; Send-RunTick $w
+    $w.Tag.Outcome | Should -BeNullOrEmpty; $res = $w.Tag.Model.Repair.Result; $res.Outcome | Should -Be 'Failed'; $res.Findings[0].Code | Should -Be 'childNoResult'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action result is not valid' }).Count | Should -Be 1
+    # A real outcome with a colour and findings of the wrong types: the outcome stands, red, the findings are left out.
+    $x = New-RunWindow; $null = Start-ToolboxRun -Window $x -ActionId 'health'; $xrun = $x.Tag.Runs.Action; $xproc = $script:fake
+    [IO.File]::WriteAllText((Join-Path $xrun.Dir 'result.json'), '{"Action":"health","Outcome":"Done","Color":"PURPLE","Findings":["x",5],"Offers":"no","Files":7}')
+    $xproc.HasExited = $true; Send-RunTick $x
+    $x.Tag.Outcome | Should -BeNullOrEmpty; $x.Tag.Model.Repair.Result.Outcome | Should -Be 'Done'; $x.Tag.Model.Repair.Result.Color | Should -Be 'RED'
+    $x.FindName('ResultPanel').Visibility | Should -Be 'Visible'
+    @(@($script:logs | Where-Object { $_.Message -eq 'Toolbox action finished' })[-1].Data.findings).Count | Should -Be 0
+    # The safety child's: chips that are no object are not read; the strip ends ready with every chip unknown.
+    $s = New-RunWindow -Set @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+    $null = Start-ToolboxRun -Window $s -ActionId 'safety' -Slot Safety; $srun = $s.Tag.Runs.Safety; $sproc = $script:fake
+    [IO.File]::WriteAllText((Join-Path $srun.Dir 'progress.json'), '{"Action":"safety","Partial":{"Chips":"x"}}'); Send-RunTick $s
+    [IO.File]::WriteAllText((Join-Path $srun.Dir 'result.json'), '{"Action":"safety","Outcome":"Done","Color":"GREEN","Data":{"Chips":[1],"DiskCheck":"x"}}')
+    $sproc.HasExited = $true; Send-RunTick $s
+    $s.Tag.Outcome | Should -BeNullOrEmpty; $s.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $s.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'unknown'
+    $s.Tag.Model.Repair.DiskCheck.Excluded | Should -BeFalse
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'a child the deadline kill could not end stays tracked: its slot is free and the result Timed out, the close is not held, every close retries the kill (M3)' {
+    $script:killWorks = $false
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake
+    Mock Get-ToolboxRunSeconds { 150 * 60 + 181 }; Send-RunTick $w
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Result.Outcome | Should -Be 'TimedOut'; $script:ToolboxChildren | Should -Contain $proc
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }).Count | Should -Be 1
+    Test-ToolboxChildrenRunning | Should -BeTrue
+    # The close guard holds only for a running action: a child that has no slot never holds the window.
+    $w.Close(); $w.Tag.Outcome | Should -Be 'Cancel'; $w.Tag.Closing | Should -BeTrue
+    # Every close retries the kill (Show-ToolboxWindow's finally, then Get-SetupChoices'); a child still alive stays tracked.
+    Stop-ToolboxChildren; @($script:killed | Where-Object { $_ -eq 4242 }).Count | Should -Be 2; $script:ToolboxChildren | Should -Contain $proc
+    $script:killWorks = $true; Stop-ToolboxChildren; $script:ToolboxChildren.Count | Should -Be 0; Test-ToolboxChildrenRunning | Should -BeFalse }
+  It 'Get-SetupChoices retries the kill of a child that is still alive, and Main can tell it is (M3)' {
+    $script:killWorks = $false; $script:fake = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }
+    Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) $script:ToolboxChildren.Add($script:fake); @{ Outcome = 'Cancel' } } `
+      -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { $script:order.Add('shutdown') } | Should -BeNullOrEmpty
+    $script:order | Should -Be @('kill:4242', 'shutdown'); Test-ToolboxChildrenRunning | Should -BeTrue
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }).Count | Should -Be 1
+    $script:fake.HasExited = $true; Test-ToolboxChildrenRunning | Should -BeFalse }
+  It 'a StartChild that gives more than one value: every process among them is tracked and killed, and the action does not start (M5)' {
+    # This test process's own Process object stands for a stray child: Stop-ProcessTree is this Describe's recorder, so
+    # nothing is killed, and AfterEach empties the list.
+    $script:me = [Diagnostics.Process]::GetCurrentProcess()
+    $w = New-RunWindow
+    $w.Tag.StartChild = { param($file, $arguments) if ($arguments -match '-ToolAction health') { 'noise'; $script:me } else { & $script:startChild $file $arguments } }
+    Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeFalse
+    @($script:killed) | Should -Contain $PID; $script:ToolboxChildren | Should -Contain $script:me   # still alive: still tracked
+    $res = $w.Tag.Model.Repair.Result; $res.Outcome | Should -Be 'Failed'; $res.Findings[0].Code | Should -Be 'childStartFailed'; $w.Tag.Runs.Action | Should -BeNullOrEmpty
+    @($res.Findings[0].Args)[0] | Should -Match '2 values' }
+  It 'a dialog that throws while an action runs: the child is killed before the close, the window closes as Failed, both timers are off (M6)' {
+    $r = Show-ToolboxWindow @showArgs -ShowDialog { param($w) $script:shown = $w; $null = Start-ToolboxRun -Window $w -ActionId 'health'; throw 'dialog broke' }
+    $r.Outcome | Should -Be 'Failed'; $r.Error | Should -BeExactly 'dialog broke'; $script:killed | Should -Be @(4242); $script:closingAtKill | Should -BeFalse
+    $script:shown.Tag.Outcome | Should -Be 'Failed'; $script:shown.Tag.Closing | Should -BeTrue
+    $script:shown.Tag.Timer.IsEnabled | Should -BeFalse; $script:shown.Tag.RunTimer.IsEnabled | Should -BeFalse; $script:ToolboxChildren.Count | Should -Be 0 }
+  It 'an action that ends while the first strip read still runs asks for a fresh read: the strip never shows a reading from before the action (M7)' {
+    $w = New-RunWindow -Set @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $first = $w.Tag.Runs.Safety; $firstProc = $script:fake
+    $null = Start-ToolboxRun -Window $w -ActionId 'health'; $actionProc = $script:fake
+    Write-TestResult $w; $actionProc.HasExited = $true; Send-RunTick $w
+    $first.Reread | Should -BeTrue; @($script:started).Count | Should -Be 2; $w.Tag.Model.Repair.Strip.State | Should -Be 'loading'
+    $crit = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'crit' } }
+    $null = Write-ToolJsonFile -Path (Join-Path $first.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $first.RunId; Partial = @{ Chips = $crit } }
+    Send-RunTick $w; $w.Tag.Model.Repair.Strip.Disk | Should -BeNullOrEmpty   # read before the action ended: not shown
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $crit }; $firstProc.HasExited = $true; Send-RunTick $w
+    @($script:started).Count | Should -Be 3; $script:started[-1].Args | Should -Match '-ToolAction safety'
+    $w.Tag.Model.Repair.Strip.State | Should -Be 'loading'; $w.Tag.Model.Repair.Strip.Disk | Should -BeNullOrEmpty; $w.Tag.Runs.Safety.Reread | Should -Not -BeTrue
+    $ok = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $ok }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $w.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'ok'; $w.Tag.Runs.Safety | Should -BeNullOrEmpty }
 }

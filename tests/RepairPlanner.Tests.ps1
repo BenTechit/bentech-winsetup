@@ -172,6 +172,18 @@ Describe 'the run in the model (repair Task 4: New-RepairRunModel, Update-Repair
     $odd = New-HealthProgress; $odd.Steps[0].Status = 'exploded'
     @((Update-RepairRunModel -Repair $r -Progress $odd -ElapsedSeconds 5).Run.Steps.Status)[0] | Should -BeExactly 'pending'
     $none = (New-TestModel @{}).Repair; (Update-RepairRunModel -Repair $none -Progress (New-HealthProgress) -ElapsedSeconds 9).Run | Should -BeNullOrEmpty }
+  It 'a Current, a step row or a log line of the wrong type is tolerated, never thrown (review M1, RD-R16)' {
+    $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'health' -RunId '20261022-101500-health'
+    foreach ($bad in 'x', 1e12, 2.5, $true, @(1, 2), @{ a = 1 }) {
+      $p = New-HealthProgress; $p.Current = $bad
+      $n = Update-RepairRunModel -Repair $r -Progress $p -ElapsedSeconds 5
+      $n.Run.Current | Should -Be -1 -Because "Current = $bad"; @($n.Run.Steps.Status) | Should -Be @('done', 'running', 'pending') }
+    $p = New-HealthProgress; $p.Current = '2'; (Update-RepairRunModel -Repair $r -Progress $p -ElapsedSeconds 5).Run.Current | Should -Be 2
+    # Rows that are no object, or have no Id, are left out; a progress with no usable row keeps the run's steps.
+    $p = New-HealthProgress; $p.Steps = @('junk', @{ Id = 'volumeState'; Status = 'done' }, @{ Status = 'done' }, 7)
+    $n = Update-RepairRunModel -Repair $r -Progress $p -ElapsedSeconds 5; @($n.Run.Steps.Id) | Should -Be @('volumeState')
+    $p = New-HealthProgress; $p.Steps = 'oops'; @((Update-RepairRunModel -Repair $r -Progress $p -ElapsedSeconds 5).Run.Steps).Count | Should -Be 7
+    $p = New-HealthProgress; $p.Log = @('kept', @{ a = 1 }, 5); @((Update-RepairRunModel -Repair $r -Progress $p -ElapsedSeconds 5).Run.Log) | Should -Be @('kept', '5') }
   It 'the result ends the run: no run, the result shown, the visit''s list grows, the strip reloads and the refused close is forgotten' {
     $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'standard' -RunId '20261022-101500-standard'; $r.CloseRefused = $true
     $n = Complete-RepairRunModel -Repair $r -Result $script:resultSample

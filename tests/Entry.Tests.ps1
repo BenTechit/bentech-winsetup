@@ -103,6 +103,7 @@ Describe 'Start-BenTechSetup' {
     # shutdown.exe), so it is always mocked; no restart request unless a test asks for one.
     Mock Invoke-StatelessRestart { $true }
     Mock Get-ToolboxRestartRequest { $false }
+    Mock Test-ToolboxChildrenRunning { $false }   # RD-R16 M3: no toolbox child left running unless a test says so
   }
 
   AfterEach {
@@ -529,6 +530,17 @@ Describe 'Start-BenTechSetup' {
       Mock Get-SetupChoices { $script:choices }; Invoke-Entry | Should -Be 0                    # a run
       Mock Get-ToolboxRestartRequest { $false }; Mock Get-SetupChoices { $null }; Invoke-Entry | Should -Be 0   # a plain Cancel
       Should -Invoke Invoke-StatelessRestart -Times 0 }
+    It 'a Restart PC that fails is exit 1, so the launcher keeps the red line on screen (RD-R16 M2)' {
+      Mock Get-SetupChoices { $null }; Mock Get-ToolboxRestartRequest { $true }; Mock Invoke-StatelessRestart { $script:order.Add('restart'); $false }
+      $result = @(Invoke-Entry); $result.Count | Should -Be 1; $result[0] | Should -Be 1
+      @($script:order | Where-Object { $_ -in 'cleanup:Cancel', 'restart' }) | Should -Be @('cleanup:Cancel', 'restart')
+      $script:crashes.Count | Should -Be 0 }   # not a crash: the restart's own red line is the message
+    It 'a toolbox child still running keeps C:\BenTech: no cleanup, a WARN; a requested restart still happens (RD-R16 M3)' {
+      Mock Get-SetupChoices { $null }; Mock Test-ToolboxChildrenRunning { $true }
+      Invoke-Entry | Should -Be 0; Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly
+      Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'A toolbox child process is still running; the setup folder is kept' }
+      Mock Get-ToolboxRestartRequest { $true }; $script:order.Clear()
+      Invoke-Entry | Should -Be 0; @($script:order | Where-Object { $_ -like 'cleanup:*' -or $_ -eq 'restart' }) | Should -Be @('restart') }
     It 'passes Root and ScriptPath to Get-SetupChoices' {
       Invoke-Entry | Out-Null
       Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive -and $ScriptPath -like '*\setup.ps1' }

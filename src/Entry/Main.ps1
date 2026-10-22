@@ -341,8 +341,8 @@ function Invoke-SetupMainFlow {
 function Start-BenTechSetup {
   <#
   .SYNOPSIS
-    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound or
-    -WuUnhide child) or 2 (another run holds the lock).
+    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, a failed -WuRound or
+    -WuUnhide child, or a Restart PC whose restarts both failed) or 2 (another run holds the lock).
   .DESCRIPTION
     -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide and
     windowsUpdate.installMode, the state's Machine.IsWindows10 and the power status read now (-OnAC; a
@@ -389,10 +389,13 @@ function Start-BenTechSetup {
     toolbox's, or Escape on the console) with no earlier run state runs -Mode Cancel (C:\BenTech deleted,
     because nothing ran). A crash, 'Rebooting', 'NoState', a cancel after an unfinished earlier run and a
     lock held by another run delete nothing.
+    No cleanup runs while a process the toolbox window started still runs (Test-ToolboxChildrenRunning: one its
+    kills could not end): WARN, the folder is kept (repair Task 4 review M3).
     Last, Restart PC in the toolbox (repair spec 6.9, ruling RD-R5): a 'Cancelled' flow whose Restart is set
     restarts the PC through Invoke-StatelessRestart, after the cleanup when there was one (after an unfinished
-    earlier run its folder stays, and the restart still happens). Never after a crash.
-    The exit code does not change.
+    earlier run its folder stays, and the restart still happens). Never after a crash. When both restarts fail
+    (one red line on the console), the exit code is 1, so the launcher keeps its window open (review M2).
+    Otherwise the exit code does not change.
 
     Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash
     text "Setup crashed: <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with
@@ -518,6 +521,12 @@ function Start-BenTechSetup {
 
   # Only now: the tick is gone, the run lock and its mutex are released and the transcript (a file in
   # Logs) is closed, so nothing of this run holds the folder open.
+  # Repair Task 4 review M3: a toolbox child that its kills could not end may still write into C:\BenTech; then the
+  # folder is kept (its own deadline ends it; the next run's cleanup removes the folder).
+  if ($null -ne $cleanup -and (Test-ToolboxChildrenRunning)) {
+    Write-SetupLog -Level WARN -Message 'A toolbox child process is still running; the setup folder is kept' -Data @{ mode = $cleanup.Mode }
+    $cleanup = $null
+  }
   if ($null -ne $cleanup) {
     try {
       $null = Invoke-SetupCleanup -Root $Root @cleanup
@@ -528,7 +537,8 @@ function Start-BenTechSetup {
       Write-Host ('Cleanup failed: {0}' -f $_.Exception.Message) -ForegroundColor White -BackgroundColor DarkRed
     }
   }
-  # Restart PC (repair spec 6.9): the last thing this process does. Invoke-StatelessRestart never throws.
-  if ($restartAfter) { $null = Invoke-StatelessRestart }
+  # Restart PC (repair spec 6.9): the last thing this process does. Invoke-StatelessRestart never throws. When both
+  # restarts failed it showed one red line: exit 1, so the launcher keeps the window open to read it (review M2).
+  if ($restartAfter -and -not (Invoke-StatelessRestart)) { $exitCode = 1 }
   return $exitCode
 }

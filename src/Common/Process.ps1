@@ -52,7 +52,7 @@ function Get-ProcessTreeId {
     try {
       $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -OperationTimeoutSec 10 -ErrorAction Stop)
     } catch {
-      Write-SetupLog -Message "Could not enumerate children of ${parent}: $($_.Exception.Message)" -Level WARN -Data @{ processId = $parent }
+      Write-SetupLog -Message "Could not enumerate children of ${parent}: $(ConvertTo-ScreenText -Text $_.Exception.Message)" -Level WARN -Data @{ processId = $parent }
       continue
     }
     foreach ($child in $children) {
@@ -70,6 +70,8 @@ function Stop-ProcessTree {
     The whole tree is collected BEFORE anything is killed, because killing a parent orphans its
     children and the walk would lose them. A hung installer usually hangs inside a child
     (msiexec, setup.exe) that Process.Kill() on the parent alone would leave running.
+    A logged exception text goes through ConvertTo-ScreenText (StartScreen.ps1; a Hebrew Windows
+    localizes it: repair Task 4 review M8); the bundle defines every function before it runs.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][int]$ProcessId)
@@ -89,7 +91,7 @@ function Stop-ProcessTree {
     } catch {
       # Already gone is fine; still running means access denied or similar.
       if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
-        Write-SetupLog -Message 'Could not kill process' -Level WARN -Data @{ processId = $id; error = $_.Exception.Message }
+        Write-SetupLog -Message 'Could not kill process' -Level WARN -Data @{ processId = $id; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
       }
     }
   }
@@ -347,7 +349,7 @@ function Start-BackgroundExternal {
     $null = $proc.Handle
   } catch {
     $proc.Dispose()
-    Write-SetupLog -Message 'Background process failed to start' -Level ERROR -Data @{ file = $FilePath; error = $_.Exception.Message }
+    Write-SetupLog -Message 'Background process failed to start' -Level ERROR -Data @{ file = $FilePath; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     throw (New-Object InvalidOperationException ("Cannot start '$FilePath': $($_.Exception.Message)", $_.Exception))
   }
 

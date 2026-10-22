@@ -8,7 +8,8 @@
 # inside $TestDrive. Every refusal test mocks Invoke-External to throw.
 BeforeAll {
   # Steps\Prepare: Unregister-ResumeTask (final review I1), always mocked in the Invoke-SetupCleanup tests.
-  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'Steps\Prepare', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
+  # UI\StartScreen: ConvertTo-ScreenText, for the logged exception texts (Task 4 review M8).
+  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'UI\StartScreen', 'Steps\Prepare', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Disk($id, $serial, $type = 2) { [pscustomobject]@{ DeviceID = $id; VolumeSerialNumber = $serial; DriveType = $type } }
 }
 Describe 'Get-LauncherInfo' {
@@ -23,6 +24,13 @@ Describe 'Get-LauncherInfo' {
     Get-LauncherInfo -Path $null | Should -BeNullOrEmpty
     $unc = Get-LauncherInfo -Path '\\server\share\BenTechSetup.cmd'; $unc.VolumeSerial | Should -BeNullOrEmpty; $unc.Drive | Should -BeNullOrEmpty
     Mock Get-CimInstance { throw 'WMI down' }; (Get-LauncherInfo -Path 'E:\BenTechSetup.cmd').VolumeSerial | Should -BeNullOrEmpty
+  }
+  It 'logs a failed query''s reason in ASCII (a Hebrew Windows localizes it: Task 4 review M8)' {
+    $script:logs = New-Object Collections.ArrayList; Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Get-CimInstance { throw ('WMI ' + [char]0x05D0 + [char]0x05D1) }
+    (Get-LauncherInfo -Path 'E:\BenTechSetup.cmd').VolumeSerial | Should -BeNullOrEmpty
+    $w = @($script:logs | Where-Object { $_.Message -eq 'Could not read the volume serial of the launcher drive' }); $w.Count | Should -Be 1
+    $w[0].Data.error | Should -BeExactly 'WMI ??'
   }
 }
 Describe 'Find-SetupStick (Review Focus 1)' {

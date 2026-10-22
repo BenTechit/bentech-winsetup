@@ -15,7 +15,8 @@
 # Invoke-SetupCleanup calls it only for %SystemDrive%\BenTech. The old logs on the stick are replaced with rd
 # too, and a BenTech-Logs that is a link is left alone. C:\BenTech is kept while the resume task is still
 # registered (final review I1). Needs Logging.ps1, Activity.ps1 (Wait-SetupDelay), Process.ps1
-# (Invoke-External) and Prepare.ps1 (Unregister-ResumeTask).
+# (Invoke-External), Prepare.ps1 (Unregister-ResumeTask) and StartScreen.ps1 (ConvertTo-ScreenText, for a logged
+# exception text: repair Task 4 review M8).
 #
 # None of these functions throws.
 
@@ -41,7 +42,7 @@ function Get-LauncherInfo {
     $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $info.Drive) -OperationTimeoutSec 10 -ErrorAction Stop | Select-Object -First 1
     if ($null -ne $disk -and -not [string]::IsNullOrWhiteSpace([string]$disk.VolumeSerialNumber)) { $info.VolumeSerial = [string]$disk.VolumeSerialNumber }
   } catch {
-    Write-SetupLog -Level WARN -Message 'Could not read the volume serial of the launcher drive' -Data @{ drive = $info.Drive; error = $_.Exception.Message }
+    Write-SetupLog -Level WARN -Message 'Could not read the volume serial of the launcher drive' -Data @{ drive = $info.Drive; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
   return $info
 }

@@ -401,6 +401,28 @@ function ConvertTo-RepairPercent {
   return $null
 }
 
+function Test-RepairObject {
+  # Private. $true for a hashtable or an object read from JSON: a row the run model can read fields from.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()]$Value)
+
+  return ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject])
+}
+
+function ConvertTo-RepairIndex {
+  # Private. progress.json's Current as an [int], or -1 when it is no whole number in Int32's range (text, a fraction,
+  # 1e12, a bool, a list, an object): a malformed field never ends the window (Task 4 review M1, ruling RD-R16).
+  [CmdletBinding()]
+  [OutputType([int])]
+  param([AllowNull()]$Value)
+
+  $index = 0
+  if ($null -eq $Value -or $Value -is [bool] -or (Test-RepairObject -Value $Value) -or ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string])) { return -1 }
+  if ([int]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$index)) { return $index }
+  return -1
+}
+
 function New-RepairRunModel {
   <#
   .SYNOPSIS
@@ -444,10 +466,13 @@ function Update-RepairRunModel {
     Without a run, -Repair as it is. -Progress (a hashtable, or an object read from JSON, or $null when there is none
     yet) counts only when its Action is the run's, and its RunId too when both have one; then:
       - Steps: its rows @{ Id; Status; Percent } (a status this page does not know is 'pending'; a percent that is no
-        number is $null); a progress without steps keeps the run's;
-      - Current: its index (-1 when it has none); Percent: the running step's percent ($null when unknown);
-      - Log: its last 12 lines, as text.
-    ElapsedSeconds is always taken; Action, RunId and Stopping (Stop already pressed) stay.
+        number is $null; a row that is no object or has no Id is left out); a progress without a usable row keeps
+        the run's;
+      - Current: its index (-1 when it has none or it is no whole Int32: ConvertTo-RepairIndex); Percent: the running
+        step's percent ($null when unknown);
+      - Log: its last 12 lines, as text (an object in the list is left out).
+    ElapsedSeconds is always taken; Action, RunId and Stopping (Stop already pressed) stay. A field of the wrong type
+    never throws (Task 4 review M1).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -469,20 +494,19 @@ function Update-RepairRunModel {
     ($runId -eq '' -or [string]$run['RunId'] -eq '' -or $runId -ceq [string]$run['RunId'])
   if ($ours) {
     $steps = @(foreach ($row in @(Get-RepairEntry -From $Progress -Name 'Steps')) {
-        if ($null -eq $row) { continue }
+        if (-not (Test-RepairObject -Value $row)) { continue }
+        $id = [string](Get-RepairEntry -From $row -Name 'Id')
+        if ($id -eq '') { continue }
         $status = [string](Get-RepairEntry -From $row -Name 'Status')
         if ($script:RepairStepStatuses -cnotcontains $status) { $status = 'pending' }
-        @{ Id = [string](Get-RepairEntry -From $row -Name 'Id'); Status = $status; Percent = (ConvertTo-RepairPercent -Value (Get-RepairEntry -From $row -Name 'Percent')) }
+        @{ Id = $id; Status = $status; Percent = (ConvertTo-RepairPercent -Value (Get-RepairEntry -From $row -Name 'Percent')) }
       })
     if ($steps.Count -gt 0) { $nextRun['Steps'] = $steps }
-    $current = -1
-    $index = Get-RepairEntry -From $Progress -Name 'Current'
-    if ($null -ne $index -and $index -isnot [bool]) { $current = [int]$index }
-    $nextRun['Current'] = $current
+    $nextRun['Current'] = ConvertTo-RepairIndex -Value (Get-RepairEntry -From $Progress -Name 'Current')
     $percent = $null
     foreach ($step in @($nextRun['Steps'])) { if ($step['Status'] -ceq 'running' -and $null -ne $step['Percent']) { $percent = $step['Percent'] } }
     $nextRun['Percent'] = $percent
-    $log = @(foreach ($line in @(Get-RepairEntry -From $Progress -Name 'Log')) { if ($null -ne $line) { [string]$line } })
+    $log = @(foreach ($line in @(Get-RepairEntry -From $Progress -Name 'Log')) { if ($null -ne $line -and -not (Test-RepairObject -Value $line)) { [string]$line } })
     if ($log.Count -gt 12) { $log = $log[($log.Count - 12)..($log.Count - 1)] }
     $nextRun['Log'] = $log
   }

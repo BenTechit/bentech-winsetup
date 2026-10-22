@@ -776,11 +776,48 @@ function Remove-ToolboxChild {
   }
 }
 
+function Stop-ToolboxChild {
+  # Private. Kills -Process's tree (Stop-ProcessTree, which never throws) and returns $true when the process has ended:
+  # it then leaves $script:ToolboxChildren. One that still runs (or whose state cannot be read) stays tracked, WARN
+  # 'Toolbox child still running after the kill', so every later close retries it and Start-BenTechSetup removes no
+  # folder under it (Test-ToolboxChildrenRunning; Task 4 review M3).
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()]$Process, [AllowEmptyString()][string]$Action = '')
+
+  $id = $null
+  try { $id = [int]$Process.Id } catch { $id = $null }
+  if ($null -ne $id) { Stop-ProcessTree -ProcessId $id }
+  $exited = $false
+  try { $exited = [bool]$Process.HasExited } catch { $exited = $false }
+  if ($exited) {
+    Remove-ToolboxChild -Process $Process
+    return $true
+  }
+  $tracked = $false
+  foreach ($child in $script:ToolboxChildren.ToArray()) { if ([object]::ReferenceEquals($child, $Process)) { $tracked = $true } }
+  if (-not $tracked) { $script:ToolboxChildren.Add($Process) }
+  Write-SetupLog -Level WARN -Message 'Toolbox child still running after the kill' -Data @{ processId = $(if ($null -ne $id) { $id } else { 'unknown' }); action = $Action }
+  return $false
+}
+
+function Start-ToolboxSafetyRun {
+  # Private. A fresh read of the strip (the safety child). One that cannot even be asked for leaves the strip ready,
+  # every chip unknown, so nothing stays blocked behind a strip that never loads.
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $null = Start-ToolboxRun -Window $Window -ActionId 'safety' -Slot 'Safety'
+  if ($null -eq $state.Runs['Safety'] -and [string]$state.Model['Repair']['Strip']['State'] -cne 'ready') { Complete-ToolboxSafetyRun -Window $Window -Chips $null }
+}
+
 function Complete-ToolboxActionRun {
   # Private. An action's end (its result, or the window's own): the model (Complete-RepairRunModel: the result panel,
   # the visit's list, the strip loading), the one INFO line 'Toolbox action finished' (ASCII), and the strip read again
-  # by a new safety child (none starts while one still runs: that one ends the loading). A safety child that cannot
-  # even be asked for leaves the strip ready, every chip unknown, so nothing stays blocked behind a strip that never loads.
+  # by a new safety child (Start-ToolboxSafetyRun). When a safety child still runs (it began before or during the
+  # action), its reading is from before the action ended: it is marked Reread, its chips are no longer shown, and a
+  # fresh one starts when it ends (Task 4 review M7).
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
@@ -793,22 +830,23 @@ function Complete-ToolboxActionRun {
   $state = $Window.Tag
   $state.Model['Repair'] = Complete-RepairRunModel -Repair $state.Model['Repair'] -Result $Result
   $codes = @(foreach ($finding in @(Get-RepairEntry -From $Result -Name 'Findings')) {
-      if ($null -ne $finding) { ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $finding -Name 'Code')) } })
+      if (Test-RepairObject -Value $finding) { ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $finding -Name 'Code')) } })
   Write-SetupLog -Level INFO -Message 'Toolbox action finished' -Data @{
     action = (ConvertTo-ScreenText -Text $ActionId); runId = (ConvertTo-ScreenText -Text $RunId)
     outcome = (ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $Result -Name 'Outcome')))
     color = (ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $Result -Name 'Color')))
     minutes = [double][math]::Round([math]::Max(0, $Seconds) / 60, 1); findings = $codes }
   if ($null -eq $state.Runs['Safety']) {
-    $null = Start-ToolboxRun -Window $Window -ActionId 'safety' -Slot 'Safety'
-    if ($null -eq $state.Runs['Safety'] -and [string]$state.Model['Repair']['Strip']['State'] -cne 'ready') { Complete-ToolboxSafetyRun -Window $Window -Chips $null }
+    Start-ToolboxSafetyRun -Window $Window
+  } else {
+    $state.Runs['Safety']['Reread'] = $true
   }
 }
 
 function Complete-ToolboxSafetyRun {
   # Private. The safety child's end: the strip from -Chips (its result's Data.Chips, else the last partial ones), every
   # chip it did not read unknown, and ready (spec 5: unknown is yellow and blocks nothing); -DiskCheck (Data.DiskCheck)
-  # into the model.
+  # into the model. Chips or a DiskCheck that are no object are not read.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
@@ -816,8 +854,9 @@ function Complete-ToolboxSafetyRun {
     [AllowNull()]$DiskCheck
   )
 
+  if (-not (Test-RepairObject -Value $Chips)) { $Chips = $null }
   $values = @{ Strip = (ConvertTo-RepairStrip -Chips $Chips -Final $true) }
-  if ($null -ne $DiskCheck) {
+  if (Test-RepairObject -Value $DiskCheck) {
     $values['DiskCheck'] = @{ Dirty = (Get-RepairEntry -From $DiskCheck -Name 'Dirty'); Excluded = ((Get-RepairEntry -From $DiskCheck -Name 'Excluded') -eq $true) }
   }
   Set-ToolboxRepair -State $Window.Tag -Values $values
@@ -892,7 +931,14 @@ function Start-ToolboxRun {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ToolAction {1} -ToolArgs "{2}"' -f [string]$state['ScriptPath'], $ActionId, $argsPath
     $outputs = @(& $state['StartChild'] "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" $arguments)
-    if ($outputs.Count -ne 1 -or $null -eq $outputs[0]) { throw 'no process was started' }
+    if ($outputs.Count -ne 1 -or $null -eq $outputs[0]) {
+      # A stray value beside a process: every process among the outputs is tracked and killed, never left running
+      # untracked (Task 4 review M5); one the kill does not end stays tracked.
+      foreach ($stray in $outputs) {
+        if ($stray -is [Diagnostics.Process]) { $script:ToolboxChildren.Add($stray); $null = Stop-ToolboxChild -Process $stray -Action $action }
+      }
+      throw ('the child start gave {0} values instead of one process' -f $outputs.Count)
+    }
     $process = $outputs[0]
     $script:ToolboxChildren.Add($process)
   } catch {
@@ -927,15 +973,20 @@ function Update-ToolboxRuns {
   .DESCRIPTION
     Nothing runs: nothing happens (no render). For each slot busy when the tick began:
       - progress.json (Read-ToolJsonFile): the Action slot's into the run panel (Update-RepairRunModel, with the run's
-        Stopwatch seconds); the Safety slot's Partial.Chips into the strip, still loading (ConvertTo-RepairStrip);
+        Stopwatch seconds); the Safety slot's Partial.Chips (an object) into the strip, still loading
+        (ConvertTo-RepairStrip), unless that safety child is marked Reread;
       - its process has exited: the slot is cleared and the process leaves $script:ToolboxChildren; result.json is the
-        result (Action: Complete-ToolboxActionRun; Safety: the strip from Data.Chips, ready). Without one: WARN 'Toolbox
-        action ended without a result' with the exit code; Action: Failed, red, childNoResult with the exit code;
-        Safety: the last partial chips, the others unknown;
+        result (Action: Complete-ToolboxActionRun; Safety: the strip from Data.Chips, ready). A result whose Outcome is
+        none of the child's is no result (WARN 'Toolbox action result is not valid'); an unknown Color is RED. Without
+        one: WARN 'Toolbox action ended without a result' with the exit code; Action: Failed, red, childNoResult with
+        the exit code; Safety: the last partial chips, the others unknown;
       - still running past its budget + 3 minutes on the run's own Stopwatch (Get-ToolboxRunSeconds; RD-R8, RD-R9):
-        Stop-ProcessTree, WARN 'Toolbox action killed at its deadline', the slot cleared; Action: TimedOut, red,
-        actionTimedOut with the budget's minutes, the running step timedout and the pending ones skipped
-        (New-RepairWindowResult); Safety: the last partial chips, the others unknown (spec 5: blocks nothing).
+        Stop-ToolboxChild (a child the kill does not end stays tracked), WARN 'Toolbox action killed at its deadline',
+        the slot cleared; Action: TimedOut, red, actionTimedOut with the budget's minutes, the running step timedout
+        and the pending ones skipped (New-RepairWindowResult); Safety: the last partial chips, the others unknown
+        (spec 5: blocks nothing).
+      A safety child marked Reread (an action ended while it ran) is never the strip's reading: when it ends, a fresh
+      one starts (Start-ToolboxSafetyRun; review M7). Malformed files never throw here (review M1, M6).
     Then the repair page alone is rendered again (Update-RepairView; plan call: not the whole window every 500 ms).
   #>
   [CmdletBinding()]
@@ -957,9 +1008,10 @@ function Update-ToolboxRuns {
     $progress = Read-ToolJsonFile -Path ([IO.Path]::Combine([string]$run['Dir'], 'progress.json'))
     if ($slot -ceq 'Action') {
       $state.Model['Repair'] = Update-RepairRunModel -Repair $state.Model['Repair'] -Progress $progress -ElapsedSeconds ([int][math]::Floor($seconds))
-    } else {
+    } elseif ($run['Reread'] -ne $true) {
+      # A safety child marked Reread began before an action ended: its chips are no longer shown (review M7).
       $chips = Get-RepairEntry -From (Get-RepairEntry -From $progress -Name 'Partial') -Name 'Chips'
-      if ($null -ne $chips) {
+      if (Test-RepairObject -Value $chips) {
         $run['Chips'] = $chips
         Set-ToolboxRepair -State $state -Values @{ Strip = (ConvertTo-RepairStrip -Chips $chips) }
       }
@@ -971,6 +1023,15 @@ function Update-ToolboxRuns {
       $runs[$slot] = $null
       Remove-ToolboxChild -Process $run['Process']
       $result = Read-ToolJsonFile -Path ([IO.Path]::Combine([string]$run['Dir'], 'result.json'))
+      if ($null -ne $result) {
+        # A result whose Outcome is none of the child's is no result; an unknown colour is red (review M1, M6).
+        if ([string](Get-RepairEntry -From $result -Name 'Outcome') -cnotin 'Done', 'Stopped', 'TimedOut', 'NeedsRestart', 'Failed') {
+          Write-SetupLog -Level WARN -Message 'Toolbox action result is not valid' -Data @{ action = $action; runId = $runId }
+          $result = $null
+        } elseif ([string](Get-RepairEntry -From $result -Name 'Color') -cnotin 'GREEN', 'YELLOW', 'RED') {
+          $result['Color'] = 'RED'
+        }
+      }
       $exitCode = 'unknown'
       if ($null -eq $result) {
         try { $exitCode = ConvertTo-ScreenText -Text ([string]$run['Process'].ExitCode) } catch { $exitCode = 'unknown' }
@@ -982,24 +1043,26 @@ function Update-ToolboxRuns {
           $result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'Failed' -Code 'childNoResult' -Arguments @($exitCode) -EndedAt (Format-ToolTime -Value (Get-Date))
         }
         Complete-ToolboxActionRun -Window $Window -Result $result -ActionId ([string]$run['ActionId']) -RunId ([string]$run['RunId']) -Seconds $seconds
+      } elseif ($run['Reread'] -eq $true) {
+        Start-ToolboxSafetyRun -Window $Window   # its reading is from before an action ended: read again (review M7)
       } else {
         $data = Get-RepairEntry -From $result -Name 'Data'
-        $finalChips = if ($null -ne $result) { Get-RepairEntry -From $data -Name 'Chips' } else { $run['Chips'] }
+        $finalChips = Get-RepairEntry -From $data -Name 'Chips'
+        if (-not (Test-RepairObject -Value $finalChips)) { $finalChips = $run['Chips'] }
         Complete-ToolboxSafetyRun -Window $Window -Chips $finalChips -DiskCheck (Get-RepairEntry -From $data -Name 'DiskCheck')
       }
     } elseif ($seconds -gt ([double]$run['BudgetSeconds'] + $script:ToolboxKillGraceSeconds)) {
-      try {
-        Stop-ProcessTree -ProcessId ([int]$run['Process'].Id)
-      } catch {
-        Write-SetupLog -Level WARN -Message 'Could not stop a toolbox child process' -Data @{ action = $action; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
-      }
+      # One the kill does not end stays tracked (Stop-ToolboxChild): the slot is free and the result timed out, but
+      # every close retries the kill and no cleanup removes C:\BenTech under it (review M3).
+      $null = Stop-ToolboxChild -Process $run['Process'] -Action $action
       $runs[$slot] = $null
-      Remove-ToolboxChild -Process $run['Process']
       $minutes = [int][math]::Round([double]$run['BudgetSeconds'] / 60)
       Write-SetupLog -Level WARN -Message 'Toolbox action killed at its deadline' -Data @{ action = $action; runId = $runId; budgetMinutes = $minutes }
       if ($slot -ceq 'Action') {
         $result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'TimedOut' -Code 'actionTimedOut' -Arguments @($minutes) -EndedAt (Format-ToolTime -Value (Get-Date))
         Complete-ToolboxActionRun -Window $Window -Result $result -ActionId ([string]$run['ActionId']) -RunId ([string]$run['RunId']) -Seconds $seconds
+      } elseif ($run['Reread'] -eq $true) {
+        Start-ToolboxSafetyRun -Window $Window
       } else {
         Complete-ToolboxSafetyRun -Window $Window -Chips $run['Chips']
       }
@@ -1045,12 +1108,14 @@ function Request-ToolboxStop {
 function Stop-ToolboxChildren {
   <#
   .SYNOPSIS
-    Kills the process tree of every child the window started that still runs (Stop-ProcessTree), then empties
-    $script:ToolboxChildren. Never throws.
+    Kills the process tree of every child the window started that still runs (Stop-ToolboxChild). The ones that
+    ended leave $script:ToolboxChildren; one the kill does not end stays in it. Never throws.
   .DESCRIPTION
     Show-ToolboxWindow's finally calls it before the window closes, Get-SetupChoices' finally before WPF stops (spec
     4.4, Review Focus 2): no child may run on while the console fallback or the Cancel cleanup removes C:\BenTech.
-    Each kill is INFO 'Toolbox child process stopped' (its id); one that fails is a WARN.
+    Each kill that ends the child is INFO 'Toolbox child process stopped' (its id). A child still running afterwards
+    stays tracked (WARN 'Toolbox child still running after the kill'): the next call retries it, and
+    Start-BenTechSetup removes no folder while one runs (Test-ToolboxChildrenRunning; Task 4 review M3).
   #>
   [CmdletBinding()]
   param()
@@ -1058,22 +1123,15 @@ function Stop-ToolboxChildren {
   try {
     if ($null -eq $script:ToolboxChildren) { return }
     foreach ($process in $script:ToolboxChildren.ToArray()) {
-      if ($null -eq $process) { continue }
-      $exited = $false
-      try { $exited = [bool]$process.HasExited } catch { $exited = $false }
-      if ($exited) { continue }
-      try {
-        $id = [int]$process.Id
-        Stop-ProcessTree -ProcessId $id
-        Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id }
-      } catch {
-        Write-SetupLog -Level WARN -Message 'Could not stop a toolbox child process' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
-      }
+      $exited = ($null -eq $process)
+      if (-not $exited) { try { $exited = [bool]$process.HasExited } catch { $exited = $false } }
+      if ($exited) { Remove-ToolboxChild -Process $process; continue }
+      $id = $null
+      try { $id = [int]$process.Id } catch { $id = $null }
+      if (Stop-ToolboxChild -Process $process) { Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id } }
     }
   } catch {
     Write-SetupLog -Level WARN -Message 'Could not stop the toolbox child processes' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
-  } finally {
-    if ($null -ne $script:ToolboxChildren) { $script:ToolboxChildren.Clear() }
   }
 }
 
