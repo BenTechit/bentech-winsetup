@@ -4,9 +4,13 @@
 # (ConvertTo-RepairStrip), the gate of every action (Get-RepairGate), the chips as the window shows them
 # (Get-RepairChips), the YES check (Test-RepairYes) and whether an open confirmation may be confirmed
 # (Test-RepairConfirmReady). RepairPage.ps1 renders it; the toolbox model holds it as Model.Repair.
+# Task 4: the run in the model: a run started (New-RepairRunModel), brought up to date from the child's progress
+# (Update-RepairRunModel), ended on its result (Complete-RepairRunModel), and the result the window writes itself
+# when the child gave none (New-RepairWindowResult).
 #
 # Pure: no logging, no I/O, no window, no clock. Values in, values out. Needs Repair\ToolEngine.ps1's
-# $script:ToolActionCatalog for the actions this version has; the bundle holds every file.
+# $script:ToolActionCatalog for the actions this version has and Get-ToolText for a finding's English text, and
+# UI\StartScreen.ps1's ConvertTo-ScreenText; the bundle holds every file.
 #
 # The gate table (plan "Gates"; the first rule that fires wins, a warn adds a line to the confirmation):
 #   every action          reason.running (an action runs); reason.noScript (no setup files to run a child from);
@@ -377,4 +381,199 @@ function Format-RepairElapsed {
   $culture = [Globalization.CultureInfo]::InvariantCulture
   if ($hours -gt 0) { return [string]::Format($culture, '{0}:{1:00}:{2:00}', [int]$hours, [int]$minutes, [int]$rest) }
   return [string]::Format($culture, '{0}:{1:00}', [int]$minutes, [int]$rest)
+}
+
+# --- The run (repair Task 4) ---------------------------------------------------------------------------------------
+# The window (RepairPage.ps1) runs one action at a time in a child process and polls its progress.json; these turn
+# what it reads into the page's model. Pure, like the rest of this file: each returns a copy, the input is unchanged.
+
+# A step's status as the run panel knows it (plan "The files of one run": progress Steps.Status).
+$script:RepairStepStatuses = @('pending', 'running', 'done', 'warn', 'failed', 'skipped', 'timedout')
+
+function ConvertTo-RepairPercent {
+  # Private. A percent read from progress.json as a [double], or $null when it is no number.
+  [CmdletBinding()]
+  param([AllowNull()]$Value)
+
+  if ($null -eq $Value -or $Value -is [bool]) { return $null }
+  $number = 0.0
+  if ([double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) { return $number }
+  return $null
+}
+
+function New-RepairRunModel {
+  <#
+  .SYNOPSIS
+    -Repair with -ActionId's run started (plan "The repair model": Run). Pure; returns a copy.
+  .DESCRIPTION
+    Run = @{ Action; RunId; Steps = every step of the catalog's action, each @{ Id; Status = 'pending'; Percent = $null };
+    Current = -1; Percent = $null; Log = @(); ElapsedSeconds = 0; Stopping = $false }. CloseRefused is $false again.
+    The confirmation, the result and the strip are left as they are (the run panel comes before the result).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Repair,
+    [Parameter(Mandatory)][string]$ActionId,
+    [AllowEmptyString()][string]$RunId = ''
+  )
+
+  $entry = $script:ToolActionCatalog[$ActionId]
+  $ids = if ($entry -is [System.Collections.IDictionary]) { @($entry['Steps']) } else { @() }
+  $next = $Repair.Clone()
+  $next['Run'] = @{
+    Action         = $ActionId
+    RunId          = $RunId
+    Steps          = @(foreach ($id in $ids) { @{ Id = [string]$id; Status = 'pending'; Percent = $null } })
+    Current        = -1
+    Percent        = $null
+    Log            = @()
+    ElapsedSeconds = 0
+    Stopping       = $false
+  }
+  $next['CloseRefused'] = $false
+  return $next
+}
+
+function Update-RepairRunModel {
+  <#
+  .SYNOPSIS
+    -Repair with its run brought up to date from the child's progress.json (-Progress) and the window's clock
+    (-ElapsedSeconds, the run's own Stopwatch). Pure; returns a copy.
+  .DESCRIPTION
+    Without a run, -Repair as it is. -Progress (a hashtable, or an object read from JSON, or $null when there is none
+    yet) counts only when its Action is the run's, and its RunId too when both have one; then:
+      - Steps: its rows @{ Id; Status; Percent } (a status this page does not know is 'pending'; a percent that is no
+        number is $null); a progress without steps keeps the run's;
+      - Current: its index (-1 when it has none); Percent: the running step's percent ($null when unknown);
+      - Log: its last 12 lines, as text.
+    ElapsedSeconds is always taken; Action, RunId and Stopping (Stop already pressed) stay.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Repair,
+    [AllowNull()]$Progress,
+    [int]$ElapsedSeconds = 0
+  )
+
+  $run = $Repair['Run']
+  if ($run -isnot [System.Collections.IDictionary]) { return $Repair }
+  $nextRun = @{}
+  foreach ($key in @($run.Keys)) { $nextRun[$key] = $run[$key] }
+  $nextRun['ElapsedSeconds'] = [math]::Max(0, $ElapsedSeconds)
+
+  $action = [string](Get-RepairEntry -From $Progress -Name 'Action')
+  $runId = [string](Get-RepairEntry -From $Progress -Name 'RunId')
+  $ours = ($null -ne $Progress) -and ($action -ceq [string]$run['Action']) -and
+    ($runId -eq '' -or [string]$run['RunId'] -eq '' -or $runId -ceq [string]$run['RunId'])
+  if ($ours) {
+    $steps = @(foreach ($row in @(Get-RepairEntry -From $Progress -Name 'Steps')) {
+        if ($null -eq $row) { continue }
+        $status = [string](Get-RepairEntry -From $row -Name 'Status')
+        if ($script:RepairStepStatuses -cnotcontains $status) { $status = 'pending' }
+        @{ Id = [string](Get-RepairEntry -From $row -Name 'Id'); Status = $status; Percent = (ConvertTo-RepairPercent -Value (Get-RepairEntry -From $row -Name 'Percent')) }
+      })
+    if ($steps.Count -gt 0) { $nextRun['Steps'] = $steps }
+    $current = -1
+    $index = Get-RepairEntry -From $Progress -Name 'Current'
+    if ($null -ne $index -and $index -isnot [bool]) { $current = [int]$index }
+    $nextRun['Current'] = $current
+    $percent = $null
+    foreach ($step in @($nextRun['Steps'])) { if ($step['Status'] -ceq 'running' -and $null -ne $step['Percent']) { $percent = $step['Percent'] } }
+    $nextRun['Percent'] = $percent
+    $log = @(foreach ($line in @(Get-RepairEntry -From $Progress -Name 'Log')) { if ($null -ne $line) { [string]$line } })
+    if ($log.Count -gt 12) { $log = $log[($log.Count - 12)..($log.Count - 1)] }
+    $nextRun['Log'] = $log
+  }
+
+  $next = $Repair.Clone()
+  $next['Run'] = $nextRun
+  return $next
+}
+
+function Complete-RepairRunModel {
+  <#
+  .SYNOPSIS
+    -Repair with its run ended on -Result (result.json, or the window's own: New-RepairWindowResult). Pure; returns a
+    copy.
+  .DESCRIPTION
+    Run = $null; Result = -Result (the result panel shows it); Done gets @{ Action; Outcome; Color; EndedAt } (the
+    visit's list, which the next child gets in its args); Strip.State = 'loading' with the chips kept (the window reads
+    the strip again after every action: plan, "The strip ... again after every action"); CloseRefused = $false.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Repair,
+    [AllowNull()]$Result
+  )
+
+  $action = [string](Get-RepairEntry -From $Result -Name 'Action')
+  if ($action -eq '' -and $Repair['Run'] -is [System.Collections.IDictionary]) { $action = [string]$Repair['Run']['Action'] }
+  $done = New-Object System.Collections.Generic.List[object]
+  foreach ($entry in @($Repair['Done'])) { if ($null -ne $entry) { $done.Add($entry) } }
+  $done.Add(@{ Action = $action; Outcome = [string](Get-RepairEntry -From $Result -Name 'Outcome'); Color = [string](Get-RepairEntry -From $Result -Name 'Color')
+               EndedAt = [string](Get-RepairEntry -From $Result -Name 'EndedAt') })
+
+  $strip = @{}
+  if ($Repair['Strip'] -is [System.Collections.IDictionary]) { foreach ($key in @($Repair['Strip'].Keys)) { $strip[$key] = $Repair['Strip'][$key] } }
+  $strip['State'] = 'loading'
+
+  $next = $Repair.Clone()
+  $next['Run'] = $null
+  $next['Result'] = $Result
+  $next['Done'] = $done.ToArray()
+  $next['Strip'] = $strip
+  $next['CloseRefused'] = $false
+  return $next
+}
+
+function New-RepairWindowResult {
+  <#
+  .SYNOPSIS
+    The result the window writes itself when the child gave none (plan "The files of one run": result). Pure.
+  .DESCRIPTION
+    For -Outcome TimedOut (the window killed the child at its deadline) and Failed (the child ended without a result,
+    or could not start). The steps are the run's last ones (its last progress): the running step 'timedout'
+    (TimedOut) or 'failed' (Failed), the pending ones 'skipped', the others as they were. One CRIT finding -Code with
+    -Arguments in ASCII and its English text (Get-ToolText; the window shows finding.<Code> in its language). RED.
+    @{ Action; RunId; Outcome; Color = 'RED'; Steps; Findings; RestartRequired = $false; Offers = @{ DiskCheck =
+    $false; DismSource = $null }; Files = @{}; Data = @{}; StartedAt = ''; EndedAt = -EndedAt }.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][hashtable]$Repair,
+    [Parameter(Mandatory)][ValidateSet('TimedOut', 'Failed')][string]$Outcome,
+    [Parameter(Mandatory)][string]$Code,
+    [AllowNull()][object[]]$Arguments,
+    [AllowEmptyString()][string]$EndedAt = ''
+  )
+
+  $run = $Repair['Run']
+  if ($run -isnot [System.Collections.IDictionary]) { $run = @{} }
+  $running = if ($Outcome -ceq 'TimedOut') { 'timedout' } else { 'failed' }
+  $steps = @(foreach ($step in @($run['Steps'])) {
+      if ($null -eq $step) { continue }
+      $status = [string](Get-RepairEntry -From $step -Name 'Status')
+      if ($status -ceq 'running') { $status = $running } elseif ($status -ceq 'pending') { $status = 'skipped' }
+      @{ Id = [string](Get-RepairEntry -From $step -Name 'Id'); Status = $status; Percent = $null }
+    })
+  $values = [string[]]@(foreach ($a in @($Arguments)) { if ($null -ne $a) { ConvertTo-ScreenText -Text ([string]$a) } })
+  $finding = @{ Level = 'CRIT'; Code = $Code; Text = (Get-ToolText -Key ('finding.' + $Code) -Arguments $values); Args = $values }
+  return @{
+    Action          = [string]$run['Action']
+    RunId           = [string]$run['RunId']
+    Outcome         = $Outcome
+    Color           = 'RED'
+    Steps           = $steps
+    Findings        = @($finding)
+    RestartRequired = $false
+    Offers          = @{ DiskCheck = $false; DismSource = $null }
+    Files           = @{}
+    Data            = @{}
+    StartedAt       = ''
+    EndedAt         = $EndedAt
+  }
 }

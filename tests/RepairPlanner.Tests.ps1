@@ -133,3 +133,69 @@ Describe 'Test-RepairYes and Test-RepairConfirmReady (spec 4.2, RD-R2)' {
 Describe 'Format-RepairElapsed' {
   It '<S> seconds is <E>' -ForEach @(@{ S = 0; E = '0:00' }, @{ S = 754; E = '12:34' }, @{ S = 3725; E = '1:02:05' }, @{ S = -5; E = '0:00' }) { Format-RepairElapsed -Seconds $S | Should -BeExactly $E }
 }
+
+Describe 'the run in the model (repair Task 4: New-RepairRunModel, Update-RepairRunModel, Complete-RepairRunModel, New-RepairWindowResult)' {
+  BeforeAll {
+    # Health check's progress as the child writes it (read back as hashtables): the disk state done, the image check at 30%.
+    function New-HealthProgress([string]$RunId = '20261022-101500-health', [string]$Action = 'health') {
+      @{ Action = $Action; RunId = $RunId; State = 'running'; Current = 1; Partial = @{}; UpdatedAt = '2026-10-22T10:16:00'
+         Steps = @(@{ Id = 'volumeState'; Status = 'done'; Percent = $null }, @{ Id = 'imageCheck'; Status = 'running'; Percent = 30 }, @{ Id = 'imageScan'; Status = 'pending'; Percent = $null })
+         Log = @(foreach ($i in 1..14) { "line $i" }) }
+    }
+  }
+  It 'the toolbox model hands CanRun and the visit''s stamp to the page (stamped now by default)' {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -Previous $null -IsFresh $true -OnAC $true -AdminProtection 'Off' -CanRun $true -SessionStamp '2026-10-22_1015'
+    $mo.Repair.CanRun | Should -BeTrue; $mo.Repair.SessionStamp | Should -BeExactly '2026-10-22_1015'
+    $d = (New-ToolboxModel -Machine $m -Config $cfg -Previous $null -IsFresh $true -OnAC $true -AdminProtection 'Off').Repair
+    $d.CanRun | Should -BeFalse; $d.SessionStamp | Should -Match '^\d{4}-\d{2}-\d{2}_\d{4}$' }
+  It 'a new run lists every step of the catalog''s action as pending, with no percent, no log and no refused close' {
+    $r = New-TestModel @{ CloseRefused = $true }; $n = New-RepairRunModel -Repair $r.Repair -ActionId 'health' -RunId '20261022-101500-health'
+    $n.Run.Action | Should -BeExactly 'health'; $n.Run.RunId | Should -BeExactly '20261022-101500-health'
+    @($n.Run.Steps.Id) | Should -Be @($script:ToolActionCatalog['health'].Steps); @($n.Run.Steps.Status | Select-Object -Unique) | Should -Be @('pending')
+    $n.Run.Current | Should -Be -1; $n.Run.Percent | Should -BeNullOrEmpty; @($n.Run.Log).Count | Should -Be 0; $n.Run.ElapsedSeconds | Should -Be 0; $n.Run.Stopping | Should -BeFalse
+    $n.CloseRefused | Should -BeFalse; $r.Repair.Run | Should -BeNullOrEmpty; $r.Repair.CloseRefused | Should -BeTrue   # the input is not changed
+    (Get-RepairGate -Model @{ Repair = $n; OnAC = $true } -ActionId 'standard').Reason | Should -BeExactly 'reason.running' }
+  It 'progress fills the steps, the current step, its percent, the log and the elapsed time; Stop pressed stays pressed' {
+    $r = (New-TestModel @{}).Repair; $r = New-RepairRunModel -Repair $r -ActionId 'health' -RunId '20261022-101500-health'; $r.Run.Stopping = $true
+    $n = Update-RepairRunModel -Repair $r -Progress (New-HealthProgress) -ElapsedSeconds 75
+    @($n.Run.Steps.Status) | Should -Be @('done', 'running', 'pending'); $n.Run.Current | Should -Be 1; $n.Run.Percent | Should -Be 30
+    @($n.Run.Log).Count | Should -Be 12; @($n.Run.Log)[-1] | Should -BeExactly 'line 14'; $n.Run.ElapsedSeconds | Should -Be 75; $n.Run.Stopping | Should -BeTrue
+    $r.Run.ElapsedSeconds | Should -Be 0   # a copy
+    # Read from JSON as objects, it is the same.
+    $j = Update-RepairRunModel -Repair $r -Progress ((New-HealthProgress) | ConvertTo-Json -Depth 5 | ConvertFrom-Json) -ElapsedSeconds 76
+    @($j.Run.Steps.Status) | Should -Be @('done', 'running', 'pending'); $j.Run.Percent | Should -Be 30 }
+  It 'no progress yet moves only the clock; another run''s progress or an unknown status changes no step' {
+    $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'health' -RunId '20261022-101500-health'
+    $n = Update-RepairRunModel -Repair $r -Progress $null -ElapsedSeconds 3; $n.Run.ElapsedSeconds | Should -Be 3; @($n.Run.Steps).Count | Should -Be 7
+    (Update-RepairRunModel -Repair $r -Progress (New-HealthProgress -RunId '20261022-101400-health') -ElapsedSeconds 4).Run.Current | Should -Be -1
+    (Update-RepairRunModel -Repair $r -Progress (New-HealthProgress -Action 'standard') -ElapsedSeconds 4).Run.Current | Should -Be -1
+    $odd = New-HealthProgress; $odd.Steps[0].Status = 'exploded'
+    @((Update-RepairRunModel -Repair $r -Progress $odd -ElapsedSeconds 5).Run.Steps.Status)[0] | Should -BeExactly 'pending'
+    $none = (New-TestModel @{}).Repair; (Update-RepairRunModel -Repair $none -Progress (New-HealthProgress) -ElapsedSeconds 9).Run | Should -BeNullOrEmpty }
+  It 'the result ends the run: no run, the result shown, the visit''s list grows, the strip reloads and the refused close is forgotten' {
+    $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'standard' -RunId '20261022-101500-standard'; $r.CloseRefused = $true
+    $n = Complete-RepairRunModel -Repair $r -Result $script:resultSample
+    $n.Run | Should -BeNullOrEmpty; $n.Result.Outcome | Should -Be 'Done'; $n.CloseRefused | Should -BeFalse
+    @($n.Done).Count | Should -Be 1; $n.Done[0].Action | Should -Be 'standard'; $n.Done[0].Outcome | Should -Be 'Done'; $n.Done[0].Color | Should -Be 'YELLOW'
+    $n.Strip.State | Should -Be 'loading'; $n.Strip.Free.Level | Should -Be 'ok'   # the chips stay until the safety child reads them again
+    $r.Strip.State | Should -Be 'ready'; $r.Run | Should -Not -BeNullOrEmpty; @($r.Done).Count | Should -Be 0   # the input is not changed
+    $twice = Complete-RepairRunModel -Repair $n -Result @{ Action = 'health'; Outcome = 'Stopped'; Color = 'YELLOW'; EndedAt = '2026-10-22T11:00:00' }
+    @($twice.Done.Action) | Should -Be @('standard', 'health'); $twice.Done[1].EndedAt | Should -Be '2026-10-22T11:00:00' }
+  It 'the window''s own result: <Outcome> marks the running step <Running>, the pending ones skipped, red, with the English finding' -ForEach @(
+    @{ Outcome = 'TimedOut'; Code = 'actionTimedOut'; A = @(150); Running = 'timedout'; Text = 'The action reached its deadline (150 min) and was stopped' }
+    @{ Outcome = 'Failed'; Code = 'childNoResult'; A = @(1); Running = 'failed'; Text = 'The action ended without a result (exit 1)' }
+  ) {
+    $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'health' -RunId '20261022-101500-health'
+    $r = Update-RepairRunModel -Repair $r -Progress (New-HealthProgress) -ElapsedSeconds 9
+    $res = New-RepairWindowResult -Repair $r -Outcome $Outcome -Code $Code -Arguments $A -EndedAt '2026-10-22T12:00:00'
+    $res.Outcome | Should -Be $Outcome; $res.Color | Should -Be 'RED'; $res.Action | Should -Be 'health'; $res.RunId | Should -Be '20261022-101500-health'
+    @($res.Steps.Status) | Should -Be @('done', $Running, 'skipped'); $res.EndedAt | Should -Be '2026-10-22T12:00:00'
+    @($res.Findings).Count | Should -Be 1; $res.Findings[0].Level | Should -Be 'CRIT'; $res.Findings[0].Code | Should -Be $Code
+    $res.Findings[0].Text | Should -BeExactly $Text; @($res.Findings[0].Args) | Should -Be @([string]$A[0])
+    $res.RestartRequired | Should -BeFalse; $res.Offers.DiskCheck | Should -BeFalse }
+  It 'a start that failed: every step skipped, the reason in ASCII' {
+    $r = New-RepairRunModel -Repair (New-TestModel @{}).Repair -ActionId 'health' -RunId '20261022-101500-health'
+    $res = New-RepairWindowResult -Repair $r -Outcome Failed -Code childStartFailed -Arguments @('no powershell ' + [char]0x05D0)
+    @($res.Steps.Status | Select-Object -Unique) | Should -Be @('skipped'); $res.Findings[0].Text | Should -BeExactly 'The action could not start: no powershell ?'
+    @($res.Findings[0].Args) | Should -Be @('no powershell ?') }
+}

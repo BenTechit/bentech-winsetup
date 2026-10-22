@@ -677,4 +677,49 @@ Describe 'ToolEngine (repair Task 1)' {
       [string]$script:tickHandler | Should -Match 'Update-ToolTick'
     }
   }
+
+  # Repair Task 4: the findings the window adds itself, and Restart PC's stateless restart (Reboot.ps1, spec 6.9).
+  Describe 'the window''s findings (repair Task 4)' {
+    It 'holds childNoResult and childStartFailed, exactly in English, and in Hebrew with the same arguments' {
+      $expected = @{ 'finding.childNoResult' = 'The action ended without a result (exit {0})'; 'finding.childStartFailed' = 'The action could not start: {0}' }
+      foreach ($k in $expected.Keys) {
+        $script:ToolboxStrings.en[$k] | Should -BeExactly $expected[$k] -Because $k
+        $script:ToolboxStrings.he[$k] | Should -Match '[א-ת]' -Because $k
+        $script:ToolboxStrings.he[$k] | Should -Match '\{0\}' -Because $k
+      }
+    }
+  }
+
+  Describe 'Invoke-StatelessRestart (Restart PC, spec 6.9)' {
+    BeforeEach { $script:hosts = New-Object System.Collections.ArrayList; Mock Write-Host { [void]$script:hosts.Add(@{ Text = "$Object"; Fore = "$ForegroundColor"; Back = "$BackgroundColor" }) } }
+    It 'restarts with Restart-Computer -Force: no state, no countdown, no fallback' {
+      $script:restarts = New-Object System.Collections.ArrayList
+      Mock Restart-Computer { [void]$script:restarts.Add([bool]$Force) }   # replaces the safety net with a recorder: nothing restarts
+      Invoke-StatelessRestart | Should -BeTrue
+      @($script:restarts) | Should -Be @($true); Should -Invoke Invoke-External -Times 0 -Exactly; $script:hosts.Count | Should -Be 0
+    }
+    It 'Invoke-StatelessRestart falls back to shutdown.exe /r /t 5 /f and accepts 1190' {
+      foreach ($code in 0, 1115, 1190) {
+        Mock Invoke-External { @{ ExitCode = $script:code; TimedOut = $false; Output = '' } }; $script:code = $code
+        Invoke-StatelessRestart -RestartAction { throw 'Restart-Computer failed' } | Should -BeTrue -Because "exit $code"
+      }
+      Should -Invoke Invoke-External -Times 3 -Exactly   # one fallback per case, nothing else
+      Should -Invoke Invoke-External -Times 3 -Exactly -ParameterFilter { $FilePath -eq "$env:windir\System32\shutdown.exe" -and $ArgumentList -eq '/r /t 5 /f' -and $TimeoutMinutes -eq 1 }
+      $script:hosts.Count | Should -Be 0
+    }
+    It 'both failing is $false and one White on DarkRed line' {
+      foreach ($fallback in @{ ExitCode = 5; TimedOut = $false; Output = '' }, @{ ExitCode = $null; TimedOut = $true; Output = '' }) {
+        $script:hosts.Clear(); $script:fallback = $fallback; Mock Invoke-External { $script:fallback }
+        Invoke-StatelessRestart -RestartAction { throw ('no restart ' + [char]0x05D0) } | Should -BeFalse
+        $script:hosts.Count | Should -Be 1; $script:hosts[0].Fore | Should -Be 'White'; $script:hosts[0].Back | Should -Be 'DarkRed'
+        $script:hosts[0].Text | Should -BeLike 'Could not restart the PC: *'; $script:hosts[0].Text | Should -Not -Match '[^\x00-\x7F]'
+      }
+    }
+    It 'never throws: a fallback that cannot start is $false too' {
+      Mock Invoke-External { throw "Cannot start 'shutdown.exe'" }
+      { Invoke-StatelessRestart -RestartAction { throw 'no' } } | Should -Not -Throw
+      Invoke-StatelessRestart -RestartAction { throw 'no' } | Should -BeFalse
+      Invoke-StatelessRestart -RestartAction { throw 'no' } -FallbackRestartAction { throw 'neither' } | Should -BeFalse
+    }
+  }
 }

@@ -2,13 +2,21 @@
 # Repair Task 3: the repair page's look (repair spec 4.1-4.4, 5; repair plan "XAML contract additions"): the XAML,
 # the strings and the view (Update-RepairView) on the pure model of RepairPlanner.ps1.
 #
+# Repair Task 4: the window runs actions (repair spec 4.3, 4.4, 6.9, 7): the background child, the 500 ms run timer,
+# the deadline kill on the run's own Stopwatch (RD-R8, RD-R9), Stop, the close guard and Restart PC.
+#
 # SAFETY: as Toolbox.Tests, the window is only parsed, never shown. No ShowDialog, no Dispatcher.InvokeShutdown, no
 # registry, no CIM, no child process: the model is built from plain sample values (tests\fixtures\RepairSamples.ps1),
 # setup.log goes to $script:logs and the power state is never read for real. Clicks are raised in code (RaiseEvent).
+# No process is ever started or killed: the run tests give every window a recording -StartChild seam that returns a
+# fake process object (Id 4242, 4243, ...), and every BeforeEach mocks Start-BackgroundExternal, Stop-ProcessTree,
+# Invoke-External, Start-Process and Restart-Computer to throw (the run tests replace Stop-ProcessTree with a
+# recorder). The run folders are written under $TestDrive\Root only.
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'State\State', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
-                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Common\Process', 'Detect\Detection', 'Detect\PcName', 'State\State', 'Engine\Catalog',
+                 'UI\StartScreen', 'Entry\Cleanup', 'Repair\ToolEngine', 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml',
+                 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   # The Dell sample machine of tools\Preview-Toolbox.ps1.
   $script:m = @{ Manufacturer = 'Dell Inc.'; Model = 'Latitude 5440'; FriendlyModel = 'Latitude 5440'; Serial = '7HX2K93'; NewName = 'DELL-7HX2K93'
@@ -59,7 +67,65 @@ BeforeAll {
     $script:logs = New-Object Collections.ArrayList
     Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
     Mock Test-OnACPower { $true }
+    # Safety nets (Task 4): nothing here may start or kill a process, or restart this PC.
+    Mock Start-BackgroundExternal { throw 'blocked by the test: Start-BackgroundExternal' }
+    Mock Stop-ProcessTree { throw 'blocked by the test: Stop-ProcessTree' }
+    Mock Invoke-External { throw 'blocked by the test: Invoke-External' }
+    Mock Start-Process { throw 'blocked by the test: Start-Process' }
+    Mock Restart-Computer { throw 'blocked by the test: Restart-Computer' }
     $script:w = New-RepairWindow @{}
+  }
+
+  # Task 4: the run tests' seams and windows. $script:startChild records each start as @{ File; Args; Process } in
+  # $script:started and returns a fake process (Id 4242, 4243, ...), also kept in $script:fake (the latest one).
+  function Set-RunTestMocks {
+    Set-RepairTestMocks
+    $script:killed = New-Object Collections.ArrayList
+    $script:order = New-Object Collections.Generic.List[string]   # Add returns nothing: a seam that records into it returns only its own value
+    $script:shown = $null; $script:closingAtKill = $null
+    Mock Stop-ProcessTree {
+      [void]$script:killed.Add($ProcessId); [void]$script:order.Add("kill:$ProcessId")
+      if ($null -ne $script:shown) { $script:closingAtKill = $script:shown.Tag.Closing } }
+    $script:ToolboxChildren.Clear()
+    $script:started = New-Object Collections.ArrayList
+    $script:nextId = 4242; $script:fake = $null
+    $script:startChild = { param($file, $arguments)
+      $p = [pscustomobject]@{ Id = $script:nextId; HasExited = $false; ExitCode = 0 }; $script:nextId++; $script:fake = $p
+      [void]$script:started.Add(@{ File = $file; Args = $arguments; Process = $p }); $p }
+    $script:findStick = { param($l) @{ Root = 'E:\'; Drive = 'E:' } }
+    $script:showArgs = @{ Machine = $script:m; Config = $script:cfg; Version = '2026.10.22.1'; Previous = $null; IsFresh = $false
+      Root = "$TestDrive\Root"; ScriptPath = "$TestDrive\Root\setup.ps1"; OnAC = { $true }; AdminProtection = { 'Off' }
+      WorkArea = { New-Object Windows.Rect 0, 0, 1920, 1040 }; Launcher = { $null }; FindStick = $script:findStick; StartChild = $script:startChild }
+    # Get-SetupChoices' five parameters, Root and ScriptPath; every call passes its four seams by name (Toolbox.Tests'
+    # seam guard reads the calls, not the splat).
+    $script:choiceArgs = @{ Machine = $script:m; Config = $script:cfg; Version = '2026.10.22.1'; Previous = $null; IsFresh = $false
+      Root = "$TestDrive\Root"; ScriptPath = 'x' }
+  }
+  # A window that can run actions: the sample model on -Page with a ready strip, stick E:, the setup files under
+  # $TestDrive\Root, the recording seams, its handlers and a run timer that is never started.
+  function New-RunWindow([string]$Page = 'repair', [hashtable]$Set = @{}) {
+    $model = New-TestModel $Set; $model.Page = $Page
+    $w = New-ToolboxWindow -Model $model -Machine $script:m -Config $script:cfg -Version '2026.10.22.1' -Root "$TestDrive\Root" -ScriptPath "$TestDrive\Root\setup.ps1" `
+      -Launcher $null -StartChild $script:startChild -FindStick $script:findStick
+    $w.Tag.RunTimer = New-ToolboxRunTimer -Window $w
+    Register-ToolboxHandlers -Window $w
+    $w
+  }
+  function Send-RunTick($w) { Invoke-ToolboxAction -Sender $w.Tag.RunTimer -Action 'RunTick' }
+  # The child's files, as it writes them (UTF-8, through a .tmp file): Health check's progress with the disk state
+  # done and the image check running at -Percent, and a result.
+  function Write-TestProgress($w, [int]$Percent = 30, [string[]]$Status = @('done', 'running', 'pending')) {
+    $run = $w.Tag.Runs.Action; $ids = @('volumeState', 'imageCheck', 'imageScan')
+    $steps = @(for ($i = 0; $i -lt $Status.Count; $i++) { @{ Id = $ids[$i]; Status = $Status[$i]; Percent = $(if ($Status[$i] -eq 'running') { $Percent } else { $null }) } })
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; State = 'running'; Current = 1; Steps = $steps
+      Log = @('Disk state: started', 'Disk state: done', 'Windows image check: started'); Partial = @{}; UpdatedAt = '2026-10-22T10:16:00' }
+  }
+  function Write-TestResult($w, [string]$Outcome = 'Done', [string]$Color = 'GREEN', [string]$Slot = 'Action', [hashtable]$Data = @{}) {
+    $run = $w.Tag.Runs[$Slot]
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'result.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; Outcome = $Outcome; Color = $Color
+      Steps = @(@{ Id = 'volumeState'; Status = 'done'; Percent = $null }); Findings = @(@{ Level = 'WARN'; Code = 'sfcCorrupt'; Text = 'System files: 3 integrity problems found (nothing repaired yet)'; Args = @('3') })
+      RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }; Files = @{ Folder = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015' }
+      Data = $Data; StartedAt = '2026-10-22T10:15:00'; EndedAt = '2026-10-22T10:20:00' }
   }
 }
 
@@ -299,4 +365,247 @@ Describe 'the repair page review fixes (ruling RD-R14)' {
     $x = New-RepairWindow @{ Stick = $null; NetBackup = @{ Path = 'E:\x\network.json'; Sha256 = 'AB'; CreatedAt = '2026-10-20T09:05:00'; Adapters = 1 } }
     $x.FindName('NetRestoreButton').ToolTip.Text | Should -BeExactly 'Plug in the BenTech stick: the network and device backups are kept there'
     $script:ToolboxStrings.he['reason.noStickBackup'] | Should -Not -Match 'לשרוד' }
+}
+
+Describe 'action runs (spec 7, 4.3, 4.4)' {
+  BeforeEach { Set-RunTestMocks }
+
+  It 'starts the child hidden and without waiting, with the args the child reads' {
+    $w = New-RunWindow; Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeTrue
+    @($script:started).Count | Should -Be 1
+    $script:started[0].File | Should -BeLike '*\WindowsPowerShell\v1.0\powershell.exe'
+    $script:started[0].File | Should -BeExactly "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $script:started[0].Args | Should -BeLike '-NoProfile -ExecutionPolicy Bypass -File "*\Root\setup.ps1" -ToolAction health -ToolArgs "*\Root\Tool\*-health\args.json"'
+    $a = Read-ToolJsonFile (Get-ChildItem "$TestDrive\Root\Tool" -Recurse -Filter args.json).FullName; $a.Action | Should -Be 'health'; $a.Identity.Key | Should -Be 'SN-7HX2K93'
+    $script:ToolboxChildren | Should -Contain $script:fake; @($w.Tag.Model.Repair.Run.Steps.Status | Select-Object -Unique) | Should -Be @('pending')
+    # The run: its own folder named after its RunId, its process and its own Stopwatch.
+    $run = $w.Tag.Runs.Action; $run.ActionId | Should -Be 'health'; $run.RunId | Should -Match '^\d{8}-\d{6}-health$'
+    $run.Dir | Should -Be (Join-Path "$TestDrive\Root\Tool" $run.RunId); [object]::ReferenceEquals($run.Process, $script:fake) | Should -BeTrue
+    $run.Clock | Should -BeOfType [Diagnostics.Stopwatch]; $run.Clock.IsRunning | Should -BeTrue; $run.BudgetSeconds | Should -Be 9000
+    $w.Tag.Runs.Safety | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Run.RunId | Should -Be $run.RunId
+    $w.FindName('RunPanel').Visibility | Should -Be 'Visible'; $w.FindName('RunTitle').Text | Should -Be 'Health check' }
+  It 'args.json is the Shared shape: the budget in seconds (RD-R8), the visit folder on the stick, the page''s state; the child''s own check accepts it' {
+    $w = New-RunWindow -Set @{ Disk = 'warn' }
+    $w.Tag.Model.Repair.Complaint = 'Slow since the update'
+    $w.Tag.Model.Repair.Done = @(@{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; EndedAt = '2026-10-22T10:10:00' })
+    $null = Start-ToolboxRun -Window $w -ActionId 'health' -Options @{ Answer = 42 }
+    $argsPath = Join-Path $w.Tag.Runs.Action.Dir 'args.json'; $a = Read-ToolJsonFile $argsPath
+    $a.Version | Should -Be 1; $a.RunId | Should -Be $w.Tag.Runs.Action.RunId; $a.BudgetSeconds | Should -Be 9000   # timeoutsMinutes.tool.health = 150
+    $deadline = [datetime]::Parse($a.DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    ($deadline.ToUniversalTime() - [datetime]::UtcNow).TotalMinutes | Should -BeGreaterThan 148   # for the child's log only
+    $a.SessionDir | Should -BeExactly ('E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_' + $w.Tag.Model.Repair.SessionStamp); $a.StickRoot | Should -BeExactly 'E:\'
+    $a.Complaint | Should -BeExactly 'Slow since the update'; @($a.Done).Count | Should -Be 1; $a.Done[0].Action | Should -Be 'health'
+    $a.Identity.FolderPart | Should -Be '7HX2K93'; $a.Identity.Serial | Should -Be '7HX2K93'; $a.Identity.ComputerName | Should -Be 'DESKTOP-4F7K2LQ'
+    $a.Identity.Brand | Should -Be 'DELL'; $a.Identity.Model | Should -Be 'Latitude 5440'; $a.Identity.Manufacturer | Should -Be 'Dell Inc.'
+    $a.Machine.IsLaptop | Should -BeTrue; $a.Machine.OsBuild | Should -Be 26200
+    $a.Strip.Disk | Should -Be 'warn'; $a.Strip.Restart | Should -Be 'ok'; $a.Strip.Free | Should -Be 'ok'; $a.Options.Answer | Should -Be 42
+    (Read-ToolArgs -Path $argsPath -Root "$TestDrive\Root" -ActionId 'health').BudgetSeconds | Should -Be 9000 }
+  It 'an action without a configured deadline gets 30 minutes; no stick puts the visit folder under Root\Logs\Repair; a strip not read yet is unknown' {
+    $w = New-RunWindow -Set @{ Stick = $null; State = 'loading'; Disk = $null }
+    $c = $script:cfg | ConvertTo-Json -Depth 12 | ConvertFrom-Json; $c.timeoutsMinutes.tool.PSObject.Properties.Remove('health'); $w.Tag.Config = $c
+    $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json')
+    $a.BudgetSeconds | Should -Be 1800; $w.Tag.Runs.Action.BudgetSeconds | Should -Be 1800; $a.StickRoot | Should -BeExactly ''; $a.Strip.Disk | Should -Be 'unknown'
+    $a.SessionDir | Should -BeExactly (Join-Path "$TestDrive\Root\Logs\Repair" ('DESKTOP-4F7K2LQ_7HX2K93_' + $w.Tag.Model.Repair.SessionStamp)) }
+  It 'the visit folder''s name keeps only letters, digits and dashes of the PC name and the serial (spec 8, RD-R6)' {
+    $w = New-RunWindow; $w.Tag.Machine = $w.Tag.Machine.Clone(); $w.Tag.Machine.ComputerName = 'PC_' + [char]0x05D0 + ' 1'; $w.Tag.Machine.Serial = 'AB 12/34'
+    Get-ToolboxSessionDir -State $w.Tag | Should -BeExactly ('E:\BenTech-Reports\PC1_AB1234_' + $w.Tag.Model.Repair.SessionStamp) }
+  It 'refuses a busy slot, a window without its setup files and an action this version does not have: nothing starts' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeFalse
+    $n = New-RunWindow; $n.Tag.ScriptPath = ''; Start-ToolboxRun -Window $n -ActionId 'health' | Should -BeFalse
+    $n.Tag.Root = ''; $n.Tag.ScriptPath = "$TestDrive\Root\setup.ps1"; Start-ToolboxRun -Window $n -ActionId 'health' | Should -BeFalse
+    $u = New-RunWindow; Start-ToolboxRun -Window $u -ActionId 'noSuchAction' | Should -BeFalse
+    @($script:started).Count | Should -Be 1; $n.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $u.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $n.Tag.Runs.Action | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like 'Toolbox action refused*' }).Count | Should -Be 4 }
+  It 'a child that cannot start is a red Failed result with childStartFailed in ASCII; the strip is read again' {
+    $w = New-RunWindow
+    $w.Tag.StartChild = { param($file, $arguments) if ($arguments -match '-ToolAction health') { throw ('no powershell ' + [char]0x05D0) }; & $script:startChild $file $arguments }
+    Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeFalse
+    $res = $w.Tag.Model.Repair.Result; $res.Outcome | Should -Be 'Failed'; $res.Color | Should -Be 'RED'; $res.Action | Should -Be 'health'
+    $res.Findings[0].Code | Should -Be 'childStartFailed'; @($res.Findings[0].Args) | Should -Be @('no powershell ?')
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $w.FindName('ResultPanel').Visibility | Should -Be 'Visible'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action could not start' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox action finished' -and $_.Data.outcome -eq 'Failed' }).Count | Should -Be 1
+    $script:started[-1].Args | Should -Match '-ToolAction safety'; $w.Tag.Model.Repair.Strip.State | Should -Be 'loading'
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'a run folder that is already there is never reused: a stale result in it is never read' {
+    Mock New-ToolboxRunId { '20261022-101500-health' }
+    $dir = "$TestDrive\Root\Tool\20261022-101500-health"; $null = New-Item -ItemType Directory -Path $dir -Force
+    [IO.File]::WriteAllText("$dir\result.json", '{"Action":"health","Outcome":"Done","Color":"GREEN"}')
+    $w = New-RunWindow; Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeFalse
+    $w.Tag.Model.Repair.Result.Outcome | Should -Be 'Failed'; $w.Tag.Model.Repair.Result.Findings[0].Code | Should -Be 'childStartFailed'
+    @($script:started | Where-Object { $_.Args -match '-ToolAction health' }).Count | Should -Be 0; Test-Path "$dir\args.json" | Should -BeFalse }
+  It 'the same action started again within the second gets the next second''s run folder' {
+    $script:ids = @('20261022-111500-health', '20261022-111500-health', '20261022-111501-health'); $script:idCall = 0
+    Mock New-ToolboxRunId { if ($ActionId -eq 'health') { $script:ids[$script:idCall++] } else { '20261022-111500-safety' } }
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $w.Tag.Runs.Action.RunId | Should -Be '20261022-111500-health'
+    $script:fake.HasExited = $true; Send-RunTick $w   # it ended at once (no result); the strip's child starts
+    Start-ToolboxRun -Window $w -ActionId 'health' | Should -BeTrue; $w.Tag.Runs.Action.RunId | Should -Be '20261022-111501-health'
+    (Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json')).RunId | Should -Be '20261022-111501-health' }
+  It 'polls progress into the run panel and ends on the result, with one ASCII log line' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake
+    Write-TestProgress $w -Percent 30; Send-RunTick $w
+    $w.FindName('RunBar').Value | Should -Be 30; $w.FindName('RunLog').Text | Should -Match 'Windows image check: started'
+    @($w.Tag.Model.Repair.Run.Steps.Status) | Should -Be @('done', 'running', 'pending'); $w.Tag.Runs.Action | Should -Not -BeNullOrEmpty
+    Write-TestResult $w; $proc.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.Result.Outcome | Should -Be 'Done'; @($script:logs | Where-Object Message -eq 'Toolbox action finished').Count | Should -Be 1
+    $script:started[-1].Args | Should -Match '-ToolAction safety'; ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]'
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $script:ToolboxChildren | Should -Not -Contain $proc
+    $w.FindName('ResultPanel').Visibility | Should -Be 'Visible'; @($w.Tag.Model.Repair.Done).Count | Should -Be 1; $w.Tag.Model.Repair.Done[0].Color | Should -Be 'GREEN'
+    $line = @($script:logs | Where-Object Message -eq 'Toolbox action finished')[0]
+    $line.Level | Should -Be 'INFO'; $line.Data.action | Should -Be 'health'; $line.Data.runId | Should -Be $w.Tag.Model.Repair.Result.RunId
+    $line.Data.outcome | Should -Be 'Done'; $line.Data.color | Should -Be 'GREEN'; @($line.Data.findings) | Should -Be @('sfcCorrupt'); $line.Data.minutes | Should -BeOfType [double]
+    $w.Tag.Runs.Safety.ActionId | Should -Be 'safety'; $w.Tag.Model.Repair.Strip.State | Should -Be 'loading'; $script:ToolboxChildren | Should -Contain $script:fake }
+  It 'kills the tree past the deadline and reports Timed out (red) with what was done' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake; Write-TestProgress $w; Send-RunTick $w
+    Mock Get-ToolboxRunSeconds { 150 * 60 + 181 }   # the run's own Stopwatch, past the budget + 3 min (RD-R9)
+    Invoke-ToolboxAction -Sender $w.Tag.RunTimer -Action 'RunTick'
+    $script:killed | Should -Be @(4242); $w.Tag.Model.Repair.Result.Color | Should -Be 'RED'; $w.Tag.Model.Repair.Result.Steps.Status | Should -Be @('done','timedout','skipped')
+    $res = $w.Tag.Model.Repair.Result; $res.Outcome | Should -Be 'TimedOut'; $res.Findings[0].Code | Should -Be 'actionTimedOut'; @($res.Findings[0].Args) | Should -Be @('150')
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action killed at its deadline' }).Count | Should -Be 1
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $script:ToolboxChildren | Should -Not -Contain $proc; $w.FindName('ResultPanel').Visibility | Should -Be 'Visible'
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox action finished' -and $_.Data.outcome -eq 'TimedOut' }).Count | Should -Be 1 }
+  It 'the deadline is budget + 3 minutes on the run''s own Stopwatch, never the wall clock (RD-R8, RD-R9)' {
+    $clock = [Diagnostics.Stopwatch]::StartNew(); $s = Get-ToolboxRunSeconds -Run @{ Clock = $clock }; $s | Should -BeGreaterOrEqual 0; $s | Should -BeLessThan 60
+    Get-ToolboxRunSeconds -Run @{} | Should -Be 0
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    $w.Tag.Runs.Action.DeadlineUtc = [datetime]::UtcNow.AddHours(-5).ToString('o')   # the wall clock moved (a time sync): no kill
+    $w.Tag.Runs.Action.StartedUtc = [datetime]::UtcNow.AddHours(-5).ToString('o')
+    Send-RunTick $w; $script:killed | Should -BeNullOrEmpty
+    Mock Get-ToolboxRunSeconds { 150 * 60 + 179 }; Send-RunTick $w; $script:killed | Should -BeNullOrEmpty   # 2 min 59 s over: the child may still be ending
+    Mock Get-ToolboxRunSeconds { 150 * 60 + 181 }; Send-RunTick $w; $script:killed | Should -Be @(4242) }
+  It 'the elapsed time shown comes from the same Stopwatch' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    Mock Get-ToolboxRunSeconds { 754 }; Send-RunTick $w
+    $w.Tag.Model.Repair.Run.ElapsedSeconds | Should -Be 754; $w.FindName('RunElapsed').Text | Should -Be 'Elapsed 12:34' }
+  It 'a child that exits without a result is Failed with childNoResult' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $script:fake.HasExited = $true; $script:fake.ExitCode = 1
+    Invoke-ToolboxAction -Sender $w.Tag.RunTimer -Action 'RunTick'; $res = $w.Tag.Model.Repair.Result
+    $res.Outcome | Should -Be 'Failed'; $res.Color | Should -Be 'RED'; $res.Findings[0].Code | Should -Be 'childNoResult'; $res.Findings[0].Args | Should -Be @('1')
+    @($res.Steps.Status | Select-Object -Unique) | Should -Be @('skipped'); $script:killed | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action ended without a result' }).Count | Should -Be 1 }
+  It 'Stop writes the flag and never kills (only between steps)' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; Write-TestProgress $w; Send-RunTick $w
+    Click $w 'StopButton'; Test-Path "$($w.Tag.Runs.Action.Dir)\stop.flag" | Should -BeTrue; $script:killed | Should -BeNullOrEmpty; $w.FindName('StopButton').IsEnabled | Should -BeFalse
+    $w.FindName('StoppingText').Text | Should -BeExactly ($script:ToolboxStrings.en['run.stopping'] -f $script:ToolboxStrings.en['tool.step.imageCheck'])
+    Send-RunTick $w; $w.Tag.Model.Repair.Run.Stopping | Should -BeTrue; $w.FindName('StopButton').IsEnabled | Should -BeFalse; $w.Tag.Runs.Action | Should -Not -BeNullOrEmpty
+    $idle = New-RunWindow; { Click $idle 'StopButton' } | Should -Not -Throw; $idle.Tag.Outcome | Should -BeNullOrEmpty
+    @(Get-ChildItem "$TestDrive\Root\Tool" -Recurse -Filter stop.flag).Count | Should -Be 1 }
+  It 'X, Alt+F4 and Cancel are refused while an action runs' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake
+    $w.Close(); $w.Tag.Outcome | Should -BeNullOrEmpty; $w.Tag.Closing | Should -BeFalse; $w.FindName('CloseRefusedText').Visibility | Should -Be 'Visible'
+    Click $w 'CloseButton'; $w.Tag.Outcome | Should -BeNullOrEmpty
+    Click $w 'CancelButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $w.Tag.Closing | Should -BeFalse
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Close refused: an action is running' }).Count | Should -Be 3
+    # Once the action has ended the window closes again; the safety child that then starts does not hold it.
+    Write-TestResult $w; $proc.HasExited = $true; Send-RunTick $w; $w.Tag.Model.Repair.CloseRefused | Should -BeFalse; $w.Tag.Runs.Safety | Should -Not -BeNullOrEmpty
+    $w.Close(); $w.Tag.Outcome | Should -Be 'Cancel'; $w.Tag.Closing | Should -BeTrue }
+  It 'a running safety child does not block closing, and is killed with the window' {
+    $w = New-RunWindow; Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety | Should -BeTrue; $w.Close(); $w.Tag.Outcome | Should -Be 'Cancel'
+    $script:ToolboxChildren.Clear()
+    $r = Show-ToolboxWindow @showArgs -ShowDialog { param($w) $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $w.Close() }
+    $r.Outcome | Should -Be 'Cancel'; $script:killed | Should -Be @(4243); $script:ToolboxChildren.Count | Should -Be 0 }
+  It 'Start, the nav and Restart PC are refused while an action runs' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    Click $w 'StartButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $w.FindName('NavSetup').IsChecked = $true; Click $w 'NavSetup'; $w.Tag.Model.Page | Should -Be 'repair'
+    Click $w 'RestartButton'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; Click $w 'ChipRestartButton'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty
+    $w.FindName('NavSetup').IsChecked | Should -BeFalse; $w.FindName('NavRepair').IsChecked | Should -BeTrue; $w.Tag.Closing | Should -BeFalse
+    foreach ($msg in 'Start refused: an action is running', 'Page change refused: an action is running', 'Restart refused: an action is running') {
+      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq $msg }).Count | Should -BeGreaterThan 0 -Because $msg } }
+  It 'Restart PC asks first; Cancel closes the question, Confirm closes the window as Restart' {
+    $w = New-RunWindow; Click $w 'RestartButton'
+    $w.Tag.Model.Repair.Confirm.Kind | Should -Be 'restart'; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'
+    $w.FindName('ConfirmTitle').Text | Should -Be 'Restart this PC now?'; $w.FindName('ConfirmButton').IsEnabled | Should -BeTrue; $w.Tag.Outcome | Should -BeNullOrEmpty
+    Click $w 'ConfirmCancelButton'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Collapsed'; $w.Tag.Outcome | Should -BeNullOrEmpty
+    Click $w 'ChipRestartButton'; Click $w 'ConfirmButton'; $w.Tag.Outcome | Should -Be 'Restart'; $w.Tag.Closing | Should -BeTrue }
+  It 'a Restart question opened before an action started cannot be confirmed while it runs' {
+    $w = New-RunWindow; Click $w 'RestartButton'; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    Click $w 'ConfirmButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $w.Tag.Closing | Should -BeFalse }
+  It 'a Failed window closes even while a child runs' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'
+    Close-ToolboxWindow -Window $w -Outcome Failed -ErrorText 'x'; $w.Tag.Closing | Should -BeTrue; $w.Tag.Outcome | Should -Be 'Failed' }
+  It 'a tick that throws closes the window as Failed, never thrown' {
+    $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; Mock Update-RepairRunModel { throw 'tick broke' }
+    { Send-RunTick $w } | Should -Not -Throw; $w.Tag.Outcome | Should -Be 'Failed'; $w.Tag.Error | Should -BeExactly 'tick broke'; $w.Tag.Closing | Should -BeTrue }
+  It 'the run timer ticks every 500 ms; with nothing running a tick does nothing, and a tick renders the repair page only' {
+    $w = New-RunWindow; $t = New-ToolboxRunTimer -Window $w; $t.Interval.TotalMilliseconds | Should -Be 500; [object]::ReferenceEquals($t.Tag, $w) | Should -BeTrue; $t.IsEnabled | Should -BeFalse
+    Mock Update-RepairView { }; Send-RunTick $w; Should -Invoke Update-RepairView -Times 0 -Exactly
+    $null = Start-ToolboxRun -Window $w -ActionId 'health'; Mock Update-ToolboxView { throw 'not the whole window every 500 ms' }
+    Send-RunTick $w; $w.Tag.Outcome | Should -BeNullOrEmpty; Should -Invoke Update-RepairView -Times 2 -Exactly }   # the start, then the tick
+  It 'the safety child fills the strip chip by chip and makes it ready at the end; it is no action' {
+    $w = New-RunWindow -Set @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+    Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety | Should -BeTrue; $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $run = $w.Tag.Runs.Safety
+    $run.BudgetSeconds | Should -Be 180
+    $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $run.RunId; State = 'running'; Current = 1; Steps = @(); Log = @()
+      Partial = @{ Chips = @{ Restart = @{ Level = 'ok'; Args = @(); Detail = @{} } } } }
+    Send-RunTick $w; $w.FindName('ChipRestartText').Text | Should -Be 'No restart pending'; $w.FindName('ChipDiskText').Text | Should -Be 'Checking...'
+    $w.Tag.Model.Repair.Strip.State | Should -Be 'loading'
+    $chips = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'warn' } }
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; DiskCheck = @{ Dirty = $false; Excluded = $false } }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.Strip.State | Should -Be 'ready'; $w.Tag.Model.Repair.Strip.Disk.Level | Should -Be 'warn'; $w.FindName('ChipDiskText').Text | Should -Be 'Disk: check'
+    $w.Tag.Model.Repair.DiskCheck.Dirty | Should -BeFalse; $w.Tag.Runs.Safety | Should -BeNullOrEmpty; $script:ToolboxChildren.Count | Should -Be 0
+    $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty; @($script:logs | Where-Object Message -eq 'Toolbox action finished').Count | Should -Be 0 }
+  It 'a safety child killed at its deadline, or gone without a result, keeps the chips it read and leaves the rest unknown (spec 5)' {
+    foreach ($case in 'deadline', 'noResult') {
+      $script:killed.Clear()
+      $w = New-RunWindow -Set @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+      $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $run = $w.Tag.Runs.Safety
+      $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $run.RunId; State = 'running'; Current = 4; Steps = @(); Log = @()
+        Partial = @{ Chips = @{ Restart = @{ Level = 'ok'; Args = @(); Detail = @{} } } } }
+      Send-RunTick $w
+      if ($case -eq 'deadline') { Mock Get-ToolboxRunSeconds { 3 * 60 + 181 } } else { $script:fake.HasExited = $true }
+      Send-RunTick $w
+      $script:killed.Count | Should -Be $(if ($case -eq 'deadline') { 1 } else { 0 }) -Because $case
+      $s = $w.Tag.Model.Repair.Strip; $s.State | Should -Be 'ready'; $s.Restart.Level | Should -Be 'ok'; $s.Disk.Level | Should -Be 'unknown' -Because $case
+      $w.FindName('TileStandard').IsEnabled | Should -BeTrue -Because 'an unknown chip blocks nothing'; $w.Tag.Runs.Safety | Should -BeNullOrEmpty
+      Mock Get-ToolboxRunSeconds { 0 } }
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action killed at its deadline' -and $_.Data.action -eq 'safety' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox action ended without a result' -and $_.Data.action -eq 'safety' }).Count | Should -Be 1 }
+}
+
+Describe 'Show-ToolboxWindow and Get-SetupChoices with children' {
+  BeforeEach { Set-RunTestMocks }
+
+  It 'Show-ToolboxWindow kills its children before it closes the window' {   # the ShowDialog seam starts a run and returns; Stop-ProcessTree records whether the window was already closing
+    $r = Show-ToolboxWindow @showArgs -ShowDialog { param($w) $script:shown = $w; $null = Start-ToolboxRun -Window $w -ActionId 'health' }
+    $r.Outcome | Should -Be 'Failed'; $script:killed | Should -Be @(4242); $script:closingAtKill | Should -BeFalse; $script:shown.Tag.Closing | Should -BeTrue
+    $script:ToolboxChildren.Count | Should -Be 0; $script:shown.Tag.RunTimer.IsEnabled | Should -BeFalse }
+  It 'the window it shows can run actions: Root, ScriptPath, CanRun, the seams, the launcher and the 500 ms run timer' {
+    $a = $script:showArgs.Clone(); $a.Launcher = { @{ Path = 'E:\BenTechSetup.cmd'; Drive = 'E:'; VolumeSerial = '1A2B3C4D' } }
+    $r = Show-ToolboxWindow @a -ShowDialog { param($w) $script:shown = $w
+      $script:seen = @{ Timer = $w.Tag.RunTimer.IsEnabled; Interval = $w.Tag.RunTimer.Interval.TotalMilliseconds; CanRun = $w.Tag.Model.Repair.CanRun }; $w.Close() }
+    $r.Outcome | Should -Be 'Cancel'; $script:seen.Timer | Should -BeTrue; $script:seen.Interval | Should -Be 500; $script:seen.CanRun | Should -BeTrue
+    $t = $script:shown.Tag; $t.Root | Should -Be "$TestDrive\Root"; $t.ScriptPath | Should -Be "$TestDrive\Root\setup.ps1"; $t.Launcher.VolumeSerial | Should -Be '1A2B3C4D'
+    [object]::ReferenceEquals($t.StartChild, $script:startChild) | Should -BeTrue; [object]::ReferenceEquals($t.FindStick, $script:findStick) | Should -BeTrue
+    $t.RunTimer.IsEnabled | Should -BeFalse; $t.Runs.Action | Should -BeNullOrEmpty
+    $n = $script:showArgs.Clone(); $n.Root = ''; $n.Launcher = { throw ('no launcher ' + [char]0x05D0) }
+    $r2 = Show-ToolboxWindow @n -ShowDialog { param($w) $script:shown = $w; $w.Close() }
+    $r2.Outcome | Should -Be 'Cancel'; $script:shown.Tag.Model.Repair.CanRun | Should -BeFalse; $script:shown.Tag.Launcher | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the launcher for the toolbox' -and $_.Data.error -eq 'no launcher ?' }).Count | Should -Be 1 }
+  It 'Restart PC is the window''s fourth outcome' {
+    $r = Show-ToolboxWindow @showArgs -ShowDialog { param($w) Click $w 'RestartButton'; Click $w 'ConfirmButton' }
+    $r.Outcome | Should -Be 'Restart'; $r.Choices | Should -BeNullOrEmpty }
+  It 'a window that fails while a child runs kills it before the shutdown, the console and the cleanup (Review Focus 2)' {
+    $script:fake = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }
+    $r = Get-SetupChoices -Machine $m -Config $cfg -Version 'v' -Previous $null -IsFresh $false -Root "$TestDrive\Root" -ScriptPath 'x' -TestHost { @{ Ok = $true } } `
+      -ShowToolbox { param($p) $script:ToolboxChildren.Add($script:fake); @{ Outcome = 'Failed'; Error = 'boom' } } -ShowConsole { param($p) $script:order.Add('console'); $null } -ShutdownDispatcher { $script:order.Add('shutdown') }
+    $script:order | Should -Be @('kill:4242','shutdown','console'); $r | Should -BeNullOrEmpty; $script:ToolboxChildren.Count | Should -Be 0 }
+  It 'Restart returns $null and records the request; Cancel does not' {
+    Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) @{ Outcome = 'Restart' } } -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { } |
+      Should -BeNullOrEmpty
+    Get-ToolboxRestartRequest | Should -BeTrue
+    @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox closed' -and $_.Data.outcome -eq 'Restart' }).Count | Should -Be 1
+    Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) @{ Outcome = 'Cancel' } } -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { } |
+      Should -BeNullOrEmpty
+    Get-ToolboxRestartRequest | Should -BeFalse
+    $script:ToolboxRestartRequested = $true   # a request left from an earlier call is forgotten when the console answers too
+    Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $false; Reason = 'session 0' } } -ShowToolbox { param($p) throw 'must not open' } -ShowConsole { param($p) $null } -ShutdownDispatcher { } |
+      Should -BeNullOrEmpty
+    Get-ToolboxRestartRequest | Should -BeFalse }
+  It 'the console still gets exactly Show-StartScreen''s parameters; the window gets Root and ScriptPath' {
+    $null = Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) $script:toolboxArgs = $p; @{ Outcome = 'Failed'; Error = 'x' } } `
+      -ShowConsole { param($p) $script:consoleArgs = $p; $null } -ShutdownDispatcher { }
+    @($script:consoleArgs.Keys | Sort-Object) | Should -Be @('Config','IsFresh','Machine','NoAutoStart','Previous','Version'); $script:toolboxArgs.Root | Should -Be "$TestDrive\Root"
+    $script:toolboxArgs.ScriptPath | Should -Be 'x'; $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse }
 }

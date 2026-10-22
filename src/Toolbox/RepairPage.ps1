@@ -5,7 +5,8 @@
 #
 # The rules of Toolbox.ps1 hold here too: the model decides every state (a control never decides its own); every
 # .NET call's output goes to $null, so each function returns exactly one value or nothing; no console, no sleep, no
-# closures, no handler; colours come from the window's one resource dictionary. Texts come from the string table in
+# closures, no handler (the one exception: the run timer's one-line Tick, which calls Invoke-ToolboxAction as the
+# power timer's does); colours come from the window's one resource dictionary. Texts come from the string table in
 # the model's language (Format-RepairText over Get-ToolboxString); machine values, the log tail, file paths and
 # adapter lines stay left-to-right in Hebrew (ruling RD-R14: a value inside a Hebrew line is wrapped in
 # left-to-right marks; a whole machine-value line is a left-to-right element).
@@ -19,9 +20,16 @@
 # logged once (review M4). Confirm.Lines entries are @{ Key = '<string key>'; Args = @(...) } (a text of the window's
 # language) or @{ Ltr = '<machine value>' } (a left-to-right value line; review M2).
 #
-# Needs Toolbox.ps1 (Get-ToolboxString, New-ToolboxTextBlock, Write-ToolboxWarningOnce), RepairPlanner.ps1
-# (Get-RepairGate, Get-RepairChips, Test-RepairConfirmReady, Format-RepairElapsed, $script:RepairTileRows),
-# State.ps1 (ConvertTo-HashtableDeep), StartScreen.ps1 (ConvertTo-ScreenText) and WPF; the bundle holds every file.
+# Task 4: it also runs the actions (the section "Running actions" at the end): each in a hidden child process started
+# without waiting, polled every 500 ms, killed at its deadline on its own Stopwatch, stopped between steps on request,
+# and every child it started killed before the window closes (Stop-ToolboxChildren).
+#
+# Needs Toolbox.ps1 (Get-ToolboxString, New-ToolboxTextBlock, Write-ToolboxWarningOnce, Invoke-ToolboxAction),
+# RepairPlanner.ps1 (Get-RepairGate, Get-RepairChips, Test-RepairConfirmReady, Format-RepairElapsed, the run in the
+# model, $script:RepairTileRows), State.ps1 (ConvertTo-HashtableDeep), StartScreen.ps1 (ConvertTo-ScreenText),
+# Repair\ToolEngine.ps1 (Read-ToolJsonFile, Write-ToolJsonFile, Get-ToolConfigMinutes, Format-ToolTime,
+# $script:ToolActionCatalog), Detect\PcName.ps1 (Get-MachineIdentity), Common\Process.ps1 (Stop-ProcessTree; the
+# StartChild seam's Start-BackgroundExternal), Common\Logging.ps1 and WPF; the bundle holds every file.
 
 # The glyph and the colours of a run step's status (plan, Glyphs; pending is a ring, EA3A, rather than the plan's
 # filled E91F: an empty circle reads as "still to come" on the screenshots).
@@ -600,4 +608,491 @@ function Update-RepairView {
     'RunPanel' { Set-RepairRunPanel -Window $Window }
     'ResultPanel' { Set-RepairResultPanel -Window $Window }
   }
+}
+
+# --- Running actions (repair Task 4; repair spec 4.3, 4.4, 7) --------------------------------------------------------
+# Each action runs in its own hidden child process of the same setup.ps1 (-ToolAction <id> -ToolArgs <args.json>),
+# started through the window's StartChild seam (Start-BackgroundExternal: no wait, the second named exception to
+# "every child goes through Invoke-External"). Two slots: Action (the action the technician started; the run panel
+# shows it) and Safety (the safety strip's child). Tag.Runs.<Slot> = @{ ActionId; RunId; Process; Dir; StartedUtc;
+# DeadlineUtc; Clock; BudgetSeconds; Chips }. The run timer (500 ms) polls each busy slot's progress.json and, once its
+# process has exited, its result.json. The window kills a child that is still running at its budget + 3 minutes,
+# measured on the run's own Stopwatch (rulings RD-R8, RD-R9: never the wall clock, which the time sync moves; the
+# child's own Stopwatch starts only after PowerShell's start-up and the bundle's parsing, so it stops itself first).
+# Stop only asks (stop.flag): the child stops between steps (spec 4.3). Nothing here waits on a process or sleeps.
+
+# The processes the window started, so Get-SetupChoices' finally can kill them once the window is gone (a script-scope
+# exception to "no outer variables", plan WPF rules; no handler reads it).
+$script:ToolboxChildren = New-Object 'System.Collections.Generic.List[object]'
+
+# How long past its budget a child may still run before the window kills its process tree (ruling RD-R9).
+$script:ToolboxKillGraceSeconds = 180
+
+function Test-ToolboxActionRunning {
+  # $true while the Action slot is busy: an action's child runs (spec 4.4: no close, no page change, no Start, no
+  # Restart PC). The safety child alone holds nothing. Never throws.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()]$State)
+
+  return ($State -is [System.Collections.IDictionary] -and $State['Runs'] -is [System.Collections.IDictionary] -and $null -ne $State['Runs']['Action'])
+}
+
+function Set-ToolboxRepair {
+  # Private. Model.Repair with -Values set, as a copy: the repair model is replaced, never changed in place.
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][hashtable]$Values)
+
+  $next = $State.Model['Repair'].Clone()
+  foreach ($key in @($Values.Keys)) { $next[$key] = $Values[$key] }
+  $State.Model['Repair'] = $next
+}
+
+function New-ToolboxRunId {
+  # Private. A run's id (plan "The files of one run"): 'yyyyMMdd-HHmmss-<action>' of -Time (local), invariant culture.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$ActionId, [Parameter(Mandatory)][datetime]$Time)
+
+  return ('{0}-{1}' -f $Time.ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture), $ActionId)
+}
+
+function Get-ToolboxBudgetSeconds {
+  # Private. An action's whole time in seconds: config timeoutsMinutes.tool.<id> times 60, else 30 minutes (RD-R8).
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([AllowNull()]$Config, [Parameter(Mandatory)][string]$ActionId)
+
+  $section = $null
+  try { $section = $Config.timeoutsMinutes.tool } catch { $section = $null }
+  $minutes = Get-ToolConfigMinutes -Section $section -Name $ActionId
+  if ($null -eq $minutes) { $minutes = 30.0 }
+  return [double]($minutes * 60)
+}
+
+function Get-ToolboxRunSeconds {
+  <#
+  .SYNOPSIS
+    The seconds since the window started -Run's child, on the run's own Stopwatch (Run.Clock; rulings RD-R8, RD-R9:
+    no deadline reads the wall clock). 0 without one. The deadline and the elapsed time shown both come from here;
+    tests mock this seam.
+  #>
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  $clock = $Run['Clock']
+  if ($clock -is [Diagnostics.Stopwatch]) { return [double]$clock.Elapsed.TotalSeconds }
+  return 0.0
+}
+
+function Get-ToolboxSessionDir {
+  <#
+  .SYNOPSIS
+    The visit's folder (plan "Shared shapes", spec 8, ruling RD-R6): <stick>\BenTech-Reports\<PC>_<serial>_<stamp> with
+    the stick, else <Root>\Logs\Repair\<PC>_<serial>_<stamp>.
+  .DESCRIPTION
+    <PC> is the computer name and <serial> Get-MachineIdentity's FolderPart, each reduced to [A-Za-z0-9-] ('PC' and
+    'NOSERIAL' when nothing is left); <stamp> is the page's SessionStamp ('yyyy-MM-dd_HHmm', when the window opened),
+    so every action of one visit writes to one folder. The child creates it (New-ToolSessionDir), never through a link.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][hashtable]$State)
+
+  $repair = $State.Model['Repair']
+  $machine = $State['Machine']
+  if ($machine -isnot [hashtable]) { $machine = @{} }
+  $identity = Get-MachineIdentity -Machine $machine
+  $pc = ([string]$machine['ComputerName']) -creplace '[^A-Za-z0-9-]', ''
+  if ($pc -eq '') { $pc = 'PC' }
+  $serial = ([string]$identity['FolderPart']) -creplace '[^A-Za-z0-9-]', ''
+  if ($serial -eq '') { $serial = 'NOSERIAL' }
+  $stamp = ([string]$repair['SessionStamp']) -creplace '[^0-9_-]', ''
+  if ($stamp -eq '') { $stamp = 'visit' }
+  $name = '{0}_{1}_{2}' -f $pc, $serial, $stamp
+  if (Test-RepairStick -Repair $repair) { return [IO.Path]::Combine([string]$repair['Stick']['Root'], 'BenTech-Reports', $name) }
+  return [IO.Path]::Combine([string]$State['Root'], 'Logs', 'Repair', $name)
+}
+
+function New-ToolboxRunArgs {
+  # Private. args.json of one run (plan "The files of one run"): everything the child needs, answered in the window.
+  # Read-ToolArgs (the child) checks it; BudgetSeconds is required there (RD-R8), DeadlineUtc is for its log only.
+  [CmdletBinding()]
+  [OutputType([System.Collections.Specialized.OrderedDictionary])]
+  param(
+    [Parameter(Mandatory)][hashtable]$State,
+    [Parameter(Mandatory)][string]$ActionId,
+    [Parameter(Mandatory)][string]$RunId,
+    [Parameter(Mandatory)][double]$BudgetSeconds,
+    [Parameter(Mandatory)][string]$DeadlineUtc,
+    [AllowNull()][hashtable]$Options
+  )
+
+  $repair = $State.Model['Repair']
+  $machine = $State['Machine']
+  if ($machine -isnot [hashtable]) { $machine = @{} }
+  $identity = Get-MachineIdentity -Machine $machine
+  $stickRoot = ''
+  if (Test-RepairStick -Repair $repair) { $stickRoot = [string]$repair['Stick']['Root'] }
+  $strip = @{}
+  foreach ($name in $script:RepairChipNames) {
+    $level = Get-RepairChipLevel -Repair $repair -Name $name
+    $strip[$name] = $(if ($level -eq '') { 'unknown' } else { $level })
+  }
+  $complaint = [string]$repair['Complaint']
+  if ($complaint.Length -gt 2000) { $complaint = $complaint.Substring(0, 2000) }
+  $done = @(foreach ($entry in @($repair['Done'])) {
+      if ($null -eq $entry) { continue }
+      @{ Action = [string](Get-RepairEntry -From $entry -Name 'Action'); Outcome = [string](Get-RepairEntry -From $entry -Name 'Outcome')
+         Color = [string](Get-RepairEntry -From $entry -Name 'Color'); EndedAt = [string](Get-RepairEntry -From $entry -Name 'EndedAt') }
+    })
+  return [ordered]@{
+    Version       = 1
+    Action        = $ActionId
+    RunId         = $RunId
+    DeadlineUtc   = $DeadlineUtc
+    BudgetSeconds = $BudgetSeconds
+    SessionDir    = (Get-ToolboxSessionDir -State $State)
+    StickRoot     = $stickRoot
+    Complaint     = $complaint
+    Done          = $done
+    Identity      = @{ Key = [string]$identity['Key']; FolderPart = [string]$identity['FolderPart']; Serial = [string]$identity['Serial']
+                       BiosUuid = [string]$identity['BiosUuid']; ComputerName = [string]$machine['ComputerName']
+                       Manufacturer = [string]$machine['Manufacturer']; Model = [string]$machine['Model']; Brand = [string]$machine['Brand'] }
+    Machine       = @{ IsLaptop = ($machine['IsLaptop'] -eq $true); OsBuild = $machine['OsBuild']; Arch = [string]$machine['Arch'] }
+    Strip         = $strip
+    Options       = $(if ($null -ne $Options) { $Options } else { @{} })
+  }
+}
+
+function Remove-ToolboxChild {
+  # Private. -Process out of $script:ToolboxChildren (by reference): its run is over.
+  [CmdletBinding()]
+  param([AllowNull()]$Process)
+
+  for ($i = $script:ToolboxChildren.Count - 1; $i -ge 0; $i--) {
+    if ([object]::ReferenceEquals($script:ToolboxChildren[$i], $Process)) { $script:ToolboxChildren.RemoveAt($i) }
+  }
+}
+
+function Complete-ToolboxActionRun {
+  # Private. An action's end (its result, or the window's own): the model (Complete-RepairRunModel: the result panel,
+  # the visit's list, the strip loading), the one INFO line 'Toolbox action finished' (ASCII), and the strip read again
+  # by a new safety child (none starts while one still runs: that one ends the loading). A safety child that cannot
+  # even be asked for leaves the strip ready, every chip unknown, so nothing stays blocked behind a strip that never loads.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [AllowNull()]$Result,
+    [Parameter(Mandatory)][string]$ActionId,
+    [AllowEmptyString()][string]$RunId = '',
+    [double]$Seconds = 0
+  )
+
+  $state = $Window.Tag
+  $state.Model['Repair'] = Complete-RepairRunModel -Repair $state.Model['Repair'] -Result $Result
+  $codes = @(foreach ($finding in @(Get-RepairEntry -From $Result -Name 'Findings')) {
+      if ($null -ne $finding) { ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $finding -Name 'Code')) } })
+  Write-SetupLog -Level INFO -Message 'Toolbox action finished' -Data @{
+    action = (ConvertTo-ScreenText -Text $ActionId); runId = (ConvertTo-ScreenText -Text $RunId)
+    outcome = (ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $Result -Name 'Outcome')))
+    color = (ConvertTo-ScreenText -Text ([string](Get-RepairEntry -From $Result -Name 'Color')))
+    minutes = [double][math]::Round([math]::Max(0, $Seconds) / 60, 1); findings = $codes }
+  if ($null -eq $state.Runs['Safety']) {
+    $null = Start-ToolboxRun -Window $Window -ActionId 'safety' -Slot 'Safety'
+    if ($null -eq $state.Runs['Safety'] -and [string]$state.Model['Repair']['Strip']['State'] -cne 'ready') { Complete-ToolboxSafetyRun -Window $Window -Chips $null }
+  }
+}
+
+function Complete-ToolboxSafetyRun {
+  # Private. The safety child's end: the strip from -Chips (its result's Data.Chips, else the last partial ones), every
+  # chip it did not read unknown, and ready (spec 5: unknown is yellow and blocks nothing); -DiskCheck (Data.DiskCheck)
+  # into the model.
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [AllowNull()]$Chips,
+    [AllowNull()]$DiskCheck
+  )
+
+  $values = @{ Strip = (ConvertTo-RepairStrip -Chips $Chips -Final $true) }
+  if ($null -ne $DiskCheck) {
+    $values['DiskCheck'] = @{ Dirty = (Get-RepairEntry -From $DiskCheck -Name 'Dirty'); Excluded = ((Get-RepairEntry -From $DiskCheck -Name 'Excluded') -eq $true) }
+  }
+  Set-ToolboxRepair -State $Window.Tag -Values $values
+}
+
+function Start-ToolboxRun {
+  <#
+  .SYNOPSIS
+    Starts -ActionId's child in -Slot (Action or Safety) without waiting (spec 7). $true when it started. Never waits.
+  .DESCRIPTION
+    Refused ($false, WARN 'Toolbox action refused: ...', nothing changes): a busy slot, a window without its setup files
+    (Tag.Root, Tag.ScriptPath), an action this version's catalog does not have.
+    Otherwise, in order:
+      1. the RunId (New-ToolboxRunId; when <Root>\Tool\<RunId> is already there, the next second's, up to a minute
+         on) and, for the Action slot, Model.Repair.Run with every step of the catalog pending (New-RepairRunModel);
+      2. the run folder <Root>\Tool\<RunId>\ (one that is already there is never reused: a stale result.json in it
+         would be read as this run's) and args.json (New-ToolboxRunArgs: BudgetSeconds = timeoutsMinutes.tool.<id> * 60,
+         30 minutes when missing, RD-R8; DeadlineUtc for the child's log only);
+      3. the run's own Stopwatch, started before the child (RD-R9);
+      4. Tag.StartChild "%windir%\System32\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass
+         -File "<ScriptPath>" -ToolAction <id> -ToolArgs "<args.json>"' (Start-BackgroundExternal: hidden, no wait);
+         its process goes into $script:ToolboxChildren and the run into Tag.Runs.<Slot>.
+    Any of 2-4 failing (the folder, the args, a StartChild that throws or gives no process) is WARN 'Toolbox action
+    could not start' with the reason in ASCII and $false: for the Action slot a red Failed result with childStartFailed
+    (as if it had ended: the INFO line, the strip read again); for the Safety slot the strip ready, every chip unknown.
+    The repair page is rendered again (Update-RepairView).
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [Parameter(Mandatory)][string]$ActionId,
+    [AllowNull()][hashtable]$Options,
+    [ValidateSet('Action', 'Safety')][string]$Slot = 'Action'
+  )
+
+  $state = $Window.Tag
+  $action = ConvertTo-ScreenText -Text $ActionId
+  $refusal = ''
+  if ($state['Runs'] -isnot [System.Collections.IDictionary]) { $refusal = 'the window runs no actions' }
+  elseif ($null -ne $state['Runs'][$Slot]) { $refusal = 'another one is running' }
+  elseif ([string]::IsNullOrEmpty([string]$state['Root']) -or [string]::IsNullOrEmpty([string]$state['ScriptPath'])) { $refusal = 'no setup files to run it from' }
+  elseif (@($script:ToolActionCatalog.Keys) -cnotcontains $ActionId) { $refusal = 'not an action of this version' }
+  if ($refusal -ne '') {
+    Write-SetupLog -Level WARN -Message ('Toolbox action refused: ' + $refusal) -Data @{ action = $action; slot = $Slot }
+    return $false
+  }
+
+  # The run folder is new: one already there (the same action started again within a second) is never reused, since a
+  # result.json in it would be read as this run's. The id moves on a second at a time (it names the run, not a time
+  # of record).
+  $now = Get-Date
+  for ($offset = 0; $offset -lt 60; $offset++) {
+    $runId = New-ToolboxRunId -ActionId $ActionId -Time $now.AddSeconds($offset)
+    $dir = [IO.Path]::Combine([string]$state['Root'], 'Tool', $runId)
+    if (-not [IO.Directory]::Exists($dir)) { break }
+  }
+  $argsPath = [IO.Path]::Combine($dir, 'args.json')
+  $budget = Get-ToolboxBudgetSeconds -Config $state['Config'] -ActionId $ActionId
+  $startedUtc = [datetime]::UtcNow
+  $deadlineUtc = $startedUtc.AddSeconds($budget).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+  if ($Slot -ceq 'Action') { $state.Model['Repair'] = New-RepairRunModel -Repair $state.Model['Repair'] -ActionId $ActionId -RunId $runId }
+
+  $process = $null
+  $clock = $null
+  $failure = $null
+  try {
+    if ([IO.Directory]::Exists($dir)) { throw 'the run folder already exists' }
+    $null = [IO.Directory]::CreateDirectory($dir)
+    $runArgs = New-ToolboxRunArgs -State $state -ActionId $ActionId -RunId $runId -BudgetSeconds $budget -DeadlineUtc $deadlineUtc -Options $Options
+    if (-not (Write-ToolJsonFile -Path $argsPath -InputObject $runArgs -Depth 8)) { throw 'args.json could not be written' }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ToolAction {1} -ToolArgs "{2}"' -f [string]$state['ScriptPath'], $ActionId, $argsPath
+    $outputs = @(& $state['StartChild'] "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" $arguments)
+    if ($outputs.Count -ne 1 -or $null -eq $outputs[0]) { throw 'no process was started' }
+    $process = $outputs[0]
+    $script:ToolboxChildren.Add($process)
+  } catch {
+    $failure = ConvertTo-ScreenText -Text $_.Exception.Message
+  }
+
+  if ($null -ne $failure) {
+    Write-SetupLog -Level WARN -Message 'Toolbox action could not start' -Data @{ action = $action; slot = $Slot; runId = $runId; error = $failure }
+    if ($Slot -ceq 'Action') {
+      $result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'Failed' -Code 'childStartFailed' -Arguments @($failure) -EndedAt (Format-ToolTime -Value (Get-Date))
+      Complete-ToolboxActionRun -Window $Window -Result $result -ActionId $ActionId -RunId $runId
+    } else {
+      Complete-ToolboxSafetyRun -Window $Window -Chips $null
+    }
+    Update-RepairView -Window $Window
+    return $false
+  }
+
+  $state['Runs'][$Slot] = @{
+    ActionId = $ActionId; RunId = $runId; Process = $process; Dir = $dir
+    StartedUtc = $startedUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture); DeadlineUtc = $deadlineUtc
+    Clock = $clock; BudgetSeconds = $budget; Chips = $null
+  }
+  Update-RepairView -Window $Window
+  return $true
+}
+
+function Update-ToolboxRuns {
+  <#
+  .SYNOPSIS
+    The run timer's tick (every 500 ms, spec 7): each busy slot read and, when it is over, ended. Never waits.
+  .DESCRIPTION
+    Nothing runs: nothing happens (no render). For each slot busy when the tick began:
+      - progress.json (Read-ToolJsonFile): the Action slot's into the run panel (Update-RepairRunModel, with the run's
+        Stopwatch seconds); the Safety slot's Partial.Chips into the strip, still loading (ConvertTo-RepairStrip);
+      - its process has exited: the slot is cleared and the process leaves $script:ToolboxChildren; result.json is the
+        result (Action: Complete-ToolboxActionRun; Safety: the strip from Data.Chips, ready). Without one: WARN 'Toolbox
+        action ended without a result' with the exit code; Action: Failed, red, childNoResult with the exit code;
+        Safety: the last partial chips, the others unknown;
+      - still running past its budget + 3 minutes on the run's own Stopwatch (Get-ToolboxRunSeconds; RD-R8, RD-R9):
+        Stop-ProcessTree, WARN 'Toolbox action killed at its deadline', the slot cleared; Action: TimedOut, red,
+        actionTimedOut with the budget's minutes, the running step timedout and the pending ones skipped
+        (New-RepairWindowResult); Safety: the last partial chips, the others unknown (spec 5: blocks nothing).
+    Then the repair page alone is rendered again (Update-RepairView; plan call: not the whole window every 500 ms).
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $runs = $state['Runs']
+  if ($runs -isnot [System.Collections.IDictionary]) { return }
+  # The slots busy now: a safety child an ending action starts below waits for the next tick.
+  $busy = @(foreach ($slot in 'Action', 'Safety') { if ($null -ne $runs[$slot]) { @{ Slot = $slot; Run = $runs[$slot] } } })
+  if ($busy.Count -eq 0) { return }
+
+  foreach ($entry in $busy) {
+    $slot = $entry.Slot
+    $run = $entry.Run
+    $action = ConvertTo-ScreenText -Text ([string]$run['ActionId'])
+    $runId = ConvertTo-ScreenText -Text ([string]$run['RunId'])
+    $seconds = Get-ToolboxRunSeconds -Run $run
+    $progress = Read-ToolJsonFile -Path ([IO.Path]::Combine([string]$run['Dir'], 'progress.json'))
+    if ($slot -ceq 'Action') {
+      $state.Model['Repair'] = Update-RepairRunModel -Repair $state.Model['Repair'] -Progress $progress -ElapsedSeconds ([int][math]::Floor($seconds))
+    } else {
+      $chips = Get-RepairEntry -From (Get-RepairEntry -From $progress -Name 'Partial') -Name 'Chips'
+      if ($null -ne $chips) {
+        $run['Chips'] = $chips
+        Set-ToolboxRepair -State $state -Values @{ Strip = (ConvertTo-RepairStrip -Chips $chips) }
+      }
+    }
+
+    $exited = $false
+    try { $exited = [bool]$run['Process'].HasExited } catch { $exited = $false }
+    if ($exited) {
+      $runs[$slot] = $null
+      Remove-ToolboxChild -Process $run['Process']
+      $result = Read-ToolJsonFile -Path ([IO.Path]::Combine([string]$run['Dir'], 'result.json'))
+      $exitCode = 'unknown'
+      if ($null -eq $result) {
+        try { $exitCode = ConvertTo-ScreenText -Text ([string]$run['Process'].ExitCode) } catch { $exitCode = 'unknown' }
+        if ($exitCode -eq '') { $exitCode = 'unknown' }
+        Write-SetupLog -Level WARN -Message 'Toolbox action ended without a result' -Data @{ action = $action; runId = $runId; exitCode = $exitCode }
+      }
+      if ($slot -ceq 'Action') {
+        if ($null -eq $result) {
+          $result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'Failed' -Code 'childNoResult' -Arguments @($exitCode) -EndedAt (Format-ToolTime -Value (Get-Date))
+        }
+        Complete-ToolboxActionRun -Window $Window -Result $result -ActionId ([string]$run['ActionId']) -RunId ([string]$run['RunId']) -Seconds $seconds
+      } else {
+        $data = Get-RepairEntry -From $result -Name 'Data'
+        $finalChips = if ($null -ne $result) { Get-RepairEntry -From $data -Name 'Chips' } else { $run['Chips'] }
+        Complete-ToolboxSafetyRun -Window $Window -Chips $finalChips -DiskCheck (Get-RepairEntry -From $data -Name 'DiskCheck')
+      }
+    } elseif ($seconds -gt ([double]$run['BudgetSeconds'] + $script:ToolboxKillGraceSeconds)) {
+      try {
+        Stop-ProcessTree -ProcessId ([int]$run['Process'].Id)
+      } catch {
+        Write-SetupLog -Level WARN -Message 'Could not stop a toolbox child process' -Data @{ action = $action; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      }
+      $runs[$slot] = $null
+      Remove-ToolboxChild -Process $run['Process']
+      $minutes = [int][math]::Round([double]$run['BudgetSeconds'] / 60)
+      Write-SetupLog -Level WARN -Message 'Toolbox action killed at its deadline' -Data @{ action = $action; runId = $runId; budgetMinutes = $minutes }
+      if ($slot -ceq 'Action') {
+        $result = New-RepairWindowResult -Repair $state.Model['Repair'] -Outcome 'TimedOut' -Code 'actionTimedOut' -Arguments @($minutes) -EndedAt (Format-ToolTime -Value (Get-Date))
+        Complete-ToolboxActionRun -Window $Window -Result $result -ActionId ([string]$run['ActionId']) -RunId ([string]$run['RunId']) -Seconds $seconds
+      } else {
+        Complete-ToolboxSafetyRun -Window $Window -Chips $run['Chips']
+      }
+    }
+  }
+  Update-RepairView -Window $Window
+}
+
+function Request-ToolboxStop {
+  <#
+  .SYNOPSIS
+    Stop (spec 4.3): asks the running action to stop at its next safe point, between steps. Never kills.
+  .DESCRIPTION
+    Writes <run folder>\stop.flag and sets Run.Stopping (the Stop button goes off, StoppingText names the running
+    step); INFO 'Toolbox action stop requested'. A flag that cannot be written is a WARN and changes nothing. With no
+    action running there is nothing to stop. The repair page is rendered again.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $state = $Window.Tag
+  $run = $null
+  if ($state['Runs'] -is [System.Collections.IDictionary]) { $run = $state['Runs']['Action'] }
+  if ($null -ne $run) {
+    $action = ConvertTo-ScreenText -Text ([string]$run['ActionId'])
+    try {
+      [IO.File]::WriteAllText([IO.Path]::Combine([string]$run['Dir'], 'stop.flag'), 'stop', (New-Object Text.UTF8Encoding $false))
+      $current = $state.Model['Repair']['Run']
+      if ($current -is [System.Collections.IDictionary]) {
+        $nextRun = @{}
+        foreach ($key in @($current.Keys)) { $nextRun[$key] = $current[$key] }
+        $nextRun['Stopping'] = $true
+        Set-ToolboxRepair -State $state -Values @{ Run = $nextRun }
+      }
+      Write-SetupLog -Level INFO -Message 'Toolbox action stop requested' -Data @{ action = $action; runId = (ConvertTo-ScreenText -Text ([string]$run['RunId'])) }
+    } catch {
+      Write-SetupLog -Level WARN -Message 'Could not ask the toolbox action to stop' -Data @{ action = $action; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+  }
+  Update-RepairView -Window $Window
+}
+
+function Stop-ToolboxChildren {
+  <#
+  .SYNOPSIS
+    Kills the process tree of every child the window started that still runs (Stop-ProcessTree), then empties
+    $script:ToolboxChildren. Never throws.
+  .DESCRIPTION
+    Show-ToolboxWindow's finally calls it before the window closes, Get-SetupChoices' finally before WPF stops (spec
+    4.4, Review Focus 2): no child may run on while the console fallback or the Cancel cleanup removes C:\BenTech.
+    Each kill is INFO 'Toolbox child process stopped' (its id); one that fails is a WARN.
+  #>
+  [CmdletBinding()]
+  param()
+
+  try {
+    if ($null -eq $script:ToolboxChildren) { return }
+    foreach ($process in $script:ToolboxChildren.ToArray()) {
+      if ($null -eq $process) { continue }
+      $exited = $false
+      try { $exited = [bool]$process.HasExited } catch { $exited = $false }
+      if ($exited) { continue }
+      try {
+        $id = [int]$process.Id
+        Stop-ProcessTree -ProcessId $id
+        Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id }
+      } catch {
+        Write-SetupLog -Level WARN -Message 'Could not stop a toolbox child process' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      }
+    }
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Could not stop the toolbox child processes' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+  } finally {
+    if ($null -ne $script:ToolboxChildren) { $script:ToolboxChildren.Clear() }
+  }
+}
+
+function New-ToolboxRunTimer {
+  <#
+  .SYNOPSIS
+    The run timer (spec 7: the window polls every 500 ms). Not started: Show-ToolboxWindow starts it with the power
+    timer and stops it in its finally.
+  .DESCRIPTION
+    Its Tag is the window, so its Tick handler (Invoke-ToolboxAction -Action RunTick: Update-ToolboxRuns) finds the
+    window without an outer variable. It runs on the window's dispatcher, so it ticks only while the dialog runs.
+  #>
+  [CmdletBinding()]
+  [OutputType([System.Windows.Threading.DispatcherTimer])]
+  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+
+  $timer = New-Object System.Windows.Threading.DispatcherTimer([System.Windows.Threading.DispatcherPriority]::Background, $Window.Dispatcher)
+  $timer.Interval = [TimeSpan]::FromMilliseconds(500)
+  $timer.Tag = $Window
+  $timer.Add_Tick({ Invoke-ToolboxAction -Sender $this -Action 'RunTick' })
+  return $timer
 }

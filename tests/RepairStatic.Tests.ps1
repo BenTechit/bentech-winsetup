@@ -130,6 +130,22 @@ $e = Invoke-CimMethod -InputObject $v -MethodName 'GetKeyProtectorNumericalPassw
         $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name } })
     foreach ($n in $script:allowedReads) { $names | Should -Contain $n }
   }
+  It 'the window''s files call no hang-prone cmdlet and never wait on a process (Review Focus 1)' {
+    # The window's thread polls; it never blocks: a hung disk, spooler or WMI may only ever hang a child (repair Task 4).
+    $banned = 'Get-PhysicalDisk','Get-StorageReliabilityCounter','Repair-Volume','Repair-WindowsImage','Get-Printer','Get-WindowsDriver','Get-PnpDevice','Get-NetAdapter','Get-NetIPAddress',
+              'Get-NetIPConfiguration','Get-BitLockerVolume','Get-WinEvent','Invoke-External','Invoke-PowerShellChild','Invoke-ToolJsonChild','Wait-Process','Start-Sleep','Wait-SetupDelay'
+    $files = @(Get-ChildItem "$PSScriptRoot\..\src\Toolbox" -Filter *.ps1)
+    @($files.Name) | Should -Contain 'RepairPage.ps1'
+    foreach ($f in $files) {
+      $ast = [Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+      $calls = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $banned -contains $_ })
+      $calls | Should -BeNullOrEmpty -Because $f.Name
+      [IO.File]::ReadAllText($f.FullName) | Should -Not -Match '\.WaitForExit\(|\.WaitOne\(' -Because $f.Name
+    }
+    # The guard itself finds a banned call and a wait.
+    $probe = [Management.Automation.Language.Parser]::ParseInput('function F { Get-PhysicalDisk; $p.WaitForExit() }', [ref]$null, [ref]$null)
+    @($probe.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $banned -contains $_ }) | Should -Be @('Get-PhysicalDisk')
+  }
   It 'no src file calls the disk-check exclusion tool (ruling RD-R1)' {
     $tool = 'chk' + 'ntfs'
     foreach ($f in Get-ChildItem -LiteralPath $script:srcRoot -Recurse -File -Filter *.ps1) {

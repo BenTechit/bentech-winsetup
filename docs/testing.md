@@ -343,7 +343,7 @@ The toolbox window replaces the console start screen ([toolbox spec](specs/2026-
 - [ ] Start with no Choices, no result, more than one result or an unknown outcome is Failed and falls back to the console.
 - [ ] The UCPD refusal (above), the `(default)` token (above) and the frequency restore on a timeout (above): their real-machine checks are in the items of this section.
 
-### 1.20 Repair & diagnostics: the checks proven by mocks only (repair Task 2; Task 9 completes this section)
+### 1.20 Repair & diagnostics: the checks proven by mocks only (repair Tasks 2 and 4; Task 9 completes this section)
 
 The child side of the Health check and the safety strip is tested with mocked grandchildren, events and network (`tests\ToolChecks.Tests.ps1`). The values below were checked read-only against this dev PC's Windows (rulings RD-R10 to RD-R12), but the verdicts need real machines: a Hebrew Windows 11 VM checkpoint, and the same VM made unhealthy where an item says so. **Never on the dev PC.** Record the real values.
 
@@ -356,6 +356,14 @@ The child side of the Health check and the safety strip is tested with mocked gr
 - [ ] **A CBS.log rotation compressed during a scan (review M2).** If a `CbsPersist_*.cab` appears during a long SFC run, `setup.log` has `A CBS log rotated during the scan is compressed and not read`. Record whether it ever happens (CBS.log rotated at about 90 MB on the dev PC).
 - [ ] **WinRE from the BCD.** On a VM after a clone (a stale ReAgent.xml), the verdict follows the BCD. A missing `recoveryenabled` element counts as on (Plan call); an element that cannot be read is `winreUnreadable`, never "disagree".
 - [ ] **BitLocker with protection suspended (review M6).** Suspend protection on an encrypted VM: the chip still warns (ConversionStatus 1). On Windows 11 Home with Device Encryption waiting for activation, record ProtectionStatus and ConversionStatus.
+
+The window's runs (repair Task 4) are tested with a fake child process (`tests\RepairPage.Tests.ps1`); on the VM:
+
+- [ ] **The action child.** Health check from the window: no console window appears, the window stays responsive, the run panel moves (steps, the DISM-style percent, the log tail) about twice a second, and `C:\BenTech\Setup\Tool\<RunId>\` holds `args.json`, `progress.json` and `result.json`. `setup.log` has one `Toolbox action finished` line per action, and the strip reloads after it.
+- [ ] **Stop.** Press Stop during the image check: the button goes off, "Stopping after ..." names the running step, the child ends after that step (`Stopped`, yellow), and nothing is killed.
+- [ ] **The close guard (spec 4.4).** While an action runs: the X, Alt+F4 and Cancel leave the window open with "An action is running: press Stop, then close"; the nav and Start do nothing. After the action, the window closes normally.
+- [ ] **The deadline kill (RD-R8, RD-R9).** With a release whose `timeoutsMinutes.tool.health` is 1: the window kills the child at about 4 minutes on its own clock, the result is Timed out (red), and Task Manager shows no `powershell.exe` child or grandchild (DISM, a grandchild PowerShell) left. Change the clock by an hour during a run: nothing is killed early. Record how long the window freezes while `Stop-ProcessTree` walks the tree (a CIM query per process).
+- [ ] **Restart PC (spec 6.9).** On a fresh run: Restart PC, then Restart in the question: the transcript closes, `C:\BenTech` is gone (no earlier run) and the PC restarts within a few seconds with no countdown. After an unfinished earlier run: the folder stays and the PC still restarts. Record whether `Restart-Computer -Force` or the `shutdown.exe` fallback did it.
 
 ---
 

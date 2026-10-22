@@ -123,6 +123,8 @@ $script:ToolboxStrings = @{
     'finding.volumeDirty'        = 'The disk is marked dirty: a check will run at the next start'
     'finding.winreUnreadable'    = 'WinRE could not be checked: the boot configuration could not be read ({0})'
     'finding.captivePortal'      = 'Captive portal or proxy: the Windows internet test page came back different'
+    'finding.childNoResult'      = 'The action ended without a result (exit {0})'
+    'finding.childStartFailed'   = 'The action could not start: {0}'
 
     'repair.row.safety'     = 'SAFETY'
     'repair.row.check'      = 'CHECK'
@@ -415,6 +417,8 @@ $script:ToolboxStrings = @{
     'finding.volumeDirty'        = 'הדיסק מסומן לבדיקה: בדיקה תרוץ בהפעלה הבאה'
     'finding.winreUnreadable'    = 'לא ניתן היה לבדוק את WinRE: לא ניתן היה לקרוא את הגדרות האתחול ({0})'
     'finding.captivePortal'      = 'פורטל התחברות או פרוקסי: דף בדיקת האינטרנט של Windows חזר שונה'
+    'finding.childNoResult'      = 'הפעולה הסתיימה בלי תוצאה (קוד יציאה {0})'
+    'finding.childStartFailed'   = 'לא ניתן היה להפעיל את הפעולה: {0}'
 
     'repair.row.safety'     = 'בטיחות'
     'repair.row.check'      = 'בדיקה'

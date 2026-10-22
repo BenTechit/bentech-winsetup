@@ -351,7 +351,8 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
     @($script:logs | Where-Object { $_.Message -eq 'Start refused: Administrator protection is on' }).Count | Should -Be 1
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is not off' -and $_.Data.state -eq 'On' }).Count | Should -Be 1 }
   It 'calls ShowDialog only through the seam; no key handlers, no closures (Toolbox.ps1 and Xaml.ps1, TB-R7, Task 3 M6)' {
-    $src = Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw
+    # Repair Task 4: RepairPage.ps1 (the action runs) shows no dialog either.
+    $src = (Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw) + (Get-Content "$PSScriptRoot\..\src\Toolbox\RepairPage.ps1" -Raw)
     ([regex]::Matches($src, '\.ShowDialog\(')).Count | Should -Be 1; $src | Should -Match '\$ShowDialog = \{ param\(\$w\) \$w\.ShowDialog\(\) \}'
     # Any key-handler wiring, in code or in XAML (Should -Match ignores case): an event or its routed event (KeyDown, PreviewKeyDown,
     # KeyUp, PreviewKeyUp, KeyDownEvent ...), a key binding, a default or a cancel button.
@@ -438,7 +439,7 @@ Describe 'Get-SetupChoices (toolbox spec 5.1)' {
     foreach ($tb in { param($p) @{ Outcome = 'Failed'; Error = 'view broke' } }, { param($p) throw 'boom' }) {
       $script:consoleArgs = $null; $null = Get $tb; $script:consoleArgs.NoAutoStart | Should -BeTrue }
     $null = Get { param($p) $script:toolboxArgs = $p; @{ Outcome = 'Cancel' } }
-    $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse   # the window gets Show-StartScreen's five parameters only
+    $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse   # the window gets Show-StartScreen's five parameters (and, repair Task 4, Root and ScriptPath)
     # The real Show-StartScreen takes the splat (its other seams given, so it reads no console): Escape is $null.
     Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) Show-StartScreen @p -ReadKey { 'Escape' } -Now { [datetime]'2026-10-22' } -Sleep { } -OnAC { $true } -Write { } -FlushInput { } } |
       Should -BeNullOrEmpty }

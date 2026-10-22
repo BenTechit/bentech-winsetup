@@ -99,6 +99,10 @@ Describe 'Start-BenTechSetup' {
     # one through, it stops at these instead of opening a real window.
     Mock Show-ToolboxWindow { throw 'blocked: Show-ToolboxWindow' }
     Mock Test-ToolboxHost { throw 'blocked: Test-ToolboxHost' }
+    # Repair Task 4: Restart PC in the toolbox. SAFETY: the real stateless restart restarts this PC (Restart-Computer,
+    # shutdown.exe), so it is always mocked; no restart request unless a test asks for one.
+    Mock Invoke-StatelessRestart { $true }
+    Mock Get-ToolboxRestartRequest { $false }
   }
 
   AfterEach {
@@ -497,6 +501,38 @@ Describe 'Start-BenTechSetup' {
     It 'an empty -ToolAction is a normal start, not the child' {
       Mock Invoke-SetupToolProcess { 0 }; Invoke-Entry -ToolAction '' -ToolArgs 'x' | Should -Be 0
       Should -Invoke Invoke-SetupToolProcess -Times 0 -Exactly; Should -Invoke Enter-RunLock -Times 1 -Exactly }
+  }
+
+  # Repair Task 4 (repair spec 6.9, RD-R5): Restart PC in the toolbox is the Cancel path plus a stateless restart, after
+  # the cleanup (the transcript stopped, the lock released, C:\BenTech removed when no earlier run exists).
+  Context 'Restart PC from the toolbox' {
+    BeforeEach {
+      $script:order = New-Object System.Collections.Generic.List[string]
+      Mock Invoke-SetupCleanup { $script:order.Add("cleanup:$Mode") }
+      Mock Invoke-StatelessRestart { $script:order.Add('restart'); $true }
+      Mock Exit-RunLock { $script:order.Add('unlock') }
+      Mock Stop-Transcript { $script:order.Add('transcript') }
+    }
+    It 'Restart PC: the Cancel path, the cleanup, then a stateless restart' { Mock Get-SetupChoices { $null }; Mock Get-ToolboxRestartRequest { $true }
+      Invoke-Entry | Should -Be 0; @($script:order | Where-Object { $_ -in 'cleanup:Cancel', 'restart' }) | Should -Be @('cleanup:Cancel','restart')
+      Should -Invoke Unregister-ResumeTask -Times 1
+      $script:order | Should -Be @('unlock', 'transcript', 'cleanup:Cancel', 'restart')   # the lock and the transcript first (spec 6.9)
+      Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'Restart requested in the toolbox' }
+      Should -Invoke Save-RunState -Times 0 -Exactly; Should -Invoke Invoke-SetupRun -Times 0 -Exactly }
+    It 'after an unfinished earlier run: no cleanup, still the restart' { Mock Get-SetupChoices { $null }; Mock Get-ToolboxRestartRequest { $true }
+      Mock Read-RunState { New-FakeState -RunId 'old-run' }
+      Invoke-Entry | Should -Be 0; @($script:order | Where-Object { $_ -like 'cleanup:*' -or $_ -eq 'restart' }) | Should -Be @('restart')
+      Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly }
+    It 'no restart after a crash, a plain Cancel or a run' {
+      Mock Get-ToolboxRestartRequest { $true }   # even with a request left over: only a Cancel from the window restarts
+      Mock Get-SetupChoices { throw 'start screen broke' }; Invoke-Entry | Should -Be 1
+      Mock Get-SetupChoices { $script:choices }; Invoke-Entry | Should -Be 0                    # a run
+      Mock Get-ToolboxRestartRequest { $false }; Mock Get-SetupChoices { $null }; Invoke-Entry | Should -Be 0   # a plain Cancel
+      Should -Invoke Invoke-StatelessRestart -Times 0 }
+    It 'passes Root and ScriptPath to Get-SetupChoices' {
+      Invoke-Entry | Out-Null
+      Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive -and $ScriptPath -like '*\setup.ps1' }
+      Get-Content "$PSScriptRoot\..\src\Entry\Main.ps1" -Raw | Should -Match '\$choices = Get-SetupChoices -Machine \$machine -Config \$config -Version \$Version -Previous \$previousSummary -IsFresh \$fresh -Root \$Root -ScriptPath \$ScriptPath' }
   }
 
   # Final review I3: in the classic console host one click into the window starts a QuickEdit selection,

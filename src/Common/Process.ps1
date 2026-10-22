@@ -312,8 +312,12 @@ function Start-BackgroundExternal {
     Starts a program in the background and returns its System.Diagnostics.Process at once. The
     caller owns the wait and its deadline.
   .DESCRIPTION
-    The one exception to "every child goes through Invoke-External" (Global Constraints): its only
-    caller is the office step, whose Wait-OfficeBackground enforces timeoutsMinutes.office.
+    The named exception to "every child goes through Invoke-External" (Global Constraints). Its callers:
+    - the office step, whose Wait-OfficeBackground enforces timeoutsMinutes.office;
+    - the toolbox window (repair spec 7, 10), through its StartChild seam: the Repair & diagnostics action
+      child (setup.ps1 -ToolAction), whose deadline (timeoutsMinutes.tool.<id> + 3 minutes, on the run's own
+      Stopwatch) the window's run timer enforces with Stop-ProcessTree, and "Open folder" (explorer.exe),
+      which nobody waits for.
     - UseShellExecute = $true with a hidden window: the child gets its own (hidden) console and
       inherits no handles, so nothing it writes lands on the setup screen and the operator's keys
       never reach it.

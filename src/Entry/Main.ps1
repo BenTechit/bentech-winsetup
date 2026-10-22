@@ -256,11 +256,14 @@ function Complete-SetupRun {
 
 function Invoke-SetupMainFlow {
   # Private; Start-BenTechSetup is its only caller. Everything that runs while this process holds the run
-  # lock. Returns @{ Outcome; State; HadPrevious }: Outcome is 'Cancelled' (Cancel in the toolbox, or Escape
-  # on the console start screen it falls back to: a leftover resume task is removed, nothing else
+  # lock. Returns @{ Outcome; State; HadPrevious; Restart }: Outcome is 'Cancelled' (Cancel in the toolbox, or
+  # Escape on the console start screen it falls back to: a leftover resume task is removed, nothing else
   # changes), 'NoState' (resumed without a state), 'Rebooting' or 'Completed'; State is the run state
   # ($null when there is none); HadPrevious says whether a run state was already there when this process
-  # started (an earlier run on a new run, the saved run on a resume). Exceptions propagate to Start-BenTechSetup's crash handler.
+  # started (an earlier run on a new run, the saved run on a resume); Restart is $true only on 'Cancelled' when the
+  # toolbox closed with Restart PC (Get-ToolboxRestartRequest, repair spec 6.9). The toolbox gets Root and
+  # ScriptPath: its Repair & diagnostics actions run in children of this setup.ps1. Exceptions propagate to
+  # Start-BenTechSetup's crash handler.
   # A new run records the launcher (Get-LauncherInfo on $env:BT_SELF, which the launcher sets) in the
   # state, so the final screen can find the USB stick (spec 10.2). A resume records nothing: the resume
   # task has no BT_SELF.
@@ -298,13 +301,16 @@ function Invoke-SetupMainFlow {
     $fresh = Test-SetupMachineFresh -Machine $machine -Config $config
     # The toolbox window, or the console start screen when the window fails (Get-SetupChoices; the same
     # parameters and the same return contract as Show-StartScreen): Choices, or $null for Cancel.
-    $choices = Get-SetupChoices -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh
+    $choices = Get-SetupChoices -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh -Root $Root -ScriptPath $ScriptPath
     if ($null -eq $choices) {
       # Ruling R27 (spec 8.1, 8.5): cancel (the toolbox's Cancel, X or Alt+F4, or Esc on the console) leaves no
       # changes and no resume task, so a task left by an earlier, unfinished run is removed too. No state is saved.
+      # Restart PC in the toolbox (repair spec 6.9) ends here too, with a request Start-BenTechSetup performs last.
+      $restart = ((Get-ToolboxRestartRequest) -eq $true)
       Write-SetupLog -Message 'Cancelled on the start screen; removing any leftover resume task, nothing else is changed'
+      if ($restart) { Write-SetupLog -Message 'Restart requested in the toolbox' }
       $null = Unregister-ResumeTask
-      return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious }
+      return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious; Restart = $restart }
     }
     # A new run starts an empty feed: the previous run's activity.txt is archived under its RunId.
     $previousRunId = if ($null -ne $previous) { [string]$previous['RunId'] } else { $null }
@@ -383,6 +389,9 @@ function Start-BenTechSetup {
     toolbox's, or Escape on the console) with no earlier run state runs -Mode Cancel (C:\BenTech deleted,
     because nothing ran). A crash, 'Rebooting', 'NoState', a cancel after an unfinished earlier run and a
     lock held by another run delete nothing.
+    Last, Restart PC in the toolbox (repair spec 6.9, ruling RD-R5): a 'Cancelled' flow whose Restart is set
+    restarts the PC through Invoke-StatelessRestart, after the cleanup when there was one (after an unfinished
+    earlier run its folder stays, and the restart still happens). Never after a crash.
     The exit code does not change.
 
     Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash
@@ -435,6 +444,7 @@ function Start-BenTechSetup {
   $keepLock = $false
   $transcriptStarted = $false
   $cleanup = $null
+  $restartAfter = $false
   try {
     $null = Initialize-SetupLog -LogDirectory $logDir
     # The activity feed reads its history back from Logs\activity.txt, so it survives a restart.
@@ -464,14 +474,16 @@ function Start-BenTechSetup {
         Write-SetupLog -Message 'Restarting; the run lock is kept until the machine restarts'
       } elseif ($flow.Outcome -eq 'Completed') {
         $cleanup = @{ Mode = 'Finish'; State = $flow.State }
-      } elseif ($flow.Outcome -eq 'Cancelled' -and -not $flow.HadPrevious) {
-        $cleanup = @{ Mode = 'Cancel' }
+      } elseif ($flow.Outcome -eq 'Cancelled') {
+        if (-not $flow.HadPrevious) { $cleanup = @{ Mode = 'Cancel' } }
+        $restartAfter = ($flow.Restart -eq $true)
       }
       $exitCode = 0
     }
   } catch {
-    # A crash keeps everything for diagnosis (spec 10.6).
+    # A crash keeps everything for diagnosis (spec 10.6), and never restarts.
     $cleanup = $null
+    $restartAfter = $false
     # First: no progress-screen redraw may land on the crash text.
     Unregister-SetupTick
     $message = $_.Exception.Message
@@ -516,5 +528,7 @@ function Start-BenTechSetup {
       Write-Host ('Cleanup failed: {0}' -f $_.Exception.Message) -ForegroundColor White -BackgroundColor DarkRed
     }
   }
+  # Restart PC (repair spec 6.9): the last thing this process does. Invoke-StatelessRestart never throws.
+  if ($restartAfter) { $null = Invoke-StatelessRestart }
   return $exitCode
 }

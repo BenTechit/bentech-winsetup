@@ -221,8 +221,9 @@ function New-ToolboxModel {
         'Unknown');
       - MaxAgeDays is freshInstall.maxInstallAgeDays, for the "older than N days" warning;
       - Page is 'setup' (the window opens on New PC setup) and Repair is the Repair & diagnostics page's model
-        (New-RepairModel, RepairPlanner.ps1), its visit stamped now ('yyyy-MM-dd_HHmm'). It cannot start an action
-        yet (CanRun $false): the window that runs actions passes its setup files in (repair plan Task 4).
+        (New-RepairModel, RepairPlanner.ps1) with -CanRun ($false by default: Show-ToolboxWindow passes $true when
+        it has the setup files an action's child runs from, repair Task 4) and -SessionStamp, the visit's folder
+        stamp ('yyyy-MM-dd_HHmm', invariant; by default now, when the window opens).
     The window renders it (Update-ToolboxView); nothing here reads the machine.
   #>
   [CmdletBinding()]
@@ -233,7 +234,9 @@ function New-ToolboxModel {
     [AllowNull()][hashtable]$Previous,
     [Parameter(Mandatory)][bool]$IsFresh,
     [Parameter(Mandatory)][bool]$OnAC,
-    [Parameter(Mandatory)][AllowEmptyString()][string]$AdminProtection
+    [Parameter(Mandatory)][AllowEmptyString()][string]$AdminProtection,
+    [bool]$CanRun = $false,
+    [AllowEmptyString()][string]$SessionStamp = ([datetime]::Now.ToString('yyyy-MM-dd_HHmm', [Globalization.CultureInfo]::InvariantCulture))
   )
 
   $language = 'en'
@@ -251,7 +254,7 @@ function New-ToolboxModel {
     Previous        = $Previous
     MaxAgeDays      = [int]$Config.freshInstall.maxInstallAgeDays
     Page            = 'setup'
-    Repair          = (New-RepairModel -Machine $Machine -SessionStamp ([datetime]::Now.ToString('yyyy-MM-dd_HHmm', [Globalization.CultureInfo]::InvariantCulture)))
+    Repair          = (New-RepairModel -Machine $Machine -SessionStamp $SessionStamp -CanRun $CanRun)
   }
 }
 
