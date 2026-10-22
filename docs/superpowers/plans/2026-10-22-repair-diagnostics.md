@@ -187,7 +187,7 @@ Merged into the existing sections. **Plan call:** `repair` is not a required key
 | Action | Kind | Confirm | Stick | Logs | Steps, in order (`*` = servicing: re-checked for a pending servicing restart first) | Task |
 |---|---|---|---|---|---|---|
 | `safety` | info | none | no | local | `safetyRestart`, `safetyFree`, `safetyBitLocker`, `safetyInternet`, `safetyDisk`, `safetyDiskCheck`; + `safetyNetBackup` (T7), `safetyEarlier` (T9) | 2 |
-| `health` | readonly | none | no | session | `volumeScan`, `imageCheck`, `imageScan`, `sfcVerify`, `winre`, `devices`, `activation` | 2 |
+| `health` | readonly | none | no | session | `volumeState`, `imageCheck`, `imageScan`, `sfcVerify`, `winre`, `devices`, `activation` | 2 |
 | `standard` | repair | confirm | no | session | `timeSync`, `volumeScan`, `dism`*, `sfc`*, `winreFix` | 6 |
 | `postClone` | repair | confirm | no | session | standard's five, then `pnpScan`, `devices`, `oemLeftovers`, `pageFile`, `trim`, `activation`, `componentCleanup`*, `wuScan` | 6 |
 | `dismSource` | repair | confirm | no | session | `dismSource`*, `sfc`* | 6 |
@@ -936,7 +936,7 @@ Repair = @{ Available = [string[]] (catalog ids); CanRun = <bool>; IsLaptop = <b
     It 'typing YES (or the Hebrew-layout YES) enables Confirm; Confirm starts the action' { ClickTag $w 'a:Tile:diskCheck'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse
       $w.FindName('YesBox').Text = 'yes'; $w.FindName('ConfirmButton').IsEnabled | Should -BeTrue; Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction diskCheck' }
     It 'Health check end to end: tile, live steps, findings in colour, files, Open folder, Restart PC' {
-      ClickTag $w 'a:Tile:health'; <# progress: volumeScan done, imageCheck running; RunTick #> $w.FindName('RunSteps').Children.Count | Should -Be 7
+      ClickTag $w 'a:Tile:health'; <# progress: volumeState done, imageCheck running; RunTick #> $w.FindName('RunSteps').Children.Count | Should -Be 7
       <# result YELLOW with sfcCorrupt; exited; RunTick #> $w.FindName('ResultFindings').Children[0].Foreground | Should -Be $w.FindResource('WarnBrush')
       Click $w 'OpenFolderButton'; $script:started[-1].File | Should -BeLike '*\explorer.exe'; $script:ToolboxChildren | Should -Not -Contain $script:started[-1].Process
       Click $w 'RestartButton'; Click $w 'ConfirmButton'; $w.Tag.Outcome | Should -Be 'Restart' }
@@ -1138,7 +1138,7 @@ Repair = @{ Available = [string[]] (catalog ids); CanRun = <bool>; IsLaptop = <b
     |---|---|---|---|
     | 01 | System | registry `CurrentVersion` (name corrected by build, DisplayVersion, build.UBR, EditionID, InstallDate), CIM computer/OS/BIOS (`-OperationTimeoutSec 30`), uptime, clock offset (`Test-ToolInternet`, run once per report and kept in `Data.Internet` for section 09), servicing restart signals, .NET release; raw `systeminfo` (native) | systeminfo |
     | 02 | Hardware | BIOS, board, CPU, `Win32_PhysicalMemory` sum, GPU (`Win32_VideoController`, `InfFilename display.inf` = basic display), monitors (`WmiMonitorID` serials), batteries (`root\wmi` full/design, summed per battery), `Confirm-SecureBootUEFI`, `Win32_Tpm`, `Win32_DeviceGuard` | monitors |
-    | 03 | Storage | the disk grandchildren (Task 2), `Win32_Volume` (free, dirty bit), TRIM value, BitLocker types, page file, restore points (`root\default SystemRestore`), the disk events; Full: the volume scan (only when the Disk chip is not red; **Plan call**: no heavy scan on a failing disk), raw `vssadmin list shadows` / `shadowstorage` | scan, vssadmin |
+    | 03 | Storage | the disk grandchildren (Task 2), `Win32_Volume` (free, dirty bit), TRIM value, BitLocker types, page file, restore points (`root\default SystemRestore`), the disk events; Full: the read-only volume state from Task 2's `volumeState` (`Get-Volume` + dirty bit; **never `Repair-Volume -Scan`, which can fix errors online**, RD-R12), raw `vssadmin list shadows` / `shadowstorage` | scan, vssadmin |
     | 04 | Boot and recovery | `Get-ToolBcdState` (WinRE, safeboot), ReAgent.xml, EFI/recovery partitions (`MSFT_Partition` by GptType), boot times (Diagnostics-Performance 100 `Properties`), 6005/6006/6008/41/1074 counts | |
     | 05 | Windows Update | `Win32_QuickFixEngineering` newest 40, last search/install success (`Microsoft.Update.AutoUpdate` `.Results`, grandchild), WU policy values, services' start types, last SFC (`ConvertFrom-CbsSrText`), WindowsUpdateClient events; Full: CBS.log and dism.log error lines condensed (`Read-ToolLogErrors`: `, Error`, `HRESULT = 0x8`, `[SR] Cannot repair`), raw copies, `Get-WindowsUpdateLog` in a grandchild (`wuLog`) to raw | logs |
     | 06 | Drivers and devices | problem devices (Task 2), ghost count by class; Full: `Get-WindowsDriver -Online` (grandchild, `drivers`) third-party list + core drivers older than 6 years, setupapi.dev.log `!!!` lines condensed + raw, Kernel-PnP events | drivers, setupapi |
