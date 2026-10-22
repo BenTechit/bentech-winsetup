@@ -343,6 +343,20 @@ The toolbox window replaces the console start screen ([toolbox spec](specs/2026-
 - [ ] Start with no Choices, no result, more than one result or an unknown outcome is Failed and falls back to the console.
 - [ ] The UCPD refusal (above), the `(default)` token (above) and the frequency restore on a timeout (above): their real-machine checks are in the items of this section.
 
+### 1.20 Repair & diagnostics: the checks proven by mocks only (repair Task 2; Task 9 completes this section)
+
+The child side of the Health check and the safety strip is tested with mocked grandchildren, events and network (`tests\ToolChecks.Tests.ps1`). The values below were checked read-only against this dev PC's Windows (rulings RD-R10 to RD-R12), but the verdicts need real machines: a Hebrew Windows 11 VM checkpoint, and the same VM made unhealthy where an item says so. **Never on the dev PC.** Record the real values.
+
+- [ ] **Internet (RD-R11).** On a normal network the chip is OK: TCP 443 to `www.microsoft.com`, the HTTPS `HEAD https://www.microsoft.com/` answers (a 200 or a 403 both count: the dev PC saw both) and its `Date` header gives a clock offset under a few seconds; `http://www.msftconnecttest.com/connecttest.txt` answers exactly `Microsoft Connect Test`. Behind a hotel-style captive portal (or a phone hotspot before its login) the chip is red with `Probe = different`; behind a proxy that rewrites HTTP it is yellow. Unplugged: red. Set the clock 5 minutes off: the offset reads about 300 s.
+- [ ] **Disk state, read-only (RD-R12).** On a healthy VM the Health check's disk state is Healthy (`Get-Volume` HealthStatus code 0, OperationalStatus 2). Mark the volume dirty on the VM (`fsutil dirty set C:`): `volumeDirty` appears. Record the codes Get-Volume shows on a volume that needs a scan, if one can be produced.
+- [ ] **Repair-Volume -Scan's result (RD-R12, Task 6).** Record the real `Volume.RepairStatus` name on a clean VM volume (`NoErrorsFound` or `ScanNoErrorsFound`) and on a damaged one: both must map to a finding, never `volumeUnknown`.
+- [ ] **The disk chip judges the system disk only (RD-R10).** With the BenTech stick plugged in, and with an external USB disk, the chip judges only the disk holding C:. `disk` events 7, 51 and 153 of the stick (`\Device\Harddisk<N>\` of another disk) leave it OK and are counted in `OtherEvents`. On a laptop with a failing disk, record its HealthStatus and counters. `Get-StorageReliabilityCounter` gives values when elevated; record which disks report none.
+- [ ] **NTFS 55's DriveName.** On a VM where NTFS logs event 55 (a damaged test volume), its first property is the drive (`C:`), and only the system volume's counts.
+- [ ] **SFC's CBS.log (review M1).** After `sfc /verifyonly` on the Hebrew VM, CBS.log has one `[SR] Verifying N components` and one `[SR] Verify complete` per batch, and the Health check waits until the last batch is in and the `[SR]` lines stop changing (`Data.Sfc.Settled`). Record how long the second read takes after sfc exits.
+- [ ] **A CBS.log rotation compressed during a scan (review M2).** If a `CbsPersist_*.cab` appears during a long SFC run, `setup.log` has `A CBS log rotated during the scan is compressed and not read`. Record whether it ever happens (CBS.log rotated at about 90 MB on the dev PC).
+- [ ] **WinRE from the BCD.** On a VM after a clone (a stale ReAgent.xml), the verdict follows the BCD. A missing `recoveryenabled` element counts as on (Plan call); an element that cannot be read is `winreUnreadable`, never "disagree".
+- [ ] **BitLocker with protection suspended (review M6).** Suspend protection on an encrypted VM: the chip still warns (ConversionStatus 1). On Windows 11 Home with Device Encryption waiting for activation, record ProtectionStatus and ConversionStatus.
+
 ---
 
 ## 2. Per VM type

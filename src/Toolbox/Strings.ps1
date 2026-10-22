@@ -100,6 +100,10 @@ $script:ToolboxStrings = @{
     'finding.devicesUnknown'     = 'The device list could not be read ({0})'
     'finding.notActivated'       = 'Windows is not activated'
     'finding.activationUnknown'  = 'Activation could not be read'
+    'finding.volumeFixedOnline'  = 'Disk scan found errors and fixed them online'
+    'finding.volumeDirty'        = 'The system volume is marked dirty: Windows checks it at the next start'
+    'finding.winreUnreadable'    = 'WinRE could not be checked: the boot configuration could not be read ({0})'
+    'finding.captivePortal'      = 'Captive portal or proxy: the Windows internet test page came back different'
   }
   he = @{
     'app.title'             = 'ארגז הכלים של BENTECH'
@@ -186,5 +190,9 @@ $script:ToolboxStrings = @{
     'finding.devicesUnknown'     = 'לא ניתן היה לקרוא את רשימת ההתקנים ({0})'
     'finding.notActivated'       = 'Windows לא מופעל'
     'finding.activationUnknown'  = 'לא ניתן היה לקרוא את מצב ההפעלה'
+    'finding.volumeFixedOnline'  = 'סריקת הדיסק מצאה שגיאות ותיקנה אותן במצב מקוון'
+    'finding.volumeDirty'        = 'אמצעי האחסון של המערכת מסומן לבדיקה: Windows יבדוק אותו בהפעלה הבאה'
+    'finding.winreUnreadable'    = 'לא ניתן היה לבדוק את WinRE: לא ניתן היה לקרוא את הגדרות האתחול ({0})'
+    'finding.captivePortal'      = 'פורטל התחברות או פרוקסי: דף בדיקת האינטרנט של Windows חזר שונה'
   }
 }

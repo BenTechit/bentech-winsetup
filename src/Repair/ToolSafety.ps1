@@ -11,22 +11,28 @@
 #   Restart   : the servicing signals only (CBS RebootPending / PackagesPending, pending.xml, WU RebootRequired) are
 #               red; a pending file or computer rename is a grey note.
 #   Free      : the system drive under freeSpace.minPercent % or under freeSpace.minGB GB is red.
-#   BitLocker : CIM Win32_EncryptableVolume, protection status and protector TYPES only (never a key or password).
-#   Internet  : TCP 443 to repair.internet.host, then an HTTPS GET of repair.internet.url (5 s each); its Date header
-#               gives the clock offset.
-#   Disk      : Get-PhysicalDisk and Get-StorageReliabilityCounter in grandchildren, and the System log's disk 7, 51,
-#               153 and NTFS 55 events of the last diskEventDays.
+#   BitLocker : CIM Win32_EncryptableVolume: protection status, conversion status and protector TYPES only (never a
+#               key or a password).
+#   Internet  : ruling RD-R11: TCP 443 to repair.internet.host (www.microsoft.com), an HTTPS HEAD of repair.internet.url
+#               (https://www.microsoft.com/; its Date header gives the clock offset), then Windows' own captive-portal
+#               probe over plain HTTP (repair.internet.probeUrl, expecting repair.internet.probeContent). 5 s each.
+#   Disk      : ruling RD-R10: only the physical disk(s) holding the system volume. Get-PhysicalDisk and
+#               Get-StorageReliabilityCounter in grandchildren, the System log's disk 7, 51 and 153 events of that
+#               disk (\Device\Harddisk<N>\) and NTFS 55 of the system volume, in the last diskEventDays. Other disks
+#               (the BenTech stick among them) are only recorded in Detail, for the report.
 # Plus the disk check state: the system volume's dirty bit, and whether BootExecute excludes the drive (/k:).
 #
 # Every threshold comes from config.json's repair section; a missing key falls back to the values the spec pins
 # (repair is not a required config key). Needs ToolEngine (Invoke-ToolJsonChild, Add-ToolLog, Write-ToolProgress),
-# Reboot (Get-ServicingRebootSignals, Test-ServicingRebootPending, Get-RebootRegistryValue), Logging and StartScreen
-# (ConvertTo-ScreenText). The bundle holds every file.
+# ToolChecks (Get-ToolSystemLetter), Reboot (Get-ServicingRebootSignals, Test-ServicingRebootPending,
+# Get-RebootRegistryValue), Logging and StartScreen (ConvertTo-ScreenText). The bundle holds every file.
 
-# Get-PhysicalDisk: one row per disk. HealthStatus and MediaType are enum names (Healthy, Warning, Unhealthy,
-# Unknown; SSD, HDD), never localized.
+# Get-PhysicalDisk: one row per disk, plus the disk number(s) of the system volume's partition(s) (<L> is its
+# letter), which a physical disk's DeviceId names. HealthStatus and MediaType are enum names (Healthy, Warning,
+# Unhealthy, Unknown; SSD, HDD), never localized.
 $script:ToolDisksCommand = @'
-@{ Items = @(Get-PhysicalDisk | ForEach-Object {
+@{ SystemDisks = @(Get-Partition -DriveLetter '<L>' | ForEach-Object { [int]$_.DiskNumber } | Sort-Object -Unique)
+   Items = @(Get-PhysicalDisk | ForEach-Object {
   @{ DeviceId = [string]$_.DeviceId; FriendlyName = [string]$_.FriendlyName; MediaType = [string]$_.MediaType
      BusType = [string]$_.BusType; HealthStatus = [string]$_.HealthStatus; Size = [long]$_.Size } }) }
 '@
@@ -44,7 +50,9 @@ $script:ToolReliabilityCommand = @'
 
 $script:ToolBitLockerNamespace = 'root\cimv2\Security\MicrosoftVolumeEncryption'
 
-# Win32_EncryptableVolume.GetKeyProtectorType -> the type names Get-BitLockerVolume uses. Only the TYPES are read.
+# Win32_EncryptableVolume.GetKeyProtectorType -> the BitLocker module's type names. Only the TYPES are read; the one
+# constant below that names the numerical password protector is the only place its name may appear in src\Repair
+# (tests\RepairStatic.Tests.ps1).
 $script:ToolKeyProtectorTypes = @{
   0 = 'Unknown'; 1 = 'Tpm'; 2 = 'ExternalKey'; 3 = 'RecoveryPassword'; 4 = 'TpmPin'; 5 = 'TpmStartupKey'
   6 = 'TpmPinStartupKey'; 7 = 'PublicKey'; 8 = 'Password'; 9 = 'TpmNetworkKey'; 10 = 'AdAccountOrGroup'
@@ -227,14 +235,18 @@ function Get-ToolFreeSpaceChip {
 function Get-ToolBitLockerChip {
   <#
   .SYNOPSIS
-    The BitLocker chip of -Drive (the system drive): 'ok' when protection is off, 'warn' when it is on (the
-    reminder: have the recovery key before BIOS or board work), 'unknown' when it cannot be read in 15 s. Never
-    throws.
+    The BitLocker chip of -Drive (the system drive): 'warn' when the volume is protected or encrypted (the reminder:
+    have the recovery key before BIOS or board work), 'ok' when protection is off and the volume is fully decrypted,
+    'unknown' when it cannot be read in 15 s. Never throws.
   .DESCRIPTION
-    CIM Win32_EncryptableVolume (root\cimv2\Security\MicrosoftVolumeEncryption) with -OperationTimeoutSec 15: its
-    ProtectionStatus (0 off, 1 on, anything else unknown), GetKeyProtectors and GetKeyProtectorType for each id.
-    Detail = @{ ProtectionStatus; Protectors = the type names (Tpm, RecoveryPassword, ...) }. No method that returns
-    a key or a password is ever called.
+    CIM Win32_EncryptableVolume (root\cimv2\Security\MicrosoftVolumeEncryption) with -OperationTimeoutSec 15:
+      - ProtectionStatus: 0 off, 1 on, anything else unknown;
+      - ConversionStatus (review M6): anything but 0 (fully decrypted) means the volume is encrypted, or partly so.
+        Protection suspended (after a vendor BIOS update) and Device Encryption waiting for activation report
+        protection off on an encrypted volume, and protection comes back on later, so they warn too;
+      - GetKeyProtectors, and GetKeyProtectorType for each id.
+    Detail = @{ ProtectionStatus; ConversionStatus (<int|$null>); Protectors = the type names (Tpm, ExternalKey, ...) }.
+    No method that returns a key or a password is ever called.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -245,6 +257,8 @@ function Get-ToolBitLockerChip {
       Select-Object -First 1
     if ($null -eq $volume) { return (New-ToolUnknownChip -Name 'BitLocker' -Reason ('no encryptable volume {0}' -f $Drive)) }
     $status = [int]$volume.ProtectionStatus
+    $conversion = $null
+    if ($null -ne $volume.ConversionStatus) { $conversion = [int]$volume.ConversionStatus }
     $answer = Invoke-CimMethod -InputObject $volume -MethodName 'GetKeyProtectors' -Arguments @{ KeyProtectorType = [uint32]0 } -OperationTimeoutSec 15 -ErrorAction Stop
     if ($null -ne $answer.ReturnValue -and [long]$answer.ReturnValue -ne 0) { throw ('GetKeyProtectors returned {0}' -f [long]$answer.ReturnValue) }
     $types = New-Object System.Collections.Generic.List[string]
@@ -254,75 +268,166 @@ function Get-ToolBitLockerChip {
       $number = [int]$type.KeyProtectorType
       if ($script:ToolKeyProtectorTypes.ContainsKey($number)) { $types.Add($script:ToolKeyProtectorTypes[$number]) } else { $types.Add('Unknown') }
     }
+    $encrypted = ($null -ne $conversion -and $conversion -ne 0)
     $level = 'unknown'
-    if ($status -eq 0) { $level = 'ok' } elseif ($status -eq 1) { $level = 'warn' }
-    return (New-ToolChip -Level $level -Detail @{ ProtectionStatus = $status; Protectors = $types.ToArray() })
+    if ($status -eq 1 -or $encrypted) { $level = 'warn' } elseif ($status -eq 0) { $level = 'ok' }
+    return (New-ToolChip -Level $level -Detail @{ ProtectionStatus = $status; ConversionStatus = $conversion; Protectors = $types.ToArray() })
   } catch {
     return (New-ToolUnknownChip -Name 'BitLocker' -Reason $_.Exception.Message)
+  }
+}
+
+# --- Internet (ruling RD-R11) -------------------------------------------------------------------------------------
+
+function ConvertFrom-ToolHttpDate {
+  # Private, pure. An HTTP Date header (RFC 1123, 'r': "Thu, 22 Oct 2026 11:42:50 GMT") as a UTC [datetime], or
+  # $null. Invariant culture, so a Hebrew calendar on the thread changes nothing.
+  [CmdletBinding()]
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+
+  $parsed = [datetime]::MinValue
+  if (-not [string]::IsNullOrWhiteSpace($Text) -and [datetime]::TryParseExact($Text.Trim(), 'r', [Globalization.CultureInfo]::InvariantCulture,
+      ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$parsed)) {
+    return $parsed
+  }
+  return $null
+}
+
+function Test-ToolTcpPort {
+  # Private: Test-ToolInternet's default -Connect. $true when a TCP connection to -HostName port 443 opens within
+  # -Milliseconds (DNS included: ConnectAsync resolves the name inside the bound). Never throws.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([string]$HostName, [int]$Milliseconds)
+
+  $client = New-Object Net.Sockets.TcpClient
+  try {
+    return [bool]$client.ConnectAsync($HostName, 443).Wait($Milliseconds)
+  } catch {
+    return $false
+  } finally {
+    $client.Dispose()
+  }
+}
+
+function Invoke-ToolHttpsHead {
+  <#
+  .SYNOPSIS
+    Private: Test-ToolInternet's default -Fetch. An HTTPS HEAD of -Url with TLS 1.2, Timeout and ReadWriteTimeout
+    -Milliseconds, no redirect followed: @{ Ok; Date (UTC or $null) }. Never throws.
+  .DESCRIPTION
+    Ok means an HTTP answer came back over a TLS session whose certificate was validated: any status counts (a 403 or
+    a 302 from the server still proves the connection works; review C1), read from the WebException's Response when
+    the status is not a success. A certificate, name, DNS, timeout or connection failure has no Response: Ok = $false.
+    The Date header of that answer gives the clock offset. Plan call: HttpWebRequest because WebClient has no
+    timeout; never Invoke-WebRequest.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([string]$Url, [int]$Milliseconds)
+
+  $response = $null
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.Method = 'HEAD'
+    $request.Timeout = $Milliseconds
+    $request.ReadWriteTimeout = $Milliseconds
+    $request.AllowAutoRedirect = $false
+    try {
+      $response = $request.GetResponse()
+    } catch [Net.WebException] {
+      $response = $_.Exception.Response
+    }
+    if ($null -eq $response) { return @{ Ok = $false; Date = $null } }
+    return @{ Ok = $true; Date = (ConvertFrom-ToolHttpDate -Text ([string]$response.Headers['Date'])) }
+  } catch {
+    return @{ Ok = $false; Date = $null }
+  } finally {
+    if ($null -ne $response) { $response.Close() }
+  }
+}
+
+function Invoke-ToolHttpProbe {
+  <#
+  .SYNOPSIS
+    Private: Test-ToolInternet's default -Probe. A plain HTTP GET of -Url (Windows' captive-portal test page) with
+    Timeout and ReadWriteTimeout -Milliseconds, no redirect followed: @{ Answered; Content = the first 4 KB as ASCII }.
+    Never throws.
+  .DESCRIPTION
+    Any HTTP answer counts as answered (a portal's redirect too; its body is then compared and differs). The body is
+    a fixed English page from Microsoft, compared whole; at most 4 KB of it is read.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([string]$Url, [int]$Milliseconds)
+
+  $response = $null
+  try {
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.Method = 'GET'
+    $request.Timeout = $Milliseconds
+    $request.ReadWriteTimeout = $Milliseconds
+    $request.AllowAutoRedirect = $false
+    try {
+      $response = $request.GetResponse()
+    } catch [Net.WebException] {
+      $response = $_.Exception.Response
+    }
+    if ($null -eq $response) { return @{ Answered = $false; Content = '' } }
+    $stream = $response.GetResponseStream()
+    $buffer = New-Object byte[] 4096
+    $total = 0
+    while ($total -lt $buffer.Length) {
+      $count = $stream.Read($buffer, $total, $buffer.Length - $total)
+      if ($count -le 0) { break }
+      $total += $count
+    }
+    return @{ Answered = $true; Content = [Text.Encoding]::ASCII.GetString($buffer, 0, $total) }
+  } catch {
+    return @{ Answered = $false; Content = '' }
+  } finally {
+    if ($null -ne $response) { $response.Close() }
   }
 }
 
 function Test-ToolInternet {
   <#
   .SYNOPSIS
-    The internet check (spec 5): @{ Tcp; Https; ClockOffsetSeconds; Chip }. Never throws.
+    The internet check (spec 5, ruling RD-R11): @{ Tcp; Https; Probe = 'ok'|'different'|'failed'|'skipped';
+    ClockOffsetSeconds; Chip }. Never throws.
   .DESCRIPTION
-    First TCP 443 to repair.internet.host (www.msftconnecttest.com), then, only when that answered, an HTTPS GET of
-    repair.internet.url (https://www.msftconnecttest.com/connecttest.txt), each bounded by repair.internet.seconds
-    (5). The chip is 'ok' when both answered, else 'crit'. ClockOffsetSeconds is this PC's UTC time minus the
-    response's Date header (positive: the PC is ahead), $null without it.
-    The two seams (tests pass their own):
-      -Connect { param($HostName, $Milliseconds) } -> bool: TcpClient.ConnectAsync(host, 443).Wait(ms).
-      -Fetch   { param($Url, $Milliseconds) } -> @{ Ok; Date (UTC [datetime] or $null) }: [Net.HttpWebRequest] GET with
-               Timeout and ReadWriteTimeout ms and TLS 1.2, no redirect followed; Ok for a 2xx status. Plan call:
-               HttpWebRequest because WebClient has no timeout; never Invoke-WebRequest.
+    1. TCP 443 to repair.internet.host (www.microsoft.com). When it fails, nothing more is tried.
+    2. An HTTPS HEAD of repair.internet.url (https://www.microsoft.com/, a valid certificate): any answer over a
+       validated TLS session proves HTTPS works; its Date header gives ClockOffsetSeconds = this PC's UTC time minus
+       the server's (positive: the PC is ahead), $null without it.
+    3. Windows' own captive-portal probe over plain HTTP: repair.internet.probeUrl
+       (http://www.msftconnecttest.com/connecttest.txt) must answer exactly repair.internet.probeContent
+       (Microsoft Connect Test). Probe is 'ok', 'different' (another page: a captive portal or a proxy), or 'failed'
+       (no answer). It runs after TCP even when HTTPS failed, so the detail can tell a portal from no internet.
+    Each is bounded by repair.internet.seconds (5). The chip: 'crit' when TCP or HTTPS failed; else 'warn' when the
+    probe was not 'ok' ("captive portal or proxy", the captivePortal finding's text); else 'ok'. Detail = @{ Tcp;
+    Https; Probe; ClockOffsetSeconds }.
+    The three seams (tests pass their own; the defaults are Test-ToolTcpPort, Invoke-ToolHttpsHead and
+    Invoke-ToolHttpProbe):
+      -Connect { param($HostName, $Milliseconds) } -> bool
+      -Fetch   { param($Url, $Milliseconds) } -> @{ Ok; Date (UTC [datetime] or $null) }
+      -Probe   { param($Url, $Milliseconds) } -> @{ Answered; Content }
     A seam that throws or answers anything else counts as failed.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][AllowNull()]$Config,
-    [scriptblock]$Connect = {
-      param([string]$HostName, [int]$Milliseconds)
-      $client = New-Object Net.Sockets.TcpClient
-      try {
-        return [bool]$client.ConnectAsync($HostName, 443).Wait($Milliseconds)
-      } catch {
-        return $false
-      } finally {
-        $client.Dispose()
-      }
-    },
-    [scriptblock]$Fetch = {
-      param([string]$Url, [int]$Milliseconds)
-      $response = $null
-      try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
-        $request.Method = 'GET'
-        $request.Timeout = $Milliseconds
-        $request.ReadWriteTimeout = $Milliseconds
-        $request.AllowAutoRedirect = $false
-        $response = [Net.HttpWebResponse]$request.GetResponse()
-        $code = [int]$response.StatusCode
-        $date = $null
-        $parsed = [datetime]::MinValue
-        $header = [string]$response.Headers['Date']
-        if ($header -ne '' -and [datetime]::TryParseExact($header, 'r', [Globalization.CultureInfo]::InvariantCulture,
-            ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$parsed)) {
-          $date = $parsed
-        }
-        return @{ Ok = ($code -ge 200 -and $code -lt 300); Date = $date }
-      } catch {
-        return @{ Ok = $false; Date = $null }
-      } finally {
-        if ($null -ne $response) { $response.Close() }
-      }
-    }
+    [scriptblock]$Connect = { param($HostName, $Milliseconds) Test-ToolTcpPort -HostName $HostName -Milliseconds $Milliseconds },
+    [scriptblock]$Fetch = { param($Url, $Milliseconds) Invoke-ToolHttpsHead -Url $Url -Milliseconds $Milliseconds },
+    [scriptblock]$Probe = { param($Url, $Milliseconds) Invoke-ToolHttpProbe -Url $Url -Milliseconds $Milliseconds }
   )
 
-  $hostName = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'host' -Default 'www.msftconnecttest.com')
-  $url = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'url' -Default 'https://www.msftconnecttest.com/connecttest.txt')
+  $hostName = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'host' -Default 'www.microsoft.com')
+  $url = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'url' -Default 'https://www.microsoft.com/')
+  $probeUrl = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'probeUrl' -Default 'http://www.msftconnecttest.com/connecttest.txt')
+  $probeContent = [string](Get-ToolRepairSetting -Config $Config -Path 'internet', 'probeContent' -Default 'Microsoft Connect Test')
   $milliseconds = [int][math]::Round((Get-ToolRepairNumber -Config $Config -Path 'internet', 'seconds' -Default 5) * 1000)
 
   $tcp = $false
@@ -334,6 +439,7 @@ function Test-ToolInternet {
   }
   $https = $false
   $offset = $null
+  $probeResult = 'skipped'
   if ($tcp) {
     try {
       $answer = @(& $Fetch $url $milliseconds)
@@ -348,70 +454,112 @@ function Test-ToolInternet {
     } catch {
       $https = $false
     }
+    $probeResult = 'failed'
+    try {
+      $answer = @(& $Probe $probeUrl $milliseconds)
+      if ($answer.Count -eq 1 -and $answer[0] -is [System.Collections.IDictionary] -and $answer[0]['Answered'] -eq $true) {
+        $probeResult = 'different'
+        if (([string]$answer[0]['Content']).Trim() -ceq $probeContent) { $probeResult = 'ok' }
+      }
+    } catch {
+      $probeResult = 'failed'
+    }
   }
-  $level = if ($tcp -and $https) { 'ok' } else { 'crit' }
-  Write-SetupLog -Message 'Internet check' -Data @{ tcp = $tcp; https = $https; clockOffsetSeconds = $offset }
+  $level = 'ok'
+  if (-not ($tcp -and $https)) { $level = 'crit' } elseif ($probeResult -ne 'ok') { $level = 'warn' }
+  Write-SetupLog -Message 'Internet check' -Data @{ tcp = $tcp; https = $https; probe = $probeResult; clockOffsetSeconds = $offset }
   return @{
     Tcp                = $tcp
     Https              = $https
+    Probe              = $probeResult
     ClockOffsetSeconds = $offset
-    Chip               = (New-ToolChip -Level $level -Detail @{ Tcp = $tcp; Https = $https; ClockOffsetSeconds = $offset })
+    Chip               = (New-ToolChip -Level $level -Detail @{ Tcp = $tcp; Https = $https; Probe = $probeResult; ClockOffsetSeconds = $offset })
   }
 }
+
+# --- Disk (ruling RD-R10) -----------------------------------------------------------------------------------------
 
 function Get-ToolDiskEventCount {
   <#
   .SYNOPSIS
-    The listed disk events of the last -Days days: @{ Ok; Count; Ids = [string[]] ('<provider>/<id>') }. Never
-    throws.
+    The listed disk events of the last -Days days, split by where they happened: @{ Ok; Count (on the system disk or
+    volume); Other (elsewhere: the stick, another disk or volume); Ids = [string[]] ('<provider>/<id>' of the counted
+    ones) }. Never throws.
   .DESCRIPTION
     Get-WinEvent -FilterHashtable on the System log by ID (7, 51, 153, 55) and start time, then by provider: 'disk'
     with 7, 51 or 153, and 'Ntfs' or 'Microsoft-Windows-Ntfs' with 55 (an event's provider name is never localized).
     The providers are checked after the query because a ProviderName that is not registered on a PC fails the whole
-    query (NoMatchingProvidersFound). NoMatchingEventsFound is 0 events; any other error is Ok = $false.
+    query (NoMatchingProvidersFound).
+    Ruling RD-R10, where the event happened, from its first property (a device path or a drive name, never
+    localized):
+      - a disk event counts when it is \Device\Harddisk<N>\... with N one of -SystemDisks;
+      - NTFS 55 counts when its DriveName is -SystemDrive ('C:').
+    NoMatchingEventsFound is 0 events; any other error is Ok = $false.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
-  param([Parameter(Mandatory)][int]$Days)
+  param(
+    [Parameter(Mandatory)][int]$Days,
+    [AllowNull()][int[]]$SystemDisks,
+    [AllowNull()][AllowEmptyString()][string]$SystemDrive
+  )
 
+  if ($null -eq $SystemDisks) { $SystemDisks = [int[]]@() }
+  $drive = ([string]$SystemDrive).Trim().TrimEnd('\')
   $events = @()
   try {
     $filter = @{ LogName = 'System'; Id = @(7, 51, 153, 55); StartTime = (Get-Date).AddDays(-$Days) }
     $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents 5000 -ErrorAction Stop)
   } catch {
-    if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return @{ Ok = $true; Count = 0; Ids = [string[]]@() } }
+    if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return @{ Ok = $true; Count = 0; Other = 0; Ids = [string[]]@() } }
     $reason = ConvertTo-ScreenText -Text $_.Exception.Message
     Write-SetupLog -Level WARN -Message 'The disk events could not be read' -Data @{ error = $reason }
-    return @{ Ok = $false; Count = $null; Ids = [string[]]@(); Error = $reason }
+    return @{ Ok = $false; Count = $null; Other = $null; Ids = [string[]]@(); Error = $reason }
   }
-  $hits = @(foreach ($e in $events) {
-      $provider = [string]$e.ProviderName
-      $id = [int]$e.Id
-      if (($provider -eq 'disk' -and $id -in 7, 51, 153) -or ($provider -in 'Ntfs', 'Microsoft-Windows-Ntfs' -and $id -eq 55)) {
-        '{0}/{1}' -f $provider, $id
-      }
-    })
-  return @{ Ok = $true; Count = $hits.Count; Ids = [string[]]@($hits | Sort-Object -Unique) }
+  $counted = New-Object System.Collections.Generic.List[string]
+  $other = 0
+  foreach ($e in $events) {
+    $provider = [string]$e.ProviderName
+    $id = [int]$e.Id
+    $first = ''
+    $properties = $e.Properties
+    if ($null -ne $properties -and $properties.Count -gt 0 -and $null -ne $properties[0]) { $first = ([string]$properties[0].Value).Trim() }
+    $onSystem = $false
+    if ($provider -eq 'disk' -and $id -in 7, 51, 153) {
+      $device = [regex]::Match($first, '^\\Device\\Harddisk([0-9]{1,4})\\', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+      $onSystem = $device.Success -and ($SystemDisks -contains [int]$device.Groups[1].Value)
+    } elseif ($provider -in 'Ntfs', 'Microsoft-Windows-Ntfs' -and $id -eq 55) {
+      $onSystem = ($drive -ne '' -and $first.TrimEnd('\') -eq $drive)
+    } else {
+      continue
+    }
+    if ($onSystem) { $counted.Add(('{0}/{1}' -f $provider, $id)) } else { $other++ }
+  }
+  return @{ Ok = $true; Count = $counted.Count; Other = $other; Ids = [string[]]@($counted.ToArray() | Sort-Object -Unique) }
 }
 
 function Get-ToolDiskChip {
   <#
   .SYNOPSIS
-    The Disk chip (spec 5). Never throws.
+    The Disk chip (spec 5, ruling RD-R10): the physical disk(s) holding the system volume. Never throws.
   .DESCRIPTION
-    Sources: the grandchild 'disks' (Get-PhysicalDisk), the grandchild 'reliability' (Get-StorageReliabilityCounter;
-    not run when the disk list failed, as it would hang or fail the same way) and Get-ToolDiskEventCount for
-    repair.thresholds.diskEventDays (30).
-      crit    : a disk whose HealthStatus is not Healthy, uncorrected read or write errors above 0, or any listed disk
-                event (the reason 'health', 'errors' or 'events');
+    Sources: the grandchild 'disks' (Get-PhysicalDisk, and the system volume's disk numbers from Get-Partition), the
+    grandchild 'reliability' (Get-StorageReliabilityCounter; run only when the disk list came back with disks, as it
+    would hang or fail the same way), both bounded by toolStep.disks (review M7: a hung disk must not keep the strip
+    loading for minutes), and Get-ToolDiskEventCount for repair.thresholds.diskEventDays (30).
+    Only the system disk(s) are judged:
+      crit    : HealthStatus Warning or Unhealthy, uncorrected read or write errors above 0, or a listed event on the
+                system disk or volume (the reason 'health', 'errors' or 'events');
       warn    : wear at or above thresholds.diskWearPercent (80) or a temperature at or above
                 thresholds.diskTemperatureC (60) ('wear', 'temperature');
-      unknown : a source failed or timed out ('disks', 'reliability' or 'events' in Detail.Failed), or no disk was
-                listed, and nothing above;
+      unknown : a HealthStatus that is empty, Unknown or anything else ('health' in Detail.Failed), a source that
+                failed or timed out ('disks', 'reliability', 'events'), or no system disk found ('systemDisk'), and
+                nothing above;
       ok      : else.
-    A known problem wins over a source that failed. Detail = @{ Reasons; Failed; Events; EventIds; Disks = @( @{
-    DeviceId; FriendlyName; MediaType; BusType; Health; Wear; Temperature; ReadErrorsUncorrected;
-    WriteErrorsUncorrected } ) } (ASCII).
+    A known problem wins over a source that failed. Other disks (the stick) and their events are only recorded:
+    Detail = @{ Reasons; Failed; Events (system); OtherEvents; EventIds; SystemDisks; Disks = @( @{ DeviceId; System;
+    FriendlyName; MediaType; BusType; Health; Wear; Temperature; ReadErrorsUncorrected; WriteErrorsUncorrected } ) }
+    (ASCII).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -423,33 +571,46 @@ function Get-ToolDiskChip {
     $days = [int](Get-ToolRepairNumber -Config $Run.Config -Path 'thresholds', 'diskEventDays' -Default 30)
     $failed = New-Object System.Collections.Generic.List[string]
     $reasons = New-Object System.Collections.Generic.List[string]
+    $letter = Get-ToolSystemLetter
 
     $disks = @()
-    $list = Invoke-ToolJsonChild -Run $Run -Name 'disks' -Command $script:ToolDisksCommand
+    $systemDisks = [int[]]@()
+    $list = @{ Ok = $false; TimedOut = $false; Data = $null; Error = 'no system drive letter' }
+    if ($letter -ne '') {
+      $list = Invoke-ToolJsonChild -Run $Run -Name 'disks' -Command ($script:ToolDisksCommand.Replace('<L>', $letter)) -StepTimeout 'disks'
+    }
     if ($list.Ok -and $list.Data.ContainsKey('Items')) {
       $disks = @(foreach ($d in @($list.Data['Items'])) { if ($d -is [System.Collections.IDictionary]) { $d } })
-      if ($disks.Count -eq 0) { $failed.Add('disks') }
+      $systemDisks = [int[]]@(foreach ($n in @($list.Data['SystemDisks'])) {
+          $number = 0
+          if ($null -ne $n -and [int]::TryParse([string]$n, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) { $number }
+        })
     } else {
       $failed.Add('disks')
     }
     $counters = @{}
-    if ($list.Ok) {
-      $reliability = Invoke-ToolJsonChild -Run $Run -Name 'reliability' -Command $script:ToolReliabilityCommand
+    if ($disks.Count -gt 0) {
+      $reliability = Invoke-ToolJsonChild -Run $Run -Name 'reliability' -Command $script:ToolReliabilityCommand -StepTimeout 'disks'
       if ($reliability.Ok -and $reliability.Data.ContainsKey('Items')) {
         foreach ($c in @($reliability.Data['Items'])) { if ($c -is [System.Collections.IDictionary]) { $counters[[string]$c['DeviceId']] = $c } }
       } else {
         $failed.Add('reliability')
       }
     } else {
-      Add-ToolLog -Run $Run -Text 'Disk list not read: the disk counters were skipped'
+      Add-ToolLog -Run $Run -Text 'No disk list: the disk counters were skipped'
       $failed.Add('reliability')
     }
-    $events = Get-ToolDiskEventCount -Days $days
+    $systemDrive = ''
+    if ($letter -ne '') { $systemDrive = $letter + ':' }
+    $events = Get-ToolDiskEventCount -Days $days -SystemDisks $systemDisks -SystemDrive $systemDrive
     if (-not $events.Ok) { $failed.Add('events') } elseif ($events.Count -gt 0) { $reasons.Add('events') }
 
     $rows = New-Object System.Collections.Generic.List[object]
+    $systemSeen = 0
     foreach ($d in $disks) {
       $id = [string]$d['DeviceId']
+      $number = -1
+      $isSystem = [int]::TryParse($id, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and ($systemDisks -contains $number)
       $c = $counters[$id]
       if ($c -isnot [System.Collections.IDictionary]) { $c = @{} }
       $health = [string]$d['HealthStatus']
@@ -457,16 +618,24 @@ function Get-ToolDiskChip {
       $heat = ConvertTo-ToolNumber -Value $c['Temperature']
       $readErrors = ConvertTo-ToolNumber -Value $c['ReadErrorsUncorrected']
       $writeErrors = ConvertTo-ToolNumber -Value $c['WriteErrorsUncorrected']
-      if ($health -ne '' -and $health -ne 'Healthy' -and -not $reasons.Contains('health')) { $reasons.Add('health') }
-      if ((($null -ne $readErrors -and $readErrors -gt 0) -or ($null -ne $writeErrors -and $writeErrors -gt 0)) -and -not $reasons.Contains('errors')) { $reasons.Add('errors') }
-      if ($null -ne $wear -and $wear -ge $wearLimit -and -not $reasons.Contains('wear')) { $reasons.Add('wear') }
-      if ($null -ne $heat -and $heat -ge $heatLimit -and -not $reasons.Contains('temperature')) { $reasons.Add('temperature') }
+      if ($isSystem) {
+        $systemSeen++
+        if ($health -cin 'Warning', 'Unhealthy') {
+          if (-not $reasons.Contains('health')) { $reasons.Add('health') }
+        } elseif ($health -cne 'Healthy' -and -not $failed.Contains('health')) {
+          $failed.Add('health')
+        }
+        if ((($null -ne $readErrors -and $readErrors -gt 0) -or ($null -ne $writeErrors -and $writeErrors -gt 0)) -and -not $reasons.Contains('errors')) { $reasons.Add('errors') }
+        if ($null -ne $wear -and $wear -ge $wearLimit -and -not $reasons.Contains('wear')) { $reasons.Add('wear') }
+        if ($null -ne $heat -and $heat -ge $heatLimit -and -not $reasons.Contains('temperature')) { $reasons.Add('temperature') }
+      }
       $rows.Add(@{
-          DeviceId = (ConvertTo-ScreenText -Text $id); FriendlyName = (ConvertTo-ScreenText -Text $d['FriendlyName'])
+          DeviceId = (ConvertTo-ScreenText -Text $id); System = [bool]$isSystem; FriendlyName = (ConvertTo-ScreenText -Text $d['FriendlyName'])
           MediaType = (ConvertTo-ScreenText -Text $d['MediaType']); BusType = (ConvertTo-ScreenText -Text $d['BusType'])
           Health = (ConvertTo-ScreenText -Text $health); Wear = $wear; Temperature = $heat
           ReadErrorsUncorrected = $readErrors; WriteErrorsUncorrected = $writeErrors })
     }
+    if ($list.Ok -and $systemSeen -eq 0) { $failed.Add('systemDisk') }
 
     $level = 'ok'
     if ($reasons.Contains('health') -or $reasons.Contains('errors') -or $reasons.Contains('events')) {
@@ -477,7 +646,8 @@ function Get-ToolDiskChip {
       $level = 'unknown'
     }
     return (New-ToolChip -Level $level -Detail @{
-        Reasons = $reasons.ToArray(); Failed = $failed.ToArray(); Events = $events.Count; EventIds = $events.Ids; Disks = $rows.ToArray() })
+        Reasons = $reasons.ToArray(); Failed = $failed.ToArray(); Events = $events.Count; OtherEvents = $events.Other
+        EventIds = $events.Ids; SystemDisks = $systemDisks; Disks = $rows.ToArray() })
   } catch {
     return (New-ToolUnknownChip -Name 'Disk' -Reason $_.Exception.Message)
   }
@@ -589,7 +759,7 @@ function Invoke-ToolStepSafetyInternet {
 }
 
 function Invoke-ToolStepSafetyDisk {
-  # Step safetyDisk: the Disk chip (Get-ToolDiskChip, its grandchildren bounded by the action's time).
+  # Step safetyDisk: the Disk chip (Get-ToolDiskChip, its grandchildren bounded by toolStep.disks).
   [CmdletBinding()]
   [OutputType([string])]
   param([Parameter(Mandatory)][hashtable]$Run)

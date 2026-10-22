@@ -14,10 +14,24 @@ BeforeAll {
   # Task 2 adds the CBS.log reader (SFC's verdict, always English) and the ReAgent.xml reader (WinRE's supporting
   # evidence, read by attribute); Task 8 adds Read-ToolLogErrors.
   $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs', 'Read-ToolCbsLog', 'Get-ToolReAgentState')
-  # A key protector's password: the WMI method that returns it, or the property / parameter that holds it
-  # ($kp.RecoveryPassword, -RecoveryPassword...). The protector TYPE's name 'RecoveryPassword' as a plain label (the
-  # BitLocker chip lists the types) is not a read, so the pattern needs the '.' or '-' in front.
-  $script:secretPattern = '(?i)GetKeyProtectorNumericalPassword|[.\-]RecoveryPassword'
+  # A key protector's password (review M3). No repair file names the WMI method that returns it, the BitLocker
+  # module's cmdlet whose protector objects carry it, or manage-bde; and the word RecoveryPassword appears only as the
+  # one string constant 'RecoveryPassword' inside $script:ToolKeyProtectorTypes (the protector TYPE's name, which the
+  # BitLocker chip lists). Anywhere else (a property, an index, a bare word, a comment, a here-string) it is flagged.
+  $script:bannedSecretPattern = '(?i)GetKeyProtectorNumericalPassword|manage-bde|Get-BitLockerVolume'
+  function Get-SecretViolation {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][string]$Name)
+    foreach ($m in [regex]::Matches($Text, $script:bannedSecretPattern)) { '{0} offset {1}: {2}' -f $Name, $m.Index, $m.Value }
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    $table = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:ToolKeyProtectorTypes' }, $true)
+    foreach ($t in $tokens) {
+      if ($t.Text -notmatch '(?i)RecoveryPassword') { continue }
+      $allowed = ($null -ne $table) -and ($t.Kind -eq 'StringLiteral') -and ($t.Value -ceq 'RecoveryPassword') -and
+        ($t.Extent.StartOffset -ge $table.Extent.StartOffset) -and ($t.Extent.EndOffset -le $table.Extent.EndOffset)
+      if (-not $allowed) { '{0} line {1}: RecoveryPassword ({2})' -f $Name, $t.Extent.StartLineNumber, $t.Kind }
+    }
+  }
 
   function Get-EnclosingFunction {
     param([Parameter(Mandatory)][Management.Automation.Language.Ast]$Node)
@@ -88,14 +102,27 @@ $top = [IO.File]::ReadAllText('x')
     foreach ($f in $script:repairFiles) {
       $text = [IO.File]::ReadAllText($f.FullName)
       $text | Should -Not -Match '(?i)/release|/renew|ResetBase' -Because $f.Name
-      $text | Should -Not -Match $script:secretPattern -Because $f.Name
+      @(Get-SecretViolation -Text $text -Name $f.Name) -join "`n" | Should -BeNullOrEmpty
     }
   }
-  It 'the password pattern flags a read of the password and passes the protector type''s name' {
-    foreach ($bad in '$kp.RecoveryPassword', 'Add-BitLockerKeyProtector -RecoveryPasswordProtector', "Invoke-CimMethod -MethodName 'GetKeyProtectorNumericalPassword'") {
-      $bad | Should -Match $script:secretPattern
-    }
-    "@{ 3 = 'RecoveryPassword' }" | Should -Not -Match $script:secretPattern
+  It 'the password guard flags every way of reaching a password and passes only the protector type table''s constant (review M3)' {
+    $snippet = @'
+$script:ToolKeyProtectorTypes = @{ 1 = 'Tpm'; 3 = 'RecoveryPassword' }
+$a = $kp.RecoveryPassword
+$b = $kp['RecoveryPassword']
+$c = $x | Select-Object -ExpandProperty RecoveryPassword
+# keeps the RecoveryPassword
+$d = "the $($kp.RecoveryPassword)"
+manage-bde -protectors -get C:
+Get-BitLockerVolume -MountPoint C:
+$e = Invoke-CimMethod -InputObject $v -MethodName 'GetKeyProtectorNumericalPassword'
+'@
+    $found = @(Get-SecretViolation -Text $snippet -Name 'snippet')
+    $found.Count | Should -Be 8
+    ($found -join '|') | Should -Not -Match 'line 1:'
+    foreach ($line in 2, 3, 4, 5, 6) { ($found -join '|') | Should -Match ('line {0}:' -f $line) }
+    foreach ($word in 'manage-bde', 'Get-BitLockerVolume', 'GetKeyProtectorNumericalPassword') { ($found -join '|') | Should -Match $word }
+    @(Get-SecretViolation -Text "`$other = @{ 3 = 'RecoveryPassword' }" -Name 'x').Count | Should -Be 1
   }
   It 'the CBS.log and ReAgent.xml readers exist in src\Repair (the allow-list names real functions)' {
     $names = @(foreach ($f in $script:repairFiles) {

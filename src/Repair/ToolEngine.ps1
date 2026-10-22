@@ -45,11 +45,13 @@
 #
 # Task 2: safety (the strip, computed in this child: spec 5; ToolSafety.ps1) and health (the read-only Health check:
 # spec 6.1; ToolChecks.ps1). Neither has a servicing step: read-only actions run with a restart pending (spec 5).
+# The Health check reads the disk state (volumeState, Get-Volume); volumeScan (Repair-Volume -Scan, which can fix
+# online) is Standard repair's and Post-clone's (ruling RD-R12; Task 6 adds those actions).
 $script:ToolActionCatalog = [ordered]@{
   safety = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
               Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck') }
   health = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
-              Steps = [string[]]@('volumeScan', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
+              Steps = [string[]]@('volumeState', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
 }
 $script:ToolSteps = @{
   safetyRestart   = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
@@ -58,6 +60,7 @@ $script:ToolSteps = @{
   safetyInternet  = @{ Function = 'Invoke-ToolStepSafetyInternet'; Servicing = $false }
   safetyDisk      = @{ Function = 'Invoke-ToolStepSafetyDisk'; Servicing = $false }
   safetyDiskCheck = @{ Function = 'Invoke-ToolStepSafetyDiskCheck'; Servicing = $false }
+  volumeState     = @{ Function = 'Invoke-ToolStepVolumeState'; Servicing = $false }
   volumeScan      = @{ Function = 'Invoke-ToolStepVolumeScan'; Servicing = $false }
   imageCheck      = @{ Function = 'Invoke-ToolStepImageCheck'; Servicing = $false }
   imageScan       = @{ Function = 'Invoke-ToolStepImageScan'; Servicing = $false }

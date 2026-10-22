@@ -8,7 +8,7 @@
                        "tool": { "safety": 3, "health": 150, "standard": 300, "postClone": 420, "dismSource": 240, "wuReset": 30,
                                  "diskCheck": 5, "netInfo": 3, "netReset": 15, "netRestore": 10,
                                  "ghostList": 10, "ghostRemove": 30, "quickReport": 10, "fullReport": 45, "compare": 10 },
-                       "toolStep": { "native": 3, "grandchild": 3, "volumeScan": 60, "imageCheck": 15, "imageScan": 60, "dism": 150,
+                       "toolStep": { "native": 3, "grandchild": 3, "disks": 1, "volumeScan": 60, "imageCheck": 15, "imageScan": 60, "dism": 150,
                                      "sfc": 90, "timeSync": 3, "pnpScan": 5, "componentCleanup": 90, "retrim": 30, "wuScan": 15,
                                      "service": 2, "pnputil": 2, "ghostList": 8, "drivers": 10, "printers": 1, "events": 5,
                                      "msinfo32": 4, "wuLog": 5 } },
@@ -97,7 +97,8 @@
   ],
   "toolbox": { "language": "en" },
   "repair": {
-    "internet": { "host": "www.msftconnecttest.com", "url": "https://www.msftconnecttest.com/connecttest.txt", "seconds": 5 },
+    "internet": { "host": "www.microsoft.com", "url": "https://www.microsoft.com/", "probeUrl": "http://www.msftconnecttest.com/connecttest.txt",
+                  "probeContent": "Microsoft Connect Test", "seconds": 5 },
     "freeSpace": { "minPercent": 10, "minGB": 15 },
     "reportMaxKB": 150,
     "thresholds": { "clockOffsetMinutes": 2, "diskWearPercent": 80, "diskTemperatureC": 60, "diskEventDays": 30,
