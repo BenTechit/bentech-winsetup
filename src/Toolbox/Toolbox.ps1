@@ -16,9 +16,9 @@
 # seam).
 #
 # And the seam (Task 4): Test-ToolboxHost (can this process show a WPF window at all?) and Get-SetupChoices, which
-# Main.ps1 calls where it called Show-StartScreen: the window, or the unchanged console start screen when the host
-# check or the window fails, with the same parameters and the same return contract (Choices, or $null for Cancel).
-# It is also the one place that stops WPF once the window is gone.
+# Main.ps1 calls where it called Show-StartScreen: the window, or the console start screen when the host check or
+# the window fails (with -NoAutoStart: it waits for Enter, ruling TB-R8), with the same parameters and the same
+# return contract (Choices, or $null for Cancel). It is also the one place that stops WPF once the window is gone.
 #
 # The WPF rules (spec 5.1; the plan's Global Constraints), which every later addition keeps:
 #   - The window's state lives in $window.Tag (the plan's "Toolbox model and window state"). Every handler is one
@@ -232,7 +232,8 @@ function New-ToolboxWindow {
     Adds one profile tile per Get-SetupProfiles entry to ProfilePanel and one tweak row per Get-TweakCatalog entry to
     TweakPanel (Update-ToolboxView hides the rows the rules rule out), fills the machine values once (shown as
     read, left-to-right), puts the window state in Tag (the plan's "Toolbox model and window state": Outcome,
-    Choices and Error $null, Closing $false, Timer $null) and calls Update-ToolboxView. No handlers (Task 3).
+    Choices and Error $null, Closing $false, Timer $null; PowerWarned $false until a failed power read is logged,
+    review M2) and calls Update-ToolboxView. No handlers (Task 3).
     -ReadOnAC is what the power timer will call (Task 3).
   #>
   [CmdletBinding()]
@@ -278,7 +279,7 @@ function New-ToolboxWindow {
     Model = $Model; Machine = $Machine; Config = $Config; Version = $Version
     Strings = (New-ToolboxStringTable -Config $Config)
     ProfileTiles = $tiles; TweakRows = $rows
-    ReadOnAC = $ReadOnAC; Timer = $null
+    ReadOnAC = $ReadOnAC; Timer = $null; PowerWarned = $false
     Outcome = $null; Choices = $null; Error = $null; Closing = $false
   }
   Update-ToolboxView -Window $window
@@ -493,14 +494,15 @@ function Invoke-ToolboxAction {
       - Drag: DragMove(). Its InvalidOperationException (the button is already up) is ignored: the one benign
         exception.
       - Power: Tag.ReadOnAC. A read that throws keeps the last value and logs WARN 'Could not read the power
-        state for the toolbox'; otherwise the model (Update-ToolboxModel -Action Power), then the view.
+        state for the toolbox', once per window (Tag.PowerWarned; review M2: not on every 5-second tick);
+        otherwise the model (Update-ToolboxModel -Action Power), then the view.
       - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
         handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
       - Any other action (Profile, Mode, Office, Remote, SevenZip, RestorePoint, Tweak, Language):
         Update-ToolboxModel, then Update-ToolboxView. A control never decides its own state: the model does.
     Any exception: the window closes as Failed with the message in ASCII (Close-ToolboxWindow), and setup.log
-    gets one ERROR line 'Toolbox action failed' with @{ action; error } (ASCII). A failure is never read as
-    Cancel (spec 5.1).
+    gets one ERROR line 'Toolbox action failed' with @{ action; error; type } (ASCII; type is the exception's
+    .NET type name, review M3). A failure is never read as Cancel (spec 5.1).
   #>
   [CmdletBinding()]
   param(
@@ -558,7 +560,10 @@ function Invoke-ToolboxAction {
         try {
           $onAC = [bool](& $state.ReadOnAC)
         } catch {
-          Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+          if ($state.PowerWarned -ne $true) {
+            $state.PowerWarned = $true
+            Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+          }
         }
         if ($null -ne $onAC) {
           $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config
@@ -583,7 +588,8 @@ function Invoke-ToolboxAction {
     }
   } catch {
     $message = ConvertTo-ScreenText -Text $_.Exception.Message
-    Write-SetupLog -Level ERROR -Message 'Toolbox action failed' -Data @{ action = (ConvertTo-ScreenText -Text $Action); error = $message }
+    Write-SetupLog -Level ERROR -Message 'Toolbox action failed' -Data @{ action = (ConvertTo-ScreenText -Text $Action); error = $message
+      type = (ConvertTo-ScreenText -Text $_.Exception.GetType().FullName) }
     if ($null -ne $window) { Close-ToolboxWindow -Window $window -Outcome 'Failed' -ErrorText $message }
   }
 }
@@ -628,22 +634,25 @@ function Invoke-ToolboxUnhandled {
   .DESCRIPTION
     Marks the exception handled, so WPF does not end the process. When a toolbox window is open
     ($script:ToolboxOpenWindow), closes it as Failed with the message in ASCII. Logs ERROR 'Toolbox error' with
-    @{ error } (ASCII).
+    @{ error; type } (ASCII; type is the exception's .NET type name, review M3).
   #>
   [CmdletBinding()]
   param([AllowNull()]$EventArgs)
 
   try {
     $message = ''
+    $type = ''
     if ($null -ne $EventArgs) {
       $EventArgs.Handled = $true
       $message = ConvertTo-ScreenText -Text $EventArgs.Exception.Message
+      if ($null -ne $EventArgs.Exception) { $type = ConvertTo-ScreenText -Text $EventArgs.Exception.GetType().FullName }
     }
     $open = $script:ToolboxOpenWindow
     if ($null -ne $open) { Close-ToolboxWindow -Window $open -Outcome 'Failed' -ErrorText $message }
-    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = $message }
+    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = $message; type = $type }
   } catch {
-    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    Write-SetupLog -Level ERROR -Message 'Toolbox error' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message)
+      type = (ConvertTo-ScreenText -Text $_.Exception.GetType().FullName) }
   }
 }
 
@@ -652,10 +661,11 @@ function Set-ToolboxWindowSize {
   .SYNOPSIS
     Fits the window into the screen's work area (spec 4.1): at most 1000 x 680, centred. Returns nothing.
   .DESCRIPTION
-    On a small screen (the basic display driver at 1024x768, or 150% scaling) the window takes the whole work
-    area and its content scrolls (ContentScroll). -WorkArea is in device-independent pixels, as
-    [Windows.SystemParameters]::WorkArea gives it, and may start away from 0,0 (a second monitor, a taskbar at
-    the top or the left).
+    On a small screen (150% scaling at 1024x768) the window takes the whole work area and its content scrolls
+    (ContentScroll). -WorkArea is in device-independent pixels, as [Windows.SystemParameters]::WorkArea gives it,
+    and may start away from 0,0 (a second monitor, a taskbar at the top or the left). A work area whose width or
+    height is not above 0 (Rect.Empty, a zero size) is ignored: the window keeps its 1000 x 680 (review M4: a
+    zero-size modal window could never be seen, and it waits for Start).
   #>
   [CmdletBinding()]
   param(
@@ -663,6 +673,7 @@ function Set-ToolboxWindowSize {
     [Parameter(Mandatory)][System.Windows.Rect]$WorkArea
   )
 
+  if (-not ($WorkArea.Width -gt 0 -and $WorkArea.Height -gt 0)) { return }
   $width = [math]::Min(1000, $WorkArea.Width)
   $height = [math]::Min(680, $WorkArea.Height)
   $Window.Width = $width
@@ -699,17 +710,21 @@ function Show-ToolboxWindow {
   .DESCRIPTION
     The same inputs as Show-StartScreen. In order:
       1. software rendering for the whole process (spec 5.1: the PC has no GPU driver yet);
-      2. the power state (a read that throws counts as on AC, logged WARN) and Administrator protection (logged
-         WARN when it is not Off);
+      2. the power state (a read that throws counts as on AC, logged WARN, and the window's power timer then
+         logs no second one: Tag.PowerWarned) and Administrator protection (logged WARN when it is not Off);
       3. the model, the window (its power timer reads -OnAC), the handlers and the work-area clamp;
       4. the power timer, started (Tag.Timer);
       5. the dispatcher backstop (Invoke-ToolboxUnhandled), for exceptions no handler caught;
-      6. the dialog, through the -ShowDialog seam, with $script:ToolboxOpenWindow set for the backstop;
+      6. the dialog, through the -ShowDialog seam, with $script:ToolboxOpenWindow set for the backstop. A dialog
+         that returns while the Outcome is still empty (the window was not closed: WPF's modal loop ended some
+         other way) is Failed at once, BEFORE the cleanup below closes the window, so the Closing handler (which
+         reads an empty Outcome as Cancel) can never turn it into Cancel (review M1: failure is never Cancel, by
+         construction);
       7. finally: the timer stops, the backstop is removed, $script:ToolboxOpenWindow is cleared and the window
          is closed (a Close() that fails is logged WARN).
-    The result is Tag's Outcome, Choices and Error. An Outcome still empty after the dialog is Failed, never
-    Cancel (spec 5.1: a failure is never read as a Cancel). Any exception is Failed with its message in ASCII,
-    logged ERROR 'Toolbox window failed'. WPF is not shut down here (Get-SetupChoices does that).
+    The result is Tag's Outcome, Choices and Error. Any exception is Failed with its message in ASCII, logged
+    ERROR 'Toolbox window failed' with @{ error; line; type }. WPF is not shut down here (Get-SetupChoices does
+    that).
 
     The seams (production defaults shown):
       -ShowDialog       shows the window as a dialog; the only place that does
@@ -735,15 +750,18 @@ function Show-ToolboxWindow {
     [System.Windows.Media.RenderOptions]::ProcessRenderMode = [System.Windows.Interop.RenderMode]::SoftwareOnly
 
     $onACNow = $true
+    $powerWarned = $false
     try {
       $onACNow = [bool](& $OnAC)
     } catch {
+      $powerWarned = $true
       Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     }
     $model = New-ToolboxModel -Machine $Machine -Config $Config -Previous $Previous -IsFresh $IsFresh -OnAC $onACNow -AdminProtection ([string](& $AdminProtection))
     if ($model.AdminProtection -ne 'Off') { Write-SetupLog -Level WARN -Message 'Administrator protection is not off' -Data @{ state = $model.AdminProtection } }
 
     $window = New-ToolboxWindow -Model $model -Machine $Machine -Config $Config -Version $Version -ReadOnAC $OnAC
+    $window.Tag.PowerWarned = $powerWarned
     $timer = $null
     $backstop = { Invoke-ToolboxUnhandled -EventArgs $_ }
     try {
@@ -755,6 +773,11 @@ function Show-ToolboxWindow {
       $window.Dispatcher.Add_UnhandledException($backstop)
       $script:ToolboxOpenWindow = $window
       $null = & $ShowDialog $window
+      # Before the finally's Close(): its Closing handler would read an empty Outcome as Cancel (review M1).
+      if ($null -eq $window.Tag.Outcome) {
+        $window.Tag.Outcome = 'Failed'
+        $window.Tag.Error = 'The toolbox dialog ended without an outcome'
+      }
     } finally {
       if ($null -ne $timer) { $timer.Stop() }
       $window.Dispatcher.Remove_UnhandledException($backstop)
@@ -767,11 +790,11 @@ function Show-ToolboxWindow {
     }
 
     $state = $window.Tag
-    if ($null -eq $state.Outcome) { return @{ Outcome = 'Failed'; Choices = $null; Error = 'The toolbox window closed without an outcome' } }
     return @{ Outcome = $state.Outcome; Choices = $state.Choices; Error = $state.Error }
   } catch {
     $message = ConvertTo-ScreenText -Text $_.Exception.Message
-    Write-SetupLog -Level ERROR -Message 'Toolbox window failed' -Data @{ error = $message; line = $_.InvocationInfo.ScriptLineNumber }
+    Write-SetupLog -Level ERROR -Message 'Toolbox window failed' -Data @{ error = $message; line = $_.InvocationInfo.ScriptLineNumber
+      type = (ConvertTo-ScreenText -Text $_.Exception.GetType().FullName) }
     return @{ Outcome = 'Failed'; Choices = $null; Error = $message }
   }
 }
@@ -843,12 +866,17 @@ function Get-SetupChoices {
       3. The outcome:
            Start   INFO 'Toolbox closed' with @{ outcome; profile }; the Choices are returned.
            Cancel  INFO 'Toolbox closed' with @{ outcome }; $null is returned (Esc on the console does the same).
-           Failed  ERROR 'Toolbox failed; using the console start screen' with @{ error }, then the console. So
-                   does anything else: no result, more than one value, an unknown outcome, or a Start without
-                   Choices. A failure is never read as a Cancel (spec 5.1).
-      4. The console is Show-StartScreen, unchanged (it keeps its own 30-second countdown on a fresh machine: the
-         emergency path). Its $null (Escape) is returned as it is; its Choices pass ConvertTo-ValidChoices.
-         An exception from the console is not caught here: it reaches the entry point's crash handler, as before.
+           Failed  ERROR 'Toolbox failed; using the console start screen' with @{ error } (and type, the .NET
+                   type name, when the window threw), then the console. So does anything else: no result, more
+                   than one value, an unknown outcome, or a Start without Choices. A failure is never read as a
+                   Cancel (spec 5.1).
+      4. The console is Show-StartScreen with the same parameters plus -NoAutoStart (ruling TB-R8): the console
+         fallback waits for Enter. It never counts down, not even on a fresh machine, because the window promised
+         to wait (Q18) and a window that failed after it opened must not start a run nobody pressed Start for, on
+         choices nobody made. Otherwise the console screen is unchanged. Its $null (Escape), or no result at all,
+         is returned as $null; a single hashtable passes ConvertTo-ValidChoices. Anything else (a string, more
+         than one value) throws 'Start screen returned an unexpected result': it never starts a run. That
+         exception, like any from the console, is not caught here: it reaches the entry point's crash handler.
     ConvertTo-ValidChoices drops unknown tweak ids; they are logged WARN 'Unknown tweak ids dropped'.
 
     The seams (production defaults shown), so no test opens a window or stops WPF:
@@ -874,6 +902,7 @@ function Get-SetupChoices {
   $p = @{ Machine = $Machine; Config = $Config; Version = $Version; Previous = $Previous; IsFresh = $IsFresh }
   $raw = $null
   $fromToolbox = $false
+  $thrownType = ''
 
   $hostCheck = & $TestHost
   if ($hostCheck -isnot [System.Collections.IDictionary] -or $hostCheck['Ok'] -ne $true) {
@@ -886,6 +915,7 @@ function Get-SetupChoices {
       if ($outputs.Count -eq 1) { $result = $outputs[0] }
     } catch {
       $result = @{ Outcome = 'Failed'; Error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      $thrownType = ConvertTo-ScreenText -Text $_.Exception.GetType().FullName
     } finally {
       try {
         $null = & $ShutdownDispatcher
@@ -914,13 +944,19 @@ function Get-SetupChoices {
       }
     }
     if (-not $fromToolbox) {
-      Write-SetupLog -Level ERROR -Message 'Toolbox failed; using the console start screen' -Data @{ error = (ConvertTo-ScreenText -Text $failure) }
+      $data = @{ error = (ConvertTo-ScreenText -Text $failure) }
+      if ($thrownType -ne '') { $data.type = $thrownType }
+      Write-SetupLog -Level ERROR -Message 'Toolbox failed; using the console start screen' -Data $data
     }
   }
 
   if (-not $fromToolbox) {
-    $raw = & $ShowConsole $p
-    if ($null -eq $raw) { return $null }
+    $console = $p.Clone()
+    $console.NoAutoStart = $true   # TB-R8: the console fallback waits for Enter
+    $fromConsole = @(& $ShowConsole $console)
+    if ($fromConsole.Count -eq 0 -or ($fromConsole.Count -eq 1 -and $null -eq $fromConsole[0])) { return $null }
+    if ($fromConsole.Count -ne 1 -or $fromConsole[0] -isnot [hashtable]) { throw 'Start screen returned an unexpected result' }
+    $raw = $fromConsole[0]
   }
 
   $valid = ConvertTo-ValidChoices -Choices $raw -Config $Config -Machine $Machine

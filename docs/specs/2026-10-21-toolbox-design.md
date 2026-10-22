@@ -97,7 +97,8 @@ The content scrolls when the window is clamped to a small screen's work area.
 - **Inside:** the window's outcome is **Start**, **Cancel** or **Failed**.
   - Start returns the Choices.
   - Cancel returns `$null`.
-  - **Only Failed** falls back to the unchanged console `Show-StartScreen`, which keeps its own 30-second auto-start (the emergency path).
+  - **Only Failed** falls back to the console `Show-StartScreen` (the emergency path).
+  - **The console fallback waits for Enter (TB-R8).** `Get-SetupChoices` always calls it with `-NoAutoStart`: no countdown and no automatic start, even on a fresh PC. In every fallback case the technician has just launched the setup and is at the PC, and a window that fails after it opened must not start a run nobody pressed Start for, on choices nobody made. Everything else on the console screen (lines, keys, colours) is unchanged, and without `-NoAutoStart` `Show-StartScreen` behaves exactly as before.
   - A failure is never read as a Cancel.
 - **Checks before WPF loads.** Any one failing means Failed, which falls back to the console:
   - the thread is STA;
@@ -268,11 +269,12 @@ Every WinUtil tweak not listed in 6.3 was rejected by rule:
 ## 7. Files
 - **New:**
   - `src\Toolbox\Strings.ps1`: the string tables;
-  - `src\Toolbox\Toolbox.ps1`: XAML here-strings, `Show-ToolboxWindow`, `Invoke-ToolboxAction`, the language switch;
-  - `src\Toolbox\SetupPlanner.ps1`: pure functions for profiles, validation and the plan preview;
+  - `src\Toolbox\Xaml.ps1`: the window's XAML (`$script:ToolboxXaml`; moved out of `Toolbox.ps1`, TB-R6);
+  - `src\Toolbox\Toolbox.ps1`: `Show-ToolboxWindow`, `Invoke-ToolboxAction`, the language switch, `Test-ToolboxHost` and `Get-SetupChoices`;
+  - `src\Toolbox\SetupPlanner.ps1` (created in Task 1): pure functions for profiles, validation and the plan preview;
   - `src\Steps\Tweaks.ps1`;
   - `tools\Preview-Toolbox.ps1`.
-- **Changed:** `src\Entry\Main.ps1` (line 295), `src\UI\StartScreen.ps1` (`New-DefaultChoices`), `src\Engine\Catalog.ps1`, `src\Steps\Finalize.ps1`, `src\Report\Report.ps1`, `config\config.json`, `tools\Build-Bundle.ps1` (`$BundleOrder`).
+- **Changed:** `src\Entry\Main.ps1` (the start-screen call, now `Get-SetupChoices`), `src\UI\StartScreen.ps1` (`New-DefaultChoices`, `Format-PreviousRun`, `Show-StartScreen -NoAutoStart`), `src\Detect\Detection.ps1` (`Test-AdminProtection`), `src\Steps\Prepare.ps1` (`Set-RegistryString`, `Get-RegistryValue`), `src\State\State.ps1` (the restore-point keys), `src\Engine\Catalog.ps1`, `src\Steps\Finalize.ps1`, `src\Report\Report.ps1`, `config\config.json`, `tools\Build-Bundle.ps1` (`$BundleOrder`).
 - **Untouched:** the launcher, the keys, the console progress and final screens, and the resume path.
 
 ## 8. Rules this changes
@@ -280,7 +282,7 @@ Every WinUtil tweak not listed in 6.3 was rejected by rule:
 |---|---|
 | v1 spec 36: "Any GUI framework. A console UI is enough." | One WPF window, before the run only. |
 | v2 spec 48: "No GUI (WinForms/WPF)." | The same. The console screens stay for the run. |
-| v2 Q1: zero-touch start (30-second countdown) | The toolbox waits for Start (Q18). The console fallback keeps its countdown. |
+| v2 Q1: zero-touch start (30-second countdown) | The toolbox waits for Start (Q18). The console fallback waits for Enter (TB-R8): no countdown. |
 | v1 anti-goal "the tool stops and waits" | Still true for the run. Waiting before anything starts is intended. |
 | ASCII-only and colour rules | Unchanged for the console. The window may show Hebrew (`Strings.ps1` only) and uses hex colours. |
 
@@ -313,7 +315,7 @@ Every WinUtil tweak not listed in 6.3 was rejected by rule:
 2. **NumLock (`desktopOnly`) is enforced, not just a default.** It is applied only when Type is DESKTOP, including in the console fallback.
 3. **The restore-point frequency value is set and restored by the main process,** never left at 0, even when the child times out.
 4. **There is no undo in step 1.** Every original value is in setup.log.
-5. **The default profile wins over `defaults.office/remote/sevenZip`.** Those values stay for the console fallback, and for a profile that does not set them.
+5. **The default profile wins over `defaults.office/remote/sevenZip`.** With `defaults.profile` naming a valid profile (the console fallback opens on it too), those three do not decide the start choices. `defaults.office` and `defaults.sevenZip` only fill in a profile's own missing or invalid `office` and `sevenZip`; a profile without `remote` gets ANYDESK (`Get-RemoteChoice`, `SetupPlanner.ps1:70`), never `defaults.remote`. All three apply as before only when `defaults.profile` names no valid profile.
 6. **The Profile line in the report keeps the profile's name** even after Ben changes an option, followed by `(changed)`.
 7. **Business picks AnyDesk and ScreenConnect.** ScreenConnect means unattended access, so the Q16 rule applies: get the customer's OK at the counter.
 

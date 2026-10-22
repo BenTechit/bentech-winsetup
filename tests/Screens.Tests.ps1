@@ -551,6 +551,66 @@ Describe 'Show-StartScreen' {
   }
 }
 
+Describe 'Show-StartScreen -NoAutoStart (TB-R8: the console fallback waits for Enter)' {
+  # The same safety net as 'Show-StartScreen': the screen reaches the console only through its seams.
+  BeforeAll {
+    # Show-StartScreen -NoAutoStart against the fake clock, with Invoke-StartScreen's seams.
+    function Invoke-NoAutoStart([bool]$IsFresh = $true, [scriptblock]$KeyAt = { param($s) }) {
+      Reset-FakeClock
+      $script:screens = New-Object System.Collections.ArrayList
+      $script:keyAt = $KeyAt
+      $script:readCalls = 0
+      Show-StartScreen -Machine $script:m -Config $script:cfg -Version '2026.10.18.1' -Previous $null -IsFresh $IsFresh -NoAutoStart `
+        -ReadKey { $script:readCalls++; if ($script:readCalls -gt 5000) { throw 'runaway loop: the fake clock stopped advancing' }; & $script:keyAt (Get-ElapsedSeconds) } `
+        -Now { $script:clock } -Sleep { param($ms) $script:clock = $script:clock.AddMilliseconds($ms) } -OnAC { $true } -FlushInput { } `
+        -Write { param($lines) $null = $script:screens.Add(($lines -join "`n")) }
+    }
+    $script:enterLine = '   ENTER = start now           ESC = cancel, change nothing'
+  }
+  BeforeEach {
+    Mock Clear-Host { throw 'Clear-Host must not run in tests' }
+    Mock Write-Host { throw 'Write-Host must not run in tests' }
+    Mock Start-Process { throw 'Start-Process must not run in tests' }
+    Mock Write-SetupLog { }
+    Reset-ConsoleFrame
+  }
+  It 'a fresh PC never starts by itself: no countdown at all, still waiting at 120 s, then Escape is $null' {
+    $r = Invoke-NoAutoStart -KeyAt { param($s) if ($s -ge 120) { 'Escape' } }
+    $r | Should -BeNullOrEmpty
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 120
+    $screens.Count | Should -BeGreaterOrEqual 120   # it kept redrawing (the power line) the whole time
+    @($screens | Where-Object { $_ -match 'Starts by itself' }).Count | Should -Be 0
+    @($screens | Where-Object { ($_ -split "`n") -ccontains $script:enterLine }).Count | Should -Be $screens.Count
+  }
+  It 'only Enter starts it, long after 30 s, with the choices as toggled; toggles and stray keys start nothing' {
+    $script:sent = New-Object System.Collections.Queue
+    $r = Invoke-NoAutoStart -KeyAt { param($s)
+      if ($s -ge 5 -and -not $script:sent.Contains('Z')) { $script:sent.Enqueue('Z'); 'Z' }
+      elseif ($s -ge 20 -and -not $script:sent.Contains('X')) { $script:sent.Enqueue('X'); 'X' }
+      elseif ($s -ge 75) { 'Enter' } }
+    $r | Should -Not -BeNullOrEmpty; $r.SevenZip | Should -BeFalse; $r.Office | Should -Be 'CRAFT'
+    Get-ElapsedSeconds | Should -BeGreaterOrEqual 75
+    @($screens | Where-Object { $_ -match 'Starts by itself' }).Count | Should -Be 0
+  }
+  It 'the fresh screen is the countdown screen without its countdown line; every other line stays (Format-StartScreen)' {
+    $c = @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'CRAFT'; Remote = 'BOTH' }
+    $counting = @(Format-StartScreen -Machine $m -Choices $c -SecondsLeft 25 -Version 'v1' -OnAC $false -IsFresh $true -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'RED' })
+    $waiting = @(Format-StartScreen -Machine $m -Choices $c -SecondsLeft 25 -Version 'v1' -OnAC $false -IsFresh $true -Previous @{ StartedAt = '2026-10-17T14:05:09'; Color = 'RED' } -NoAutoStart)
+    $waiting | Should -Be @($counting | Where-Object { $_ -notlike '   Starts by itself*' })
+    $waiting.Count | Should -Be ($counting.Count - 1)
+    $waiting[-2] | Should -BeExactly $script:enterLine
+    $waiting[-1] | Should -BeExactly (' ' + ('=' * 77))
+  }
+  It 'a PC that does not look fresh shows exactly what it shows today' {
+    $c = @{ Mode = 'DESKTOP'; SevenZip = $false; Office = 'OFF' }
+    @(Format-StartScreen -Machine $m -Choices $c -SecondsLeft 30 -Version 'v1' -OnAC $true -IsFresh $false -Previous $null -NoAutoStart) |
+      Should -Be @(Format-StartScreen -Machine $m -Choices $c -SecondsLeft 30 -Version 'v1' -OnAC $true -IsFresh $false -Previous $null)
+    $r = Invoke-NoAutoStart -IsFresh $false -KeyAt { param($s) if ($s -ge 40) { 'Escape' } }
+    $r | Should -BeNullOrEmpty
+    @($screens | Where-Object { $_ -match 'press ENTER to run anyway' }).Count | Should -Be $screens.Count
+  }
+}
+
 Describe 'Format-ProgressScreen (v2)' {
   It 'draws header, checklist columns, NOW and JUST HAPPENED' {
     $l = Format-ProgressScreen -State (New-V2State) -Catalog $cat -Now $now -Width 100 -Height 30 -Spinner '/' -NowView $view -Activity $act

@@ -122,8 +122,11 @@ function Invoke-StepTweaks {
     (logged as 'skipped', not written); Unknown is treated as the same user, as the setup assumes, and is a
     WARN too. Each tweak's values then run in order (Invoke-TweakValue). A tweak is:
       - refused when any of its values is refused or differs: Note '<title> could not be applied';
-      - applied when none is and at least one value was written or already set;
-      - skipped when every value was skipped (all HKCU, Administrator protection On).
+      - skipped when none is and any of its values was skipped (HKCU, Administrator protection On), even when
+        its other values were written: NumLock's HKU\.DEFAULT value is still written and logged, but the
+        account's own value is not, so NumLock is not "applied" (final review M3);
+      - applied when none of its values was refused, differed or was skipped, and at least one was written
+        or already set.
     Done('<n> tweaks applied', n = the applied ones; verbatim also for 1), with the Note 'Per-user tweaks
     skipped: Windows Administrator protection is on' once when any value was skipped. Data holds ids only, in
     catalog order: @{ Applied; Refused; Skipped }. Activity 'Tweaks: <n> applied', plus ', <m> refused by
@@ -156,9 +159,11 @@ function Invoke-StepTweaks {
     if ($effective -cnotcontains $tweak.Id) { continue }
     $done = 0
     $failed = $false
+    $partSkipped = $false
     foreach ($value in @($tweak.Values)) {
       if ($protection -eq 'On' -and $value.Path.StartsWith('HKCU:\', [StringComparison]::OrdinalIgnoreCase)) {
         $anyValueSkipped = $true
+        $partSkipped = $true
         Write-SetupLog -Message 'Tweak value' -Data @{ tweak = $tweak.Id; path = (ConvertTo-ScreenText $value.Path); name = (ConvertTo-ScreenText $value.Name)
           type = [string]$value.Type; original = ''; new = ''; readBack = ''; result = 'skipped' }
         continue
@@ -169,10 +174,10 @@ function Invoke-StepTweaks {
     if ($failed) {
       $refused.Add($tweak.Id)
       $refusedNotes.Add(('{0} could not be applied' -f (ConvertTo-ScreenText $tweak.Title.en)))
-    } elseif ($done -gt 0) {
-      $applied.Add($tweak.Id)
-    } else {
+    } elseif ($partSkipped -or $done -eq 0) {
       $skipped.Add($tweak.Id)
+    } else {
+      $applied.Add($tweak.Id)
     }
   }
 

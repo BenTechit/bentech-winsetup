@@ -220,8 +220,9 @@ function Format-StartScreen {
 
     With -IsFresh the last block is the countdown ("Starts by itself in N s" and a bar that empties over
     StartCountdownSeconds); without it the countdown is replaced by the two-line "older than N days" notice
-    (-MaxAgeDays) and the screen never counts down. -Previous is the @{ StartedAt; Color } summary of an
-    earlier run, or $null.
+    (-MaxAgeDays) and the screen never counts down. -NoAutoStart (the toolbox's console fallback, ruling TB-R8)
+    leaves the countdown line out, so a fresh PC shows only the ENTER / ESC line; every other line is the same.
+    -Previous is the @{ StartedAt; Color } summary of an earlier run, or $null.
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -234,7 +235,8 @@ function Format-StartScreen {
     [Parameter(Mandatory)][bool]$IsFresh,
     [AllowNull()][hashtable]$Previous,
     [bool]$HasDriverTool = $true,
-    [int]$MaxAgeDays = 14
+    [int]$MaxAgeDays = 14,
+    [switch]$NoAutoStart
   )
 
   $frame = ' ' + ('=' * 77)
@@ -291,10 +293,12 @@ function Format-StartScreen {
   }
 
   if ($IsFresh) {
-    $barWidth = $script:StartBarWidth
-    $filled = [int][math]::Ceiling($barWidth * $SecondsLeft / [double]$script:StartCountdownSeconds)
-    $filled = [math]::Min($barWidth, [math]::Max(0, $filled))
-    $lines.Add(('   Starts by itself in {0} s   {1}{2}' -f $SecondsLeft, ('#' * $filled), ('.' * ($barWidth - $filled))))
+    if (-not $NoAutoStart) {
+      $barWidth = $script:StartBarWidth
+      $filled = [int][math]::Ceiling($barWidth * $SecondsLeft / [double]$script:StartCountdownSeconds)
+      $filled = [math]::Min($barWidth, [math]::Max(0, $filled))
+      $lines.Add(('   Starts by itself in {0} s   {1}{2}' -f $SecondsLeft, ('#' * $filled), ('.' * ($barWidth - $filled))))
+    }
     $lines.Add('   ENTER = start now           ESC = cancel, change nothing')
   } else {
     # Two lines, so neither is cut in an 80-column console.
@@ -358,6 +362,9 @@ function Show-StartScreen {
     polls for a key every 100 ms. When -IsFresh it counts down from 30 and starts at 0; any key other
     than Enter and Escape (a toggle, or an unknown key: Q1) resets the count to 30, so it starts by
     itself only when nobody touches it. When not fresh it never starts by itself: only Enter does.
+    -NoAutoStart (ruling TB-R8: Get-SetupChoices always passes it, so the toolbox's console fallback waits
+    for Enter) takes the countdown away even on a fresh PC: no countdown line, no automatic start, only Enter
+    starts; every other line, key and colour is the same.
     Escape returns $null. -Previous is the @{ StartedAt; Color } summary of an earlier run, or $null.
     The screen is drawn through the console writer, which can fail when the window is resized or closed
     in the middle of a frame; that is logged and the next frame starts over, it never stops the run.
@@ -381,6 +388,7 @@ function Show-StartScreen {
     [Parameter(Mandatory)][string]$Version,
     [AllowNull()][hashtable]$Previous,
     [Parameter(Mandatory)][bool]$IsFresh,
+    [switch]$NoAutoStart,
     [scriptblock]$ReadKey = { if ([Console]::KeyAvailable) { [Console]::ReadKey($true).Key.ToString() } },
     [scriptblock]$Now = { Get-Date },
     [scriptblock]$Sleep = { param($ms) Start-Sleep -Milliseconds $ms },
@@ -403,7 +411,7 @@ function Show-StartScreen {
   $maxAgeDays = [int]$Config.freshInstall.maxInstallAgeDays
   $draw = {
     $lines = @(Format-StartScreen -Machine $Machine -Choices $choices -SecondsLeft $secondsLeft -Version $Version -OnAC $powerOnAC -IsFresh $IsFresh -Previous $Previous `
-      -HasDriverTool $hasDriverTool -MaxAgeDays $maxAgeDays)
+      -HasDriverTool $hasDriverTool -MaxAgeDays $maxAgeDays -NoAutoStart:$NoAutoStart)
     try { $null = & $Write $lines }
     catch {
       # Best effort, like the power read: the next frame clears the window and draws everything again.
@@ -445,7 +453,7 @@ function Show-StartScreen {
     if ([math]::Max($sleptMs, ($current - $lastTick).TotalMilliseconds) -ge 1000) {
       $lastTick = $current
       $sleptMs = 0
-      if ($IsFresh) {
+      if ($IsFresh -and -not $NoAutoStart) {
         $secondsLeft--
         if ($secondsLeft -le 0) { return $choices }
       }

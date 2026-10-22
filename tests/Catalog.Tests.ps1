@@ -201,6 +201,8 @@ Describe 'Get-TweakCatalog guard: every rule keeps or drops (toolbox spec 5.3, r
     @{ Why = 'has a .. segment';                     P = '"HKCU:\\Software\\Microsoft\\..\\Classes"' }
     @{ Why = 'ends in ..';                           P = '"HKCU:\\Software\\Microsoft\\.."' }
     @{ Why = 'has a . segment';                      P = '"HKCU:\\Software\\.\\BenTech"' }
+    @{ Why = 'has a NUL (Windows cuts the name there: Policies)'; P = '"HKLM:\\SOFTWARE\\Policies\u0000x"' }   # task 1 re-review N1
+    @{ Why = 'has a control character (0x1F)';      P = '"HKCU:\\Software\\Ben\u001fTech"' }
   ) { Get-KeptCount (Get-ValueEntry ('{"path":' + $P + ',"name":"n","type":"DWord","op":"set","value":0}')) | Should -Be 0 }
   It 'keeps <Why>' -ForEach @(
     @{ Why = 'a DWord set of 0';                      F = '"name":"n","type":"DWord","op":"set","value":0' }

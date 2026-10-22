@@ -138,6 +138,9 @@ function ConvertTo-TweakValueEntry {
   # The path is judged as written, so nothing may change it on the way (review I1): the registry provider turns
   # '/' into '\' and resolves '.' and '..' segments, and New-Item -Path takes * ? [ ] as wildcards.
   if ($path.IndexOfAny([char[]]'/*?[]') -ge 0) { return $null }
+  # No control character either: Windows cuts a key name at a NUL, so 'Policies<NUL>x' passes the segment test
+  # below and still opens the Policies key (task 1 re-review N1).
+  if ($path -cmatch '[\x00-\x1F]') { return $null }
   foreach ($segment in $path.Split('\')) {
     # No Policies key anywhere, the last segment included: a policy makes Settings say "managed by your
     # organization". -eq ignores case.
@@ -218,7 +221,8 @@ function Get-TweakCatalog {
       - title.en is empty, or values is empty;
       - a value's path does not start with HKCU:\, HKLM:\ or Registry::HKEY_USERS\.DEFAULT\ (any case); has a
         Policies segment anywhere (any case, the last one too); or has a '/', a '*', '?', '[' or ']', or a '.'
-        or '..' segment (the provider would change the path after this check: review I1);
+        or '..' segment (the provider would change the path after this check: review I1); or has a control
+        character (0x00-0x1F: Windows cuts a name at a NUL, re-review N1);
       - a value's type is not String or DWord, or its op not set or clearBit;
       - a clearBit value is not a String with a power-of-two bit in 1..0x80000000 and a decimal-digit value;
       - a DWord set value is not an integer in 0..0x7FFFFFFF; a String value is not a string (it may be empty);

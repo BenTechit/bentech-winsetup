@@ -242,6 +242,16 @@ Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
     $w.Tag.Model.OnAC | Should -BeFalse; $w.FindName('WarnText').Text | Should -Match 'BIOS updates will be skipped'
     $w.Tag.ReadOnAC = { throw 'no power status' }; Invoke-ToolboxAction -Sender $t -Action 'Power'; $w.Tag.Model.OnAC | Should -BeFalse; $w.Tag.Outcome | Should -BeNullOrEmpty
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 1 }
+  It 'a power read that keeps failing is one WARN per window, not one per 5-second tick (Task 3 M2)' {
+    foreach ($ticks in 3, 2) {
+      $w = New-LiveWindow; $t = New-ToolboxPowerTimer -Window $w; $w.Tag.ReadOnAC = { throw 'no power status' }
+      foreach ($i in 1..$ticks) { Invoke-ToolboxAction -Sender $t -Action 'Power' }
+      $w.Tag.Outcome | Should -BeNullOrEmpty }
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 2 }   # one per window
+  It 'a zero or negative work area is ignored: the window keeps 1000 x 680 (Task 3 M4)' {
+    foreach ($area in (New-Object Windows.Rect 0, 0, 0, 0), (New-Object Windows.Rect 0, 0, 1920, 0), (New-Object Windows.Rect 0, 0, 0, 1040), [Windows.Rect]::Empty) {
+      $w = New-LiveWindow; { Set-ToolboxWindowSize -Window $w -WorkArea $area } | Should -Not -Throw
+      $w.Width | Should -Be 1000; $w.Height | Should -Be 680 } }   # Rect.Empty is the negative case: its width and height are -Infinity
   It 'clamps the window to a small work area and lets the content scroll' {
     $w = New-LiveWindow; Set-ToolboxWindowSize -Window $w -WorkArea (New-Object Windows.Rect 0, 0, 683, 512)
     $w.Width | Should -Be 683; $w.Height | Should -Be 512; $w.Left | Should -Be 0
@@ -276,10 +286,55 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
   It 'opens with the timer running, the window registered for the backstop, clamped and centred' {
     $null = Show { param($w) $script:seen = @{ Timer = $w.Tag.Timer.IsEnabled; Open = [object]::ReferenceEquals($script:ToolboxOpenWindow, $w); Width = $w.Width; Left = $w.Left; Top = $w.Top } }
     $script:seen.Timer | Should -BeTrue; $script:seen.Open | Should -BeTrue; $script:seen.Width | Should -Be 1000; $script:seen.Left | Should -Be 460; $script:seen.Top | Should -Be 180 }
-  It 'a dialog that ends with nothing chosen is Cancel through Closing; one that throws is Failed' {
-    (Show { param($w) }).Outcome | Should -Be 'Cancel'
+  It 'a dialog closed with nothing chosen is Cancel through Closing; one that throws is Failed' {
+    (Show { param($w) $w.Close() }).Outcome | Should -Be 'Cancel'   # the X, Alt+F4: the window closes during the dialog
     $r = Show { param($w) throw 'dialog broke' }; $r.Outcome | Should -Be 'Failed'; $r.Error | Should -BeExactly 'dialog broke'
     $script:ToolboxOpenWindow | Should -BeNullOrEmpty }
+  It 'a dialog that returns with the window still open is Failed, set before the cleanup Close(): never Cancel (Task 3 M1)' {
+    $r = @(Show { param($w) $script:openAtReturn = ($w.Tag.Closing -ne $true) })
+    $script:openAtReturn | Should -BeTrue   # the case: nothing closed the window during the dialog
+    $r.Count | Should -Be 1; $r[0].Outcome | Should -Be 'Failed'; $r[0].Error | Should -Not -BeNullOrEmpty; $r[0].Choices | Should -BeNullOrEmpty }
+  It 'an exception raised through the dispatcher ends as Failed through the backstop, which is removed afterwards (Task 3 M5)' {
+    # Offscreen: the seam pumps one short dispatcher frame instead of a dialog (the window is never shown). The first
+    # operation throws as a layout or render error would; the second ends the frame.
+    $r = @(Show { param($w)
+      $script:frame = New-Object Windows.Threading.DispatcherFrame
+      $null = $w.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Normal, [action]{ throw ('layout boom ' + [char]0x05D0) })
+      $null = $w.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [action]{ $script:frame.Continue = $false })
+      [Windows.Threading.Dispatcher]::PushFrame($script:frame) })
+    $r.Count | Should -Be 1; $r[0].Outcome | Should -Be 'Failed'; $r[0].Error | Should -BeExactly 'layout boom ?'   # the backstop's, not 'Exception calling "PushFrame"'
+    @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox error' }).Count | Should -Be 1
+    # Afterwards a dispatcher exception reaches only this test's own handler (which marks it handled): the toolbox's is gone.
+    $d = [Windows.Threading.Dispatcher]::CurrentDispatcher; $script:late = 0
+    $own = [Windows.Threading.DispatcherUnhandledExceptionEventHandler]{ param($s, $e) $e.Handled = $true; $script:late++ }
+    $d.Add_UnhandledException($own)
+    try {
+      $script:frame = New-Object Windows.Threading.DispatcherFrame
+      $null = $d.BeginInvoke([Windows.Threading.DispatcherPriority]::Normal, [action]{ throw 'late' })
+      $null = $d.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [action]{ $script:frame.Continue = $false })
+      [Windows.Threading.Dispatcher]::PushFrame($script:frame)
+    } finally { $d.Remove_UnhandledException($own) }
+    $script:late | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox error' }).Count | Should -Be 1 }
+  It 'a failed first power read counts for the window: the ticks after it log nothing more (Task 3 M2)' {
+    $r = Show { param($w) foreach ($i in 1..3) { Invoke-ToolboxAction -Sender $w.Tag.Timer -Action 'Power' }; $w.Close() } -OnAC { throw 'no power status' }
+    $r.Outcome | Should -Be 'Cancel'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 1 }
+  It 'the error logs carry the exception type as well as the ASCII message (Task 3 M3)' {
+    $w = New-LiveWindow; $open = New-LiveWindow   # both built before the view is made to throw
+    Mock Update-ToolboxView { throw [InvalidOperationException]::new('view broke ' + [char]0x05D0) }
+    ClickTag $w 'a:Office:HOME'
+    $a = @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox action failed' })
+    $a.Count | Should -Be 1; $a[0].Data.type | Should -BeExactly 'System.InvalidOperationException'; $a[0].Data.error | Should -BeExactly 'view broke ?'
+    $script:ToolboxOpenWindow = $open
+    try { Invoke-ToolboxUnhandled -EventArgs ([pscustomobject]@{ Handled = $false; Exception = [ArgumentException]::new('layout') }) } finally { $script:ToolboxOpenWindow = $null }
+    $b = @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox error' })
+    $b.Count | Should -Be 1; $b[0].Data.type | Should -BeExactly 'System.ArgumentException'; $b[0].Data.error | Should -BeExactly 'layout'
+    Mock New-ToolboxWindow { throw [IO.IOException]::new('xaml broke') }
+    $null = Show { param($w) throw 'must not open' }
+    $c = @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox window failed' })
+    $c.Count | Should -Be 1; $c[0].Data.type | Should -BeExactly 'System.IO.IOException'; $c[0].Data.error | Should -BeExactly 'xaml broke'
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
   It 'an Outcome still empty after the dialog is Failed, never Cancel' {
     Mock Register-ToolboxHandlers { }   # no Closing handler, so nothing sets Cancel
     $r = Show { param($w) }; $r.Outcome | Should -Be 'Failed'; $r.Error | Should -Not -BeNullOrEmpty }
@@ -291,13 +346,21 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
     $r = Show { param($w) $script:onAC = $w.Tag.Model.OnAC; Click $w 'StartButton' } -OnAC { throw 'no power status' }
     $script:onAC | Should -BeTrue; $r.Outcome | Should -Be 'Start'
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not read the power state for the toolbox' }).Count | Should -Be 1
-    $b = Show { param($w) Click $w 'StartButton' } -Protection 'On'; $b.Outcome | Should -Be 'Cancel'   # refused, then closed by the finally
+    $b = Show { param($w) Click $w 'StartButton'; $script:refusedOpen = ($w.Tag.Closing -ne $true); Click $w 'CancelButton' } -Protection 'On'
+    $script:refusedOpen | Should -BeTrue; $b.Outcome | Should -Be 'Cancel'   # refused (the window stayed open), then Cancel
+    @($script:logs | Where-Object { $_.Message -eq 'Start refused: Administrator protection is on' }).Count | Should -Be 1
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is not off' -and $_.Data.state -eq 'On' }).Count | Should -Be 1 }
-  It 'calls ShowDialog only through the seam; no key handlers, no closures (Toolbox.ps1 and Xaml.ps1, TB-R7)' {
+  It 'calls ShowDialog only through the seam; no key handlers, no closures (Toolbox.ps1 and Xaml.ps1, TB-R7, Task 3 M6)' {
     $src = Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw
     ([regex]::Matches($src, '\.ShowDialog\(')).Count | Should -Be 1; $src | Should -Match '\$ShowDialog = \{ param\(\$w\) \$w\.ShowDialog\(\) \}'
+    # Any key-handler wiring, in code or in XAML (Should -Match ignores case): an event or its routed event (KeyDown, PreviewKeyDown,
+    # KeyUp, PreviewKeyUp, KeyDownEvent ...), a key binding, a default or a cancel button.
+    $keyWiring = 'KeyDown|KeyUp|InputBindings|KeyBinding|IsDefault="True"|IsCancel="True"'
+    foreach ($sample in 'Add_KeyDown(', 'Add_PreviewKeyDown(', 'Add_KeyUp(', '$w.AddHandler([Windows.UIElement]::KeyDownEvent, $h)', 'KeyDown="OnKey"',
+                        'PreviewKeyUp="OnKey"', '$w.InputBindings.Add($b)', '<KeyBinding Key="Enter"/>', 'IsDefault="True"', 'IsCancel="true"') {
+      $sample | Should -Match $keyWiring -Because 'the guard must catch every kind of key wiring' }
     foreach ($file in 'Toolbox', 'Xaml') {
-      Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match 'Add_(Preview)?Key(Down|Up)|IsCancel="True"|GetNewClosure|KeyBinding|InputBindings' -Because $file }
+      Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match "$keyWiring|GetNewClosure" -Because $file }
     $script:ToolboxXaml | Should -Not -Match 'IsCancel|IsDefault="True"' }
 }
 Describe 'Test-ToolboxHost (toolbox spec 5.1)' {
@@ -369,6 +432,28 @@ Describe 'Get-SetupChoices (toolbox spec 5.1)' {
   It 'a console Escape is $null; a console exception is not swallowed' {
     Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) $null } | Should -BeNullOrEmpty
     { Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) throw 'console broke' } } | Should -Throw '*console broke*' }
+  It 'the console fallback never counts down: its seam gets NoAutoStart, after a failed host check and after a failed window (TB-R8)' {
+    $null = Get { param($p) throw 'must not open' } -HostOk $false
+    $script:consoleArgs.NoAutoStart | Should -BeTrue; $script:consoleArgs.IsFresh | Should -BeFalse
+    foreach ($tb in { param($p) @{ Outcome = 'Failed'; Error = 'view broke' } }, { param($p) throw 'boom' }) {
+      $script:consoleArgs = $null; $null = Get $tb; $script:consoleArgs.NoAutoStart | Should -BeTrue }
+    $null = Get { param($p) $script:toolboxArgs = $p; @{ Outcome = 'Cancel' } }
+    $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse   # the window gets Show-StartScreen's five parameters only
+    # The real Show-StartScreen takes the splat (its other seams given, so it reads no console): Escape is $null.
+    Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) Show-StartScreen @p -ReadKey { 'Escape' } -Now { [datetime]'2026-10-22' } -Sleep { } -OnAC { $true } -Write { } -FlushInput { } } |
+      Should -BeNullOrEmpty }
+  It 'a console result that is neither $null nor exactly one hashtable never starts a run: it throws (Task 4 review M1)' {
+    foreach ($c in { param($p) 'Start' }, { param($p) @{ Mode = 'DESKTOP' }; @{ Mode = 'LAPTOP' } }, { param($p) [pscustomobject]@{ Mode = 'DESKTOP' } },
+                   { param($p) 'noise'; $null }, { param($p) $null; $null }, { param($p) 'noise'; @{ Mode = 'DESKTOP' } }) {
+      { Get { param($p) @{ Outcome = 'Failed' } } -Console $c } | Should -Throw 'Start screen returned an unexpected result' }
+    Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) } | Should -BeNullOrEmpty   # no result at all is Escape, as $null is
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox closed' }).Count | Should -Be 0 }
+  It 'a toolbox that throws is logged with the exception type (Task 3 M3)' {
+    $null = Get { param($p) throw [InvalidOperationException]::new('boom ' + [char]0x05D0) }
+    $e = @($script:logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'Toolbox failed; using the console start screen' })
+    $e.Count | Should -Be 1; $e[0].Data.error | Should -BeExactly 'boom ?'; $e[0].Data.type | Should -BeExactly 'System.InvalidOperationException'
+    $null = Get { param($p) @{ Outcome = 'Failed'; Error = 'view broke' } }   # no exception here: the window logged its own type
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox failed; using the console start screen' })[1].Data.Contains('type') | Should -BeFalse }
   It 'the console''s Choices pass ConvertTo-ValidChoices too: unknown tweak ids are dropped and logged' {
     $r = Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) @{ Mode = 'DESKTOP'; Office = 'CRAFT'; Remote = 'ANYDESK'; SevenZip = $true; Profile = 'home'; RestorePoint = $true; Tweaks = @('numLock', 'widgets') } }
     @($r.Tweaks) | Should -Be @('numLock')
@@ -386,6 +471,60 @@ Describe 'Get-SetupChoices (toolbox spec 5.1)' {
   It 'InvokeShutdown appears once in src, as this seam''s default (no test can reach it)' {
     $hits = @(Get-ChildItem "$PSScriptRoot\..\src" -Recurse -Filter *.ps1 | Select-String -Pattern 'InvokeShutdown' -SimpleMatch)
     $hits.Count | Should -Be 1; $hits[0].Line | Should -Match '\$ShutdownDispatcher = \{ \[Windows\.Threading\.Dispatcher\]::CurrentDispatcher\.InvokeShutdown\(\) \}' }
+}
+Describe 'every test passes the WPF seams (final review M5)' {
+  # A static guard over tests\*.ps1, read with the PowerShell parser rather than a regex, so a call split over lines with
+  # backticks, or a name inside a string or a Should -Invoke, is judged correctly. Every command call of
+  #   Show-ToolboxWindow passes -ShowDialog (else it would open a real modal window and hang the suite), and
+  #   Get-SetupChoices passes -TestHost, -ShowToolbox, -ShowConsole and -ShutdownDispatcher (else it could load WPF, open a
+  #     real window, read the real console or stop WPF for the rest of the run),
+  # by name. A call without them is allowed only inside a Describe whose own BeforeEach or BeforeAll mocks that command
+  # (Entry.Tests mocks both in its BeforeEach). A Mock inside one It covers only that It, so it does not count.
+  BeforeAll {
+    $script:seamsNeeded = @{ 'Show-ToolboxWindow' = @('ShowDialog'); 'Get-SetupChoices' = @('TestHost', 'ShowToolbox', 'ShowConsole', 'ShutdownDispatcher') }
+    function Get-EnclosingCommand($Node, [string[]]$Names) {
+      for ($n = $Node.Parent; $null -ne $n; $n = $n.Parent) {
+        if ($n -is [Management.Automation.Language.CommandAst] -and $Names -contains $n.GetCommandName()) { return $n } }
+      return $null }
+    function Test-MockedForDescribe($Call, [string]$Name) {
+      $describe = Get-EnclosingCommand $Call @('Describe')
+      if ($null -eq $describe) { return $false }
+      $mocks = $describe.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Mock' -and
+        $n.CommandElements.Count -ge 2 -and $n.CommandElements[1].Extent.Text -eq $Name }, $true)
+      foreach ($mock in $mocks) {
+        $block = Get-EnclosingCommand $mock @('BeforeEach', 'BeforeAll', 'It', 'Context', 'Describe')
+        if ($block.GetCommandName() -in 'BeforeEach', 'BeforeAll' -and [object]::ReferenceEquals((Get-EnclosingCommand $block @('Describe', 'Context')), $describe)) { return $true } }
+      return $false }
+    # One line per call that misses a seam and is not covered by a mock; $script:callsSeen counts every call looked at.
+    function Get-SeamViolations([Management.Automation.Language.Ast]$Ast, [string]$File) {
+      $calls = $Ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $script:seamsNeeded.ContainsKey([string]$n.GetCommandName()) }, $true)
+      foreach ($call in $calls) {
+        $script:callsSeen++
+        $name = $call.GetCommandName()
+        $passed = @($call.CommandElements | Where-Object { $_ -is [Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+        $missing = @($script:seamsNeeded[$name] | Where-Object { $passed -notcontains $_ })
+        if ($missing.Count -gt 0 -and -not (Test-MockedForDescribe $call $name)) { '{0}:{1} {2} without -{3}' -f $File, $call.Extent.StartLineNumber, $name, ($missing -join ', -') } } }
+    function Read-Snippet([string]$Text) { [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null) }
+  }
+  It 'the check itself: it finds a missing seam, also over several lines, and accepts only a Describe-wide mock' {
+    $script:callsSeen = 0
+    @(Get-SeamViolations (Read-Snippet "Describe 'd' { It 'i' { Show-ToolboxWindow -Machine `$m ``
+      -IsFresh `$true } }") 'a') | Should -Be @('a:1 Show-ToolboxWindow without -ShowDialog')
+    @(Get-SeamViolations (Read-Snippet "Describe 'd' { It 'i' { Get-SetupChoices -TestHost { } -ShowToolbox { } -ShowConsole { } } }") 'b') |
+      Should -Be @('b:1 Get-SetupChoices without -ShutdownDispatcher')
+    @(Get-SeamViolations (Read-Snippet "Describe 'd' { BeforeEach { Mock Get-SetupChoices { } }; Context 'c' { It 'i' { Get-SetupChoices -IsFresh `$true } } }") 'c') | Should -BeNullOrEmpty
+    @(Get-SeamViolations (Read-Snippet "Describe 'd' { It 'i' { Mock Get-SetupChoices { } }; It 'j' { Get-SetupChoices -IsFresh `$true } }") 'd').Count | Should -Be 1
+    @(Get-SeamViolations (Read-Snippet "Describe 'd' { It 'i' { Should -Invoke Get-SetupChoices; `$x = 'Show-ToolboxWindow' } }") 'e') | Should -BeNullOrEmpty
+    $script:callsSeen | Should -Be 4 }
+  It 'every call in tests\*.ps1 passes the seams, or sits in a Describe that mocks the command' {
+    $script:callsSeen = 0
+    $found = foreach ($file in Get-ChildItem $PSScriptRoot -Filter *.ps1 -Recurse) {
+      $errors = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+      @($errors).Count | Should -Be 0 -Because $file.Name
+      Get-SeamViolations $ast $file.Name }
+    @($found) | Should -BeNullOrEmpty
+    $script:callsSeen | Should -BeGreaterOrEqual 5 }   # not vacuous: it sees the real calls in Toolbox.Tests and Entry.Tests
 }
 Describe 'tools\Preview-Toolbox.ps1' {
   It 'renders the four PNGs at 1000x680 without showing a window' {

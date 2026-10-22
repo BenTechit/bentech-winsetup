@@ -1401,7 +1401,9 @@ Describe 'restore point at the end (toolbox spec 5.4)' {
     else { $script:dwords[-1].Value | Should -Be $Before; $script:regPresent[$sr][$fn] | Should -Be $Before }
     $ctx.State.Notes | Should -Not -Contain 'Restore point frequency value could not be put back'
     if ($Child -is [hashtable] -and $Child.ExitCode -eq 0) { $ctx.State.Notes | Should -Not -Contain 'Restore point could not be confirmed' }
-    else { $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'; Get-ReportLines -Context $ctx | Should -Contain 'Restore point: could not be confirmed' } }
+    else { $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'
+      # A child was started, so System Protection may now be on and reserve disk space (final review M4).
+      Get-ReportLines -Context $ctx | Should -Contain 'Restore point: could not be confirmed (System Protection may now be on)' } }
   It 'a frequency that cannot be put back is its own Note' {
     $script:regPresent[$sr] = @{ $fn = 1440 }; $script:freqStuck = $true   # the restore write "succeeds", the read-back still says 0
     $null = Complete-SetupFinalization -Context $ctx; $ctx.State.Notes | Should -Contain 'Restore point frequency value could not be put back' }
@@ -1440,7 +1442,26 @@ Describe 'restore point at the end (toolbox spec 5.4)' {
     $null = Complete-SetupFinalization -Context $ctx
     Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; @($script:dwords).Count | Should -Be 0; @($script:regRemoved).Count | Should -Be 0
     $script:regPresent[$sr][$fn] | Should -Be 1440; $ctx.State.RestorePointTried | Should -BeFalse
-    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed' }
+    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'
+    Get-ReportLines -Context $ctx | Should -Contain 'Restore point: could not be confirmed' }   # no child, so no "(System Protection may now be on)"
+  It 'an original that is not a DWORD (<Kind>): no attempt, nothing written or removed, the Note (final review M1)' -ForEach @(
+    @{ Kind = 'String'; Value = '1440' }, @{ Kind = 'QWord'; Value = [long]1440 }, @{ Kind = 'ExpandString'; Value = '0x5A0' }
+  ) {
+    $script:origKind = $Kind; $script:origValue = $Value
+    Mock Get-RegistryValue { @{ Exists = $true; Value = $script:origValue; Kind = $script:origKind; Failed = $false } }
+    $null = Complete-SetupFinalization -Context $ctx
+    Should -Invoke Invoke-PowerShellChild -Times 0 -Exactly; @($script:dwords).Count | Should -Be 0; @($script:regRemoved).Count | Should -Be 0
+    $ctx.State.RestorePointTried | Should -BeFalse; $ctx.State.RestorePointOriginalFrequency | Should -BeNullOrEmpty
+    $ctx.State.Notes | Should -Contain 'Restore point could not be confirmed'
+    Get-ReportLines -Context $ctx | Should -Contain 'Restore point: could not be confirmed'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -like 'No restore point:*not a DWORD*' -and $_.Data.kind -eq $Kind }).Count | Should -Be 1 }
+  It 'Remove-RegistryValueIfPresent logs a Hebrew refusal as ASCII (final review M2)' {
+    $script:regPresent['HKLM:\SOFTWARE\BenTechTest'] = @{ v = 1 }
+    Mock Remove-ItemProperty { Write-Error -Message "$Hebrew denied" -Category PermissionDenied }
+    Remove-RegistryValueIfPresent -Path 'HKLM:\SOFTWARE\BenTechTest' -Name 'v'
+    $w = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Registry value could not be removed' })
+    $w.Count | Should -Be 1; $w[0].Data.error | Should -BeExactly '???? denied'
+    (@($script:logs) | ConvertTo-Json -Depth 5 -Compress) | Should -Not -Match '[^\x00-\x7F]' }
   It 'a refused write of 0 is a WARN and the child still runs: its sequence check decides (review M7a)' {
     Mock Set-RegistryDword { [void]$script:dwords.Add(@{ Path = $Path; Name = $Name; Value = [int]$Value }); [int]$Value -ne 0 }
     $null = Complete-SetupFinalization -Context $ctx
@@ -1477,4 +1498,11 @@ Describe 'Format-SetupReport: profile, tweaks, restore point (toolbox spec 5.5)'
     @{ Why = 'no profile, no tweaks step'; Mutate = { param($c) $c.Profile = '' }; Step = $null; P = 'Profile      : none'; T = 'Tweaks       : none' }
   ) { $c = New-DefaultChoices -Machine $script:fm -Config $rcfg; & $Mutate $c; $l = Get-ToolboxReport $c $Step $true
       $l | Should -Contain $P; $l | Should -Contain $T }
+  It 'not confirmed: "(System Protection may now be on)" once the attempt started its child, plain when it made none (final review M4)' {
+    foreach ($case in @{ Tried = $false; Line = 'Restore point: could not be confirmed' }, @{ Tried = $true; Line = 'Restore point: could not be confirmed (System Protection may now be on)' }) {
+      $c = New-DefaultChoices -Machine $script:fm -Config $rcfg; $c.RestorePoint = $true
+      $s = New-RunState -Machine $script:fm -Choices $c -Plan @('chrome') -Version '2026.10.21.1'; $s.RestorePointTried = $case.Tried
+      $l = @(Format-SetupReport -State $s -Verdict (Get-RunVerdict -State $s) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{} -Config $script:rcfg)
+      $l | Should -Contain $case.Line
+      @($l | Where-Object { $_ -like 'Restore point:*' }).Count | Should -Be 1 } }
 }

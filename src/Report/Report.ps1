@@ -213,7 +213,12 @@ function Format-SetupReport {
         empty. 'none' when the State has no tweaks step; 'not applied' when that step is not Done.
       Restore point: 'created (System Protection is now on and reserves a few percent of the disk)' when
         State.RestorePointCreated; 'not chosen' when Choices.RestorePoint is not $true; else
-        'could not be confirmed'.
+        'could not be confirmed', followed by ' (System Protection may now be on)' when State.RestorePointTried
+        (final review M4): the attempt sets Tried just before its child, whose first command turns System
+        Protection on, so the customer is told about the disk space it may reserve. Tried is the one record of
+        that (it survives a crash during the child), so the rare attempt that stopped before its child (the state
+        could not be saved first) says "may" too. With no attempt (the original frequency value unreadable or
+        not a DWORD) the line has no suffix.
     then, each after a blank line:
       Apps:  '  <name> <version>' sorted by name ('  none' when empty)
       Windows Update: <rounds> rounds, <installed> installed, failed repeatedly (left to Windows Update):
@@ -295,6 +300,7 @@ function Format-SetupReport {
   }
 
   $restorePointText = 'could not be confirmed'
+  if ($State['RestorePointTried'] -eq $true) { $restorePointText += ' (System Protection may now be on)' }
   if ($State['RestorePointCreated'] -eq $true) { $restorePointText = 'created (System Protection is now on and reserves a few percent of the disk)' }
   elseif (-not (($choices['RestorePoint'] -is [bool]) -and $choices['RestorePoint'])) { $restorePointText = 'not chosen' }
 

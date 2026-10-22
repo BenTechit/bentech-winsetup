@@ -161,7 +161,10 @@ Describe 'Invoke-StepTweaks (toolbox spec 5.3)' {
     $r = Invoke-StepTweaks -Context (New-TweakContext -Tweaks @('accessKeys', 'numLock', 'noAds'))
     @($script:writes | Where-Object { $_.Path -like 'HKCU:\*' }).Count | Should -Be 0
     @($script:writes).Path | Should -Be @('Registry::HKEY_USERS\.DEFAULT\Control Panel\Keyboard')
-    @($r.Data.Applied) | Should -Be @('numLock'); @($r.Data.Skipped) | Should -Be @('accessKeys', 'noAds')
+    # NumLock's account value was skipped, so NumLock is Skipped, never Applied, although its sign-in value was written (final review M3).
+    @($r.Data.Applied).Count | Should -Be 0; @($r.Data.Skipped) | Should -Be @('accessKeys', 'numLock', 'noAds'); @($r.Data.Refused).Count | Should -Be 0
+    $r.Message | Should -BeExactly '0 tweaks applied'; @($script:activity) | Should -Be @('Tweaks: 0 applied')
+    @($script:logs | Where-Object { $_.Message -eq 'Tweak value' -and $_.Data.tweak -eq 'numLock' } | ForEach-Object { $_.Data.result }) | Should -Be @('applied', 'skipped')
     @($r.Notes) | Should -Be @('Per-user tweaks skipped: Windows Administrator protection is on')
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is on: per-user tweak values are skipped' }).Count | Should -Be 1   # review M7e
     @($script:logs | Where-Object { $_.Message -eq 'Tweak value' -and $_.Data.result -eq 'skipped' }).Count | Should -Be 10 }   # 2 accessKeys + 1 NumLock + 7 noAds

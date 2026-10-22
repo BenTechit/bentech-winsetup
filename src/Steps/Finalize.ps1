@@ -211,7 +211,8 @@ function Test-FinalRebootNeeded {
 
 function Remove-RegistryValueIfPresent {
   # Private. Removes ONE registry value, never its key (other software or an administrator may keep
-  # settings there). A value that is not there is fine. A refused removal is a WARN. Never throws.
+  # settings there). A value that is not there is fine. A refused removal is a WARN, its text in ASCII
+  # (final review M2: Hebrew Windows words its refusals in Hebrew). Never throws.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$Path,
@@ -224,7 +225,7 @@ function Remove-RegistryValueIfPresent {
     Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
     Write-SetupLog -Message 'Registry value removed' -Data @{ path = $Path; name = $Name }
   } catch {
-    Write-SetupLog -Message 'Registry value could not be removed' -Level WARN -Data @{ path = $Path; name = $Name; error = $_.Exception.Message }
+    Write-SetupLog -Message 'Registry value could not be removed' -Level WARN -Data @{ path = $Path; name = $Name; error = (ConvertTo-ScreenText $_.Exception.Message) }
   }
 }
 
@@ -448,7 +449,9 @@ function Invoke-SetupRestorePoint {
     Otherwise, in order:
       1. the original SystemRestorePointCreationFrequency is read (logged: its value, or absent). A read that
          fails (not just "absent") means no attempt at all: nothing is written or removed, no child, the Note
-         'Restore point could not be confirmed', and RestorePointTried stays $false (review M3);
+         'Restore point could not be confirmed', and RestorePointTried stays $false (review M3). So does an
+         original that exists but is not a DWORD (final review M1): it could not be written back as it was, so
+         the value would stay at 0 (Windows ignores such a value anyway);
       2. RestorePointTried = $true, RestorePointCreated = $false and RestorePointOriginalFrequency = the
          original (@{ Exists; Value }) are saved FIRST. A save that throws is 'NotConfirmed' with the Note, and
          nothing else happens: no child, the frequency value untouched;
@@ -487,6 +490,11 @@ function Invoke-SetupRestorePoint {
   $original = Get-RegistryValue -Path $script:SystemRestoreKey -Name $script:RestorePointFrequencyName
   if ($original.Failed -eq $true) {
     Write-SetupLog -Message 'No restore point: the creation frequency could not be read, so it is left alone' -Level WARN
+    Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
+    return 'NotConfirmed'
+  }
+  if ($original.Exists -eq $true -and [string]$original.Kind -cne 'DWord') {
+    Write-SetupLog -Message 'No restore point: the creation frequency is not a DWORD, so it is left alone' -Level WARN -Data @{ kind = (ConvertTo-ScreenText ([string]$original.Kind)) }
     Add-FinalizeMessage -State $runState -Field Notes -Text $notConfirmed
     return 'NotConfirmed'
   }
