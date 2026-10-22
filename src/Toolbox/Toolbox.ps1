@@ -345,7 +345,7 @@ function New-ToolboxWindow {
     RepairConfirmKey = ''; RepairItemsShape = ''
     Root = $Root; ScriptPath = $ScriptPath; Launcher = $Launcher; StartChild = $StartChild; FindStick = $FindStick
     Runs = @{ Action = $null; Safety = $null }; RunTimer = $null
-    StickPresent = $StickPresent; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false
+    StickPresent = $StickPresent; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false; StickSearchClock = $null
     SafetyStarted = $false
   }
   Update-ToolboxView -Window $window
@@ -516,8 +516,9 @@ function Register-ToolboxHandlers {
     Wires the window's handlers (spec 5.1). Each is one line that calls Invoke-ToolboxAction. Returns nothing.
   .DESCRIPTION
     - Click on every button whose Tag starts 'a:' (a ButtonBase: the tiles, the switches, EN | HE, the nav, Start,
-      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons; the
-      Ghost devices switches are made later, by the view, which wires their Click the same way);
+      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons). The
+      Ghost devices switches (a:GhostTick:) are skipped: the view makes them and wires each itself, so one already on
+      screen never gets a second handler (Task 5 review M4);
     - TextChanged on every TextBox whose Tag starts 'a:' (Text: the repair page's complaint and YES boxes, repair
       Task 5);
     - MouseEnter on the repair page's ten tiles (Hover: what the tile does, spec 4.1);
@@ -537,8 +538,12 @@ function Register-ToolboxHandlers {
   while ($pending.Count -gt 0) {
     $node = $pending.Pop()
     $tagged = ($node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal))
-    # Click exists on buttons only; the repair page's text boxes (a:Complaint:, a:YesText:) report their text instead.
-    if ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $tagged) {
+    # The Ghost devices switches (a:GhostTick:) are the view's: it wires each as it makes it (one handler each; review
+    # M4, RD-R19). Click exists on buttons only; the repair page's text boxes (a:Complaint:, a:YesText:) report their
+    # text instead.
+    if ($tagged -and $node.Tag.StartsWith('a:GhostTick:', [StringComparison]::Ordinal)) {
+      # left to Set-RepairConfirmPanel
+    } elseif ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $tagged) {
       $node.Add_Click({ Invoke-ToolboxAction -Sender $this })
     } elseif ($node -is [System.Windows.Controls.TextBox] -and $tagged) {
       $node.Add_TextChanged({ Invoke-ToolboxAction -Sender $this -Action 'Text' })

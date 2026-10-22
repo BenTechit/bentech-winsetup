@@ -491,7 +491,8 @@ function Set-RepairRunPanel {
 function Set-RepairResultPanel {
   # Private. The finished action (spec 4.1): the banner in the result's colour, the findings coloured by level in the
   # window's language (the child's English text for a code the table does not know), the restart line, the offers
-  # (Disk check at restart, DISM from a local source), the folder of the logs and reports, Open folder and Restart PC.
+  # (Disk check at restart, DISM from a local source), the folder of the logs and reports, Open folder (only for a
+  # folder on the stick: review I1) and Restart PC.
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
 
@@ -565,7 +566,11 @@ function Set-RepairResultPanel {
   $files = $result['Files']
   $folder = if ($files -is [System.Collections.IDictionary]) { [string]$files['Folder'] } else { '' }
   $hasFolder = ($folder -ne '')
-  foreach ($name in 'ResultFilesLabel', 'ResultFiles', 'OpenFolderButton') { $Window.FindName($name).Visibility = $(if ($hasFolder) { $visible } else { $collapsed }) }
+  foreach ($name in 'ResultFilesLabel', 'ResultFiles') { $Window.FindName($name).Visibility = $(if ($hasFolder) { $visible } else { $collapsed }) }
+  # Open folder only for a folder on the stick (review I1, RD-R19): a local one is under the admin-only C:\BenTech,
+  # where the non-elevated shell would offer to re-ACL it. Its path still shows.
+  $onStick = $hasFolder -and (Test-ToolboxStickFolder -Repair $model.Repair -Folder $folder)
+  $Window.FindName('OpenFolderButton').Visibility = $(if ($onStick) { $visible } else { $collapsed })
   $Window.FindName('ResultFiles').Text = $folder
   $restart = $Window.FindName('RestartButton')
   $restart.Style = $Window.FindResource($(if ($restartNeeded) { 'AccentButtonStyle' } else { 'PlainButtonStyle' }))
@@ -1353,30 +1358,37 @@ function Get-ToolboxStickPresence {
     The cheap stick presence check of the 5-second tick (ruling RD-R3): a text that changes when a BenTech stick is
     plugged in, pulled or swapped. No CIM, no WMI. Never throws.
   .DESCRIPTION
-    [IO.DriveInfo]::GetDrives(): each ready Removable or Fixed drive other than the system drive that holds
-    BenTechSetup.cmd in its root, or is the launcher's own drive (-Launcher.Drive: the stick it ran from, under any file
-    name), as '<root>|<volume label>|<size>'; sorted, joined with ';'. Network, CD-ROM and other drives are skipped. A
-    drive that cannot be read is skipped. The full search (Find-SetupStick, by volume serial) runs only when this text
-    changes (Update-ToolboxStick).
+    The drives (-Drives; by default [IO.DriveInfo]::GetDrives()): each ready Removable or Fixed drive other than the
+    system drive that holds BenTechSetup.cmd in its root (-FileExists; by default [IO.File]::Exists), or is the
+    launcher's own drive (-Launcher.Drive: the stick it ran from, under any file name; its root file is not asked for),
+    as '<root>|<volume label>|<size>'; sorted, joined with ';'. Network, CD-ROM and other drives, and drives that are
+    not ready, are skipped before any file is looked for. A drive whose root cannot be looked at is skipped; no drive
+    list is ''. (A label or size that cannot be read reads as empty: PowerShell swallows a failing property getter.)
+    The full search (Find-SetupStick, by volume serial) runs only when this text changes (Update-ToolboxStick).
+    The two seams (Task 5 review M1, ruling RD-R19) let the tests check the filters without this PC's drives: -Drives
+    gives objects with Name, DriveType (an [IO.DriveType] or its name), IsReady, VolumeLabel and TotalSize.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param(
     [AllowNull()][hashtable]$Launcher,
-    [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive
+    [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive,
+    [scriptblock]$Drives = { [IO.DriveInfo]::GetDrives() },
+    [scriptblock]$FileExists = { param($path) [IO.File]::Exists($path) }
   )
 
   $parts = New-Object System.Collections.Generic.List[string]
   try {
     $system = ([string]$SystemDrive).TrimEnd('\').ToUpperInvariant()
     $launcherDrive = if ($null -ne $Launcher) { ([string]$Launcher['Drive']).TrimEnd('\').ToUpperInvariant() } else { '' }
-    foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+    foreach ($drive in @(& $Drives)) {
       try {
-        if ($drive.DriveType -ne [IO.DriveType]::Removable -and $drive.DriveType -ne [IO.DriveType]::Fixed) { continue }
-        $letter = $drive.Name.TrimEnd('\').ToUpperInvariant()
-        if ($letter -eq $system -or -not $drive.IsReady) { continue }
-        if ($letter -ne $launcherDrive -and -not [IO.File]::Exists([IO.Path]::Combine($drive.Name, 'BenTechSetup.cmd'))) { continue }
-        $parts.Add(('{0}|{1}|{2}' -f $drive.Name.ToUpperInvariant(), $drive.VolumeLabel, $drive.TotalSize))
+        if ([string]$drive.DriveType -cnotin 'Removable', 'Fixed') { continue }
+        $name = [string]$drive.Name
+        $letter = $name.TrimEnd('\').ToUpperInvariant()
+        if ($letter -eq '' -or $letter -eq $system -or $drive.IsReady -ne $true) { continue }
+        if ($letter -ne $launcherDrive -and (& $FileExists ([IO.Path]::Combine($name, 'BenTechSetup.cmd'))) -ne $true) { continue }
+        $parts.Add(('{0}|{1}|{2}' -f $name.ToUpperInvariant(), $drive.VolumeLabel, $drive.TotalSize))
       } catch {
         continue
       }
@@ -1388,6 +1400,26 @@ function Get-ToolboxStickPresence {
   return ($parts.ToArray() -join ';')
 }
 
+# How long after an empty full search it is tried again while the presence check names a stick (review M2, RD-R19).
+$script:ToolboxStickRetrySeconds = 60
+
+function Get-ToolboxStickSearchSeconds {
+  <#
+  .SYNOPSIS
+    The seconds since the last full stick search (Update-ToolboxStick), on that search's own Stopwatch
+    (Tag.StickSearchClock: never the wall clock, which the time sync moves). No search yet is overdue
+    ([double]::MaxValue). Tests mock this seam.
+  #>
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([AllowNull()]$State)
+
+  $clock = $null
+  if ($State -is [System.Collections.IDictionary]) { $clock = $State['StickSearchClock'] }
+  if ($clock -is [Diagnostics.Stopwatch]) { return [double]$clock.Elapsed.TotalSeconds }
+  return [double]::MaxValue
+}
+
 function Update-ToolboxStick {
   <#
   .SYNOPSIS
@@ -1396,10 +1428,13 @@ function Update-ToolboxStick {
   .DESCRIPTION
     Tag.StickPresent (Get-ToolboxStickPresence: [IO.DriveInfo], no CIM) answers first; only when its answer differs
     from the last one, or on the first check, Tag.FindStick (Find-SetupStick: the full search by the launcher's volume
-    serial, one bounded CIM query) runs. A stick it finds on another root than the model's replaces Repair.Stick, and
-    the change is logged once: INFO 'Toolbox stick changed' with @{ drive } ('none' when it is gone; ASCII). A presence
-    check or a search that throws changes nothing and is logged once per window (WARN 'Could not check for the stick',
-    'Could not look for the stick').
+    serial, one bounded CIM query) runs. Also (review M2, ruling RD-R19): while the presence answer names a stick and
+    the page has none (a search that timed out reads as "no stick"), the full search runs again once a minute
+    ($script:ToolboxStickRetrySeconds on Get-ToolboxStickSearchSeconds; never more often). A stick it finds on another
+    root than the model's replaces Repair.Stick, and the change is logged once: INFO 'Toolbox stick changed' with
+    @{ drive } ('none' when it is gone; ASCII); a search that changes nothing logs nothing. A presence check or a search
+    that throws changes nothing and is logged once per window (WARN 'Could not check for the stick', 'Could not look
+    for the stick').
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -1416,9 +1451,15 @@ function Update-ToolboxStick {
     }
     return
   }
-  if ($state['StickChecked'] -eq $true -and $presence -ceq [string]$state['StickPresence']) { return }
+  $changed = ($state['StickChecked'] -ne $true -or $presence -cne [string]$state['StickPresence'])
+  if (-not $changed) {
+    $stickNow = $state.Model['Repair']['Stick']
+    $hasStick = ($stickNow -is [System.Collections.IDictionary] -and -not [string]::IsNullOrEmpty([string]$stickNow['Root']))
+    if ($presence -eq '' -or $hasStick -or (Get-ToolboxStickSearchSeconds -State $state) -lt $script:ToolboxStickRetrySeconds) { return }
+  }
   $state['StickChecked'] = $true
   $state['StickPresence'] = $presence
+  $state['StickSearchClock'] = [Diagnostics.Stopwatch]::StartNew()
 
   $found = $null
   try {
@@ -1442,6 +1483,66 @@ function Update-ToolboxStick {
   Write-SetupLog -Level INFO -Message 'Toolbox stick changed' -Data @{ drive = $(if ($drive -ne '') { ConvertTo-ScreenText -Text $drive } else { 'none' }) }
 }
 
+function ConvertTo-ToolboxFullPath {
+  <#
+  .SYNOPSIS
+    Private. A folder path as Windows opens it, for comparing: a drive-letter path ('X:\' or 'X:/') made full
+    ([IO.Path]::GetFullPath: '.', '..', '/' and doubled separators resolved), each segment without its trailing dots
+    and spaces (Windows drops them: 'C:\BenTech \x' and 'C:\BenTech.\x' open C:\BenTech\x), no trailing '\'. $null for
+    anything else (relative, drive-relative 'C:x', UNC, '\\?\', a quote, characters a path cannot hold). Never throws.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Path)
+
+  $text = [string]$Path
+  if ($text -notmatch '^[A-Za-z]:[\\/]' -or $text.Contains('"')) { return $null }
+  try {
+    $full = [IO.Path]::GetFullPath($text)
+  } catch {
+    return $null
+  }
+  if ($full -notmatch '^[A-Za-z]:\\') { return $null }
+  $segments = @(foreach ($segment in $full.Substring(3).Split([char]'\')) { $segment.TrimEnd('.', ' ') })
+  return ($full.Substring(0, 3) + (@($segments | Where-Object { $_ -ne '' }) -join '\')).TrimEnd('\')
+}
+
+function Test-ToolboxSetupFolderPath {
+  # Private. $true when the full path -Path (ConvertTo-ToolboxFullPath) is the setup folder %SystemDrive%\BenTech or
+  # under it, in any case: it is admin-only (R28b), so Explorer, started from the elevated toolbox but shown by the
+  # signed-in user's shell, would offer to re-ACL it (Task 5 review I1).
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$Path, [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive)
+
+  $drive = ([string]$SystemDrive).TrimEnd('\')
+  if ($drive -eq '') { $drive = 'C:' }
+  $setup = $drive + '\BenTech'
+  return ($Path.Equals($setup, [StringComparison]::OrdinalIgnoreCase) -or $Path.StartsWith($setup + '\', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-ToolboxStickFolder {
+  <#
+  .SYNOPSIS
+    $true when -Folder (a result's Files.Folder) is on the stick the page knows now: under Repair.Stick.Root, after
+    ConvertTo-ToolboxFullPath. Open folder is offered and run only then (Task 5 review I1, ruling RD-R19). Never throws.
+  .DESCRIPTION
+    The window's own stick, not the child's Data.SessionIsLocal: the info children and the safety child never make a
+    session folder (their folder is the run folder in C:\BenTech\Setup\Tool and they set no SessionIsLocal), nor does a
+    child that ended before it got that far, and the window's own results have no folder. A stick pulled since (no
+    root, or another one) is no stick.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()][hashtable]$Repair, [AllowNull()][AllowEmptyString()][string]$Folder)
+
+  if ($null -eq $Repair -or -not (Test-RepairStick -Repair $Repair)) { return $false }
+  $root = ConvertTo-ToolboxFullPath -Path ([string]$Repair['Stick']['Root'])
+  $full = ConvertTo-ToolboxFullPath -Path $Folder
+  if ($null -eq $root -or $null -eq $full) { return $false }
+  return $full.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Open-ToolboxFolder {
   <#
   .SYNOPSIS
@@ -1450,20 +1551,33 @@ function Open-ToolboxFolder {
     & Tag.StartChild "%windir%\explorer.exe" '"<folder>"' (Start-BackgroundExternal: no wait). Its process is never
     added to $script:ToolboxChildren: nobody waits for it, and it must hold neither the close guard nor the cleanup
     (Task 4 review); its Process object is disposed at once (that releases the handle, it does not end Explorer).
-    Nothing without a folder; a folder that is not a full local path, holds a quote, or is not there
-    (the stick was pulled) opens nothing. Those, and a start that throws, are WARN 'Could not open the folder' with
-    the reason in ASCII.
+    Nothing without a folder. These open nothing, each a WARN 'Could not open the folder' with @{ folder; error } in
+    ASCII (the view hides the button for them, but a hidden or disabled button still gets a Click raised in code):
+      - a path that cannot be made full (ConvertTo-ToolboxFullPath): 'the folder path cannot be read';
+      - %SystemDrive%\BenTech or under it, in any spelling (Test-ToolboxSetupFolderPath; review I1: Explorer runs as
+        the signed-in user, who cannot open the admin-only folder and would be offered to re-ACL it):
+        'the folder is in the admin-only setup folder';
+      - a folder not on the page's stick (Test-ToolboxStickFolder): 'the folder is not on the stick';
+      - a folder that is not there (the stick was pulled): 'the folder is not there';
+      - a start that throws: its reason.
   #>
   [CmdletBinding()]
-  param([Parameter(Mandatory)][System.Windows.Window]$Window)
+  param(
+    [Parameter(Mandatory)][System.Windows.Window]$Window,
+    [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive
+  )
 
   $state = $Window.Tag
   $folder = [string](Get-RepairEntry -From (Get-RepairEntry -From $state.Model['Repair']['Result'] -Name 'Files') -Name 'Folder')
   if ($folder -eq '') { return }
   $problem = ''
-  if ($folder -notmatch '^[A-Za-z]:\\' -or $folder.Contains('"')) { $problem = 'not a local folder path' }
-  elseif (-not [IO.Directory]::Exists($folder)) { $problem = 'the folder is not there' }
+  $full = ConvertTo-ToolboxFullPath -Path $folder
+  if ($null -eq $full) { $problem = 'the folder path cannot be read' }
+  elseif (Test-ToolboxSetupFolderPath -Path $full -SystemDrive $SystemDrive) { $problem = 'the folder is in the admin-only setup folder' }
+  elseif (-not (Test-ToolboxStickFolder -Repair $state.Model['Repair'] -Folder $full)) { $problem = 'the folder is not on the stick' }
+  elseif (-not [IO.Directory]::Exists($full)) { $problem = 'the folder is not there' }
   if ($problem -eq '') {
+    $folder = $full
     try {
       foreach ($output in @(& $state['StartChild'] "$env:windir\explorer.exe" ('"{0}"' -f $folder))) {
         if ($output -is [System.Diagnostics.Process]) { $output.Dispose() }

@@ -667,20 +667,24 @@ function Get-RepairInfoAction {
 }
 
 function Get-RepairConfirmKind {
-  # Private. How the action catalog says -ActionId is confirmed: 'none', 'confirm' or 'yes'. An action without a row,
-  # or a value this page does not know, is 'yes', the strictest (such a tile is not available anyway: its gate says
-  # reason.unavailable).
+  # Private. How -ActionId is confirmed: 'none', 'confirm' or 'yes'. The catalog's Confirm, floored by its Kind
+  # (Task 5 review M3, ruling RD-R19): a destructive action always asks for YES, a repair at least for a confirmation
+  # (spec 4.2), whatever its Confirm says. An action without a row, or a Confirm this page does not know, is 'yes', the
+  # strictest (such a tile is not available anyway: its gate says reason.unavailable).
   [CmdletBinding()]
   [OutputType([string])]
   param([AllowEmptyString()][string]$ActionId)
 
+  $confirm = ''
   $kind = ''
   if ($null -ne $script:ToolActionCatalog -and $script:ToolActionCatalog.Contains($ActionId)) {
     $entry = $script:ToolActionCatalog[$ActionId]
-    if ($entry -is [System.Collections.IDictionary]) { $kind = [string]$entry['Confirm'] }
+    if ($entry -is [System.Collections.IDictionary]) { $confirm = [string]$entry['Confirm']; $kind = [string]$entry['Kind'] }
   }
-  if ($kind -cin 'none', 'confirm', 'yes') { return $kind }
-  return 'yes'
+  if ($confirm -cnotin 'none', 'confirm', 'yes') { return 'yes' }
+  if ($kind -ceq 'destructive') { return 'yes' }
+  if ($kind -ceq 'repair' -and $confirm -ceq 'none') { return 'confirm' }
+  return $confirm
 }
 
 function ConvertTo-RepairValues {
@@ -772,7 +776,8 @@ function Update-RepairModel {
       - Tile <id>: nothing unless the tile's gate allows it (Get-RepairGate: a disabled tile's click, raised in code,
         changes nothing), and nothing when its own confirmation is already open (what was typed and ticked stays).
         A tile of the rows becomes Selected. Its action (Get-RepairStartAction: ghosts removes with ghostRemove) is
-        confirmed as the catalog says (Get-RepairConfirmKind): 'none' with a stick is Pending at once (any open
+        confirmed as the catalog says, floored by its Kind (Get-RepairConfirmKind: destructive is always YES, a repair
+        always at least a confirmation): 'none' with a stick is Pending at once (any open
         confirmation closes); otherwise a confirmation (Kind 'confirm' for a read-only action without a stick, spec
         8), its Lines @{ Key; Args }: tile.<id>.changes (not for a read-only action), then the gate's warnings.
         Network reset and Ghost devices open Loading until their info child answers (NetInfo, GhostItems). Restore

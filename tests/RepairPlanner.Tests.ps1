@@ -212,6 +212,30 @@ Describe 'the run in the model (repair Task 4: New-RepairRunModel, Update-Repair
     @($res.Findings[0].Args) | Should -Be @('no powershell ?') }
 }
 
+Describe 'the action catalog''s confirmations (Task 5 review M3, ruling RD-R19)' {
+  BeforeAll {
+    # The ids of the rows whose confirmation is weaker than their kind: a destructive action asks for YES, a repair at
+    # least for a confirmation.
+    function Get-WeakConfirmRows($catalog) {
+      @(foreach ($id in @($catalog.Keys)) {
+          $kind = [string]$catalog[$id]['Kind']; $confirm = [string]$catalog[$id]['Confirm']
+          if (($kind -eq 'destructive' -and $confirm -cne 'yes') -or ($kind -eq 'repair' -and $confirm -cnotin 'confirm', 'yes')) { $id } })
+    }
+  }
+  It 'every destructive row of the catalog asks for YES and every repair row at least confirms (the check finds a weak row)' {
+    @(Get-WeakConfirmRows ([ordered]@{ a = @{ Kind = 'destructive'; Confirm = 'none' }; b = @{ Kind = 'repair'; Confirm = 'none' }; c = @{ Kind = 'destructive'; Confirm = 'yes' }
+                                       d = @{ Kind = 'readonly'; Confirm = 'none' }; e = @{ Kind = 'repair'; Confirm = 'yes' } })) | Should -Be @('a', 'b')
+    @(Get-WeakConfirmRows $script:ToolActionCatalog).Count | Should -Be 0 }
+  It 'Get-RepairConfirmKind floors the catalog''s Confirm by its Kind: <Kind>/<Confirm> is <E>' -ForEach @(
+    @{ Kind = 'destructive'; Confirm = 'none'; E = 'yes' }, @{ Kind = 'destructive'; Confirm = 'confirm'; E = 'yes' }, @{ Kind = 'destructive'; Confirm = 'yes'; E = 'yes' }
+    @{ Kind = 'repair'; Confirm = 'none'; E = 'confirm' }, @{ Kind = 'repair'; Confirm = 'confirm'; E = 'confirm' }, @{ Kind = 'repair'; Confirm = 'yes'; E = 'yes' }
+    @{ Kind = 'readonly'; Confirm = 'none'; E = 'none' }, @{ Kind = 'info'; Confirm = 'none'; E = 'none' }, @{ Kind = 'readonly'; Confirm = 'odd'; E = 'yes' }
+  ) {
+    $script:ToolActionCatalog['floorTestRow'] = @{ Kind = $Kind; Confirm = $Confirm; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@() }
+    try { Get-RepairConfirmKind -ActionId 'floorTestRow' | Should -BeExactly $E } finally { $script:ToolActionCatalog.Remove('floorTestRow') } }
+  It 'an action without a catalog row is confirmed with YES' { Get-RepairConfirmKind -ActionId 'noSuchRow' | Should -BeExactly 'yes' }
+}
+
 Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint; spec 4.2, 6.6, 6.7)' {
   BeforeAll {
     # The catalog rows Tasks 6 to 9 add (plan "Actions and steps"), so every tile has its confirmation kind here; this
@@ -332,6 +356,14 @@ Describe 'Update-RepairModel (repair Task 5: tiles, confirmations, the complaint
     $n = Update-RepairModel -Model (Update-RepairModel -Model $mo -Action Tile -Value wuReset) -Action YesText -Value 'YES'
     (Update-RepairModel -Model $n -Action Tile -Value wuReset).Repair.Confirm.Typed | Should -BeExactly 'YES'
     $d = Update-RepairModel -Model $n -Action Tile -Value diskCheck; $d.Repair.Confirm.Action | Should -Be 'diskCheck'; $d.Repair.Confirm.Typed | Should -BeExactly '' }
+  It 'a catalog row weaker than its kind is confirmed by its kind at the tile: destructive asks for YES, a repair confirms (M3, RD-R19)' {
+    $keepWu = $script:ToolActionCatalog['wuReset']; $keepStd = $script:ToolActionCatalog['standard']
+    try {
+      $script:ToolActionCatalog['wuReset'] = @{ Kind = 'destructive'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('wuServicesStop') }
+      $script:ToolActionCatalog['standard'] = @{ Kind = 'repair'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false; Steps = [string[]]@('dism') }
+      $n = Update-RepairModel -Model $mo -Action Tile -Value wuReset; $n.Repair.Pending | Should -BeNullOrEmpty; $n.Repair.Confirm.Kind | Should -Be 'yes'
+      $s = Update-RepairModel -Model $mo -Action Tile -Value standard; $s.Repair.Pending | Should -BeNullOrEmpty; $s.Repair.Confirm.Kind | Should -Be 'confirm'
+    } finally { $script:ToolActionCatalog['wuReset'] = $keepWu; $script:ToolActionCatalog['standard'] = $keepStd } }
   It 'the confirmation carries the gate''s warnings after the change list' {
     $n = Update-RepairModel -Model (Set-NoStick (New-TestModel @{ Free = 'crit' })) -Action Tile -Value standard
     Get-LineKeys $n | Should -Be @('tile.standard.changes', 'warn.lowSpace', 'confirm.noStickLog') }

@@ -809,8 +809,9 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     $w.Tag.Model.Repair.Strip.Restart = @{ Level = 'crit'; Args = @(); Detail = @{} }
     Click $w 'ConfirmButton'; @($script:started).Count | Should -Be 0; $w.Tag.Model.Repair.Confirm.Action | Should -Be 'diskCheck' }
   It 'Health check end to end: tile, live steps, findings in colour, files, Open folder, Restart PC' {
-    $folder = Join-Path $TestDrive 'Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015'; $null = New-Item -ItemType Directory -Path $folder -Force
-    $w = New-WorkWindow; ClickTag $w 'a:Tile:health'
+    # The visit folder on the stick (a stand-in stick under $TestDrive: Open folder opens only a folder on the stick, RD-R19).
+    $stick = Join-Path $TestDrive 'Stick'; $folder = Join-Path $stick 'BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015'; $null = New-Item -ItemType Directory -Path $folder -Force
+    $w = New-WorkWindow -Set @{ Stick = @{ Root = "$stick\"; Drive = 'S:' } }; ClickTag $w 'a:Tile:health'
     $script:started[-1].Args | Should -Match '-ToolAction health'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; $proc = $script:fake
     $run = $w.Tag.Runs.Action
     $steps = @(foreach ($id in $script:ToolActionCatalog['health'].Steps) { @{ Id = $id; Status = $(if ($id -eq 'volumeState') { 'done' } elseif ($id -eq 'imageCheck') { 'running' } else { 'pending' }); Percent = $null } })
@@ -824,8 +825,10 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     $script:started[-1].Args | Should -BeExactly ('"{0}"' -f $folder); $script:ToolboxChildren | Should -Not -Contain $script:started[-1].Process
     Click $w 'RestartButton'; Click $w 'ConfirmButton'; $w.Tag.Outcome | Should -Be 'Restart' }
   It 'Open folder: a folder that is not there, or a start that throws, is only a WARN; nothing is tracked' {
-    $w = New-WorkWindow -Set @{ Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = (Join-Path $TestDrive 'gone') } } }
+    $w = New-WorkWindow -Set @{ Stick = @{ Root = "$TestDrive\"; Drive = 'S:' }   # a stand-in stick: $TestDrive
+                                Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = (Join-Path $TestDrive 'gone') } } }
     Click $w 'OpenFolderButton'; @($script:started).Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Message -eq 'Could not open the folder' })[0].Data.error | Should -BeExactly 'the folder is not there'
     $dir = Join-Path $TestDrive 'there'; $null = New-Item -ItemType Directory -Path $dir -Force
     $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = $dir } }
     $w.Tag.StartChild = { param($file, $arguments) throw ('no explorer ' + [char]0x05D0) }
@@ -901,4 +904,155 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     (Get-AllText $w.FindName('ConfirmLines')) | Should -Match 'Its build differs from this PC \(build 26200\)'
     Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction dismSource'
     $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json'); $a.Options.Path | Should -BeExactly 'E:\sources\install.wim'; $a.Options.Type | Should -Be 'wim'; $a.Options.Index | Should -Be 6 }
+}
+
+Describe 'the stick presence check (ruling RD-R3; Task 5 review M1, ruling RD-R19)' {
+  # Get-ToolboxStickPresence through its two seams only: no test enumerates this PC's drives or reads their files.
+  BeforeAll {
+    function New-FakeDrive([string]$Name, $Type, [bool]$Ready = $true, [string]$Label = 'X', [long]$Size = 1000) {
+      [pscustomobject]@{ Name = $Name; DriveType = $Type; IsReady = $Ready; VolumeLabel = $Label; TotalSize = $Size }
+    }
+  }
+  BeforeEach {
+    # J: fails when its root is looked at (PowerShell reads a property whose getter throws as empty, so the realistic
+    # per-drive failure is the file check).
+    $broken = New-FakeDrive 'J:\' ([IO.DriveType]::Removable) $true 'GONE' 1
+    $script:drives = @(
+      (New-FakeDrive 'C:\' ([IO.DriveType]::Fixed) $true 'OS' 512000000000)
+      (New-FakeDrive 'D:\' ([IO.DriveType]::Fixed) $true 'DATA' 1000000000000)
+      (New-FakeDrive 'E:\' ([IO.DriveType]::Removable) $true 'BENTECH' 32010928128)
+      (New-FakeDrive 'F:\' ([IO.DriveType]::Removable) $true 'LAUNCHER' 16000000000)
+      (New-FakeDrive 'G:\' ([IO.DriveType]::Network) $true 'SHARE' 2000)
+      (New-FakeDrive 'H:\' ([IO.DriveType]::CDRom) $true 'DVD' 4000)
+      (New-FakeDrive 'I:\' ([IO.DriveType]::Removable) $false 'CARD' 8000)
+      $broken)
+    $script:files = @('C:\BenTechSetup.cmd', 'E:\BenTechSetup.cmd', 'G:\BenTechSetup.cmd', 'H:\BenTechSetup.cmd', 'I:\BenTechSetup.cmd', 'J:\BenTechSetup.cmd')
+    $script:checked = New-Object Collections.Generic.List[string]
+    $script:exists = { param($p) $script:checked.Add($p); if ($p -like 'J:*') { throw 'the drive went away' }; $script:files -contains $p }
+    $script:launcherF = @{ Path = 'F:\BenTechSetup (2).cmd'; Drive = 'F:'; VolumeSerial = '1A2B3C4D' }
+  }
+
+  It 'keeps the ready Removable and Fixed drives with BenTechSetup.cmd in the root, and the launcher''s drive under any file name' {
+    Get-ToolboxStickPresence -Launcher $launcherF -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists |
+      Should -BeExactly 'E:\|BENTECH|32010928128;F:\|LAUNCHER|16000000000'
+    # Never the system drive, a network share, a CD-ROM, a drive that is not ready, or the launcher's own drive (it counts as it is).
+    @($script:checked) | Should -Be @('D:\BenTechSetup.cmd', 'E:\BenTechSetup.cmd', 'J:\BenTechSetup.cmd') }
+  It 'a drive that fails is skipped, the order of the drives does not matter, and without a launcher only the file counts' {
+    $reversed = @($script:drives); [array]::Reverse($reversed); $script:drives = $reversed
+    Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists | Should -BeExactly 'E:\|BENTECH|32010928128'
+    Get-ToolboxStickPresence -Launcher $null -SystemDrive 'c:' -Drives { $script:drives } -FileExists $script:exists | Should -BeExactly 'E:\|BENTECH|32010928128' }
+  It 'no drive list, or no drive at all, is an empty answer, never thrown' {
+    Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { throw 'no drives' } -FileExists { param($p) $true } | Should -BeExactly ''
+    Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { @() } -FileExists { param($p) $true } | Should -BeExactly ''
+    Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { $script:drives } -FileExists { param($p) throw 'access denied' } | Should -BeExactly '' }
+}
+
+Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling RD-R19)' {
+  BeforeAll {
+    $script:fixRows = [ordered]@{
+      netRestore  = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('netRestore') }
+      ghostList   = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $true; LogLocal = $true; Steps = [string[]]@('ghostList') }
+      ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false; Steps = [string[]]@('ghostCsv', 'ghostRemove') }
+    }
+    foreach ($k in $script:fixRows.Keys) { $script:ToolActionCatalog[$k] = $script:fixRows[$k] }
+    function New-FixWindow([hashtable]$Set = @{}) { $w = New-RunWindow -Set $Set; $w.Tag.StickPresent = { param($l) $script:presence }; $w }
+    function Write-GhostAnswer($w, [object[]]$Ghosts) {
+      $run = $w.Tag.Runs.Action
+      $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'result.json') -InputObject @{ Action = $run.ActionId; RunId = $run.RunId; Outcome = 'Done'; Color = 'GREEN'
+        Steps = @(@{ Id = 'ghostList'; Status = 'done'; Percent = $null }); Findings = @(); RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }
+        Files = @{}; Data = @{ Ghosts = $Ghosts }; StartedAt = '2026-10-22T10:15:00'; EndedAt = '2026-10-22T10:15:20' }
+    }
+    function Send-Click($element) { $element.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }
+    function Get-FolderWarns { @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not open the folder' }) }
+    function Set-ResultFolder($w, [string]$Folder) { $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = $Folder } } }
+  }
+  AfterAll { foreach ($k in $script:fixRows.Keys) { $script:ToolActionCatalog.Remove($k) } }
+  BeforeEach { Set-RunTestMocks; $script:presence = 'E:\|BENTECH|32010928128'; $script:sticks = 0 }
+
+  It 'Open folder shows only for a result folder on the stick; a local folder keeps its path without the button, and a click raised on it opens nothing (I1)' {
+    $stick = Join-Path $TestDrive 'Stick'; $visit = Join-Path $stick 'BenTech-Reports\PC_visit'; $null = New-Item -ItemType Directory -Path $visit -Force
+    $w = New-FixWindow @{ Stick = @{ Root = "$stick\"; Drive = 'S:' } }; Set-ResultFolder $w $visit; Update-ToolboxView -Window $w
+    $w.FindName('OpenFolderButton').Visibility | Should -Be 'Visible'
+    Click $w 'OpenFolderButton'; $script:started[-1].File | Should -BeExactly "$env:windir\explorer.exe"; $script:started[-1].Args | Should -BeExactly ('"{0}"' -f $visit)
+    # The local fallback (no stick, or the stick's folder could not be made): C:\BenTech is admin-only (R28b).
+    $local = Join-Path $env:SystemDrive 'BenTech\Setup\Logs\Repair\DESKTOP-4F7K2LQ_7HX2K93_2026-10-22_1015'
+    Set-ResultFolder $w $local; Update-ToolboxView -Window $w
+    $w.FindName('ResultFiles').Text | Should -BeExactly $local; $w.FindName('ResultFiles').Visibility | Should -Be 'Visible'
+    $w.FindName('ResultFilesLabel').Visibility | Should -Be 'Visible'; $w.FindName('OpenFolderButton').Visibility | Should -Be 'Collapsed'
+    $before = @($script:started).Count; Click $w 'OpenFolderButton'; @($script:started).Count | Should -Be $before
+    @(Get-FolderWarns).Count | Should -Be 1; @(Get-FolderWarns)[0].Data.error | Should -BeExactly 'the folder is in the admin-only setup folder'
+    # A folder on the stick whose stick is gone has no button either; the sample on stick E: has it.
+    (New-RepairWindow @{ Stick = $null; Result = $resultSample }).FindName('OpenFolderButton').Visibility | Should -Be 'Collapsed'
+    (New-RepairWindow @{ Result = $resultSample }).FindName('OpenFolderButton').Visibility | Should -Be 'Visible'
+    $w.Tag.Model.Repair.Stick = @{ Root = $null; Drive = $null }; Set-ResultFolder $w $visit
+    Click $w 'OpenFolderButton'; @($script:started).Count | Should -Be $before
+    @(Get-FolderWarns)[-1].Data.error | Should -BeExactly 'the folder is not on the stick'
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+  It 'Open-ToolboxFolder refuses the setup folder in any spelling, and a path it cannot read, even with a stick on that drive (I1)' {
+    $w = New-FixWindow @{ Stick = @{ Root = 'C:\'; Drive = 'C:' } }   # a stick on the system drive cannot happen: only the refusal is under test
+    $setup = 'C:\BenTech\Setup\Logs\Repair\x', 'c:\bentech\setup', 'C:\BenTech', 'C:\Windows\..\BenTech\Setup', 'C:\BenTech\.\Setup\..\Setup', 'C:\BenTech.\Setup',
+             'C:\BenTech \Setup', 'C:/BenTech/Setup', 'C:\\BenTech\\Setup'
+    $unreadable = 'C:\Ben|Tech\x', 'C:BenTech\x', '\\?\C:\BenTech\Setup', '\\localhost\c$\BenTech\Setup', 'C:\Ben"Tech'
+    foreach ($folder in @($setup) + @($unreadable)) { Set-ResultFolder $w $folder; Open-ToolboxFolder -Window $w -SystemDrive 'C:' }
+    @($script:started).Count | Should -Be 0; $warns = @(Get-FolderWarns); $warns.Count | Should -Be ($setup.Count + $unreadable.Count)
+    @($warns[0..($setup.Count - 1)] | ForEach-Object { $_.Data.error } | Select-Object -Unique) | Should -Be @('the folder is in the admin-only setup folder')
+    @($warns[$setup.Count..($warns.Count - 1)] | ForEach-Object { $_.Data.error } | Select-Object -Unique) | Should -Be @('the folder path cannot be read')
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]'
+    # The test itself: under the setup folder only, never a sibling or another drive's BenTech.
+    Test-ToolboxSetupFolderPath -Path 'C:\BENTECH' -SystemDrive 'C:' | Should -BeTrue
+    Test-ToolboxSetupFolderPath -Path 'C:\BenTech\Setup' -SystemDrive 'c:\' | Should -BeTrue
+    Test-ToolboxSetupFolderPath -Path 'C:\BenTechOther\x' -SystemDrive 'C:' | Should -BeFalse
+    Test-ToolboxSetupFolderPath -Path 'D:\BenTech\x' -SystemDrive 'C:' | Should -BeFalse }
+  It 'while the presence check names a stick and the page has none, the full search is retried once a minute, never more often (M2)' {
+    $w = New-FixWindow @{ Stick = $null }; $script:answer = @{ Root = $null; Drive = $null }
+    $w.Tag.FindStick = { param($l) $script:sticks++; $script:answer }; $tick = New-ToolboxPowerTimer -Window $w
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 1; $w.FindName('ChipStickText').Text | Should -Be 'No stick'
+    Mock Get-ToolboxStickSearchSeconds { 59 }
+    foreach ($i in 1..3) { Invoke-ToolboxAction -Sender $tick -Action 'Power' }; $script:sticks | Should -Be 1
+    Mock Get-ToolboxStickSearchSeconds { 61 }
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 2; $w.FindName('ChipStickText').Text | Should -Be 'No stick'
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox stick changed' }).Count | Should -Be 0   # nothing changed, nothing logged
+    $script:answer = @{ Root = 'E:\'; Drive = 'E:' }
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 3; $w.FindName('ChipStickText').Text | Should -Be 'Stick E:'
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 3   # the page has its stick: no more retries
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox stick changed' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox stick changed' })[0].Data.drive | Should -Be 'E:'
+    # A presence check that names no stick is never retried.
+    $script:presence = ''; $script:answer = @{ Root = $null; Drive = $null }
+    $n = New-FixWindow @{ Stick = $null }; $n.Tag.FindStick = { param($l) $script:sticks++; $script:answer }; $nTick = New-ToolboxPowerTimer -Window $n
+    Invoke-ToolboxAction -Sender $nTick -Action 'Power'; $script:sticks | Should -Be 4
+    foreach ($i in 1..3) { Invoke-ToolboxAction -Sender $nTick -Action 'Power' }; $script:sticks | Should -Be 4 }
+  It 'the time since the last full search comes from its own Stopwatch; none yet is overdue (M2)' {
+    Get-ToolboxStickSearchSeconds -State @{} | Should -BeGreaterThan 3600
+    Get-ToolboxStickSearchSeconds -State @{ StickSearchClock = [Diagnostics.Stopwatch]::StartNew() } | Should -BeLessThan 60 }
+  It 'Register-ToolboxHandlers leaves the Ghost devices switches to the view: one handler each, one toggle per click (M4)' {
+    $c = @{ Action = 'ghosts'; Kind = 'yes'; Typed = ''; AtPc = $false; Loading = $false; Remote = $null; Options = @{}; Lines = @()
+            Items = @(@{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'SanDisk Cruzer'; Ticked = $true }) }
+    $w = New-RepairWindow @{ Confirm = $c }; Register-ToolboxHandlers -Window $w
+    $box = @($w.FindName('ConfirmItems').Children | Where-Object { $_ -is [Windows.Controls.CheckBox] })[0]
+    Send-Click $box; $w.Tag.Model.Repair.Confirm.Items[0].Ticked | Should -BeFalse   # a second handler would toggle it back
+    Send-Click $box; $w.Tag.Model.Repair.Confirm.Items[0].Ticked | Should -BeTrue }
+  It 'Restore network settings through the window: the values shown, YES, and the child gets the file and its hash (M5)' {
+    $backup = @{ Path = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json'; Sha256 = ('AB' * 32); CreatedAt = '2026-10-20T09:05:00'
+                 Adapters = @(@{ Alias = 'Ethernet'; Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8') }) }
+    $w = New-FixWindow @{ NetBackup = $backup }; $w.FindName('NetRestoreButton').Visibility | Should -Be 'Visible'
+    Click $w 'NetRestoreButton'; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse
+    (Get-AllText $w.FindName('ConfirmItems')) | Should -Match 'Ethernet: 192\.168\.1\.10/24, gateway 192\.168\.1\.1, DNS 8\.8\.8\.8'
+    $w.FindName('YesBox').Text = 'YES'; Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction netRestore'
+    $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json'); $a.Options.File | Should -BeExactly $backup.Path; $a.Options.Sha256 | Should -BeExactly ('AB' * 32) }
+  It 'an empty ghost list read back from result.json is an answer: nothing to remove, nothing "not valid" (M5)' {
+    $w = New-FixWindow; ClickTag $w 'a:Tile:ghosts'; Write-GhostAnswer $w @()
+    [IO.File]::ReadAllText((Join-Path $w.Tag.Runs.Action.Dir 'result.json')) | Should -Match '"Ghosts":\s*\[\s*\]'
+    $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.Confirm.Loading | Should -BeFalse; @($w.Tag.Model.Repair.Confirm.Items).Count | Should -Be 0; $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty
+    @(@($w.Tag.Model.Repair.Confirm.Lines | Where-Object { $_.Key -eq 'confirm.ghostCount' })[0].Args) | Should -Be @(0, 0, 0)
+    $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'; $w.FindName('ConfirmButton').IsEnabled | Should -BeFalse
+    @($script:logs | Where-Object { $_.Message -in 'Toolbox action result is not valid', 'Toolbox info action failed' }).Count | Should -Be 0 }
+  It 'an answer that comes after Cancel: the run is cleared, nothing opens, no result (M5)' {
+    $w = New-FixWindow; ClickTag $w 'a:Tile:ghosts'; $p = $script:fake
+    Click $w 'ConfirmCancelButton'; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty; $w.FindName('RunPanel').Visibility | Should -Be 'Visible'   # the listing shows as a run
+    Write-GhostAnswer $w @(@{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'SanDisk Cruzer'; Excluded = '' }); $p.HasExited = $true; Send-RunTick $w
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Run | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty
+    $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty; $w.FindName('WhatPanel').Visibility | Should -Be 'Visible'
+    @($script:logs | Where-Object { $_.Message -in 'Toolbox action finished', 'Toolbox info action failed' }).Count | Should -Be 0; @($script:started).Count | Should -Be 1 }
 }
