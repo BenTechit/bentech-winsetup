@@ -3,6 +3,7 @@
 **Status:** APPROVED by Ben, 20/10/2026 (with the five builder-check calls marked "my call", and build order A). §9 and §10 added the same day from the first real-machine test and Ben's answers Q6 A and Q7 A.
 **Date:** 20/10/2026
 **Amends:** [2026-10-18-bentech-winsetup-design.md](2026-10-18-bentech-winsetup-design.md). That spec stays binding wherever this document does not change it.
+Amended by [2026-10-22-windows-update-option-design.md](2026-10-22-windows-update-option-design.md): Windows Update "drivers only" and the final screen's U key.
 
 ## 1. Why
 
