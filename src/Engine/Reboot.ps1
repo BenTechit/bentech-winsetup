@@ -117,7 +117,8 @@ function Get-ServicingRebootSignals {
       $signals[$name] = ($reboot[$name] -eq $true)
     }
   } catch {
-    Write-SetupLog -Level WARN -Message 'Could not read the pending-restart signals; treating them as none' -Data @{ error = $_.Exception.Message }
+    # ConvertTo-ScreenText (UI\StartScreen.ps1; the bundle holds every file): a Hebrew Windows can localize the message.
+    Write-SetupLog -Level WARN -Message 'Could not read the pending-restart signals; treating them as none' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
   $signals['CbsPackagesPending'] = Test-RebootRegistryKey -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
   try {

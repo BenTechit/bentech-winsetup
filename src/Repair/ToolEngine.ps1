@@ -21,6 +21,10 @@
 #     read from a tool is DISM's percent from its redirected output, for display (Update-ToolTick), so no tool output
 #     is ever captured in memory (tests\RepairStatic.Tests.ps1 pins both);
 #   - Stop works only between steps (spec 4.3): a running tool ends by its own timeout or the action's deadline;
+#   - every deadline is measured on a monotonic clock (ruling RD-R8): the child gets its budget in seconds
+#     (BudgetSeconds in the args) and measures its elapsed time with one Stopwatch started when it begins. The wall
+#     clock is never compared with anything: Standard repair's first step syncs it, and a clock hours off would end
+#     the run early. DeadlineUtc is kept for the log only;
 #   - a step timeout is capped by the time the action has left, so the child stops before the window kills it;
 #   - progress.json, result.json and the child's log are English and ASCII (ConvertTo-ScreenText on every free value):
 #     the customer complaint in the args is never logged;
@@ -201,8 +205,10 @@ function Read-ToolArgs {
     - Action is text, -ceq -ActionId, and an action of $script:ToolActionCatalog (case-sensitive).
     - RunId matches ^[0-9]{8}-[0-9]{6}-[A-Za-z]{2,20}$ and names the run folder (the window creates
       <Root>\Tool\<RunId>\, and the child derives its files from it).
-    - DeadlineUtc is a round-trip date; SessionDir is fully qualified or empty (missing = ''); Complaint is text of
-      at most 2000 characters (missing = ''); Options is an object (missing = @{}).
+    - BudgetSeconds (the action's whole time, which the child measures on its own Stopwatch, ruling RD-R8) is a
+      number above 0 and at most 7 days; DeadlineUtc (for the log only) is a round-trip date.
+    - SessionDir is fully qualified or empty (missing = ''); Complaint is text of at most 2000 characters
+      (missing = ''); Options is an object (missing = @{}).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -248,6 +254,13 @@ function Read-ToolArgs {
     throw 'The run folder is not named after the RunId'
   }
   $null = ConvertFrom-ToolDeadline -Value $data['DeadlineUtc']
+  $budget = $data['BudgetSeconds']
+  # A JSON number comes back as Int32, Int64 or Decimal (Windows PowerShell 5.1); text is refused.
+  if (-not ($budget -is [int] -or $budget -is [long] -or $budget -is [double] -or $budget -is [decimal]) -or
+      [double]$budget -le 0 -or [double]$budget -gt 604800) {
+    throw 'BudgetSeconds is not a number of seconds above 0 and at most 7 days'
+  }
+  $data['BudgetSeconds'] = [double]$budget
 
   $session = $data['SessionDir']
   if ($null -eq $session) { $session = '' }
@@ -275,7 +288,9 @@ function New-ToolRun {
     The in-memory run of one action, from its checked args (Read-ToolArgs).
   .DESCRIPTION
     @{ Args; Config; Root; Dir = <Root>\Tool\<RunId>; ProgressPath; ResultPath; StopPath (in Dir); LogDir = Dir
-       (New-ToolSessionDir moves it); SessionDir = $null; Deadline (UTC [datetime], from DeadlineUtc);
+       (New-ToolSessionDir moves it); SessionDir = $null; Deadline (UTC [datetime], from DeadlineUtc: for the log
+       only); BudgetSeconds (from the args); Clock (the run's Stopwatch: -Clock, which Invoke-SetupToolProcess starts
+       when the child begins, else one started now; every deadline is measured on it, ruling RD-R8);
        Steps = List of @{ Id; Status = 'pending'; Percent = $null } (the catalog's steps of the action);
        Current = -1; Findings = List; Log = List (the last 12 lines); Data = @{}; Partial = @{};
        RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }; Files = @{};
@@ -286,9 +301,13 @@ function New-ToolRun {
   param(
     [Parameter(Mandatory)][hashtable]$ToolArgs,
     [Parameter(Mandatory)][AllowNull()]$Config,
-    [Parameter(Mandatory)][string]$Root
+    [Parameter(Mandatory)][string]$Root,
+    [Diagnostics.Stopwatch]$Clock
   )
 
+  if ($null -eq $Clock) { $Clock = [Diagnostics.Stopwatch]::StartNew() }
+  $budget = 0.0
+  if ($null -ne $ToolArgs['BudgetSeconds']) { $budget = [double]$ToolArgs['BudgetSeconds'] }
   $dir = [IO.Path]::Combine($Root, 'Tool', [string]$ToolArgs['RunId'])
   $steps = New-Object System.Collections.Generic.List[object]
   $entry = $script:ToolActionCatalog[[string]$ToolArgs['Action']]
@@ -308,6 +327,8 @@ function New-ToolRun {
     LogDir          = $dir
     SessionDir      = $null
     Deadline        = (ConvertFrom-ToolDeadline -Value $ToolArgs['DeadlineUtc'])
+    BudgetSeconds   = $budget
+    Clock           = $Clock
     Steps           = $steps
     Current         = -1
     Findings        = (New-Object System.Collections.Generic.List[object])
@@ -330,10 +351,12 @@ function New-ToolSessionDir {
   .DESCRIPTION
     When <stick>\BenTech-Reports (the parent of SessionDir), the session folder or its logs\ is a reparse point
     (Test-StickReparsePoint, before and again after the creation), or the creation fails, nothing more is done on the
-    stick: the folder used is <Root>\Logs\Repair\<leaf> (the leaf reduced to [A-Za-z0-9_-]) and the WARN finding
-    sessionLink names it (V2-R13). An empty SessionDir uses that local folder without a finding. If even the local
-    folder cannot be made, the run folder is used. $Run.Data.SessionIsLocal is $true unless the folder used is the
-    one the window asked for on the stick (Args.StickRoot): the network backup and the ghost CSV refuse a local one.
+    stick: the folder used is <Root>\Logs\Repair\<leaf> (the leaf reduced to [A-Za-z0-9_-]), named by a WARN
+    finding: sessionLink for a link (V2-R13), sessionCreateFailed (with the reason) when the folder could not be
+    created (a pulled or write-protected stick). An empty SessionDir uses that local folder without a finding. If
+    even the local folder cannot be made, the run folder is used. $Run.Data.SessionIsLocal is $true unless the folder
+    used is the one the window asked for on the stick (Args.StickRoot): the network backup and the ghost CSV refuse a
+    local one.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -350,16 +373,19 @@ function New-ToolSessionDir {
 
   $used = $null
   $problem = $null
+  $isLink = $false
   if ($wanted -ne '') {
     try {
       $reports = [IO.Path]::GetDirectoryName($wanted.TrimEnd('\'))
       $logs = [IO.Path]::Combine($wanted, 'logs')
       if ((Test-StickReparsePoint -Path $reports) -or (Test-StickReparsePoint -Path $wanted)) {
+        $isLink = $true
         $problem = 'BenTech-Reports or the session folder is a link'
       } else {
         [void][IO.Directory]::CreateDirectory($logs)
         # Checked again once the folders exist: a link put in place meanwhile is never written through.
         if ((Test-StickReparsePoint -Path $reports) -or (Test-StickReparsePoint -Path $wanted) -or (Test-StickReparsePoint -Path $logs)) {
+          $isLink = $true
           $problem = 'BenTech-Reports or the session folder is a link'
         } else {
           $used = $wanted
@@ -384,7 +410,11 @@ function New-ToolSessionDir {
     if ($fellBack) {
       Write-SetupLog -Level WARN -Message 'The session folder on the stick was not used; the files stay on this PC' -Data @{
         wanted = (ConvertTo-ScreenText -Text $wanted); used = (ConvertTo-ScreenText -Text $used); reason = (ConvertTo-ScreenText -Text $problem) }
-      Add-ToolFinding -Run $Run -Level WARN -Code 'sessionLink' -Arguments @($used)
+      if ($isLink) {
+        Add-ToolFinding -Run $Run -Level WARN -Code 'sessionLink' -Arguments @($used)
+      } else {
+        Add-ToolFinding -Run $Run -Level WARN -Code 'sessionCreateFailed' -Arguments @($problem, $used)
+      }
     }
   }
 
@@ -580,11 +610,37 @@ function Get-ToolConfigMinutes {
   return $null
 }
 
+function Get-ToolElapsedSeconds {
+  <#
+  .SYNOPSIS
+    The seconds since the child began, on the run's monotonic clock ($Run.Clock, a Stopwatch). Ruling RD-R8: no
+    deadline ever reads the wall clock, which Standard repair's first step syncs. Tests mock this seam. 0 without a
+    clock.
+  #>
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  $clock = $Run.Clock
+  if ($clock -is [Diagnostics.Stopwatch]) { return [double]$clock.Elapsed.TotalSeconds }
+  return 0.0
+}
+
+function Get-ToolRemainingSeconds {
+  # The action's time left: BudgetSeconds minus Get-ToolElapsedSeconds (negative once the budget is spent).
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  return ([double]$Run.BudgetSeconds - (Get-ToolElapsedSeconds -Run $Run))
+}
+
 function Get-ToolStepTimeout {
   <#
   .SYNOPSIS
     A step's timeout in minutes: config timeoutsMinutes.toolStep.<Name>, else toolStep.native, else 3, capped at the
-    action's remaining time minus 0.5 minute (and at least 0.25), so the child stops before the window's kill.
+    action's remaining time (Get-ToolRemainingSeconds, the monotonic clock) minus 0.5 minute (and at least 0.25), so
+    the child stops before the window's kill.
   #>
   [CmdletBinding()]
   [OutputType([double])]
@@ -598,31 +654,17 @@ function Get-ToolStepTimeout {
   $minutes = Get-ToolConfigMinutes -Section $section -Name $Name
   if ($null -eq $minutes) { $minutes = Get-ToolConfigMinutes -Section $section -Name 'native' }
   if ($null -eq $minutes) { $minutes = 3.0 }
-  if ($Run.Deadline -is [datetime]) {
-    $left = ($Run.Deadline - [datetime]::UtcNow).TotalMinutes - 0.5
-    $minutes = [math]::Min($minutes, [math]::Max(0.25, $left))
-  }
-  return [double]$minutes
+  $left = (Get-ToolRemainingSeconds -Run $Run) / 60 - 0.5
+  return [double][math]::Min($minutes, [math]::Max(0.25, $left))
 }
 
 function Get-ToolActionMinutes {
-  # Private. The action's whole time for the actionTimedOut finding: timeoutsMinutes.tool.<action>, else the minutes
-  # from the run's start to the args' deadline.
+  # Private. The action's whole time for the actionTimedOut finding: its budget (BudgetSeconds), in whole minutes.
   [CmdletBinding()]
   [OutputType([int])]
   param([Parameter(Mandatory)][hashtable]$Run)
 
-  $section = $null
-  try { $section = $Run.Config.timeoutsMinutes.tool } catch { $section = $null }
-  $minutes = Get-ToolConfigMinutes -Section $section -Name ([string]$Run.Args['Action'])
-  if ($null -eq $minutes) {
-    try {
-      $minutes = ((ConvertFrom-ToolDeadline -Value $Run.Args['DeadlineUtc']) - ([datetime]$Run.StartedAt).ToUniversalTime()).TotalMinutes
-    } catch {
-      $minutes = 0
-    }
-  }
-  return [int][math]::Max(0, [math]::Round($minutes))
+  return [int][math]::Max(0, [math]::Round([double]$Run.BudgetSeconds / 60))
 }
 
 # --- The step runner ----------------------------------------------------------------------------------------------
@@ -630,8 +672,10 @@ function Get-ToolActionMinutes {
 function Invoke-ToolStep {
   # Private. Runs step -Index of the run: 'running' and progress, the step function, its status and progress. An
   # exception, a step without a function, or a result that is not exactly one of the step results is 'failed' with
-  # the CRIT finding stepFailed. The step runs inside a one-shot loop: a stray break or continue in step code ends
-  # only that step (as Invoke-SetupTick), never the runner's loop.
+  # the CRIT finding stepFailed. A step that ends 'failed' or 'timedout' without adding any finding gets a generic
+  # CRIT one (stepFailed '<name> failed: see the log', or stepTimedOut with the step's minutes on the run's clock), so
+  # a failure is never GREEN (fix round 1). The step runs inside a one-shot loop: a stray break or continue in step
+  # code ends only that step (as Invoke-SetupTick), never the runner's loop.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Run,
@@ -646,6 +690,8 @@ function Invoke-ToolStep {
   $Run.Current = $Index
   Add-ToolLog -Run $Run -Text ('{0}: started' -f $name)
   Write-ToolProgress -Run $Run
+  $findingsBefore = $Run.Findings.Count
+  $startedSeconds = Get-ToolElapsedSeconds -Run $Run
 
   $status = 'failed'
   $failure = $null
@@ -676,6 +722,13 @@ function Invoke-ToolStep {
   if ($null -ne $failure) {
     $status = 'failed'
     Add-ToolFinding -Run $Run -Level CRIT -Code 'stepFailed' -Arguments @($name, $failure)
+  } elseif ($Run.Findings.Count -eq $findingsBefore -and $status -eq 'failed') {
+    Write-SetupLog -Level WARN -Message 'Tool step failed without a finding; adding a generic one' -Data @{ step = $id }
+    Add-ToolFinding -Run $Run -Level CRIT -Code 'stepFailed' -Arguments @($name, 'see the log')
+  } elseif ($Run.Findings.Count -eq $findingsBefore -and $status -eq 'timedout') {
+    Write-SetupLog -Level WARN -Message 'Tool step timed out without a finding; adding a generic one' -Data @{ step = $id }
+    $minutes = [math]::Round([math]::Max(0, (Get-ToolElapsedSeconds -Run $Run) - $startedSeconds) / 60, 1)
+    Add-ToolFinding -Run $Run -Level CRIT -Code 'stepTimedOut' -Arguments @($name, $minutes)
   }
   $step['Status'] = $status
   Add-ToolLog -Run $Run -Text ('{0}: {1}' -f $name, $status)
@@ -687,9 +740,11 @@ function Invoke-ToolSteps {
   .SYNOPSIS
     Runs the run's steps in order. Returns 'Done', 'Stopped', 'TimedOut' or 'NeedsRestart'.
   .DESCRIPTION
-    Safe points before every step after the first (spec 4.3), in this order:
-      - stop.flag: the INFO finding stopped (the previous step's English name), 'Stopped';
-      - past the deadline: the CRIT finding actionTimedOut, 'TimedOut'.
+    Safe points (spec 4.3), in this order:
+      - stop.flag, before every step: the INFO finding stopped (the previous step's English name), or before the first
+        step stoppedBeforeStart (a Stop pressed while the child was starting), 'Stopped';
+      - the budget spent (Get-ToolRemainingSeconds, the monotonic clock, ruling RD-R8), before every step after the
+        first: the CRIT finding actionTimedOut (the budget's minutes), 'TimedOut'.
     Before every servicing step, the first too (spec 5): a pending servicing restart (Get-ServicingRebootSignals,
     Test-ServicingRebootPending) is the WARN finding restartFirst and 'NeedsRestart'. A file or computer rename alone
     never blocks. On any of these the steps not run are 'skipped'. A step that fails does not stop the next one (DISM
@@ -702,14 +757,18 @@ function Invoke-ToolSteps {
   $outcome = 'Done'
   for ($index = 0; $index -lt $Run.Steps.Count; $index++) {
     $id = [string]$Run.Steps[$index]['Id']
-    if ($index -gt 0) {
-      if (Test-ToolStopRequested -Run $Run) {
+    if (Test-ToolStopRequested -Run $Run) {
+      if ($index -eq 0) {
+        Add-ToolFinding -Run $Run -Level INFO -Code 'stoppedBeforeStart'
+      } else {
         Add-ToolFinding -Run $Run -Level INFO -Code 'stopped' -Arguments @(Get-ToolStepName -Id ([string]$Run.Steps[$index - 1]['Id']))
-        Add-ToolLog -Run $Run -Text 'Stopped by the technician'
-        $outcome = 'Stopped'
-        break
       }
-      if ([datetime]::UtcNow -ge $Run.Deadline) {
+      Add-ToolLog -Run $Run -Text 'Stopped by the technician'
+      $outcome = 'Stopped'
+      break
+    }
+    if ($index -gt 0) {
+      if ((Get-ToolRemainingSeconds -Run $Run) -le 0) {
         Add-ToolFinding -Run $Run -Level CRIT -Code 'actionTimedOut' -Arguments @(Get-ToolActionMinutes -Run $Run)
         Add-ToolLog -Run $Run -Text 'The action reached its deadline'
         $outcome = 'TimedOut'
@@ -875,7 +934,8 @@ function Invoke-ToolJsonChild {
     BOM) and exits 0; a throw writes @{ Error = <message> } and exits 1. Commands return a hashtable (lists go inside
     Items), never a bare array, and stay short (the command line carries them encoded).
     Then Read-ToolJsonFile: exit 0 and an object is Ok with Data. Anything else is Ok = $false with Error: 'timed
-    out', the grandchild's own message (ASCII), 'exit 0x...', or 'no result'. The grandchild's console output is
+    out', 'output too large' (the result file is over Read-ToolJsonFile's 1 MB), the grandchild's own message
+    (ASCII), 'exit 0x...', or 'no result'. The grandchild's console output is
     never read.
   #>
   [CmdletBinding()]
@@ -916,7 +976,11 @@ function Invoke-ToolJsonChild {
     }
     $data = Read-ToolJsonFile -Path $out
     if ($child.ExitCode -eq 0 -and $null -ne $data) { return @{ Ok = $true; TimedOut = $false; Data = $data; Error = $null } }
-    if ($null -ne $data -and $data.ContainsKey('Error') -and -not [string]::IsNullOrWhiteSpace([string]$data['Error'])) {
+    $outFile = New-Object IO.FileInfo $out
+    if ($null -eq $data -and $outFile.Exists -and $outFile.Length -gt 1MB) {
+      # Read-ToolJsonFile's default cap: a command that returns more must return less (or write its own file).
+      $message = 'output too large'
+    } elseif ($null -ne $data -and $data.ContainsKey('Error') -and -not [string]::IsNullOrWhiteSpace([string]$data['Error'])) {
       $message = ConvertTo-ScreenText -Text ([string]$data['Error'])
     } elseif ($null -ne $child.ExitCode -and $child.ExitCode -ne 0) {
       $message = 'exit ' + (Format-ToolExitCode -ExitCode $child.ExitCode)
@@ -940,13 +1004,15 @@ function Invoke-SetupToolProcess {
     The -ToolAction child process: one action of the repair page. Returns 0 when result.json was written, else 1.
     Never prompts, never draws.
   .DESCRIPTION
-    1. <Root> must exist (the launcher made it admin-only): without it nothing is created and the answer is 1.
+    1. The run's Stopwatch starts (every deadline is measured on it, ruling RD-R8). <Root> must exist (the launcher
+       made it admin-only): without it nothing is created and the answer is 1.
     2. The log goes to <Root>\Tool\setup.log, so a refused call logs inside the admin-only folder and creates
        nothing elsewhere. Read-ToolArgs: invalid args are an ERROR 'Tool action refused' with the ASCII reason, 1,
        and nothing else runs (no step, no progress, no result).
     3. The log moves to the run folder; Read-SetupConfig <Root>\config.json; New-ToolRun. An action that is not
        LogLocal gets its session folder (New-ToolSessionDir) and the log moves to <session>\logs.
-    4. 'Tool action started' @{ action; runId }; the tick (Update-ToolTick) is registered; Invoke-ToolSteps;
+    4. 'Tool action started' @{ action; runId; budgetSeconds; deadlineUtc }; the tick (Update-ToolTick) is
+       registered; Invoke-ToolSteps;
        Write-ToolResult. The tick is unregistered in a finally.
     A failure after the run exists marks the running step failed and the rest skipped, adds stepFailed and writes
     the result as 'Failed'. Before that (config.json unreadable) it is an ERROR and 1, without a result.
@@ -959,6 +1025,7 @@ function Invoke-SetupToolProcess {
     [AllowNull()][AllowEmptyString()][string]$ArgsPath
   )
 
+  $clock = [Diagnostics.Stopwatch]::StartNew()
   if (-not [IO.Directory]::Exists($Root)) { return 1 }
   $action = ConvertTo-ScreenText -Text $ActionId
   $run = $null
@@ -974,12 +1041,13 @@ function Invoke-SetupToolProcess {
     $runId = [string]$toolArgs['RunId']
     $null = Initialize-SetupLog -LogDirectory ([IO.Path]::Combine($Root, 'Tool', $runId))
     $config = Read-SetupConfig -Path ([IO.Path]::Combine($Root, 'config.json'))
-    $run = New-ToolRun -ToolArgs $toolArgs -Config $config -Root $Root
+    $run = New-ToolRun -ToolArgs $toolArgs -Config $config -Root $Root -Clock $clock
     if ($script:ToolActionCatalog[$toolArgs['Action']]['LogLocal'] -ne $true) {
       $null = New-ToolSessionDir -Run $run
       $null = Initialize-SetupLog -LogDirectory $run.LogDir
     }
-    Write-SetupLog -Message 'Tool action started' -Data @{ action = $action; runId = $runId }
+    Write-SetupLog -Message 'Tool action started' -Data @{
+      action = $action; runId = $runId; budgetSeconds = $run.BudgetSeconds; deadlineUtc = (ConvertTo-ScreenText -Text $toolArgs['DeadlineUtc']) }
     Register-SetupTick -Context $run -Handler { param($tickRun) Update-ToolTick -Run $tickRun }
     $outcome = Invoke-ToolSteps -Run $run
     $written = Write-ToolResult -Run $run -Outcome $outcome

@@ -80,6 +80,8 @@ $script:ToolboxStrings = @{
     'finding.actionTimedOut' = 'The action reached its deadline ({0} min) and was stopped'
     'finding.restartFirst'   = 'A Windows servicing restart is pending: restart, then run it again'
     'finding.sessionLink'    = 'BenTech-Reports on the stick is a link: the files were kept in {0}'
+    'finding.sessionCreateFailed' = 'The session folder on the stick could not be created ({0}): the files were kept in {1}'
+    'finding.stoppedBeforeStart'  = 'Stopped before the first step'
   }
   he = @{
     'app.title'             = 'ארגז הכלים של BENTECH'
@@ -146,5 +148,7 @@ $script:ToolboxStrings = @{
     'finding.actionTimedOut' = 'הפעולה הגיעה למגבלת הזמן ({0} דקות) ונעצרה'
     'finding.restartFirst'   = 'ממתינה הפעלה מחדש להשלמת עדכוני Windows: יש להפעיל מחדש ואז להריץ שוב'
     'finding.sessionLink'    = 'התיקייה BenTech-Reports בדיסק און קי היא קישור: הקבצים נשמרו ב-{0}'
+    'finding.sessionCreateFailed' = 'לא ניתן היה ליצור את תיקיית הביקור בדיסק און קי ({0}): הקבצים נשמרו ב-{1}'
+    'finding.stoppedBeforeStart'  = 'נעצר לפני הצעד הראשון'
   }
 }

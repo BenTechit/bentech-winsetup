@@ -49,9 +49,10 @@ BeforeAll {
 
   # A valid args hashtable for 'test', as the window writes it.
   function New-TestArgs {
-    param([double]$DeadlineMinutes = 600)
+    param([double]$BudgetMinutes = 600)
     @{ Version = 1; Action = 'test'; RunId = $script:runId
-       DeadlineUtc = [datetime]::UtcNow.AddMinutes($DeadlineMinutes).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+       DeadlineUtc = [datetime]::UtcNow.AddMinutes($BudgetMinutes).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+       BudgetSeconds = $BudgetMinutes * 60
        SessionDir = $script:sessionDir; StickRoot = (Join-Path $TestDrive 'Stick') + '\'; Complaint = ''; Done = @()
        Identity = @{ Key = 'SN-SN123'; FolderPart = 'SN123'; ComputerName = 'PC1' }; Options = @{} }
   }
@@ -66,10 +67,10 @@ BeforeAll {
   }
 
   function New-TestRun {
-    param([string[]]$Steps, [double]$DeadlineMinutes = 600)
+    param([string[]]$Steps, [double]$BudgetMinutes = 600)
     Register-TestAction -Steps $Steps
     Reset-TestRunDir
-    New-ToolRun -ToolArgs (New-TestArgs -DeadlineMinutes $DeadlineMinutes) -Config $script:cfg -Root $script:root
+    New-ToolRun -ToolArgs (New-TestArgs -BudgetMinutes $BudgetMinutes) -Config $script:cfg -Root $script:root
   }
 
   # Writes args.json for 'test' (changed by -Mutate) in the run folder, or with -Outside in $TestDrive\elsewhere.
@@ -123,7 +124,7 @@ Describe 'ToolEngine (repair Task 1)' {
   }
 
   Describe 'the string table and Get-ToolText (findings: repair plan, Shared shapes)' {
-    It 'holds the six Task 1 findings, exactly in English, and in Hebrew' {
+    It 'holds the Task 1 findings, exactly in English, and in Hebrew' {
       $expected = @{
         'finding.stepFailed'     = '{0} failed: {1}'
         'finding.stepTimedOut'   = '{0} timed out after {1} min'
@@ -131,6 +132,8 @@ Describe 'ToolEngine (repair Task 1)' {
         'finding.actionTimedOut' = 'The action reached its deadline ({0} min) and was stopped'
         'finding.restartFirst'   = 'A Windows servicing restart is pending: restart, then run it again'
         'finding.sessionLink'    = 'BenTech-Reports on the stick is a link: the files were kept in {0}'
+        'finding.sessionCreateFailed' = 'The session folder on the stick could not be created ({0}): the files were kept in {1}'
+        'finding.stoppedBeforeStart'  = 'Stopped before the first step'
       }
       foreach ($k in $expected.Keys) {
         $script:ToolboxStrings.en[$k] | Should -BeExactly $expected[$k] -Because $k
@@ -197,7 +200,10 @@ Describe 'ToolEngine (repair Task 1)' {
       $r.Dir | Should -Be $script:runDir; $r.ProgressPath | Should -Be "$script:runDir\progress.json"
       $r.ResultPath | Should -Be "$script:runDir\result.json"; $r.StopPath | Should -Be "$script:runDir\stop.flag"; $r.LogDir | Should -Be $script:runDir
       $r.SessionDir | Should -BeNullOrEmpty; $r.Deadline | Should -BeOfType [datetime]; $r.Deadline.Kind | Should -Be 'Utc'
-      ($r.Deadline - [datetime]::UtcNow).TotalMinutes | Should -BeGreaterThan 590
+      $r.BudgetSeconds | Should -Be 36000; $r.BudgetSeconds | Should -BeOfType [double]
+      $r.Clock | Should -BeOfType [Diagnostics.Stopwatch]; $r.Clock.IsRunning | Should -BeTrue
+      $clock = [Diagnostics.Stopwatch]::StartNew()
+      [object]::ReferenceEquals((New-ToolRun -ToolArgs (New-TestArgs) -Config $script:cfg -Root $script:root -Clock $clock).Clock, $clock) | Should -BeTrue
       @($r.Steps | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Status, $_.Percent }) | Should -Be @('fakeA|pending|', 'fakeB|pending|')
       $r.Current | Should -Be -1; $r.Findings.Count | Should -Be 0; $r.Log.Count | Should -Be 0
       $r.RestartRequired | Should -BeFalse; $r.Offers.DiskCheck | Should -BeFalse; $r.Offers.ContainsKey('DismSource') | Should -BeTrue
@@ -255,10 +261,20 @@ Describe 'ToolEngine (repair Task 1)' {
       Get-ToolStepTimeout -Run $r -Name 'dism' | Should -Be 3
     }
     It 'is capped at the action''s remaining time minus half a minute, and is at least 0.25' {
-      $t = Get-ToolStepTimeout -Run (New-TestRun 'fakeA' -DeadlineMinutes 10) -Name 'dism'
+      $t = Get-ToolStepTimeout -Run (New-TestRun 'fakeA' -BudgetMinutes 10) -Name 'dism'
       $t | Should -BeLessOrEqual 9.5; $t | Should -BeGreaterThan 9.4
-      Get-ToolStepTimeout -Run (New-TestRun 'fakeA' -DeadlineMinutes 0.2) -Name 'dism' | Should -Be 0.25
-      Get-ToolStepTimeout -Run (New-TestRun 'fakeA' -DeadlineMinutes -5) -Name 'dism' | Should -Be 0.25
+      Get-ToolStepTimeout -Run (New-TestRun 'fakeA' -BudgetMinutes 0.2) -Name 'dism' | Should -Be 0.25
+      # The remaining time comes from the run's Stopwatch (the Get-ToolElapsedSeconds seam), never from the wall clock.
+      $r = New-TestRun 'fakeA' -BudgetMinutes 600
+      Mock Get-ToolElapsedSeconds { 595 * 60 }
+      Get-ToolStepTimeout -Run $r -Name 'dism' | Should -Be 4.5
+      Mock Get-ToolElapsedSeconds { 601 * 60 }
+      Get-ToolStepTimeout -Run $r -Name 'dism' | Should -Be 0.25
+    }
+    It 'a wall clock that jumps by 12 hours (the time sync) leaves every step timeout as it was (RD-R8)' {
+      $r = New-TestRun 'fakeA' -BudgetMinutes 300
+      $r.Deadline = $r.Deadline.AddHours(-12); $r.Args.DeadlineUtc = $r.Deadline.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+      Get-ToolStepTimeout -Run $r -Name 'dism' | Should -Be 150
     }
   }
 
@@ -281,23 +297,38 @@ Describe 'ToolEngine (repair Task 1)' {
       ($r.Findings | Where-Object { $_.Code -eq 'stopped' }).Level | Should -Be 'INFO'
       ($r.Findings | Where-Object { $_.Code -eq 'stopped' }).Args | Should -Be @('fakeA')    # no tool.step.* names before Task 3: the id
     }
-    It 'a stop flag already there does not stop the first step' {
+    It 'a stop requested before the first step is honoured: Stopped, and no step runs' {
       $r = New-TestRun 'fakeA', 'fakeB'; 'x' | Set-Content $r.StopPath
-      Invoke-ToolSteps -Run $r | Should -Be 'Stopped'; $script:calls | Should -Be @('fakeA')
+      Invoke-ToolSteps -Run $r | Should -Be 'Stopped'; @($script:calls).Count | Should -Be 0
+      @($r.Steps.Status) | Should -Be @('skipped', 'skipped')
+      $f = $r.Findings | Where-Object { $_.Code -eq 'stoppedBeforeStart' }
+      $f.Level | Should -Be 'INFO'; $f.Text | Should -BeExactly 'Stopped before the first step'; @($r.Findings.Code) | Should -Not -Contain 'stopped'
+      Get-ToolResultColor -Outcome 'Stopped' -Findings $r.Findings | Should -Be 'YELLOW'
+      Should -Invoke Get-ServicingRebootSignals -Times 0 -Exactly
     }
-    It 'a passed deadline ends the action at the next safe point' {
-      $r = New-TestRun 'fakeA', 'fakeB'; $script:onCall = { $r.Deadline = [datetime]::UtcNow.AddMinutes(-1) }
-      Invoke-ToolSteps -Run $r | Should -Be 'TimedOut'; $r.Findings.Code | Should -Contain 'actionTimedOut'; $script:calls | Should -Be @('fakeA')
-      @($r.Steps.Status) | Should -Be @('done', 'skipped')
-      # No timeoutsMinutes.tool.test in the config: the minutes from the start to the args' deadline.
+    It 'a wall clock that jumps forward by 12 hours mid-run (the time sync) does not trip the deadline (RD-R8)' {
+      # After the sync the wall clock is 12 h later: seen from now, the window's DeadlineUtc lies 12 h in the past.
+      $r = New-TestRun 'fakeA', 'fakeB' -BudgetMinutes 300
+      $script:onCall = { if ($args[0] -eq 'fakeA') {
+          $r.Deadline = $r.Deadline.AddHours(-12); $r.Args.DeadlineUtc = $r.Deadline.ToString('o', [Globalization.CultureInfo]::InvariantCulture) } }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; $script:calls | Should -Be @('fakeA', 'fakeB'); @($r.Findings.Code) | Should -Not -Contain 'actionTimedOut'
+      # No deadline in the engine reads the wall clock at all.
+      [IO.File]::ReadAllText("$PSScriptRoot\..\src\Repair\ToolEngine.ps1") | Should -Not -Match 'UtcNow'
+    }
+    It 'the budget spent on the run''s Stopwatch ends the action at the next safe point (RD-R8)' {
+      $script:fakeElapsed = 0.0
+      Mock Get-ToolElapsedSeconds { $script:fakeElapsed }
+      $r = New-TestRun 'fakeA', 'fakeB' -BudgetMinutes 45
+      $script:onCall = { if ($args[0] -eq 'fakeA') { $script:fakeElapsed = 45 * 60 + 1 } }
+      Invoke-ToolSteps -Run $r | Should -Be 'TimedOut'; $script:calls | Should -Be @('fakeA'); @($r.Steps.Status) | Should -Be @('done', 'skipped')
       $f = $r.Findings | Where-Object { $_.Code -eq 'actionTimedOut' }
-      $f.Level | Should -Be 'CRIT'; $f.Text | Should -BeExactly 'The action reached its deadline (600 min) and was stopped'
+      $f.Level | Should -Be 'CRIT'; $f.Text | Should -BeExactly 'The action reached its deadline (45 min) and was stopped'
+      Get-ToolResultColor -Outcome 'TimedOut' -Findings $r.Findings | Should -Be 'RED'
     }
-    It 'the deadline finding names the action''s configured minutes (timeoutsMinutes.tool.<id>)' {
-      $r = New-TestRun 'fakeA', 'fakeB'; $script:onCall = { $r.Deadline = [datetime]::UtcNow.AddMinutes(-1) }
-      $r.Config = [pscustomobject]@{ timeoutsMinutes = [pscustomobject]@{ tool = [pscustomobject]@{ test = 45 } } }
-      Invoke-ToolSteps -Run $r | Should -Be 'TimedOut'
-      ($r.Findings | Where-Object { $_.Code -eq 'actionTimedOut' }).Args | Should -Be @('45')
+    It 'the budget is never checked before the first step' {
+      Mock Get-ToolElapsedSeconds { 10 * 3600 }
+      $r = New-TestRun 'fakeA' -BudgetMinutes 1
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; $script:calls | Should -Be @('fakeA')
     }
     It 'a servicing restart pending before a servicing step stops the action (yellow), checked before the first step too' {
       Mock Get-ServicingRebootSignals { @{ CbsRebootPending = $false; CbsPackagesPending = $true; PendingXml = $false; WuRebootRequired = $false; PendingFileRename = $true; ComputerRenamePending = $false } }
@@ -326,10 +357,23 @@ Describe 'ToolEngine (repair Task 1)' {
       @($r.Steps.Status) | Should -Be @('failed', 'failed', 'failed', 'failed')
       @($r.Findings | Where-Object { $_.Code -eq 'stepFailed' }).Count | Should -Be 4
     }
-    It 'a step''s own warn, failed and skipped results are kept, without stepFailed' {
+    It 'a step''s own warn, failed and skipped results are kept; a failure with its own finding gets no generic one' {
       $script:stepResults = @{ fakeA = 'warn'; fakeB = 'skipped'; fakeS = 'failed' }
       $r = New-TestRun 'fakeA', 'fakeB', 'fakeS'
-      Invoke-ToolSteps -Run $r | Should -Be 'Done'; @($r.Steps.Status) | Should -Be @('warn', 'skipped', 'failed'); $r.Findings.Count | Should -Be 0
+      $script:onCall = { if ($args[0] -eq 'fakeS') { Add-ToolFinding -Run $r -Level WARN -Code 'restartFirst' } }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; @($r.Steps.Status) | Should -Be @('warn', 'skipped', 'failed')
+      @($r.Findings.Code) | Should -Be @('restartFirst')
+    }
+    It 'a step that ends failed or timedout without a finding gets a generic CRIT finding, so the result is never GREEN' {
+      $script:stepResults = @{ fakeA = 'failed'; fakeB = 'timedout' }
+      $script:fakeElapsed = 0.0
+      Mock Get-ToolElapsedSeconds { $script:fakeElapsed }
+      $r = New-TestRun 'fakeA', 'fakeB'
+      $script:onCall = { if ($args[0] -eq 'fakeB') { $script:fakeElapsed += 90 * 60 } }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; @($r.Steps.Status) | Should -Be @('failed', 'timedout')
+      @($r.Findings | ForEach-Object { '{0}|{1}|{2}' -f $_.Level, $_.Code, $_.Text }) | Should -Be @(
+        'CRIT|stepFailed|fakeA failed: see the log', 'CRIT|stepTimedOut|fakeB timed out after 90 min')
+      Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'RED'
     }
     It 'a break in a step stays inside that step' {
       $script:onCall = { if ($args[0] -eq 'fakeA') { break } }
@@ -340,7 +384,7 @@ Describe 'ToolEngine (repair Task 1)' {
 
   Describe 'Invoke-ToolNative' {
     It 'redirects to a file through cmd /d /s /c, with the step timeout capped by the deadline' {
-      $r = New-TestRun 'fakeA' -DeadlineMinutes 10
+      $r = New-TestRun 'fakeA' -BudgetMinutes 10
       $null = Invoke-ToolNative -Run $r -FilePath 'C:\Windows\System32\dism.exe' -ArgumentList '/Online /Cleanup-Image /RestoreHealth' -StepTimeout 'dism' -OutputName 'dism'
       Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter { $FilePath -like '*\System32\cmd.exe' -and $ArgumentList -like '/d /s /c ""C:\Windows\System32\dism.exe" /Online /Cleanup-Image /RestoreHealth > "*\dism-*.txt" 2>&1"' -and $TimeoutMinutes -le 9.5 -and $TimeoutMinutes -gt 9 -and -not $CaptureOutput }
     }
@@ -475,6 +519,13 @@ Describe 'ToolEngine (repair Task 1)' {
       $g = Invoke-ToolJsonChild -Run (New-TestRun 'fakeA') -Name ('n' + [guid]::NewGuid().ToString('N').Substring(0, 6)) -Command '@{}'
       $g.Ok | Should -BeFalse; $g.TimedOut | Should -BeFalse; $g.Data | Should -BeNullOrEmpty; $g.Error | Should -BeExactly $Expected
     }
+    It 'a result over 1 MB is "output too large", not "no result"' {
+      Mock Invoke-PowerShellChild {
+        [IO.File]::WriteAllText(($Command -replace "(?s).*\`$out = '([^']+)'.*", '$1'), ('{"Items":"' + ('x' * 1MB) + '"}'))
+        @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+      $g = Invoke-ToolJsonChild -Run (New-TestRun 'fakeA') -Name 'big' -Command '@{ Items = @(Get-WindowsDriver -Online) }'
+      $g.Ok | Should -BeFalse; $g.TimedOut | Should -BeFalse; $g.Data | Should -BeNullOrEmpty; $g.Error | Should -BeExactly 'output too large'
+    }
     It 'a grandchild that cannot start is not Ok, never a throw' {
       Mock Invoke-PowerShellChild { throw "Cannot start 'powershell.exe': denied" }
       $g = Invoke-ToolJsonChild -Run (New-TestRun 'fakeA') -Name 'x' -Command '@{}'
@@ -495,6 +546,10 @@ Describe 'ToolEngine (repair Task 1)' {
       @{ Why = 'a complaint over 2000 characters'; Outside = $false; Mutate = { param($a) $a.Complaint = 'x' * 2001 }; Message = '*2000*' }
       @{ Why = 'a RunId that is not the run folder''s name'; Outside = $false; Mutate = { param($a) $a.RunId = '20261022-101501-test' }; Message = '*RunId*' }
       @{ Why = 'a deadline that is not a round-trip date'; Outside = $false; Mutate = { param($a) $a.DeadlineUtc = '22/10/2026 10:15' }; Message = '*deadline*' }
+      @{ Why = 'no budget'; Outside = $false; Mutate = { param($a) $a.Remove('BudgetSeconds') }; Message = '*BudgetSeconds*' }
+      @{ Why = 'a budget of 0'; Outside = $false; Mutate = { param($a) $a.BudgetSeconds = 0 }; Message = '*BudgetSeconds*' }
+      @{ Why = 'a budget given as text'; Outside = $false; Mutate = { param($a) $a.BudgetSeconds = '600' }; Message = '*BudgetSeconds*' }
+      @{ Why = 'a budget over 7 days'; Outside = $false; Mutate = { param($a) $a.BudgetSeconds = 604801 }; Message = '*BudgetSeconds*' }
       @{ Why = 'a SessionDir that is not fully qualified'; Outside = $false; Mutate = { param($a) $a.SessionDir = 'BenTech-Reports\x' }; Message = '*SessionDir*' }
       @{ Why = 'a complaint that is not text'; Outside = $false; Mutate = { param($a) $a.Complaint = @{ x = 1 } }; Message = '*Complaint*' }
       @{ Why = 'Options that are not an object'; Outside = $false; Mutate = { param($a) $a.Options = 'x' }; Message = '*Options*' }
@@ -557,7 +612,7 @@ Describe 'ToolEngine (repair Task 1)' {
       Mock Test-StickReparsePoint { $Path -like '*BenTech-Reports*' }
       Invoke-SetupToolProcess -Root "$TestDrive\Root" -ActionId 'test' -ArgsPath (Write-TestArgs) | Should -Be 0
       $res = Read-ToolJsonFile "$runDir\result.json"
-      $res.Findings.Code | Should -Contain 'sessionLink'; $res.Color | Should -Be 'YELLOW'
+      $res.Findings.Code | Should -Contain 'sessionLink'; $res.Findings.Code | Should -Not -Contain 'sessionCreateFailed'; $res.Color | Should -Be 'YELLOW'
       $local = Join-Path $script:root 'Logs\Repair\PC1_SN123_2026-10-22_1015'
       $res.Files.Folder | Should -Be $local; $res.Data.SessionIsLocal | Should -BeTrue
       ($res.Findings | Where-Object { $_.Code -eq 'sessionLink' }).Text | Should -BeExactly "BenTech-Reports on the stick is a link: the files were kept in $local"
@@ -569,7 +624,11 @@ Describe 'ToolEngine (repair Task 1)' {
       [IO.File]::WriteAllText($script:sessionDir, 'a file where the folder should be')
       Invoke-SetupToolProcess -Root "$TestDrive\Root" -ActionId 'test' -ArgsPath (Write-TestArgs) | Should -Be 0
       $res = Read-ToolJsonFile "$runDir\result.json"
-      $res.Findings.Code | Should -Contain 'sessionLink'; $res.Files.Folder | Should -Be (Join-Path $script:root 'Logs\Repair\PC1_SN123_2026-10-22_1015')
+      $local = Join-Path $script:root 'Logs\Repair\PC1_SN123_2026-10-22_1015'
+      $res.Findings.Code | Should -Not -Contain 'sessionLink'; $res.Files.Folder | Should -Be $local; $res.Data.SessionIsLocal | Should -BeTrue
+      $f = $res.Findings | Where-Object { $_.Code -eq 'sessionCreateFailed' }
+      $f.Level | Should -Be 'WARN'; @($f.Args).Count | Should -Be 2; $f.Args[0] | Should -Not -BeNullOrEmpty; $f.Args[1] | Should -Be $local
+      $f.Text | Should -BeExactly ('The session folder on the stick could not be created ({0}): the files were kept in {1}' -f $f.Args[0], $local)
     }
     It 'a LogLocal action logs in the run folder and leaves nothing on the stick' {
       Register-TestAction -Steps 'fakeA' -LogLocal $true
@@ -596,6 +655,9 @@ Describe 'ToolEngine (repair Task 1)' {
       Invoke-SetupToolProcess -Root "$TestDrive\Root" -ActionId 'test' -ArgsPath (Write-TestArgs) | Should -Be 0
       Should -Invoke Register-SetupTick -Times 1 -Exactly; Should -Invoke Unregister-SetupTick -Times 1 -Exactly
       $script:tickContext.Args.RunId | Should -Be $script:runId; $script:tickContext.ProgressPath | Should -Be "$script:runDir\progress.json"
+      # The child's Stopwatch started when it began, and its budget came from the args (RD-R8).
+      $script:tickContext.Clock | Should -BeOfType [Diagnostics.Stopwatch]; $script:tickContext.Clock.IsRunning | Should -BeTrue
+      $script:tickContext.BudgetSeconds | Should -Be 36000
       [string]$script:tickHandler | Should -Match 'Update-ToolTick'
     }
   }

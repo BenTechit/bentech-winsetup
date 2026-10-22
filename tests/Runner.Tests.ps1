@@ -1,6 +1,6 @@
 ﻿# tests/Runner.Tests.ps1
 BeforeAll {
-  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','Common\Process','State\State','Engine\Reboot','Engine\Runner','Steps\Office') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','Common\Process','State\State','Engine\Reboot','Engine\Runner','Steps\Office','UI\StartScreen') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Ctx([string[]]$plan) {
     $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null
     $st = New-RunState -Machine @{} -Choices @{} -Plan $plan -Version 'v'
@@ -580,6 +580,13 @@ Describe 'Get-ServicingRebootSignals' {
     { Get-ServicingRebootSignals } | Should -Not -Throw
     $s = Get-ServicingRebootSignals
     @($s.Values | Where-Object { $_ -ne $false }).Count | Should -Be 0; $s.Count | Should -Be 6
+  }
+  It 'logs a failed read as ASCII: a localized (Hebrew) message never reaches setup.log' {
+    Mock Get-PendingRebootSignals { throw 'שגיאה ברישום' }
+    Mock Test-Path { $false }
+    Mock Write-SetupLog { }
+    $null = Get-ServicingRebootSignals
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.error -ceq '????? ??????' }
   }
 }
 
