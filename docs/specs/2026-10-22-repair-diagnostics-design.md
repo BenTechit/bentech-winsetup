@@ -105,7 +105,9 @@ It uses the same window, look (Q29), languages (Q21) and machine card as "New PC
 
 **Also checked before a Network reset** (shown in the confirmation panel):
 - a static IP on any adapter (its settings are shown and saved as data that can be restored, section 6.6);
-- an active remote session (RDP, AnyDesk or ScreenConnect connected). That **blocks** the reset unless the technician confirms he is at the PC.
+- **the "I am at this PC, not connected remotely" tick, which is always required** (ruling RD-R2).
+  - An RDP session is detected, through `TerminalServerSession`, and turns the warning red.
+  - AnyDesk and ScreenConnect are not detected: their clients run on every PC Ben sets up, and "running" is not "connected".
 
 ## 6. Actions
 
@@ -165,7 +167,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 - **How it is scheduled** (builder check 5): `fsutil dirty set <system drive>`. It is judged by its exit code, then confirmed by `fsutil dirty query` (exit code). At the next start Windows runs autochk, the boot-time chkdsk.
   - `Repair-Volume -OfflineScanAndFix` is not used: Microsoft does not document it scheduling a boot-time check on the volume in use.
   - The real-VM test (14) confirms the dirty-bit route.
-- **Cancel:** a **Cancel scheduled disk check** button runs `chkntfs /x <system drive>`. It is shown while the volume is marked dirty.
+- **There is no Cancel (ruling RD-R1, 22/10/2026).** `chkntfs /x` would exclude the drive from **every later** start-up check until `chkntfs /d`, silently switching off a Windows safety check. The YES confirmation therefore says: "It runs at the next start and cannot be cancelled from the toolbox". The toolbox never calls `chkntfs`.
 
 ### 6.6 Network reset (YES)
 1. **Save the settings first, as data.** Every adapter's IP, gateway and DNS settings go to the stick as JSON. The write is verified before anything changes.
@@ -203,7 +205,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
   - each section's facts and findings, and raw lines grouped and counted instead of pasted verbatim.
 
   The large raw material goes in `raw\` and a zip: evtx, logs, minidumps, msinfo32, CSVs.
-- **The privacy-safe copy** (`REPORT_<PC>_<date>_SAFE.txt`, Q33) is the core with these masked consistently: user names, e-mails, the computer name, serial numbers, MAC addresses, IPs, SSIDs and BSSIDs, profile paths and phone numbers. Masking turns `user1`, `PC-1` and so on into stable tokens, so the AI can still follow them.
+- **The privacy-safe copy** (`REPORT_SAFE_<yyyy-MM-dd_HHmm>.txt`, Q33; no PC name in the file name, ruling RD-R4) is the core with these masked consistently: user names, e-mails, the computer name, serial numbers, MAC addresses, IPs, SSIDs and BSSIDs, profile paths and phone numbers. Masking turns `user1`, `PC-1` and so on into stable tokens, so the AI can still follow them.
 - **Compare with last visit:** when the stick holds an earlier report for the same PC, a short "since last visit" section lists the changes. "The same PC" means the same serial, or the BIOS UUID when the serial is a placeholder such as "To Be Filled By O.E.M." or "Default string" (as `New-PcName` does), so different whitebox PCs are never merged. The changes listed:
   - new crashes or WHEA errors;
   - disk wear and errors;
@@ -218,7 +220,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 1. **Confirm.**
 2. **Close the window with a fourth outcome, Restart.**
    - `Get-SetupChoices` still returns `$null` (no setup run).
-   - It records the restart request, which `Main.ps1` reads after its normal Cancel path: transcript stopped, lock released, logs copied to the stick, `C:\BenTech` removed when no earlier run exists.
+   - It records the restart request, which `Main.ps1` reads after its normal Cancel path: transcript stopped, lock released, `C:\BenTech` removed when no earlier run exists. No extra copy is needed: the action logs and reports are already on the stick (ruling RD-R5).
 3. **Then a stateless restart:** `Restart-Computer -Force`, with a fallback to `shutdown.exe /r /t 5 /f`.
    - Not the engine's controlled restart, which needs a run state.
    - There is no setup state, so nothing resumes, and no `C:\BenTech` is left behind.
@@ -232,7 +234,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 - **Deadlines:** a child past its deadline is killed (process tree), and the action ends as "timed out" (red) with whatever it had finished. Per-step timeouts inside the child also go through `Invoke-External`.
 - **Engine change:** `src\Entry\Param.ps1` gains `-ToolAction` and `-ToolArgs`, like `-WuRound`. That amends the pinned parameter list. The launcher does not change.
 - **The window starts the child without waiting** (builder check 1), through the engine's existing non-blocking `Start-BackgroundExternal`. The window enforces the action's deadline on its timer, killing the process tree at the deadline. This becomes the second named exception to "every child goes through `Invoke-External`" (after Office).
-- **Logs and outputs** are written by the child **directly to the stick**, in `BenTech-Reports\<PC>_<yyyy-MM-dd_HHmm>\` (section 8). The window also keeps one ASCII line per action in setup.log.
+- **Logs and outputs** are written by the child **directly to the stick**, in `BenTech-Reports\<PC>_<serial>_<yyyy-MM-dd_HHmm>\` (section 8; ruling RD-R6). The window also keeps one ASCII line per action in setup.log.
 
 ## 8. Where things are kept
 - **On the stick,** found as the setup finds it (`Find-SetupStick`): `BenTech-Reports\<PC>_<serial>_<yyyy-MM-dd_HHmm>\` holds:
@@ -242,7 +244,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
   - the ghost-device CSV.
 
   Previous visits are found there by serial (6.8).
-- **No stick** (the launcher ran from the Desktop): the page shows a red chip, "Plug in the BenTech stick to keep reports and logs". Actions that only change the PC still run, and their log goes to `C:\BenTech\Setup\Logs`, which Cancel would delete. The window says so before the action starts. **Reports are disabled until a stick is found.** The page re-checks for the stick every few seconds.
+- **No stick** (the launcher ran from the Desktop): the page shows a red chip, "Plug in the BenTech stick to keep reports and logs". Actions that only change the PC still run, and their log goes to `C:\BenTech\Setup\Logs`, which Cancel would delete. The window says so before the action starts. **Reports are disabled until a stick is found.** The page re-checks for the stick every 5 seconds with a cheap presence check (`[IO.DriveInfo]`, no WMI on the window's thread). The full stick identification runs only when the page opens and when the answer changes (ruling RD-R3).
 - **The run lock** stays held while the window is open, as today, so a second launcher instance still exits.
 
 ## 9. Online only (Q32), and its known limit
@@ -293,7 +295,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 14. **A laptop on battery** blocks Standard repair and Post-clone (5).
 15. **Restart PC** is a fourth window outcome, performed by `Main.ps1` after cleanup with a stateless restart (6.9).
 16. **DISM RestoreHealth runs as `dism.exe`,** for live percent and exit codes. Cmdlets that can hang run in bounded grandchildren. The safety strip is computed in a child (6, 5).
-17. **Disk check at restart uses the dirty bit,** with a Cancel button (`chkntfs /x`) (6.5).
+17. **Disk check at restart uses the dirty bit.** There is no Cancel button (RD-R1): `chkntfs /x` would persist (6.5).
 18. **WinRE:** the BCD decides, and `reagentc /enable` runs only when the BCD and `ReAgent.xml` both say disabled (6.1).
 19. **The unsigned `install.wim` source** is used only when the technician picks it, after seeing its details (6.2).
 20. **Network reset and Ghost devices need the stick.** Restore shows every value and needs YES (6.6, 6.7).
@@ -307,7 +309,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 - **The live progress:** DISM percent, Stop between steps, a timeout killing a stuck step.
 - **Network reset:** with a static IP, then Restore.
 - **Ghost devices:** with a paired Bluetooth headset that is turned off.
-- **Disk check at restart:** schedule it (dirty bit), see autochk run at the next start, and also test Cancel (`chkntfs /x`).
+- **Disk check at restart:** schedule it (dirty bit), and see autochk run at the next start.
 - **WinRE:** after a clone (stale `ReAgent.xml`), the BCD verdict is right.
 - **Pending restart:** on a PC with only a pending file rename, the strip is not red. After a Windows Update needing a restart, it is.
 - **Window lifecycle:** X during an action is refused. A forced window failure during an action kills the child before cleanup.
