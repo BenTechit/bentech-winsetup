@@ -339,6 +339,19 @@ Describe 'ToolEngine (repair Task 1)' {
       $first = New-TestRun 'fakeS', 'fakeA'; $script:calls.Clear()
       Invoke-ToolSteps -Run $first | Should -Be 'NeedsRestart'; @($script:calls).Count | Should -Be 0; @($first.Steps.Status) | Should -Be @('skipped', 'skipped')
     }
+    It 'a step that saw DISM''s own pending code (Data.DismPending) stops the action before the next servicing step, with one restartFirst (review M1)' {
+      # The registry says nothing; the step adds its own restartFirst, as the dism step does: the runner adds no second one.
+      $r = New-TestRun 'fakeA', 'fakeB', 'fakeS', 'fakeB'
+      $script:onCall = { if ($args[0] -eq 'fakeA') { $r.Data['DismPending'] = $true; Add-ToolFinding -Run $r -Level WARN -Code 'restartFirst' } }
+      Invoke-ToolSteps -Run $r | Should -Be 'NeedsRestart'
+      $script:calls | Should -Be @('fakeA', 'fakeB')   # a step that is not servicing still runs
+      @($r.Steps.Status) | Should -Be @('done', 'done', 'skipped', 'skipped')
+      @($r.Findings | Where-Object { $_.Code -eq 'restartFirst' }).Count | Should -Be 1
+      # Without a finding of the step's own, the runner adds it.
+      $script:calls.Clear(); $q = New-TestRun 'fakeA', 'fakeS'
+      $script:onCall = { if ($args[0] -eq 'fakeA') { $q.Data['DismPending'] = $true } }
+      Invoke-ToolSteps -Run $q | Should -Be 'NeedsRestart'; @($q.Findings | Where-Object { $_.Code -eq 'restartFirst' }).Count | Should -Be 1
+    }
     It 'a file rename alone never blocks' {
       Mock Get-ServicingRebootSignals { @{ CbsRebootPending = $false; CbsPackagesPending = $false; PendingXml = $false; WuRebootRequired = $false; PendingFileRename = $true; ComputerRenamePending = $true } }
       Invoke-ToolSteps -Run (New-TestRun 'fakeS') | Should -Be 'Done'

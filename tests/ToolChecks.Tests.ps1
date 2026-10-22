@@ -600,6 +600,23 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       $t = Test-ToolInternet -Config ([pscustomobject]@{}) -Connect { param($h, $ms) $h -eq 'www.microsoft.com' -and $ms -eq 5000 } -Fetch { param($u, $ms) @{ Ok = ($u -eq 'https://www.microsoft.com/'); Date = $null } } -Probe { param($u, $ms) @{ Answered = ($u -eq 'http://www.msftconnecttest.com/connecttest.txt'); Content = 'Microsoft Connect Test' } }
       $t.Chip.Level | Should -Be 'ok'; $t.ClockOffsetSeconds | Should -BeNullOrEmpty
     }
+    It 'internet: HTTPS that fails on a clock days off reads the offset from the HTTP probe''s Date: a clock chip, never "no internet" (review M3)' {
+      $tlsFails = { param($u, $ms) @{ Ok = $false; Date = $null } }
+      # A dead BIOS battery: this PC is two years behind Microsoft's server, so the certificate looks not yet valid.
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = [datetime]::UtcNow.AddDays(730) } }
+      $t.Https | Should -BeFalse; $t.Probe | Should -Be 'ok'
+      $t.Chip.Level | Should -Be 'warn'; $t.Chip.Detail.Clock | Should -BeTrue
+      [math]::Round($t.ClockOffsetSeconds / 86400) | Should -Be -730; $t.Chip.Detail.ClockOffsetSeconds | Should -Be $t.ClockOffsetSeconds
+      # A clock that is right while HTTPS fails is no internet (a proxy breaking TLS); the offset is still known.
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = [datetime]::UtcNow.AddSeconds(-30) } }
+      $t.Chip.Level | Should -Be 'crit'; $t.Chip.Detail.Clock | Should -BeFalse; [math]::Round($t.ClockOffsetSeconds) | Should -Be 30
+      # A portal's own page never gives the clock (its server is not Microsoft's).
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe { param($u, $ms) @{ Answered = $true; Content = 'login'; Date = [datetime]::UtcNow.AddDays(730) } }
+      $t.Chip.Level | Should -Be 'crit'; $t.ClockOffsetSeconds | Should -BeNullOrEmpty
+      # HTTPS that works keeps its own Date: the probe's is not used.
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch { param($u, $ms) @{ Ok = $true; Date = [datetime]::UtcNow.AddMinutes(-3) } } -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = [datetime]::UtcNow.AddDays(730) } }
+      $t.Chip.Level | Should -Be 'ok'; [math]::Round($t.ClockOffsetSeconds / 60) | Should -Be 3; $t.Chip.Detail.Clock | Should -BeFalse
+    }
     It 'internet: the Date header is read as RFC 1123 UTC; anything else is no date' {
       $d = ConvertFrom-ToolHttpDate -Text 'Thu, 22 Oct 2026 11:42:50 GMT'
       $d.Kind | Should -Be 'Utc'; $d.Hour | Should -Be 11; $d.Day | Should -Be 22

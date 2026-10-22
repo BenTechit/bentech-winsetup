@@ -279,6 +279,8 @@ function Get-RepairChips {
       - The five read chips say chip.loading until the safety child has read them.
       - Free shows chip.free.level at every known level, with Args = @(<drive 'C:'>, <percent>, <letter 'C'>).
       - Restart ok with a pending file or computer rename (Detail.Notes) keeps its green and adds tip.restart.note.
+      - Internet warn with Detail.Clock (HTTPS fails because the clock is days off; Test-ToolInternet) reads
+        chip.internet.clock with tip.internet.clock instead of the captive-portal text.
       - Power (laptops only, the window's own reading): ok on charger, crit on battery.
       - Stick: ok chip.stick.ok with Args = @(<drive 'E:'>, <letter 'E'>), crit 'No stick' (spec 8: a red chip).
     The letter without its colon is for the Hebrew texts (ruling RD-R14): in a right-to-left line the colon of 'E:'
@@ -309,7 +311,12 @@ function Get-RepairChips {
       $row.Args = [string[]]@($drive, $percent, (Get-RepairDriveLetter -Drive $drive))
     }
     $tips = New-Object System.Collections.Generic.List[string]
-    if ($level -ceq 'unknown') { $tips.Add('tip.unknown') }
+    if ($name -ceq 'Internet' -and $level -ceq 'warn' -and (Get-RepairEntry -From $chip['Detail'] -Name 'Clock') -eq $true) {
+      # HTTPS fails on a clock days off (review M3): say so, never "No internet". Nothing is gated on it.
+      $row.TextKey = 'chip.internet.clock'
+      $tips.Add('tip.internet.clock')
+    }
+    elseif ($level -ceq 'unknown') { $tips.Add('tip.unknown') }
     elseif ($level -cne 'ok') { $tips.Add("tip.$part.$level") }
     if ($name -ceq 'Restart' -and $level -ceq 'ok') {
       $notes = Get-RepairEntry -From $chip['Detail'] -Name 'Notes'

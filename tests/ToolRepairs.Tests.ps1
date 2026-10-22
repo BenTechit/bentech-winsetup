@@ -33,6 +33,9 @@ BeforeAll {
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   $script:root = Join-Path $TestDrive 'Root'
   $script:repairsFile = "$PSScriptRoot\..\src\Repair\ToolRepairs.ps1"
+  # The real code of two mocked functions, for the tests that run it (Pester 6 never falls through to the original).
+  $script:realSfcResult = ${function:Read-ToolSfcResult}
+  $script:realSourceRoots = ${function:Get-ToolInstallSourceRoots}
 
   # The args the window writes for -Action on a Dell laptop, stick E:\, every chip ok (Options per test).
   function New-TestArgs {
@@ -99,6 +102,15 @@ BeforeAll {
   function Get-FindingCodes { param($Run) @(foreach ($f in $Run.Findings) { [string]$f.Code }) }
   function Get-FindingArgs { param($Run, [string]$Code) @(foreach ($f in $Run.Findings) { if ($f.Code -eq $Code) { $f.Args } }) }
   function Get-StepStatus { param($Run, [string]$Id) foreach ($s in $Run.Steps) { if ($s.Id -eq $Id) { return $s.Status } } }
+  function Get-FindingCount { param($Run, [string]$Code) @(foreach ($f in $Run.Findings) { if ($f.Code -eq $Code) { $f } }).Count }
+
+  # One CBS.log line as Windows writes it (the stamp floored to the second, invariant culture), appended to
+  # $script:cbsLog.
+  function Add-CbsLine {
+    param([datetime]$At, [string]$Text)
+    $line = '{0}, Info                  CSI    00000001 {1}' -f $At.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $Text
+    [IO.File]::AppendAllText($script:cbsLog, $line + "`r`n", (New-Object Text.UTF8Encoding $false))
+  }
 }
 
 Describe 'ToolRepairs (repair Task 6)' {
@@ -117,6 +129,7 @@ Describe 'ToolRepairs (repair Task 6)' {
     $script:reg = @{ EditionID = 'Professional'; InstallLanguage = '040D'; DisableDeleteNotification = 0 }
     $script:bcd = @('On'); $script:bcdCalls = 0; $script:reagent = 'On'
     $script:pageFiles = @(); $script:existing = @('C:\'); $script:programs = @(); $script:scStarts = $true
+    $script:onNative = $null; $script:realCbs = $false; $script:sourceRoots = @('E:\', 'F:\')
 
     Mock Invoke-ToolNative {
       $file = [IO.Path]::GetFileName($FilePath)
@@ -127,10 +140,13 @@ Describe 'ToolRepairs (repair Task 6)' {
       if ($script:scStarts -and $file -eq 'sc.exe' -and $ArgumentList -eq 'start w32time' -and ($code -eq 0 -or $code -eq 1056) -and $null -ne $code -and $script:services.ContainsKey('w32time')) {
         $script:services['w32time']['Status'] = 'Running'
       }
+      if ($null -ne $script:onNative) { & $script:onNative $file $ArgumentList }
       @{ ExitCode = $code; TimedOut = ($null -eq $code); OutputPath = $null }
     }
     Mock Invoke-ToolJsonChild { $script:gcCommands[$Name] = $Command; Get-TestChildAnswer -Name $Name }
+    # $script:realCbs lets a test run the real CBS.log parser (Read-ToolSfcResult) on a synthetic log.
     Mock Read-ToolSfcResult {
+      if ($script:realCbs) { return (& $script:realSfcResult -Run $Run -Since $Since) }
       $answer = @{ Ran = $true; VerifyStarted = 1; VerifyCompleted = 1; VerifyComplete = $true; SrLines = 3; Repaired = 0; CannotRepair = 0; Corrupt = 0; Lines = [string[]]@(); Settled = $true }
       $i = $script:sfcCalls; $script:sfcCalls++
       $queue = @($script:sfc)
@@ -158,6 +174,11 @@ Describe 'ToolRepairs (repair Task 6)' {
       [void]$script:blocked.Add('Get-CimInstance'); throw 'not mocked: Get-CimInstance'
     }
     Mock Test-Path { [bool](@($script:existing) -contains [string]$LiteralPath) }
+    # The drives an install file may be on (the stick, a mounted ISO); a call that passes -Drives runs the real code.
+    Mock Get-ToolInstallSourceRoots {
+      if ($null -ne $Drives) { & $script:realSourceRoots -StickRoot $StickRoot -Drives $Drives } else { @($script:sourceRoots) }
+    }
+    Mock Get-WinEvent { [void]$script:blocked.Add('Get-WinEvent'); throw 'not mocked: Get-WinEvent' }
     Mock Get-SignedInUserName { [void]$script:blocked.Add('Get-SignedInUserName'); throw 'not mocked: Get-SignedInUserName' }
     Mock Wait-SetupDelay { }
     # Recorders: nothing here may write the registry or create an item.
@@ -256,6 +277,13 @@ Describe 'ToolRepairs (repair Task 6)' {
         'finding.wuScanSkipped'          = 'No internet: the Windows Update scan was skipped'
         # RD-R13: Repair-Volume -Scan asked to be run again.
         'finding.volumeScanRetry'        = 'Disk scan could not finish this time: run the scan again'
+        # Ruling RD-R20 (the Task 6 review): M2, M5, M6 and the dead-clock Internet chip (M3).
+        'finding.dismNoMatchingImage'    = 'An install.wim or install.esd was found, but none of its images matches this PC ({0}, {1})'
+        'finding.trimMediaUnknown'       = 'The system disk''s type is not known ({0}): it was not optimized'
+        'finding.analyzeFailed'          = 'Optimize-Volume -Analyze failed ({0})'
+        'finding.pageFileUnknown'        = 'The page file settings could not be read ({0})'
+        'chip.internet.clock'            = 'Clock wrong: HTTPS fails'
+        'tip.internet.clock'             = 'The clock is so far off that secure connections fail. Standard repair syncs it first; if the sync fails, set the date and time by hand (a dead BIOS battery?).'
       }
       foreach ($k in $expected.Keys) {
         $script:ToolboxStrings.en[$k] | Should -BeExactly $expected[$k] -Because $k
@@ -326,12 +354,18 @@ Describe 'ToolRepairs (repair Task 6)' {
       Get-FindingCodes $r | Should -Be @('restartFirst')
       $r.Data.DismOk | Should -BeFalse
     }
-    It 'DISM saying a servicing restart is pending skips SFC, even when the registry does not say so' {
+    It 'DISM saying a servicing restart is pending stops the action before SFC, even when the registry does not say so (review M1)' {
       $script:exit['dism.exe'] = -2146498513; $r = New-ActionRun standard
-      Invoke-ToolSteps -Run $r | Should -Be 'Done'
+      Invoke-ToolSteps -Run $r | Should -Be 'NeedsRestart'
       $script:native | Should -Not -Contain 'sfc.exe'
-      Get-StepStatus $r 'sfc' | Should -Be 'skipped'; Get-StepStatus $r 'winreFix' | Should -Be 'done'
-      Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'YELLOW'
+      @($r.Steps.Status) | Should -Be @('done', 'done', 'warn', 'skipped', 'skipped')
+      Get-FindingCount $r 'restartFirst' | Should -Be 1
+      Get-ToolResultColor -Outcome 'NeedsRestart' -Findings $r.Findings | Should -Be 'YELLOW'
+    }
+    It 'DISM''s pending code and the registry signals together still give one restartFirst (review M1)' {
+      $script:exit['dism.exe'] = -2146498513; $script:pendingAfter = 'dism'; $r = New-ActionRun standard
+      Invoke-ToolSteps -Run $r | Should -Be 'NeedsRestart'
+      Get-FindingCodes $r | Should -Be @('restartFirst')
     }
     It 'every source failure code (<Hex>) offers the found install.wim with its details and never retries by itself' -ForEach @(
       @{ Hex = '0x800F081F'; C = -2146498529 }, @{ Hex = '0x800F0906'; C = -2146498298 }, @{ Hex = '0x800F0950'; C = -2146498224 }) {
@@ -401,10 +435,37 @@ Describe 'ToolRepairs (repair Task 6)' {
       $r = New-ActionRun standard; Invoke-ToolStepSfc -Run $r | Should -Be 'warn'
       Get-FindingRows $r | Should -Be @('WARN|sfcNotRun')
     }
+    It 'the second SFC pass never reads the first pass''s CBS.log lines (review I1): the real parser, <Why>' -ForEach @(
+      @{ Why = 'a second pass that ran clean'; Second = $true; Outcome = 'ran clean' }
+      @{ Why = 'a second sfc.exe that wrote nothing'; Second = $false; Outcome = 'gave no result' }) {
+      # The real Read-ToolSfcResult and ConvertFrom-CbsSrText read a synthetic CBS.log in $TestDrive; a fake clock moves
+      # only when a wait or a scan takes time. The first pass ends with its repair lines, as SFC writes them.
+      $script:realCbs = $true; $script:sfcPass = 0; $script:secondWrites = $Second
+      $script:cbsLog = Join-Path $TestDrive 'CBS.log'; [IO.File]::WriteAllText($script:cbsLog, '')
+      $script:fakeNow = [datetime]'2026-10-22 10:00:00'
+      Mock Get-Date { $script:fakeNow }
+      Mock Wait-SetupDelay { $script:fakeNow = $script:fakeNow.AddSeconds($Seconds) }
+      Mock Read-ToolCbsLog { [IO.File]::ReadAllText($script:cbsLog) }
+      $script:onNative = {
+        param($file, $arguments)
+        if ($file -ne 'sfc.exe') { return }
+        $script:sfcPass++
+        if ($script:sfcPass -eq 2 -and -not $script:secondWrites) { return }
+        $start = $script:fakeNow; $script:fakeNow = $script:fakeNow.AddSeconds(90)
+        Add-CbsLine $start '[SR] Verifying 100 components'
+        Add-CbsLine $script:fakeNow.AddSeconds(-1) '[SR] Verify complete'
+        if ($script:sfcPass -eq 1) { Add-CbsLine $script:fakeNow '[SR] Repairing 2 components'; Add-CbsLine $script:fakeNow '[SR] Repair complete' }
+      }
+      $r = New-ActionRun standard; $null = Invoke-ToolStepSfc -Run $r
+      $script:sfcPass | Should -Be 2
+      Get-FindingArgs $r 'sfcRepaired' | Should -Be @('2', $Outcome)
+      $script:ToolCbsLookbackSeconds | Should -BeGreaterThan 0
+      Should -Invoke Wait-SetupDelay -Times 1 -ParameterFilter { $Seconds -gt $script:ToolCbsLookbackSeconds }
+    }
     It 'reagentc /enable runs only when the BCD and ReAgent.xml both say off: <Bcd> + <Agent> -> <Rows>' -ForEach @(
       @{ Bcd = @('Off', 'On'); Agent = 'Off'; Rows = @('INFO|winreEnabled'); Reagentc = $true; Status = 'done' }
-      @{ Bcd = @('Off'); Agent = 'Missing'; Rows = @('INFO|winreNoAgreement'); Reagentc = $false; Status = 'warn' }
-      @{ Bcd = @('Off'); Agent = 'Unknown'; Rows = @('INFO|winreNoAgreement'); Reagentc = $false; Status = 'warn' }
+      @{ Bcd = @('Off'); Agent = 'Missing'; Rows = @('WARN|winreNoAgreement'); Reagentc = $false; Status = 'warn' }
+      @{ Bcd = @('Off'); Agent = 'Unknown'; Rows = @('WARN|winreNoAgreement'); Reagentc = $false; Status = 'warn' }
       @{ Bcd = @('On'); Agent = 'Off'; Rows = @('WARN|winreUnknown'); Reagentc = $false; Status = 'warn' }
       @{ Bcd = @('Off'); Agent = 'On'; Rows = @('WARN|winreUnknown'); Reagentc = $false; Status = 'warn' }
       @{ Bcd = @('Unknown'); Agent = 'Off'; Rows = @('WARN|winreUnreadable'); Reagentc = $false; Status = 'warn' }
@@ -437,6 +498,13 @@ Describe 'ToolRepairs (repair Task 6)' {
       $script:offsetSeconds = -150; $r = New-ActionRun standard; $null = Invoke-ToolStepTimeSync -Run $r; Get-FindingArgs $r 'clockOff' | Should -Be @('2.5')
       $script:offsetSeconds = 90; $r = New-ActionRun standard; Invoke-ToolStepTimeSync -Run $r | Should -Be 'done'; Get-FindingCodes $r | Should -BeNullOrEmpty
       $script:offsetSeconds = $null; $r = New-ActionRun standard; Invoke-ToolStepTimeSync -Run $r | Should -Be 'done'; Get-FindingRows $r | Should -Be @('INFO|clockUnknown')
+    }
+    It 'a dead clock (HTTPS fails, the HTTP probe dates it two years off) is clockOff in minutes, never "no internet" (review M3)' {
+      $script:exit['w32tm.exe'] = -2147023436
+      Mock Test-ToolInternet { @{ Tcp = $true; Https = $false; Probe = 'ok'; ClockOffsetSeconds = -63072000.0; Chip = @{ Level = 'warn'; Args = @(); Detail = @{ Clock = $true } } } }
+      $r = New-ActionRun standard; Invoke-ToolStepTimeSync -Run $r | Should -Be 'warn'
+      Get-FindingCodes $r | Should -Be @('timeSyncFailed', 'clockOff'); Get-FindingArgs $r 'clockOff' | Should -Be @('1051200.0')
+      Get-FindingCodes $r | Should -Not -Contain 'clockUnknown'
     }
     It 'the time sync fails when <Why>: timeSyncFailed, the clock still measured' -ForEach @(
       @{ Why = 'sc start is refused'; Exit = @{ 'sc.exe' = 5 }; Starts = $true; Service = @{ Status = 'Stopped'; StartType = 'Manual' }; Lines = @('sc.exe start w32time') }
@@ -512,6 +580,13 @@ Describe 'ToolRepairs (repair Task 6)' {
       Get-StepStatus $r 'componentCleanup' | Should -Be 'skipped'; Get-StepStatus $r 'wuScan' | Should -Be 'skipped'
       $script:gcCommands.Keys | Should -Not -Contain 'componentCleanup'
     }
+    It 'DISM''s own pending code stops Post-clone before any later servicing step: no component cleanup, NeedsRestart, one restartFirst (review M1)' {
+      $script:exit['dism.exe'] = -2146498513; $r = New-ActionRun postClone
+      Invoke-ToolSteps -Run $r | Should -Be 'NeedsRestart'
+      $script:gcCommands.Keys | Should -Not -Contain 'componentCleanup'; $script:native | Should -Not -Contain 'sfc.exe'
+      Get-StepStatus $r 'componentCleanup' | Should -Be 'skipped'
+      Get-FindingCount $r 'restartFirst' | Should -Be 1
+    }
     It 'the device rescan: exit <C> is <S>' -ForEach @(
       @{ C = 0; S = 'done'; Rows = @(); Restart = $false }, @{ C = 3010; S = 'done'; Rows = @(); Restart = $true }
       @{ C = 1; S = 'warn'; Rows = @('WARN|pnpScanFailed'); Restart = $false }, @{ C = $null; S = 'timedout'; Rows = @('WARN|pnpScanFailed'); Restart = $false }) {
@@ -547,6 +622,11 @@ Describe 'ToolRepairs (repair Task 6)' {
       Get-FindingRows $r | Should -Be @('WARN|pageFileMissingDrive'); Get-FindingArgs $r 'pageFileMissingDrive' | Should -Be @('D:')
       $script:pageFiles = @('C:\pagefile.sys'); $r = New-ActionRun postClone; Invoke-ToolStepPageFile -Run $r | Should -Be 'done'; Get-FindingCodes $r | Should -BeNullOrEmpty
     }
+    It 'page-file settings that cannot be read are a WARN finding, never a yellow step with nothing (review M6)' {
+      Mock Get-CimInstance -ParameterFilter { $ClassName -eq 'Win32_PageFileSetting' } { Write-Error -Message 'Invalid class' -ErrorId 'HRESULT 0x80041010' -Category InvalidType }
+      $r = New-ActionRun postClone; Invoke-ToolStepPageFile -Run $r | Should -Be 'warn'
+      Get-FindingRows $r | Should -Be @('WARN|pageFileUnknown'); @(Get-FindingArgs $r 'pageFileUnknown')[0] | Should -Match 'Invalid class'
+    }
     It 'TRIM off is reported, the registry is never written; ReTrim on SSD, Analyze on HDD' {
       $script:reg['DisableDeleteNotification'] = 1; $script:gc['media'] = @{ Media = 'SSD' }
       $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'warn'
@@ -557,14 +637,22 @@ Describe 'ToolRepairs (repair Task 6)' {
       $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'done'; Get-FindingCodes $r | Should -BeNullOrEmpty
       $script:gcCommands['retrim'] | Should -Match '-Analyze'; $script:gcCommands['retrim'] | Should -Not -Match 'ReTrim'
     }
-    It 'TRIM: a missing value is on; an unknown media type optimizes nothing; a failed ReTrim is retrimFailed' {
+    It 'TRIM: a missing value is on; an unknown media type optimizes nothing and says so (review M5); a failed ReTrim is retrimFailed' {
       $script:reg.Remove('DisableDeleteNotification'); $script:gc['media'] = @{ Media = @('Unspecified') }
       $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'done'
-      Get-FindingCodes $r | Should -BeNullOrEmpty; $script:gcCommands.Keys | Should -Not -Contain 'retrim'
-      $script:gc['media'] = @{ Media = @('SSD') }; $script:gcFail['retrim'] = 'The volume does not support it'
+      Get-FindingRows $r | Should -Be @('INFO|trimMediaUnknown'); Get-FindingArgs $r 'trimMediaUnknown' | Should -Be @('Unspecified')
+      $script:gcCommands.Keys | Should -Not -Contain 'retrim'
+      $script:gcFail['media'] = 'timed out'; $r = New-ActionRun postClone; $null = Invoke-ToolStepTrim -Run $r
+      Get-FindingRows $r | Should -Be @('INFO|trimMediaUnknown'); Get-FindingArgs $r 'trimMediaUnknown' | Should -Be @('timed out')
+      $script:gcFail.Clear(); $script:gc['media'] = @{ Media = @('SSD') }; $script:gcFail['retrim'] = 'The volume does not support it'
       $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'warn'
       Get-FindingRows $r | Should -Be @('WARN|retrimFailed'); Get-FindingArgs $r 'retrimFailed' | Should -Be @('The volume does not support it')
       $script:gcFail['retrim'] = 'timed out'; $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'timedout'
+    }
+    It 'an -Analyze that fails on an HDD is analyzeFailed, never "ReTrim failed" (review M5)' {
+      $script:gc['media'] = @{ Media = @('HDD') }; $script:gcFail['retrim'] = 'Access denied'
+      $r = New-ActionRun postClone; Invoke-ToolStepTrim -Run $r | Should -Be 'warn'
+      Get-FindingRows $r | Should -Be @('WARN|analyzeFailed'); Get-FindingArgs $r 'analyzeFailed' | Should -Be @('Access denied')
     }
     It 'component cleanup never resets the base' {
       $r = New-ActionRun postClone; Invoke-ToolStepComponentCleanup -Run $r | Should -Be 'done'
@@ -634,6 +722,29 @@ Describe 'ToolRepairs (repair Task 6)' {
       Get-StepStatus $r 'dismSource' | Should -Be 'failed'
       Get-FindingRows $r | Should -Contain 'CRIT|stepFailed'
     }
+    It 'refuses an install file that is not on the stick or a mounted ISO: <Why> (spec 6.2, review M9)' -ForEach @(
+      @{ Why = 'the system drive'; Path = 'C:\sources\install.wim' }
+      @{ Why = 'a mapped network drive'; Path = 'Z:\sources\install.wim' }
+      @{ Why = 'a fixed data disk'; Path = 'D:\sources\install.esd' }) {
+      $script:existing = @($Path); $script:sourceRoots = @('E:\', 'F:\')
+      $r = New-ActionRun dismSource -Options @{ Path = $Path; Type = $Path.Substring($Path.Length - 3); Index = 6 }
+      $null = Invoke-ToolSteps -Run $r
+      $script:native | Should -Not -Contain 'dism.exe'
+      Get-StepStatus $r 'dismSource' | Should -Be 'failed'
+      @(Get-FindingArgs $r 'stepFailed')[1] | Should -Match 'stick or a mounted ISO'
+      Should -Invoke Get-ToolInstallSourceRoots -ParameterFilter { $StickRoot -eq 'E:\' }
+    }
+    It 'install files that hold no image for this PC are dismNoMatchingImage, not dismNoSource (review M2)' {
+      $script:sourceRoots = @('E:\'); $script:existing = @('E:\sources\install.wim'); $script:exit['dism.exe'] = -2146498529
+      $script:gc['installImage'] = @{ Items = @(@{ Index = 1; EditionId = 'Enterprise'; Architecture = '9'; Languages = @('en-US'); Version = '10.0.26200.1' }) }
+      $r = New-ActionRun standard; Invoke-ToolStepDism -Run $r | Should -Be 'warn'
+      Get-FindingRows $r | Should -Be @('WARN|dismSourceMissing', 'INFO|dismNoMatchingImage')
+      Get-FindingArgs $r 'dismNoMatchingImage' | Should -Be @('Professional', 'x64'); $r.Offers.DismSource | Should -BeNullOrEmpty
+      $script:reg.Remove('EditionID'); $r = New-ActionRun standard; $null = Invoke-ToolStepDism -Run $r
+      Get-FindingArgs $r 'dismNoMatchingImage' | Should -Be @('unknown', 'x64')
+      $script:existing = @(); $r = New-ActionRun standard; $null = Invoke-ToolStepDism -Run $r
+      Get-FindingRows $r | Should -Be @('WARN|dismSourceMissing', 'INFO|dismNoSource')
+    }
     It 'a source the retry cannot use is dismFailed, with no second offer' {
       $script:existing = @('E:\sources\install.wim'); $script:exit['dism.exe'] = -2146498529
       Mock Find-ToolInstallSource { Get-TestOffer }
@@ -644,7 +755,7 @@ Describe 'ToolRepairs (repair Task 6)' {
     }
     It 'Find-ToolInstallSource matches EditionID and architecture, and flags a build or language that differs' {
       # one install.wim on E: with index 1 Core x64, index 6 Professional x64 en-US build 26100, index 7 Professional ARM64; the PC: Professional x64 he-IL build 26200
-      Mock Get-ToolInstallSourceRoots { @('E:\') }
+      $script:sourceRoots = @('E:\')
       $script:existing = @('E:\sources\install.wim')
       $s = Find-ToolInstallSource -Run (New-ActionRun standard)
       $s.Path | Should -Be 'E:\sources\install.wim'; $s.Type | Should -Be 'wim'
@@ -657,7 +768,7 @@ Describe 'ToolRepairs (repair Task 6)' {
       Find-ToolInstallSource -Run (New-ActionRun standard) | Should -BeNullOrEmpty
     }
     It 'the same build and language are not flagged; the stick''s file is looked at before a mounted ISO''s' {
-      Mock Get-ToolInstallSourceRoots { @('E:\', 'D:\') }
+      $script:sourceRoots = @('E:\', 'D:\')
       $script:existing = @('E:\sources\install.esd', 'D:\sources\install.wim')
       $script:gc['installImage'] = @{ Items = @(@{ Index = 3; EditionId = 'Professional'; Architecture = 'x64'; Languages = @('he-IL', 'en-US'); Version = '10.0.26200.6584' }) }
       $s = Find-ToolInstallSource -Run (New-ActionRun standard)
@@ -666,7 +777,7 @@ Describe 'ToolRepairs (repair Task 6)' {
       Should -Invoke Invoke-ToolJsonChild -Times 1 -Exactly -ParameterFilter { $Name -eq 'installImage' }
     }
     It 'no candidate file, an unreadable image or an unknown edition: no offer' {
-      Mock Get-ToolInstallSourceRoots { @('E:\') }
+      $script:sourceRoots = @('E:\')
       $script:existing = @()
       Find-ToolInstallSource -Run (New-ActionRun standard) | Should -BeNullOrEmpty
       Should -Invoke Invoke-ToolJsonChild -Times 0 -ParameterFilter { $Name -eq 'installImage' }

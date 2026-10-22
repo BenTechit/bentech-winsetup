@@ -252,15 +252,20 @@ function Resolve-ToolDismResult {
   <#
   .SYNOPSIS
     Private. Judges a dism.exe /RestoreHealth run by its exit code alone and returns the step result. Sets
-    $Run.Data.DismOk (and $Run.Data.DismPending) for SFC and $Run.Data.Dism = @{ ExitCode; LocalSource }.
+    $Run.Data.DismOk for SFC, $Run.Data.DismPending for the runner and $Run.Data.Dism = @{ ExitCode; LocalSource }.
   .DESCRIPTION
       timed out                         : CRIT stepTimedOut (the step's name, -TimeoutMinutes), 'timedout';
       0                                 : 'done';
       3010                              : INFO dismRestart, RestartRequired, 'done';
-      0x800F082F ($DismPendingCode)     : WARN restartFirst, 'warn' (SFC is then skipped: Invoke-ToolStepSfc);
+      0x800F082F ($DismPendingCode)     : WARN restartFirst and $Run.Data.DismPending, 'warn'. The runner treats
+                                          DismPending as a pending servicing restart: the action stops before the next
+                                          servicing step (SFC) with NeedsRestart and no second restartFirst (spec 5,
+                                          review M1);
       a source failure ($DismSourceFailureCodes), from Windows Update (no -LocalSource): WARN dismSourceMissing and
-                                          the offer of a local source (Find-ToolInstallSource -> $Run.Offers.DismSource),
-                                          or INFO dismNoSource; 'warn'. The retry is never run here (builder check 6);
+                                          the offer of a local source (Find-ToolInstallSource -> $Run.Offers.DismSource);
+                                          without one, INFO dismNoMatchingImage (install files were found, none for
+                                          this PC: its edition and architecture) or INFO dismNoSource (no install file
+                                          at all); 'warn'. The retry is never run here (builder check 6);
       anything else, and a source failure of the retry itself (-LocalSource: the file the technician picked could not
       repair this PC; nothing is offered again): CRIT dismFailed with the code, 'failed'.
   #>
@@ -305,7 +310,12 @@ function Resolve-ToolDismResult {
       $Run.Offers['DismSource'] = $source
       Add-ToolLog -Run $Run -Text ('A local source can be offered: {0} index {1}' -f $source['Path'], $source['Index'])
     } else {
-      Add-ToolFinding -Run $Run -Level INFO -Code 'dismNoSource'
+      $search = $Run.Data['DismSourceSearch']
+      if ($search -is [System.Collections.IDictionary] -and @($search['Files']).Count -gt 0) {
+        Add-ToolFinding -Run $Run -Level INFO -Code 'dismNoMatchingImage' -Arguments @($search['Edition'], $search['Arch'])
+      } else {
+        Add-ToolFinding -Run $Run -Level INFO -Code 'dismNoSource'
+      }
     }
     return 'warn'
   }
@@ -404,59 +414,72 @@ function Find-ToolInstallSource {
     a mismatch is never offered, Plan call) is the offer, and the search stops. BuildDiffers: the image's build (the
     third part of its version) is not this PC's (Args.Machine.OsBuild); LanguageDiffers: its languages lack this PC's
     install language (PcLanguage). Without this PC's edition or architecture nothing is offered.
+    What was looked at is kept in $Run.Data.DismSourceSearch = @{ Files = [string[]] (the candidate files found);
+    Edition; Arch ('unknown' when not known) }, so the dism step can tell "no install file" (dismNoSource) from
+    "install files, none for this PC" (dismNoMatchingImage; review M2).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][hashtable]$Run)
 
+  $files = New-Object System.Collections.Generic.List[string]
+  $search = @{ Files = [string[]]@(); Edition = 'unknown'; Arch = 'unknown' }
+  $Run.Data['DismSourceSearch'] = $search
   try {
     $edition = ([string](Get-RebootRegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'EditionID')).Trim()
     $arch = ConvertTo-ToolImageArch -Value ([string](Get-ToolArgsEntry -Run $Run -Section 'Machine' -Name 'Arch'))
+    if ($edition -ne '') { $search['Edition'] = ConvertTo-ScreenText -Text $edition }
+    if ($arch -ne '') { $search['Arch'] = $arch }
+    foreach ($root in @(Get-ToolInstallSourceRoots -StickRoot ([string]$Run.Args['StickRoot']))) {
+      foreach ($type in 'wim', 'esd') {
+        $path = $root + 'sources\install.' + $type
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $files.Add($path) }
+      }
+    }
+    $search['Files'] = [string[]]$files.ToArray()
+    if ($files.Count -eq 0) { return $null }
     if ($edition -eq '' -or $arch -eq '') {
-      Add-ToolLog -Run $Run -Text 'No install source looked for: this PC''s edition or architecture is unknown'
+      Add-ToolLog -Run $Run -Text 'No install image looked at: this PC''s edition or architecture is unknown'
       return $null
     }
     $osBuild = [string](Get-ToolArgsEntry -Run $Run -Section 'Machine' -Name 'OsBuild')
     if ($osBuild -notmatch '^[0-9]+\z') { $osBuild = [string][Environment]::OSVersion.Version.Build }
     $pcLanguage = Get-ToolPcLanguage
 
-    foreach ($root in @(Get-ToolInstallSourceRoots -StickRoot ([string]$Run.Args['StickRoot']))) {
-      foreach ($type in 'wim', 'esd') {
-        $path = $root + 'sources\install.' + $type
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        Add-ToolLog -Run $Run -Text ('Reading the images in {0}' -f $path)
-        $child = Invoke-ToolJsonChild -Run $Run -Name 'installImage' -Command ($script:ToolInstallImageCommand.Replace('<P>', (ConvertTo-PowerShellLiteral -Text $path))) -StepTimeout 'grandchild'
-        if (-not $child.Ok) {
-          Add-ToolLog -Run $Run -Text ('{0} could not be read: {1}' -f $path, $child.Error)
-          continue
-        }
-        foreach ($image in @($child.Data['Items'])) {
-          if ($image -isnot [System.Collections.IDictionary]) { continue }
-          $index = 0
-          if (-not [int]::TryParse([string]$image['Index'], [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$index) -or $index -lt 1 -or $index -gt 99) { continue }
-          if (-not [string]::Equals(([string]$image['EditionId']).Trim(), $edition, [StringComparison]::OrdinalIgnoreCase)) { continue }
-          if ((ConvertTo-ToolImageArch -Value ([string]$image['Architecture'])) -cne $arch) { continue }
-          $languages = [string[]]@(foreach ($l in @($image['Languages'])) {
-              $name = (([string]$l).Trim() -split '\s+')[0]
-              if ($name -ne '') { ConvertTo-ScreenText -Text $name }
-            })
-          $parts = ([string]$image['Version']).Split('.')
-          $build = if ($parts.Count -ge 3) { ConvertTo-ScreenText -Text $parts[2] } else { '' }
-          $languageDiffers = ($pcLanguage -ne '') -and -not (@($languages) -contains $pcLanguage)
-          return @{
-            Path            = $path
-            Type            = $type
-            Index           = $index
-            Edition         = (ConvertTo-ScreenText -Text ([string]$image['EditionId']).Trim())
-            Arch            = $arch
-            Languages       = $languages
-            Build           = $build
-            BuildDiffers    = ($build -ne $osBuild)
-            LanguageDiffers = $languageDiffers
-            PcLanguage      = (ConvertTo-ScreenText -Text $pcLanguage)
-          }
-        }
-        Add-ToolLog -Run $Run -Text ('{0} holds no {1} {2} image' -f $path, $edition, $arch)
+    foreach ($path in $files) {
+      $type = $path.Substring($path.Length - 3)
+      Add-ToolLog -Run $Run -Text ('Reading the images in {0}' -f $path)
+      $child = Invoke-ToolJsonChild -Run $Run -Name 'installImage' -Command ($script:ToolInstallImageCommand.Replace('<P>', (ConvertTo-PowerShellLiteral -Text $path))) -StepTimeout 'grandchild'
+      if (-not $child.Ok) {
+        Add-ToolLog -Run $Run -Text ('{0} could not be read: {1}' -f $path, $child.Error)
+        continue
       }
+      foreach ($image in @($child.Data['Items'])) {
+        if ($image -isnot [System.Collections.IDictionary]) { continue }
+        $index = 0
+        if (-not [int]::TryParse([string]$image['Index'], [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$index) -or $index -lt 1 -or $index -gt 99) { continue }
+        if (-not [string]::Equals(([string]$image['EditionId']).Trim(), $edition, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ((ConvertTo-ToolImageArch -Value ([string]$image['Architecture'])) -cne $arch) { continue }
+        $languages = [string[]]@(foreach ($l in @($image['Languages'])) {
+            $name = (([string]$l).Trim() -split '\s+')[0]
+            if ($name -ne '') { ConvertTo-ScreenText -Text $name }
+          })
+        $parts = ([string]$image['Version']).Split('.')
+        $build = if ($parts.Count -ge 3) { ConvertTo-ScreenText -Text $parts[2] } else { '' }
+        $languageDiffers = ($pcLanguage -ne '') -and -not (@($languages) -contains $pcLanguage)
+        return @{
+          Path            = $path
+          Type            = $type
+          Index           = $index
+          Edition         = (ConvertTo-ScreenText -Text ([string]$image['EditionId']).Trim())
+          Arch            = $arch
+          Languages       = $languages
+          Build           = $build
+          BuildDiffers    = ($build -ne $osBuild)
+          LanguageDiffers = $languageDiffers
+          PcLanguage      = (ConvertTo-ScreenText -Text $pcLanguage)
+        }
+      }
+      Add-ToolLog -Run $Run -Text ('{0} holds no {1} {2} image' -f $path, $edition, $arch)
     }
   } catch {
     Write-SetupLog -Level WARN -Message 'Looking for an install source failed' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
@@ -467,8 +490,9 @@ function Find-ToolInstallSource {
 function Get-ToolDismSourceOptions {
   # Private. The DISM retry's Options checked again in the child (the window built them from the offer, but the args
   # file is the only thing the child trusts): @{ Path; Type; Index }. Throws with an ASCII reason when the Path is not
-  # <X>:\sources\install.wim|esd on an existing file, the Type is not wim|esd or not the file's, or the Index is not a
-  # whole number 1..99.
+  # <X>:\sources\install.wim|esd on an existing file, its drive is not the stick or a mounted ISO (a root of
+  # Get-ToolInstallSourceRoots: the stick, a ready CD-ROM or removable drive; spec 6.2, review M9), the Type is not
+  # wim|esd or not the file's, or the Index is not a whole number 1..99.
   [CmdletBinding()]
   [OutputType([hashtable])]
   param([Parameter(Mandatory)][hashtable]$Run)
@@ -478,6 +502,10 @@ function Get-ToolDismSourceOptions {
   $path = $options['Path']
   if ($path -isnot [string] -or $path -notmatch '^[A-Za-z]:\\sources\\install\.(wim|esd)\z') { throw 'The DISM source is not <drive>:\sources\install.wim or install.esd' }
   $extension = $Matches[1].ToLowerInvariant()
+  $root = $path.Substring(0, 3).ToUpperInvariant()
+  if (@(Get-ToolInstallSourceRoots -StickRoot ([string]$Run.Args['StickRoot'])) -notcontains $root) {
+    throw 'The DISM source is not on the stick or a mounted ISO'
+  }
   $type = $options['Type']
   if ($type -isnot [string] -or $type -cnotin 'wim', 'esd' -or $type -cne $extension) { throw 'The DISM source type is not wim or esd, or not the file''s' }
   $value = $options['Index']
@@ -535,14 +563,14 @@ function Invoke-ToolStepSfc {
     Step sfc (servicing): sfc.exe /scannow, judged from CBS.log's [SR] lines (review I-3). $Run.Data.Sfc =
     @{ Passes; Repaired; CannotRepair; SecondPass; ExitCode }.
   .DESCRIPTION
-    - DISM said a servicing restart is pending ($Run.Data.DismPending, its 0x800F082F): 'skipped' (SFC would give wrong
-      results, spec 5; restartFirst is already there).
     - Timed out: WARN sfcTimedOut, 'timedout' (TrustedInstaller may go on; nothing else is killed).
     - Files it could not repair: CRIT sfcCannotRepair, plus CRIT dismAndSfcFailed when DISM failed in this run
       ($Run.Data.DismOk is $false), 'warn'.
     - It repaired something (Repaired > 0) and nothing was beyond repair: ONE second pass, and INFO sfcRepaired with
-      the first pass's count and what the second did: 'ran clean', 'still repaired files', 'could not repair
-      everything' (with sfcCannotRepair as above), 'gave no result', or 'timed out' (with sfcTimedOut).
+      the first pass's count and what the second did. The second pass starts after a wait longer than the CBS.log
+      look-back ($script:ToolCbsLookbackSeconds + 1 s), so it never counts the first pass's last lines (review I1):
+      'ran clean', 'still repaired files', 'could not repair everything' (with sfcCannotRepair as above), 'gave no
+      result', or 'timed out' (with sfcTimedOut).
     - No completed verify in CBS.log: WARN sfcNotRun.
     - Else 'done'.
   #>
@@ -550,10 +578,6 @@ function Invoke-ToolStepSfc {
   [OutputType([string])]
   param([Parameter(Mandatory)][hashtable]$Run)
 
-  if ($Run.Data['DismPending'] -eq $true) {
-    Add-ToolLog -Run $Run -Text 'SFC skipped: DISM reported a pending servicing restart'
-    return 'skipped'
-  }
   $first = Invoke-ToolSfcPass -Run $Run
   if ($first.TimedOut) {
     $Run.Data['Sfc'] = @{ Passes = 1; TimedOut = $true }
@@ -570,6 +594,8 @@ function Invoke-ToolStepSfc {
     return 'warn'
   }
   if ($repaired -gt 0) {
+    # The second pass takes its start (Invoke-ToolSfcPass) after this wait: its look-back cannot reach the first pass.
+    Wait-SetupDelay -Seconds ($script:ToolCbsLookbackSeconds + 1)
     $second = Invoke-ToolSfcPass -Run $Run
     $data['Passes'] = 2
     $status = 'done'
@@ -618,7 +644,8 @@ function Invoke-ToolStepWinreFix {
       BCD unreadable                 : WARN winreUnreadable (ruling RD-R10), nothing run;
       CanEnable (BCD Off + ReAgent Off): reagentc.exe /enable; exit 0 and the BCD read again says On: INFO winreEnabled;
                                        any other exit, a timeout, or a BCD still not On: WARN winreEnableFailed;
-      Off without ReAgent.xml's agreement (Missing, Unknown): INFO winreNoAgreement, nothing run;
+      Off without ReAgent.xml's agreement (Missing, Unknown): WARN winreNoAgreement, nothing run (WinRE is off: the
+                                       Health check's winreOff is WARN too; ruling RD-R20, review M8);
       the two disagree               : WARN winreUnknown, nothing run;
       On                             : 'done'.
   #>
@@ -655,7 +682,7 @@ function Invoke-ToolStepWinreFix {
   switch -CaseSensitive ($state.Verdict) {
     'On' { return 'done' }
     'Off' {
-      Add-ToolFinding -Run $Run -Level INFO -Code 'winreNoAgreement'
+      Add-ToolFinding -Run $Run -Level WARN -Code 'winreNoAgreement'
       return 'warn'
     }
   }
@@ -827,7 +854,8 @@ function Invoke-ToolStepPageFile {
   .SYNOPSIS
     Step pageFile: a page file set on a drive that is not there any more (a clone onto a PC without that disk). The
     Win32_PageFileSetting names (CIM, 15 s) whose drive Test-Path cannot find: WARN pageFileMissingDrive with the
-    drives. A system-managed page file ('?:\pagefile.sys') is on any drive. Read only. $Run.Data.PageFile.
+    drives. A system-managed page file ('?:\pagefile.sys') is on any drive. Settings that cannot be read: WARN
+    pageFileUnknown with the reason (review M6). Read only. $Run.Data.PageFile.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -838,7 +866,7 @@ function Invoke-ToolStepPageFile {
   } catch {
     $reason = ConvertTo-ScreenText -Text $_.Exception.Message
     $Run.Data['PageFile'] = @{ Error = $reason }
-    Add-ToolLog -Run $Run -Text ('The page file settings could not be read: {0}' -f $reason)
+    Add-ToolFinding -Run $Run -Level WARN -Code 'pageFileUnknown' -Arguments @($reason)
     return 'warn'
   }
   $files = New-Object System.Collections.Generic.List[string]
@@ -867,7 +895,8 @@ function Invoke-ToolStepTrim {
       It is never changed (Plan call: spec 6.3 lists the state only); a missing value is Windows' default, on.
     - The grandchild media (toolStep.disks) reads the system disk's MediaType. All SSD: Optimize-Volume -ReTrim; all
       HDD: Optimize-Volume -Analyze (grandchild retrim, toolStep.retrim); anything else (Unspecified, a mix, no
-      answer): nothing is optimized (logged). A failed or timed-out optimization is WARN retrimFailed.
+      answer): nothing is optimized, and INFO trimMediaUnknown says why (review M5). A failed or timed-out ReTrim is
+      WARN retrimFailed, a failed or timed-out Analyze WARN analyzeFailed.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -897,13 +926,17 @@ function Invoke-ToolStepTrim {
   elseif ($kinds.Count -gt 0 -and @($kinds | Where-Object { $_ -cne 'HDD' }).Count -eq 0) { $mode = 'Analyze' }
   $trim['Mode'] = $mode
   if ($mode -eq '') {
-    $what = if ($media.Ok) { ($kinds -join ', ') } else { $media.Error }
-    Add-ToolLog -Run $Run -Text ('TRIM: the system disk''s media type is not known ({0}): nothing was optimized' -f $what)
+    $what = if (-not $media.Ok) { $media.Error } elseif ($kinds.Count -gt 0) { ($kinds -join ', ') } else { 'no disk found' }
+    Add-ToolFinding -Run $Run -Level INFO -Code 'trimMediaUnknown' -Arguments @($what)
     return $status
   }
   $optimize = Invoke-ToolJsonChild -Run $Run -Name 'retrim' -Command ($script:ToolRetrimCommand.Replace('<L>', $letter).Replace('<Mode>', $mode)) -StepTimeout 'retrim'
   if (-not $optimize.Ok) {
-    Add-ToolFinding -Run $Run -Level WARN -Code 'retrimFailed' -Arguments @($optimize.Error)
+    if ($mode -ceq 'ReTrim') {
+      Add-ToolFinding -Run $Run -Level WARN -Code 'retrimFailed' -Arguments @($optimize.Error)
+    } else {
+      Add-ToolFinding -Run $Run -Level WARN -Code 'analyzeFailed' -Arguments @($optimize.Error)
+    }
     if ($optimize.TimedOut) { return 'timedout' }
     return 'warn'
   }

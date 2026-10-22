@@ -57,6 +57,11 @@ $script:ToolRepairStatusMap = @{
   ScanNeedsRetry                       = 'NeedsRetry'
 }
 
+# How far before -Since a CBS.log line still counts (ConvertFrom-CbsSrText): CBS stamps are floored to the second and
+# sfc writes its first line a moment after it starts. Shared with Invoke-ToolStepSfc, whose wait between its two passes
+# must be longer, so the second pass never counts the first pass's last lines (review I1, ruling RD-R20).
+$script:ToolCbsLookbackSeconds = 5
+
 # Volume.HealthStatus and the three repair codes of Volume.OperationalStatus (Storage\Volume.cdxml; the test checks
 # them against the installed file). Plain hashtables: an [int] index into an ordered dictionary is a position.
 # ToolVolumeRepairOrder is the most serious first.
@@ -330,8 +335,9 @@ function ConvertFrom-CbsSrText {
     CannotRepair; Corrupt; Lines }. Pure.
   .DESCRIPTION
     Only lines that hold [SR] and whose first 19 characters parse as 'yyyy-MM-dd HH:mm:ss' (invariant culture, so a
-    Hebrew calendar on the thread changes nothing) at or after -Since minus 5 seconds count; Windows' own verify
-    blocks of earlier days are left out. CBS.log is always English.
+    Hebrew calendar on the thread changes nothing) at or after -Since minus $script:ToolCbsLookbackSeconds (5)
+    count; Windows' own verify blocks of earlier days are left out. CBS.log is always English. A caller that runs SFC
+    twice waits longer than that look-back between the passes (Invoke-ToolStepSfc, review I1).
       Ran             : at least one such line.
       VerifyStarted   : the '[SR] Verifying N components' lines (SFC verifies in batches).
       VerifyCompleted : the '[SR] Verify complete' lines.
@@ -354,7 +360,7 @@ function ConvertFrom-CbsSrText {
 
   $result = @{ Ran = $false; VerifyStarted = 0; VerifyCompleted = 0; VerifyComplete = $false; SrLines = 0; Repaired = 0; CannotRepair = 0; Corrupt = 0; Lines = [string[]]@() }
   if ([string]::IsNullOrEmpty($Text)) { return $result }
-  $from = $Since.AddSeconds(-5)
+  $from = $Since.AddSeconds(-$script:ToolCbsLookbackSeconds)
   $invariant = [Globalization.CultureInfo]::InvariantCulture
   $kept = New-Object System.Collections.Generic.List[string]
   foreach ($line in [regex]::Split($Text, '\r?\n')) {

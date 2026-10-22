@@ -50,6 +50,16 @@ Describe 'Get-RepairGate (spec 5, 6.6, 6.7, 8)' {
   ) { $g = Get-RepairGate -Model (New-TestModel $Set) -ActionId $A; $g.Reason | Should -BeExactly $E; $g.Enabled | Should -Be ($E -eq '') }
   It 'low space and an internet outage only warn' { (Get-RepairGate -Model (New-TestModel @{ Free = 'crit'; Internet = 'crit' }) -ActionId 'standard').Warns | Should -Contain 'warn.lowSpace'
     (Get-RepairGate -Model (New-TestModel @{ Internet = 'crit' }) -ActionId 'wuReset').Warns | Should -Contain 'warn.noRescan' }
+  It 'a dead clock never blocks the time sync: Standard repair and Post-clone stay open with the clock chip or no internet (review M3)' {
+    $clock = New-TestModel @{}; $clock.Repair.Strip.Internet = @{ Level = 'warn'; Args = [string[]]@(); Detail = @{ Clock = $true; ClockOffsetSeconds = -63072000 } }
+    foreach ($a in 'standard', 'postClone') {
+      $g = Get-RepairGate -Model $clock -ActionId $a; $g.Enabled | Should -BeTrue -Because $a; $g.Reason | Should -BeExactly '' -Because $a
+      (Get-RepairGate -Model (New-TestModel @{ Internet = 'crit' }) -ActionId $a).Enabled | Should -BeTrue -Because $a
+    }
+    $c = Get-RepairChips -Model $clock | Where-Object Name -eq 'Internet'
+    $c.Level | Should -Be 'warn'; $c.TextKey | Should -Be 'chip.internet.clock'; @($c.Tips) | Should -Be @('tip.internet.clock')
+    # A yellow chip without the clock flag is still the captive portal.
+    (Get-RepairChips -Model (New-TestModel @{ Internet = 'warn' }) | Where-Object Name -eq 'Internet').TextKey | Should -Be 'chip.internet.warn' }
   It 'there is no Cancel scheduled disk check action (RD-R1)' { $script:ToolActionCatalog.Keys | Should -Not -Contain 'diskCheckCancel' }
   It 'more rules of the table: no stick, no script, a ticked failing disk, the loading strip' {
     $g = Get-RepairGate -Model (New-TestModel @{ Stick = $null }) -ActionId 'netReset'; $g.Reason | Should -BeExactly 'reason.noStickBackup'

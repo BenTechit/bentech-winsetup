@@ -496,6 +496,16 @@ function Add-ToolFinding {
   Write-SetupLog -Message ('Finding {0} {1}: {2}' -f $Level, $Code, $text)
 }
 
+function Test-ToolFindingCode {
+  # Private. $true when the run already has a finding with -Code.
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][hashtable]$Run, [Parameter(Mandatory)][string]$Code)
+
+  foreach ($finding in $Run.Findings) { if ([string]$finding['Code'] -ceq $Code) { return $true } }
+  return $false
+}
+
 function Add-ToolLog {
   <#
   .SYNOPSIS
@@ -801,8 +811,9 @@ function Invoke-ToolSteps {
       - the budget spent (Get-ToolRemainingSeconds, the monotonic clock, ruling RD-R8), before every step after the
         first: the CRIT finding actionTimedOut (the budget's minutes), 'TimedOut'.
     Before every servicing step, the first too (spec 5): a pending servicing restart (Get-ServicingRebootSignals,
-    Test-ServicingRebootPending) is the WARN finding restartFirst and 'NeedsRestart'. A file or computer rename alone
-    never blocks. On any of these the steps not run are 'skipped'. A step that fails does not stop the next one (DISM
+    Test-ServicingRebootPending, or $Run.Data.DismPending: DISM itself answered 0x800F082F, which the registry may not
+    show; review M1) is the WARN finding restartFirst (once: not again when a step already added it) and
+    'NeedsRestart'. A file or computer rename alone never blocks. On any of these the steps not run are 'skipped'. A step that fails does not stop the next one (DISM
     failing must not stop SFC). Current is -1 at the end, and the progress is written.
   #>
   [CmdletBinding()]
@@ -833,9 +844,10 @@ function Invoke-ToolSteps {
     $definition = $script:ToolSteps[$id]
     if ($null -ne $definition -and $definition['Servicing'] -eq $true) {
       $signals = Get-ServicingRebootSignals
-      if (Test-ServicingRebootPending -Signals $signals) {
-        Write-SetupLog -Level WARN -Message 'A servicing restart is pending; stopping before a servicing step' -Data @{ step = $id; signals = $signals }
-        Add-ToolFinding -Run $Run -Level WARN -Code 'restartFirst'
+      $byDism = ($Run.Data['DismPending'] -eq $true)
+      if ($byDism -or (Test-ServicingRebootPending -Signals $signals)) {
+        Write-SetupLog -Level WARN -Message 'A servicing restart is pending; stopping before a servicing step' -Data @{ step = $id; signals = $signals; dism = $byDism }
+        if (-not (Test-ToolFindingCode -Run $Run -Code 'restartFirst')) { Add-ToolFinding -Run $Run -Level WARN -Code 'restartFirst' }
         Add-ToolLog -Run $Run -Text 'A Windows servicing restart is pending'
         $outcome = 'NeedsRestart'
         break

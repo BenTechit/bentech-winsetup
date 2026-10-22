@@ -317,7 +317,8 @@ Describe 'the repair page review fixes (ruling RD-R14)' {
     $r.Findings = @(@{ Level = 'WARN'; Code = 'sessionLink'; Text = 'x'; Args = @('E:\BenTech-Reports') }
                     @{ Level = 'WARN'; Code = 'sessionCreateFailed'; Text = 'x'; Args = @('access denied', 'C:\BenTech\Setup\Logs\Repair\v1') }
                     @{ Level = 'CRIT'; Code = 'notInThisVersion'; Text = 'DISM RestoreHealth failed (0x800F081F)'; Args = @('0x800F081F') }
-                    @{ Level = 'CRIT'; Code = 'dismFailed'; Text = 'DISM RestoreHealth failed (0x800F081F)'; Args = @('0x800F081F') })
+                    @{ Level = 'CRIT'; Code = 'dismFailed'; Text = 'DISM RestoreHealth failed (0x800F081F)'; Args = @('0x800F081F') }
+                    @{ Level = 'INFO'; Code = 'dismNoMatchingImage'; Text = 'x'; Args = @('Professional', 'x64') })
     $x = New-RepairWindow @{ Language = 'he'; Result = $r }; Set-TestLayout $x 1000 680
     $free = $x.FindName('ChipFreeText'); Test-ReadsLeftToRight $free '41%' | Should -BeTrue; $free.Text | Should -Not -Match 'C:'; $free.Text | Should -Match 'C'
     $stick = $x.FindName('ChipStickText'); $stick.Text | Should -Match 'E'; $stick.Text | Should -Not -Match ':'   # the letter alone: no colon met first
@@ -326,6 +327,8 @@ Describe 'the repair page review fixes (ruling RD-R14)' {
     Test-ReadsLeftToRight $rows[1] 'C:\BenTech\Setup\Logs\Repair\v1' | Should -BeTrue; Test-ReadsLeftToRight $rows[1] 'access denied' | Should -BeTrue
     Test-ReadsLeftToRight $rows[2] 'DISM RestoreHealth failed (0x800F081F)' | Should -BeTrue   # a code the table lacks: the child's text, left-to-right
     $rows[3].Text | Should -Match '[א-ת]'; Test-ReadsLeftToRight $rows[3] '0x800F081F' | Should -BeTrue   # Task 6's Hebrew dismFailed: the code left-to-right
+    $rows[4].Text | Should -Match '[א-ת]'; $rows[4].Text | Should -Match ([string][char]0x200E + 'Professional' + [char]0x200E)   # RD-R20 M2: the machine values marked
+    Test-ReadsLeftToRight $rows[4] 'Professional' | Should -BeTrue; Test-ReadsLeftToRight $rows[4] 'x64' | Should -BeTrue
     $y = New-RepairWindow @{ Language = 'he'; Run = $runSample }; Set-TestLayout $y 1000 680
     Test-ReadsLeftToRight $y.FindName('RunElapsed') '12:34' | Should -BeTrue
     # The mark is what keeps it so: the same Hebrew line without marks draws the drive's colon on the wrong side.

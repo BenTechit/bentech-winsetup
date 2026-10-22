@@ -352,8 +352,8 @@ function Invoke-ToolHttpProbe {
   <#
   .SYNOPSIS
     Private: Test-ToolInternet's default -Probe. A plain HTTP GET of -Url (Windows' captive-portal test page) with
-    Timeout and ReadWriteTimeout -Milliseconds, no redirect followed: @{ Answered; Content = the first 4 KB as ASCII }.
-    Never throws.
+    Timeout and ReadWriteTimeout -Milliseconds, no redirect followed: @{ Answered; Content = the first 4 KB as ASCII;
+    Date = the Date header (UTC) or $null }. Never throws.
   .DESCRIPTION
     Any HTTP answer counts as answered (a portal's redirect too; its body is then compared and differs). The body is
     a fixed English page from Microsoft, compared whole; at most 4 KB of it is read.
@@ -374,7 +374,8 @@ function Invoke-ToolHttpProbe {
     } catch [Net.WebException] {
       $response = $_.Exception.Response
     }
-    if ($null -eq $response) { return @{ Answered = $false; Content = '' } }
+    if ($null -eq $response) { return @{ Answered = $false; Content = ''; Date = $null } }
+    $date = ConvertFrom-ToolHttpDate -Text ([string]$response.Headers['Date'])
     $stream = $response.GetResponseStream()
     $buffer = New-Object byte[] 4096
     $total = 0
@@ -383,9 +384,9 @@ function Invoke-ToolHttpProbe {
       if ($count -le 0) { break }
       $total += $count
     }
-    return @{ Answered = $true; Content = [Text.Encoding]::ASCII.GetString($buffer, 0, $total) }
+    return @{ Answered = $true; Content = [Text.Encoding]::ASCII.GetString($buffer, 0, $total); Date = $date }
   } catch {
-    return @{ Answered = $false; Content = '' }
+    return @{ Answered = $false; Content = ''; Date = $null }
   } finally {
     if ($null -ne $response) { $response.Close() }
   }
@@ -395,7 +396,7 @@ function Test-ToolInternet {
   <#
   .SYNOPSIS
     The internet check (spec 5, ruling RD-R11): @{ Tcp; Https; Probe = 'ok'|'different'|'failed'|'skipped';
-    ClockOffsetSeconds; Chip }. Never throws.
+    ClockOffsetSeconds; Clock; Chip }. Never throws.
   .DESCRIPTION
     1. TCP 443 to repair.internet.host (www.microsoft.com). When it fails, nothing more is tried.
     2. An HTTPS HEAD of repair.internet.url (https://www.microsoft.com/, a valid certificate): any answer over a
@@ -405,14 +406,21 @@ function Test-ToolInternet {
        (http://www.msftconnecttest.com/connecttest.txt) must answer exactly repair.internet.probeContent
        (Microsoft Connect Test). Probe is 'ok', 'different' (another page: a captive portal or a proxy), or 'failed'
        (no answer). It runs after TCP even when HTTPS failed, so the detail can tell a portal from no internet.
-    Each is bounded by repair.internet.seconds (5). The chip: 'crit' when TCP or HTTPS failed; else 'warn' when the
-    probe was not 'ok' ("captive portal or proxy", the captivePortal finding's text); else 'ok'. Detail = @{ Tcp;
-    Https; Probe; ClockOffsetSeconds }.
+    Each is bounded by repair.internet.seconds (5).
+    The clock (review M3, ruling RD-R20): when HTTPS gave no Date (it failed) and the probe answered Microsoft's own
+    page ('ok'), the probe's Date header gives ClockOffsetSeconds instead (plain HTTP has no certificate). A clock days
+    off (a dead BIOS battery) makes every certificate look not yet valid or expired, so HTTPS fails while plain HTTP
+    works: when that offset is above repair.thresholds.clockOffsetMinutes (2), Clock is $true and the chip is 'warn'
+    with Detail.Clock (the window says "Clock wrong", never "No internet"; the time sync runs first in Standard repair
+    and is never blocked by this chip).
+    The chip: 'crit' when TCP failed, or HTTPS failed without the clock reason; 'warn' for the clock, or when the probe
+    was not 'ok' ("captive portal or proxy", the captivePortal finding's text); else 'ok'. Detail = @{ Tcp; Https;
+    Probe; ClockOffsetSeconds; Clock }.
     The three seams (tests pass their own; the defaults are Test-ToolTcpPort, Invoke-ToolHttpsHead and
     Invoke-ToolHttpProbe):
       -Connect { param($HostName, $Milliseconds) } -> bool
       -Fetch   { param($Url, $Milliseconds) } -> @{ Ok; Date (UTC [datetime] or $null) }
-      -Probe   { param($Url, $Milliseconds) } -> @{ Answered; Content }
+      -Probe   { param($Url, $Milliseconds) } -> @{ Answered; Content; Date (UTC [datetime] or $null; optional) }
     A seam that throws or answers anything else counts as failed.
   #>
   [CmdletBinding()]
@@ -440,6 +448,7 @@ function Test-ToolInternet {
   $https = $false
   $offset = $null
   $probeResult = 'skipped'
+  $probeDate = $null
   if ($tcp) {
     try {
       $answer = @(& $Fetch $url $milliseconds)
@@ -460,20 +469,29 @@ function Test-ToolInternet {
       if ($answer.Count -eq 1 -and $answer[0] -is [System.Collections.IDictionary] -and $answer[0]['Answered'] -eq $true) {
         $probeResult = 'different'
         if (([string]$answer[0]['Content']).Trim() -ceq $probeContent) { $probeResult = 'ok' }
+        if ($answer[0]['Date'] -is [datetime]) { $probeDate = $answer[0]['Date'] }
       }
     } catch {
       $probeResult = 'failed'
     }
   }
+  # The clock from Microsoft's own HTTP page when HTTPS gave none (review M3).
+  if ($null -eq $offset -and $probeResult -ceq 'ok' -and $null -ne $probeDate) {
+    if ($probeDate.Kind -eq [DateTimeKind]::Local) { $probeDate = $probeDate.ToUniversalTime() }
+    $offset = [math]::Round(([datetime]::UtcNow - [datetime]::SpecifyKind($probeDate, [DateTimeKind]::Utc)).TotalSeconds, 1)
+  }
+  $clockLimit = Get-ToolRepairNumber -Config $Config -Path 'thresholds', 'clockOffsetMinutes' -Default 2
+  $clock = $tcp -and -not $https -and $null -ne $offset -and ([math]::Abs([double]$offset) / 60) -gt $clockLimit
   $level = 'ok'
-  if (-not ($tcp -and $https)) { $level = 'crit' } elseif ($probeResult -ne 'ok') { $level = 'warn' }
-  Write-SetupLog -Message 'Internet check' -Data @{ tcp = $tcp; https = $https; probe = $probeResult; clockOffsetSeconds = $offset }
+  if (-not $tcp -or (-not $https -and -not $clock)) { $level = 'crit' } elseif ($clock -or $probeResult -ne 'ok') { $level = 'warn' }
+  Write-SetupLog -Message 'Internet check' -Data @{ tcp = $tcp; https = $https; probe = $probeResult; clockOffsetSeconds = $offset; clock = $clock }
   return @{
     Tcp                = $tcp
     Https              = $https
     Probe              = $probeResult
     ClockOffsetSeconds = $offset
-    Chip               = (New-ToolChip -Level $level -Detail @{ Tcp = $tcp; Https = $https; Probe = $probeResult; ClockOffsetSeconds = $offset })
+    Clock              = $clock
+    Chip               = (New-ToolChip -Level $level -Detail @{ Tcp = $tcp; Https = $https; Probe = $probeResult; ClockOffsetSeconds = $offset; Clock = $clock })
   }
 }
 
