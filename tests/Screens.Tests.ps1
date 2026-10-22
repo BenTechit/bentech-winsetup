@@ -1255,4 +1255,33 @@ Describe 'Show-FinalScreen' {
   It 'the production launcher stops on a failed start, so a refused U reaches the could-not line' {
     $p = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Launch' }
     ([regex]::Matches($p.DefaultValue.Extent.Text, '-ErrorAction Stop')).Count | Should -Be 2 }
+  # Final wave 8 (Task 3 M2): the same, by behaviour, through the production -Launch default. Start-Process is
+  # mocked to fail the way a refused start does (a non-terminating error, CLAUDE.md), so nothing is ever opened.
+  It 'a refused start through the production launcher reaches the could-not line for U and the WARN for R (mocked Start-Process; Task 3 M2)' {
+    Mock Start-Process { Write-Error 'refused by the test' }
+    $script:drawn = New-Object System.Collections.ArrayList; $script:keyQueue = New-Object System.Collections.Queue; foreach ($k in 'R', 'U', 'Enter') { $script:keyQueue.Enqueue($k) }
+    Show-FinalScreen -State ($finalState + @{ Choices = @{ WindowsUpdate = 'DRIVERS' } }) -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { if ($script:keyQueue.Count -gt 0) { $script:keyQueue.Dequeue() } } -Stick { $script:stick } -Now { [datetime]'2026-10-18T09:00:00' } -Sleep { param($ms) } `
+      -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Write { param($lines) $null = $script:drawn.Add(($lines -join "`n")) }
+    Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'ms-settings:windowsupdate-action' }
+    Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'notepad.exe' }
+    $drawn[$drawn.Count - 1] | Should -Match 'Could not open Windows Update: open Settings > Windows Update'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open Windows Update from the final screen' -and $Data.error -match 'refused by the test' }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open the report from the final screen' -and $Data.error -match 'refused by the test' }
+    Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Message -eq 'Windows Update handed to Windows' } }
+  # Final wave 8 (Task 3 M3): every U opens Settings again and the line shows the last outcome; Enter ends the
+  # screen at once (Main.ps1 then runs the cleanup once, Entry.Tests), so a key after Enter is never read.
+  It 'U twice opens Settings twice and the line shows the last outcome; the first Enter ends the screen (<Last>; Task 3 M3)' -ForEach @(
+    @{ FailOn = 2; Last = 'Could not open Windows Update: open Settings > Windows Update' }
+    @{ FailOn = 1; Last = 'Windows Update started: Windows will finish on its own' }) {
+    $script:failOn = $FailOn
+    Invoke-FinalScreen -Keys 'U', 'U', 'Enter', 'U' -Choices @{ WindowsUpdate = 'DRIVERS' } -Launch { param($t, $a) if ($script:launched.Count -eq $script:failOn) { throw 'refused once' } }
+    $launched.Count | Should -Be 2; $script:keyQueue.Count | Should -Be 1     # the U after Enter was never read
+    $drawn.Count | Should -Be 3; $drawn[2] | Should -Match ([regex]::Escape($Last))
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'Windows Update handed to Windows' }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open Windows Update from the final screen' } }
+  # Final wave 1 (final review M1, Task 3 M1): the B/R WARN goes through ConvertTo-ScreenText like U's.
+  It 'a B or R that cannot start logs the error text as ASCII' {
+    Invoke-FinalScreen -Keys 'R', 'Enter' -Launch { param($t, $a) throw ('no notepad ' + $script:Hebrew) }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open the report from the final screen' -and $Data.error -ceq 'no notepad ?????' } }
 }

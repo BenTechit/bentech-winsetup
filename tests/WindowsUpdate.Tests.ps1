@@ -620,6 +620,42 @@ Describe 'Windows Update round and step (mocked COM)' {
       $w[0].Data.round | Should -Be 1; $w[0].Data.errorCode | Should -Match '^0x[0-9A-F]{8}$'; $w[0].Data.error | Should -Be 'search failed'
       $w[0].Data.seconds | Should -BeOfType [double]
     }
+    # Final wave 1: CLAUDE.md says Hebrew never reaches setup.log, and a COM/.NET exception text can be localized.
+    It 'the could-not-count WARN logs the exception text as ASCII (final review M1)' {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria)
+        if ($Criteria -like '*BrowseOnly=1*') { throw ('search failed ' + $script:HebrewText) }
+        if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      $w = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Optional driver updates could not be counted' }); $w.Count | Should -Be 1
+      $w[0].Data.error | Should -BeExactly 'search failed ?????'
+    }
+    # Final wave 2 (Task 1 re-review M1): while the count runs the progress file says so (the parent's NOW area
+    # shows "Counting optional drivers"), and 'done' comes back when it ends. Only DRIVERS round 1 ever writes it.
+    It 'DRIVERS round 1 shows the count as a phase: done, then counting, then done again; a failing count too' -ForEach @(
+      @{ Fails = $false }, @{ Fails = $true }) {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $script:phases = New-Object System.Collections.ArrayList; $script:countFails = $Fails
+      Mock Update-WuProgress { if (-not [string]::IsNullOrEmpty($Phase)) { [void]$script:phases.Add($Phase) } }
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria)
+        if ($Criteria -like '*BrowseOnly=1*' -and $script:countFails) { throw 'search failed' }
+        if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      @($script:phases)[0] | Should -Be 'searching'
+      @($script:phases)[-3..-1] | Should -Be @('done', 'counting', 'done')
+      @($script:phases | Where-Object { $_ -eq 'counting' }).Count | Should -Be 1
+    }
+    It 'no other round writes the counting phase: DRIVERS round 2, FULL, and a DRIVERS round 1 that threw' -ForEach @(
+      @{ Scope = 'FULL'; Rounds = 1; Throw = $null }, @{ Scope = 'DRIVERS'; Rounds = 2; Throw = $null }, @{ Scope = 'DRIVERS'; Rounds = 1; Throw = 'install exploded' }) {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $script:phases = New-Object System.Collections.ArrayList; $script:installThrow = $Throw
+      Mock Update-WuProgress { if (-not [string]::IsNullOrEmpty($Phase)) { [void]$script:phases.Add($Phase) } }
+      $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds $Rounds) -Scope $Scope
+      @($script:phases) | Should -Not -Contain 'counting'
+      @($script:phases)[-1] | Should -Be 'done'
+    }
     It 'counts the optional drivers last: after the installs, the progress file''s done and SystemInfo (<Mode>; WU-R3)' -ForEach @(
       @{ Mode = 'Batch'; Installs = @('install d1,d2') }, @{ Mode = 'OneAtATime'; Installs = @('install d1', 'install d2') }) {
       $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'), (New-FakeUpdate -Id 'd2'))
@@ -633,7 +669,8 @@ Describe 'Windows Update round and step (mocked COM)' {
       Mock Get-WuRebootRequired { [void]$script:events.Add('systeminfo'); $false }
       $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS' -InstallMode $Mode
       @($script:events) | Should -Be (@("search $script:DriverCriteria") + $Installs + @('systeminfo', "search $script:OptionalDriverCriteria"))
-      $script:phaseAtCount | Should -Be 'done'
+      $script:phaseAtCount | Should -Be 'counting'   # final wave 2: the NOW area says the count runs, not "Round finished"
+      ([IO.File]::ReadAllText((Get-WuProgressPath -ResultPath $script:roundResultPath)) | ConvertFrom-Json).Phase | Should -Be 'done'   # replaced when the count ends
       @($r.Installed.Id) | Should -Be @('d1', 'd2'); $r.Found | Should -Be 2
       # Never in the result: the child's JSON keeps exactly its v2 fields.
       @($r.PSObject.Properties.Name) | Should -Be @('Installed', 'Failed', 'Hidden', 'HideFailed', 'OnlyDefinitions', 'RebootRequired', 'Error', 'ErrorCode', 'FirmwareDeferred', 'Found', 'PreviousUnhideDone')
@@ -1626,6 +1663,8 @@ Describe 'Windows Update NOW' {
       @('Batch', 'downloading', 0, 5, 'Downloading 5 updates'),
       @('OneAtATime', 'installing', 5, 5, 'Installing 5 of 5'),
       @('Batch', 'installing', 0, 5, 'Installing 5 updates'),
+      @('OneAtATime', 'counting', 0, 0, 'Counting optional drivers'),
+      @('Batch', 'counting', 0, 0, 'Counting optional drivers'),
       @('OneAtATime', 'done', 5, 5, 'Round finished'),
       @('Batch', 'done', 0, 5, 'Round finished')
     )

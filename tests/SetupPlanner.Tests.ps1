@@ -87,6 +87,21 @@ Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
     $l = @(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg)
     @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1; @($l | Where-Object { $_ -match '  Windows Update$' }).Count | Should -Be 0
     @(@(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg -Titles @{ 'windows-update' = 'WU'; 'windows-update.drivers' = 'WU drivers' }) -match '  WU drivers$').Count | Should -Be 1 }
+  # Final wave 7 (Task 2 M4): a window language that has the Windows Update title but not the drivers one still
+  # shows "drivers only" (the English drivers title), never the plain FULL title.
+  It 'DRIVERS falls back to "Windows Update (drivers only)" when -Titles has no drivers title, or an empty one' -ForEach @(
+    @{ T = @{ 'windows-update' = 'WU' } }, @{ T = @{ 'windows-update' = 'WU'; 'windows-update.drivers' = '' } }) {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg -Titles $T)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1; @($l | Where-Object { $_ -match '  WU$' }).Count | Should -Be 0 }
+  # Final wave 3 (Task 2 M2): the plan line decides through Get-WindowsUpdateChoice on the validated Choices, like
+  # every other reader. The mock flips the answer for each table it is asked about, so the line is DRIVERS only if
+  # the second question (about the validated table, where validation made it FULL) is asked.
+  It 'the DRIVERS title is decided by Get-WindowsUpdateChoice on the validated Choices (every reader goes through it)' {
+    Mock Get-WindowsUpdateChoice { if ($Choices['WindowsUpdate'] -ceq 'DRIVERS') { 'FULL' } else { 'DRIVERS' } }
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1 }
 }
 Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
   BeforeEach { $script:mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off' }

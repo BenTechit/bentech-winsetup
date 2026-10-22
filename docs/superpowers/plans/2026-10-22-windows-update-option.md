@@ -51,7 +51,7 @@
   - plan line `Windows Update (drivers only)` in DRIVERS mode.
 - **The DRIVERS search:**
   - only `Type='Driver'`;
-  - optional updates (`BrowseOnly=1`) stay skipped, and each DRIVERS round logs how many it skipped;
+  - optional updates (`BrowseOnly=1`) stay skipped, and DRIVERS round 1 only (WU-R1) logs how many it skipped;
   - every other rule is unchanged (one at a time, firmware only on AC, round and restart caps, hide and un-hide).
 - **The step's activity line:** `Windows Update: drivers only (other updates left to Windows)`.
 - **The final screen, DRIVERS only:**

@@ -623,7 +623,7 @@ $script:ToolboxXaml = @'
               </WrapPanel>
 
               <TextBlock Grid.Row="6" Style="{StaticResource RowLabelStyle}" Tag="t:row.tweaks" Margin="0,11,10,0"/>
-              <StackPanel x:Name="TweakPanel" Grid.Row="6" Grid.Column="1" Margin="0,0,0,4"/>
+              <StackPanel x:Name="TweakPanel" Grid.Row="6" Grid.Column="1" Margin="0"/>
 
               <TextBlock Grid.Row="7" Style="{StaticResource RowLabelStyle}" Tag="t:row.restore" Margin="0,11,10,0"/>
               <Border Grid.Row="7" Grid.Column="1" Style="{StaticResource TweakRowStyle}" Margin="0">

@@ -623,7 +623,7 @@ function Update-WuProgress {
     Private. Updates the round's progress (spec 4.5) and writes it to Path. Never throws.
   .DESCRIPTION
     Progress is the ordered dictionary Invoke-WuRound keeps:
-      { Round; Mode 'OneAtATime'|'Batch'; Phase 'searching'|'downloading'|'installing'|'done';
+      { Round; Mode 'OneAtATime'|'Batch'; Phase 'searching'|'downloading'|'installing'|'counting'|'done';
         Current (1-based, 0 = none); Total; Updates [ { Kb; Title; SizeMB; Status } ]; UpdatedAt }
     Status is 'pending', 'downloading', 'installing', 'installed', 'failed' or 'skipped' (not attempted:
     the loop stopped at a round-ending code). -Phase and -Current are set when given; -Index (0-based,
@@ -845,10 +845,12 @@ function Invoke-WuRound {
        exception: one more search, Get-WuSearchCriteria -Type Driver -Optional. It runs last (ruling WU-R3),
        after the installs, the progress file's Phase 'done' and SystemInfo, right before the result is written,
        so a count search that hangs can only cost the count, never the round's drivers (it still runs into
-       the round's deadline). In its own try: INFO 'Optional driver updates skipped' with @{ round; count;
-       titles; seconds } (at most the first 20 titles, each through ConvertTo-ScreenText; seconds is how long
-       the search took), or on a throw WARN 'Optional driver updates could not be counted' with @{ round;
-       errorCode; error; seconds }; either way the result is the same. The optional updates are never
+       the round's deadline). While it runs the progress file's Phase is 'counting' (the NOW area shows
+       "Counting optional drivers"), and 'done' again when it ends. In its own try: INFO 'Optional driver
+       updates skipped' with @{ round; count; titles; seconds } (at most the first 20 titles, each through
+       ConvertTo-ScreenText; seconds is how long the search took), or on a throw WARN 'Optional driver updates
+       could not be counted' with @{ round; errorCode; error (through ConvertTo-ScreenText); seconds }; either
+       way the result is the same. The optional updates are never
        converted, added to Found or the result, selected, hidden or installed. A round that ended in an
        exception skips the count (the agent just failed, and the count is only a diagnostic), so that run logs
        none. FULL runs no such search.
@@ -885,8 +887,9 @@ function Invoke-WuRound {
     read; after the selection, Total and Updates (the Install set, all 'pending'; deferred firmware is
     never listed); Batch: Phase 'downloading' / 'installing' around the two batch calls and each
     update's final status from its code; OneAtATime: Invoke-WuInstallEach keeps Phase, Current and the
-    statuses; Phase 'done' in a finally, also after an exception. The result's folder is created first,
-    so the progress file can be written from the start. A progress file that cannot be written never
+    statuses; Phase 'done' in a finally, also after an exception (DRIVERS round 1 then sets 'counting'
+    while it counts the optional drivers, step 10, and 'done' again after). The result's folder is created
+    first, so the progress file can be written from the start. A progress file that cannot be written never
     breaks the round.
   #>
   [CmdletBinding()]
@@ -1100,8 +1103,11 @@ function Invoke-WuRound {
   # for setup.log, so Ben can decide from real runs whether DRIVERS should take them. Last, after the round's
   # installs, so a search that hangs can only cost the count, never the drivers. Read-only: they are never
   # converted, added to Found or the result, selected, hidden or installed; a failed count changes nothing.
-  # Skipped after an exception: the agent just failed, and the count is only a diagnostic.
+  # Skipped after an exception: the agent just failed, and the count is only a diagnostic. While it runs the
+  # progress Phase is 'counting' (the NOW area says so instead of "Round finished"), 'done' again after it.
   if ($Scope -eq 'DRIVERS' -and $round -eq 1 -and $null -eq $errorText -and $null -ne $session) {
+    # The NOW area reads the progress file: say the count is running (the file was 'done' since the finally).
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'counting'
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
       $optional = @(ConvertTo-WuList -Value (Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type Driver -Optional)))
@@ -1109,8 +1115,9 @@ function Invoke-WuRound {
       $titles = [string[]]@($optional | Select-Object -First 20 | ForEach-Object { ConvertTo-ScreenText ([string]$_.Title) })
       Write-SetupLog -Message 'Optional driver updates skipped' -Data @{ round = $round; count = $optional.Count; titles = $titles; seconds = $seconds }
     } catch {
-      Write-SetupLog -Message 'Optional driver updates could not be counted' -Level WARN -Data @{ round = $round; errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = $_.Exception.Message; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1) }
+      Write-SetupLog -Message 'Optional driver updates could not be counted' -Level WARN -Data @{ round = $round; errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = (ConvertTo-ScreenText $_.Exception.Message); seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1) }
     }
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'done'
   }
 
   $result = [ordered]@{
@@ -1181,7 +1188,8 @@ function Get-WuProgressLines {
     real one. The phase line:
       OneAtATime  'Downloading <Current> of <Total>' / 'Installing <Current> of <Total>'
       Batch       'Downloading <Total> updates' / 'Installing <Total> updates'
-      'Searching for updates' / 'Round finished' (either mode)
+      'Searching for updates' / 'Counting optional drivers' / 'Round finished' (either mode)
+    'Counting optional drivers' is DRIVERS round 1's optional-driver count (it runs after the installs).
     An unknown phase has no phase line; the updates are still listed.
   #>
   [CmdletBinding()]
@@ -1203,6 +1211,7 @@ function Get-WuProgressLines {
       'searching' { $lines.Add('Searching for updates') }
       'downloading' { $lines.Add($(if ($oneAtATime) { "Downloading $current of $total" } else { "Downloading $total updates" })) }
       'installing' { $lines.Add($(if ($oneAtATime) { "Installing $current of $total" } else { "Installing $total updates" })) }
+      'counting' { $lines.Add('Counting optional drivers') }
       'done' { $lines.Add('Round finished') }
     }
     foreach ($update in @(ConvertTo-WuList -Value $progress.Updates)) {

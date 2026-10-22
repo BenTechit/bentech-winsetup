@@ -19,8 +19,8 @@ BeforeAll {
 
   # A window on a model from New-ToolboxModel (not fresh, on AC unless -OnAC $false, no previous run unless
   # -Previous): each $Set key goes into Model.Choices, Language into the Model itself.
-  function New-TestWindow([hashtable]$Set = @{}, [string]$Protection = 'Off', [hashtable]$Previous = $null, [bool]$OnAC = $true) {
-    $model = New-ToolboxModel -Machine $script:m -Config $script:cfg -Previous $Previous -IsFresh $false -OnAC $OnAC -AdminProtection $Protection
+  function New-TestWindow([hashtable]$Set = @{}, [string]$Protection = 'Off', [hashtable]$Previous = $null, [bool]$OnAC = $true, [bool]$IsFresh = $false) {
+    $model = New-ToolboxModel -Machine $script:m -Config $script:cfg -Previous $Previous -IsFresh $IsFresh -OnAC $OnAC -AdminProtection $Protection
     foreach ($key in $Set.Keys) { if ($key -eq 'Language') { $model.Language = $Set[$key] } else { $model.Choices[$key] = $Set[$key] } }
     New-ToolboxWindow -Model $model -Machine $script:m -Config $script:cfg -Version '2026.10.21.1'
   }
@@ -170,9 +170,29 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $w.Tag.TweakRows['classicOutlook'].Row.Visibility | Should -Be 'Visible'; $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'
     $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'; $w.FindName('StartButton').IsEnabled | Should -BeFalse
     (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match 'Microsoft 365' }
-  It 'the UPDATES row sits between REMOTE and APPS; Full is checked by default (wu spec 3.1)' {
-    $x = $script:ToolboxXaml; $x.IndexOf('t:row.remote') | Should -BeLessThan $x.IndexOf('t:row.updates'); $x.IndexOf('t:row.updates') | Should -BeLessThan $x.IndexOf('t:row.apps')
-    $w = New-TestWindow; $w.FindName('UpdatesFull').IsChecked | Should -BeTrue; $w.FindName('UpdatesDrivers').IsChecked | Should -BeFalse }
+  # The row of a named control: the Grid.Row of its ancestor that is a direct child of the options grid (final wave 6).
+  It 'the UPDATES row sits between REMOTE and APPS by Grid.Row, not by text order; Full is checked by default (wu spec 3.1)' {
+    $w = New-TestWindow
+    $rowOf = { param($name) $e = $w.FindName($name); while ($e.Parent -isnot [Windows.Controls.Grid]) { $e = $e.Parent }; [Windows.Controls.Grid]::GetRow($e) }
+    $remote = & $rowOf 'RemoteAnyDesk'; $updates = & $rowOf 'UpdatesFull'; $apps = & $rowOf 'SevenZipSwitch'
+    $remote | Should -BeLessThan $updates; $updates | Should -BeLessThan $apps
+    (& $rowOf 'RemoteBoth') | Should -Be $remote; (& $rowOf 'UpdatesDrivers') | Should -Be $updates
+    $w.FindName('UpdatesFull').IsChecked | Should -BeTrue; $w.FindName('UpdatesDrivers').IsChecked | Should -BeFalse }
+  # Final wave 4 (WU-R4): the new 36 px UPDATES row made a one-warning view overflow the 680 px window by 1 px, so
+  # it drew a scroll bar for nothing. A view with at most one warning (not fresh, on battery, an earlier run) fits.
+  It 'a view with at most one warning fits the 1000 x 680 window: no scroll bar (<N>, <Lang>; WU-R4)' -ForEach @(
+    @{ N = 'fresh, on charger, no earlier run'; Fresh = $true; AC = $true; Prev = $false; Lang = 'en' }
+    @{ N = 'fresh, on charger, an earlier run'; Fresh = $true; AC = $true; Prev = $true; Lang = 'en' }
+    @{ N = 'fresh, on battery'; Fresh = $true; AC = $false; Prev = $false; Lang = 'en' }
+    @{ N = 'not fresh, on charger'; Fresh = $false; AC = $true; Prev = $false; Lang = 'en' }
+    @{ N = 'fresh, on battery'; Fresh = $true; AC = $false; Prev = $false; Lang = 'he' }
+    @{ N = 'not fresh, on charger'; Fresh = $false; AC = $true; Prev = $false; Lang = 'he' }) {
+    $wopts = @{ Set = @{ Language = $Lang }; OnAC = $AC; IsFresh = $Fresh }
+    if ($Prev) { $wopts.Previous = @{ StartedAt = '2026-10-20T09:05:00'; Color = 'YELLOW' } }
+    $w = New-TestWindow @wopts; Set-TestLayout $w 1000 680
+    $scroll = $w.FindName('ContentScroll'); $scroll.ViewportHeight | Should -BeGreaterThan 600
+    $scroll.ScrollableHeight | Should -Be 0 -Because "the content is $($scroll.ExtentHeight) px high in a $($scroll.ViewportHeight) px viewport"
+    $w.Close() }
 }
 Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
   BeforeEach { Set-ToolboxTestMocks }

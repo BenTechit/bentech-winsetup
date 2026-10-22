@@ -75,13 +75,13 @@ function Get-SetupProfiles {
     if ($null -ne $wuProperty -and $null -ne $wuProperty.Value) { $windowsUpdate = Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$wuProperty.Value } }
 
     @{
-      Id           = $id
-      Name         = @{ en = $nameEn; he = [string]$entry.name.he }
-      Office       = $office
-      Remote       = (Get-RemoteChoice -Choices @{ Remote = [string]$entry.remote })
-      SevenZip     = $(if ($entry.sevenZip -is [bool]) { $entry.sevenZip } else { $defaultSevenZip })
-      RestorePoint = $(if ($entry.restorePoint -is [bool]) { $entry.restorePoint } else { $true })
-      Tweaks       = [string[]]@(foreach ($tweak in $catalog) { if ($wanted.Contains($tweak.Id)) { $tweak.Id } })
+      Id            = $id
+      Name          = @{ en = $nameEn; he = [string]$entry.name.he }
+      Office        = $office
+      Remote        = (Get-RemoteChoice -Choices @{ Remote = [string]$entry.remote })
+      SevenZip      = $(if ($entry.sevenZip -is [bool]) { $entry.sevenZip } else { $defaultSevenZip })
+      RestorePoint  = $(if ($entry.restorePoint -is [bool]) { $entry.restorePoint } else { $true })
+      Tweaks        = [string[]]@(foreach ($tweak in $catalog) { if ($wanted.Contains($tweak.Id)) { $tweak.Id } })
       WindowsUpdate = $windowsUpdate
     }
   }
@@ -170,13 +170,13 @@ function ConvertTo-ValidChoices {
   if ($given['Profile'] -is [string] -and $null -ne (Get-ProfileChoices -Config $Config -ProfileId $given['Profile'])) { $profileId = $given['Profile'] }
 
   $clean = @{
-    Mode         = $mode
-    Office       = $office
-    Remote       = (Get-RemoteChoice -Choices $given)
-    SevenZip     = $(if ($given['SevenZip'] -is [bool]) { $given['SevenZip'] } else { $defaults.SevenZip })
-    RestorePoint = $(if ($given['RestorePoint'] -is [bool]) { $given['RestorePoint'] } else { $defaults.RestorePoint })
-    Profile      = $profileId
-    Tweaks       = $(if ($given.Contains('Tweaks')) { $given['Tweaks'] } else { $null })
+    Mode          = $mode
+    Office        = $office
+    Remote        = (Get-RemoteChoice -Choices $given)
+    SevenZip      = $(if ($given['SevenZip'] -is [bool]) { $given['SevenZip'] } else { $defaults.SevenZip })
+    RestorePoint  = $(if ($given['RestorePoint'] -is [bool]) { $given['RestorePoint'] } else { $defaults.RestorePoint })
+    Profile       = $profileId
+    Tweaks        = $(if ($given.Contains('Tweaks')) { $given['Tweaks'] } else { $null })
     WindowsUpdate = (Get-WindowsUpdateChoice -Choices $given)
   }
 
@@ -366,7 +366,7 @@ function Get-ToolboxPlanLines {
     $n++
     $key = $id
     $title = $catalogTitles[$id]
-    if ($id -ceq 'windows-update' -and $choices['WindowsUpdate'] -ceq 'DRIVERS') { $key = 'windows-update.drivers'; $title = $script:WindowsUpdateDriversTitle }
+    if ($id -ceq 'windows-update' -and (Get-WindowsUpdateChoice -Choices $choices) -ceq 'DRIVERS') { $key = 'windows-update.drivers'; $title = $script:WindowsUpdateDriversTitle }
     if ($null -ne $Titles -and -not [string]::IsNullOrEmpty([string]$Titles[$key])) { $title = [string]$Titles[$key] }
     '{0,2}  {1}' -f $n, $title
   }

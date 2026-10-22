@@ -130,12 +130,12 @@ function Format-FinalScreen {
     The Windows Update choice comes from State.Choices through Get-WindowsUpdateChoice (a missing or
     invalid one is FULL; wu spec 3.3). In DRIVERS mode the key line is
     '  [R] report   [U] Windows Update   [ENTER] finish', without the report path (R still opens the
-    report, and after Enter it is in the logs folder on the stick), and the blank spacer line above the
-    Chrome hint and the stick line shows
-    the outcome of the last U: '  Windows Update started: Windows will finish on its own' for
-    -WindowsUpdateStatus Started, '  Could not open Windows Update: open Settings > Windows Update' for
-    Failed, and stays blank for ''. The outcome replaces a line, so the line count is unchanged and the
-    29-line worst case holds. In FULL mode the key line is today's and -WindowsUpdateStatus is ignored.
+    report, and after Enter it is in the logs folder on the stick, when the stick is found). The blank
+    spacer line above the Chrome hint and the stick line shows the outcome of the last U:
+    '  Windows Update started: Windows will finish on its own' for -WindowsUpdateStatus Started,
+    '  Could not open Windows Update: open Settings > Windows Update' for Failed, and stays blank for ''.
+    The outcome replaces a line, so the line count is unchanged and the 29-line worst case holds. In FULL
+    mode the key line is today's and -WindowsUpdateStatus is ignored.
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -242,7 +242,8 @@ function Show-FinalScreen {
     must not end the screen). B opens Settings > Default apps for Chrome, R opens the report in Notepad;
     both keep the screen up. U, in DRIVERS mode only (Get-WindowsUpdateChoice of State.Choices; wu spec
     3.3), opens ms-settings:windowsupdate-action, which opens Settings > Windows Update and starts its
-    check, so Windows downloads, installs and restarts on its own; it logs the outcome, redraws at once
+    check, so Windows downloads and installs on its own and decides when to restart (docs/testing.md 1.20
+    checks that); it logs the outcome, redraws at once
     with the outcome on the blank spacer line ('Windows Update started' or 'Could not open Windows
     Update', a WARN in setup.log), and keeps the screen up. Every press opens Settings again, and the line
     shows the last outcome. In FULL mode U is ignored, like every other key. The Chrome hint is left out
@@ -319,7 +320,7 @@ function Show-FinalScreen {
   $open = {
     param($what, $target, $arguments)
     try { $null = & $Launch $target $arguments }
-    catch { Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = $_.Exception.Message } }
+    catch { Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) } }
   }
   $readStick = {
     try {

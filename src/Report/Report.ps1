@@ -201,10 +201,11 @@ function Format-SetupReport {
       given) / AnyDesk ID ('not available' when there is none; 'not chosen' when Choices.Remote is
       SCREENCONNECT) / ScreenConnect / Profile / Tweaks / Restore point / Updates
     Choices.Remote is read with Get-RemoteChoice (a missing or invalid one is ANYDESK; ScreenConnect spec
-    4.1). Updates (wu spec 3.3) is 'drivers only (other updates left to Windows)' when Get-WindowsUpdateChoice
-    says DRIVERS, else 'full' (a missing or invalid Choices.WindowsUpdate, as in an older state, is FULL). The ScreenConnect line reads 'not chosen' (ANYDESK), 'installed (service running)' (the
+    4.1). The ScreenConnect line reads 'not chosen' (ANYDESK), 'installed (service running)' (the
     screenconnect step is Done and its Data.Service is Running), 'installed (service not running)' (Done
     with any other service state) or 'not installed' (the step failed or has no entry).
+    Updates (wu spec 3.3) is 'drivers only (other updates left to Windows)' when Get-WindowsUpdateChoice
+    says DRIVERS, else 'full' (a missing or invalid Choices.WindowsUpdate, as in an older state, is FULL).
     Toolbox spec 5.5:
       Profile: '<name.en> (<id>)' for a profile of -Config, plus ' (changed)' when Test-ProfileChanged says
         so (spec 10b.6); an id the config does not know (or no -Config) shows the id alone; an empty or
