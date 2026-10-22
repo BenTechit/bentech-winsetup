@@ -596,7 +596,8 @@ Describe 'Windows Update round and step (mocked COM)' {
     }
 
     # Wu spec 3.2: DRIVERS searches Type='Driver' only. Ruling WU-R1 (plan call 2): the optional drivers
-    # (BrowseOnly=1) are counted once per run, in DRIVERS round 1 only; they are never installed.
+    # (BrowseOnly=1) are counted once per run, in DRIVERS round 1 only; they are never installed. Ruling WU-R3:
+    # the count runs last, after the round's installs, so a count search that hangs never costs the drivers.
     It 'DRIVERS searches drivers only, then counts the optional ones: logged, never installed (spec 3.2, Review Focus 3)' {
       $script:searchResults[$script:SoftwareCriteria] = @((New-FakeUpdate -Id 's1'))
       $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
@@ -608,10 +609,43 @@ Describe 'Windows Update round and step (mocked COM)' {
     }
     It 'a failed optional-driver count is one WARN; the DRIVERS round goes on (Review Focus 4)' {
       $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
-      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria); if ($Criteria -like '*BrowseOnly=1*') { throw 'search failed' }; if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      $script:installsBeforeCount = $null
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria)
+        if ($Criteria -like '*BrowseOnly=1*') { $script:installsBeforeCount = @($script:installCalls | ForEach-Object { $_ }); throw 'search failed' }
+        if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
       $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
       $r.Error | Should -BeNullOrEmpty; @($r.Installed.Id) | Should -Be @('d1')
-      @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Optional driver updates could not be counted' }).Count | Should -Be 1
+      @($script:installsBeforeCount) | Should -Be @('d1')   # WU-R3: the drivers were installed before the count search ran
+      $w = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Optional driver updates could not be counted' }); $w.Count | Should -Be 1
+      $w[0].Data.round | Should -Be 1; $w[0].Data.errorCode | Should -Match '^0x[0-9A-F]{8}$'; $w[0].Data.error | Should -Be 'search failed'
+      $w[0].Data.seconds | Should -BeOfType [double]
+    }
+    It 'counts the optional drivers last: after the installs, the progress file''s done and SystemInfo (<Mode>; WU-R3)' -ForEach @(
+      @{ Mode = 'Batch'; Installs = @('install d1,d2') }, @{ Mode = 'OneAtATime'; Installs = @('install d1', 'install d2') }) {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'), (New-FakeUpdate -Id 'd2'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $script:events = New-Object System.Collections.ArrayList; $script:phaseAtCount = $null
+      Mock Search-WuUpdates { [void]$script:searches.Add($Criteria); [void]$script:events.Add("search $Criteria")
+        if ($Criteria -like '*BrowseOnly=1*') { $script:phaseAtCount = ([IO.File]::ReadAllText((Get-WuProgressPath -ResultPath $script:roundResultPath)) | ConvertFrom-Json).Phase }
+        if ($script:searchResults.Contains($Criteria)) { $script:searchResults[$Criteria] } }
+      Mock Invoke-WuInstall { $ids = @(foreach ($u in $Updates) { [string]$u.Identity.UpdateID }); [void]$script:installCalls.Add($ids); [void]$script:events.Add('install ' + ($ids -join ','))
+        @{ ResultCodes = @(foreach ($id in $ids) { 2 }); RebootRequired = $false; HResult = 0 } }
+      Mock Get-WuRebootRequired { [void]$script:events.Add('systeminfo'); $false }
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS' -InstallMode $Mode
+      @($script:events) | Should -Be (@("search $script:DriverCriteria") + $Installs + @('systeminfo', "search $script:OptionalDriverCriteria"))
+      $script:phaseAtCount | Should -Be 'done'
+      @($r.Installed.Id) | Should -Be @('d1', 'd2'); $r.Found | Should -Be 2
+      # Never in the result: the child's JSON keeps exactly its v2 fields.
+      @($r.PSObject.Properties.Name) | Should -Be @('Installed', 'Failed', 'Hidden', 'HideFailed', 'OnlyDefinitions', 'RebootRequired', 'Error', 'ErrorCode', 'FirmwareDeferred', 'Found', 'PreviousUnhideDone')
+    }
+    It 'a DRIVERS round 1 that ended in an exception does not count (the agent just failed; WU-R3)' {
+      $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
+      $script:searchResults[$script:OptionalDriverCriteria] = @((New-FakeUpdate -Id 'o1'))
+      $script:installThrow = 'install exploded'
+      $r = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS'
+      $r.Error | Should -Match 'install exploded'
+      @($script:searches) | Should -Be @($script:DriverCriteria)
+      @($script:logs | Where-Object { $_.Message -like 'Optional driver updates*' }).Count | Should -Be 0
     }
     It 'only DRIVERS round 1 counts the optional drivers: not round 2, never FULL (WU-R1, plan call 2)' {
       $script:searchResults[$script:DriverCriteria] = @((New-FakeUpdate -Id 'd1'))
@@ -624,13 +658,16 @@ Describe 'Windows Update round and step (mocked COM)' {
       @($script:logs | Where-Object { $_.Message -like 'Optional driver updates*' }).Count | Should -Be 0
       @($script:logs | Where-Object { $_.Message -eq 'Windows Update round starting' } | ForEach-Object { $_.Data.scope }) | Should -Be @('DRIVERS', 'FULL')
     }
-    It 'logs at most 20 optional titles, as ASCII; -SearchOnly counts them too' {
+    It 'logs at most 20 optional titles, as ASCII, and how long the search took; -SearchOnly counts them too, after its selection' {
       $script:searchResults[$script:OptionalDriverCriteria] = @(foreach ($i in 1..22) { New-FakeUpdate -Id "o$i" -Title $(if ($i -eq 1) { "Driver $script:HebrewText" } else { "Driver $i" }) })
       $null = Invoke-TestRound -StatePath (New-WuStateFile -Rounds 1) -Scope 'DRIVERS' -SearchOnly
       $l = @($script:logs | Where-Object { $_.Message -eq 'Optional driver updates skipped' }); $l.Count | Should -Be 1
       $l[0].Data.count | Should -Be 22; $l[0].Data.round | Should -Be 1; @($l[0].Data.titles).Count | Should -Be 20
       @($l[0].Data.titles)[0] | Should -BeExactly 'Driver ?????'; @($l[0].Data.titles)[19] | Should -BeExactly 'Driver 20'
+      $l[0].Data.seconds | Should -BeOfType [double]; $l[0].Data.seconds | Should -BeGreaterOrEqual 0
       $script:installCalls.Count | Should -Be 0; $script:hideCalls.Count | Should -Be 0
+      $messages = @($script:logs | ForEach-Object { $_.Message })
+      [array]::IndexOf($messages, 'Windows Update search finished') | Should -BeLessThan ([array]::IndexOf($messages, 'Optional driver updates skipped'))
     }
     It 'DRIVERS keeps the firmware rule: on battery a Firmware driver is deferred' {
       $fw = New-FakeUpdate -Id 'fw'; $fw | Add-Member NoteProperty DriverClass 'Firmware'

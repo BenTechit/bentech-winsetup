@@ -5,7 +5,8 @@
 # StartScreen.ps1 (ConvertTo-ScreenText) and Catalog.ps1 (Get-WindowsUpdateChoice); the bundle holds every file.
 #
 # Wu spec 3.2: Choices.WindowsUpdate DRIVERS makes every round search Type='Driver' only (Invoke-WuRound
-# -Scope DRIVERS; the -WuRound entry reads the choice from state.json). Everything else stays as in FULL.
+# -Scope DRIVERS; the -WuRound entry reads the choice from state.json). Everything else stays as in FULL, except
+# that DRIVERS round 1 counts the optional drivers for setup.log at the end of the round (rulings WU-R1, WU-R3).
 #
 # Two halves:
 # - The parent step, Invoke-StepWindowsUpdate, runs in the runner. Each call is ONE round: it bumps
@@ -828,14 +829,8 @@ function Invoke-WuRound {
        given: spec 9.2). Each driver update found is logged at INFO with its driverClass. Skipped
        updates are logged (WARN); deferred ones (firmware on battery) are logged at INFO and counted
        in FirmwareDeferred: they are neither installed nor failed.
-       -Scope DRIVERS (wu spec 3.2) searches Driver only; every later rule is the same as in FULL. In round 1
-       only (ruling WU-R1: once per run, answered from the catalog the driver search has just downloaded) it
-       then runs one more search, Get-WuSearchCriteria -Type Driver -Optional, in its own try: INFO 'Optional
-       driver updates skipped' with @{ round; count; titles } (at most the first 20 titles, each through
-       ConvertTo-ScreenText), or on a throw WARN 'Optional driver updates could not be counted' with
-       @{ round; errorCode; error }, and the round goes on. The optional updates are never converted, added
-       to Found, selected, hidden or installed. -SearchOnly counts them too (the search is read-only). FULL
-       runs no such search.
+       -Scope DRIVERS (wu spec 3.2) searches Driver only; every later rule is the same as in FULL. Round 1
+       also counts the optional drivers, at the very end of the round (step 10).
     5. Hides the Hide set (they failed FailuresBeforeHide times; the parent reports them in red). Each
        hide is tried on its own (ruling R24b): one that throws (a mandatory update cannot be hidden)
        is logged with its code and listed in HideFailed, and the round goes on.
@@ -846,6 +841,17 @@ function Invoke-WuRound {
        (failed), 5 (aborted) and anything else are Failed with their code.
     9. RebootRequired = the install result's RebootRequired or Microsoft.Update.SystemInfo's. SystemInfo
        is read after the round in its own try/catch, on the exception path too (ruling R24a).
+    10. -Scope DRIVERS, round 1 only (ruling WU-R1: once per run), and only when the round ended without an
+       exception: one more search, Get-WuSearchCriteria -Type Driver -Optional. It runs last (ruling WU-R3),
+       after the installs, the progress file's Phase 'done' and SystemInfo, right before the result is written,
+       so a count search that hangs can only cost the count, never the round's drivers (it still runs into
+       the round's deadline). In its own try: INFO 'Optional driver updates skipped' with @{ round; count;
+       titles; seconds } (at most the first 20 titles, each through ConvertTo-ScreenText; seconds is how long
+       the search took), or on a throw WARN 'Optional driver updates could not be counted' with @{ round;
+       errorCode; error; seconds }; either way the result is the same. The optional updates are never
+       converted, added to Found or the result, selected, hidden or installed. A round that ended in an
+       exception skips the count (the agent just failed, and the count is only a diagnostic), so that run logs
+       none. FULL runs no such search.
     Any exception ends the round: its message is Error, and whatever was already done stays listed.
     ErrorCode (ruling R23) is the numeric HRESULT as '0x' + 8 hex digits, so the parent never depends
     on localized text: an exception's code (Get-WuExceptionErrorCode); otherwise, when the install
@@ -855,7 +861,9 @@ function Invoke-WuRound {
 
     -SearchOnly (smoke test only, WhatIf-style): changes nothing on the machine. It does not register
     Microsoft Update (it is an Error when it is not registered), does not un-hide, hide, download or
-    install; it searches, writes the Install selection as Installed, and reads SystemInfo.
+    install; it searches, writes the Install selection as Installed, and reads SystemInfo. With -Scope
+    DRIVERS in round 1 it also counts the optional drivers (step 10, read-only), at the same place: after
+    its selection, the one thing it does in place of the installs.
 
     -OnAC (spec 9.2): whether the machine is on mains power; the -WuRound entry reads it at the start
     of the round. On battery, firmware driver updates are deferred.
@@ -910,6 +918,9 @@ function Invoke-WuRound {
   $eachOutcome = @{ RebootRequired = $false; ErrorCode = $null }
   # Final review C1: $true once this round un-hid the previous run's updates; the parent books it.
   $previousUnhideDone = $false
+  # Set inside the try; the optional-driver count at the end (step 10) needs both and checks them.
+  $round = 0
+  $session = $null
 
   $progressPath = Get-WuProgressPath -ResultPath $ResultPath
   $progress = [ordered]@{ Round = 0; Mode = $InstallMode; Phase = 'searching'; Current = 0; Total = 0; Updates = @(); UpdatedAt = $null }
@@ -960,19 +971,6 @@ function Invoke-WuRound {
         if ($info.IsDriver) {
           Write-SetupLog -Message 'Windows Update driver found' -Data @{ id = $info.Id; title = $info.Title; driverClass = $info.DriverClass }
         }
-      }
-    }
-
-    # Wu spec 3.2, ruling WU-R1: DRIVERS round 1 counts the optional drivers (BrowseOnly=1) for setup.log, so
-    # Ben can decide from real runs whether DRIVERS should take them. Read-only: they are never converted,
-    # added to Found, selected, hidden or installed, and a failed count never fails the round.
-    if ($Scope -eq 'DRIVERS' -and $round -eq 1) {
-      try {
-        $optional = @(ConvertTo-WuList -Value (Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type Driver -Optional)))
-        $titles = [string[]]@($optional | Select-Object -First 20 | ForEach-Object { ConvertTo-ScreenText ([string]$_.Title) })
-        Write-SetupLog -Message 'Optional driver updates skipped' -Data @{ round = $round; count = $optional.Count; titles = $titles }
-      } catch {
-        Write-SetupLog -Message 'Optional driver updates could not be counted' -Level WARN -Data @{ round = $round; errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = $_.Exception.Message }
       }
     }
 
@@ -1096,6 +1094,23 @@ function Invoke-WuRound {
     if ([bool](Get-WuRebootRequired)) { $rebootRequired = $true }
   } catch {
     Write-SetupLog -Message 'Windows Update restart flag could not be read' -Level WARN -Data @{ errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = $_.Exception.Message }
+  }
+
+  # Step 10 (wu spec 3.2, rulings WU-R1 and WU-R3): DRIVERS round 1 counts the optional drivers (BrowseOnly=1)
+  # for setup.log, so Ben can decide from real runs whether DRIVERS should take them. Last, after the round's
+  # installs, so a search that hangs can only cost the count, never the drivers. Read-only: they are never
+  # converted, added to Found or the result, selected, hidden or installed; a failed count changes nothing.
+  # Skipped after an exception: the agent just failed, and the count is only a diagnostic.
+  if ($Scope -eq 'DRIVERS' -and $round -eq 1 -and $null -eq $errorText -and $null -ne $session) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $optional = @(ConvertTo-WuList -Value (Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type Driver -Optional)))
+      $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+      $titles = [string[]]@($optional | Select-Object -First 20 | ForEach-Object { ConvertTo-ScreenText ([string]$_.Title) })
+      Write-SetupLog -Message 'Optional driver updates skipped' -Data @{ round = $round; count = $optional.Count; titles = $titles; seconds = $seconds }
+    } catch {
+      Write-SetupLog -Message 'Optional driver updates could not be counted' -Level WARN -Data @{ round = $round; errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = $_.Exception.Message; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1) }
+    }
   }
 
   $result = [ordered]@{
