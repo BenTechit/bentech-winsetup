@@ -188,6 +188,33 @@ Describe 'ToolEngine (repair Task 1)' {
       if ($null -ne $Text) { [IO.File]::WriteAllText($p, $Text) }
       Read-ToolJsonFile -Path $p | Should -BeNullOrEmpty
     }
+    It 'writes ASCII bytes: Hebrew and a surrogate pair become \uXXXX escapes, and read back as the same text (ruling RD-R21)' {
+      $name = 'אוזניות של דנה ' + [char]::ConvertFromUtf32(0x1F3A7) + ' é'
+      $p = Join-Path $script:dir 'hebrew.json'
+      Write-ToolJsonFile -Path $p -InputObject @{ Name = $name; List = @($name) } | Should -BeTrue
+      $bytes = [IO.File]::ReadAllBytes($p); @($bytes | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      $text = [IO.File]::ReadAllText($p); $text | Should -Match '\\u05d0'; $text | Should -Match '\\ud83c\\udfa7'
+      $r = Read-ToolJsonFile -Path $p; $r.Name | Should -BeExactly $name; @($r.List)[0] | Should -BeExactly $name
+    }
+    It 'ConvertTo-ToolAsciiJson escapes every character outside printable ASCII (a surrogate pair as two) and keeps the rest (RD-R21)' {
+      $name = 'דנה' + [char]::ConvertFromUtf32(0x1F600) + 'x' + [char]0x7F
+      $json = ConvertTo-Json -InputObject @{ N = $name; M = 'plain "quoted" \ text' }
+      $ascii = ConvertTo-ToolAsciiJson -Json $json
+      $ascii | Should -Not -Match '[^\x00-\x7E]'
+      $ascii | Should -Match '\\u05d3\\u05e0\\u05d4\\ud83d\\ude00x\\u007f'
+      $ascii | Should -Match "`r`n"   # the layout (new lines, indentation) is kept
+      $back = ConvertFrom-Json -InputObject $ascii; $back.N | Should -BeExactly $name; $back.M | Should -BeExactly 'plain "quoted" \ text'
+      ConvertTo-ToolAsciiJson -Json '' | Should -BeExactly ''
+      ConvertTo-ToolAsciiJson -Json '{"A":1}' | Should -BeExactly '{"A":1}'
+    }
+    It 'ConvertTo-ToolDisplayText keeps a display name''s real text: control characters become spaces, cut to -MaxLength without splitting a surrogate pair (RD-R21)' {
+      ConvertTo-ToolDisplayText -Text "אתרנט`r`n2`t " -MaxLength 64 | Should -BeExactly 'אתרנט  2'
+      ConvertTo-ToolDisplayText -Text $null -MaxLength 64 | Should -BeExactly ''
+      $long = ('א' * 63) + [char]::ConvertFromUtf32(0x1F3A7) + 'tail'
+      $cut = ConvertTo-ToolDisplayText -Text $long -MaxLength 64
+      $cut.Length | Should -Be 63; $cut | Should -BeExactly ('א' * 63)   # the pair would not fit whole
+      (ConvertTo-ToolDisplayText -Text ('x' * 500) -MaxLength 128).Length | Should -Be 128
+    }
     It 'reads a file over -MaxBytes as $null, and a file with a BOM' {
       $p = Join-Path $script:dir 'big.json'; [IO.File]::WriteAllText($p, ('{"A":"' + ('x' * 2000) + '"}'), (New-Object Text.UTF8Encoding $false))
       Read-ToolJsonFile -Path $p -MaxBytes 1000 | Should -BeNullOrEmpty

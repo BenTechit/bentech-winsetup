@@ -27,9 +27,11 @@
 # ServiceControllerStatus and ServiceStartMode; the NetTCPIP enums Dhcp, PrefixOrigin and AddressFamily; PnP property
 # keys; CIM). Every native tool runs through Invoke-ToolNative, every cmdlet that can hang (BITS, NetAdapter, NetTCPIP,
 # DnsClient, PnpDevice) in a bounded grandchild (Invoke-ToolJsonChild) whose command returns one hashtable. Nothing
-# waits without a deadline (counted Wait-SetupDelay slices). result.json stays ASCII (ConvertTo-ScreenText on every
-# name: the CSV on the stick keeps the real ones) and under 1 MB (the ghost list is capped, and says so). Nothing on
-# the stick is written or read through a link (Test-StickReparsePoint).
+# waits without a deadline (counted Wait-SetupDelay slices). result.json stays ASCII bytes: the display-only names (a
+# device's name and class, an adapter's alias) keep their real text (ConvertTo-ToolDisplayText) and are written as
+# \uXXXX escapes (ConvertTo-ToolAsciiJson; ruling RD-R21), every other value and every log line is ASCII
+# (ConvertTo-ScreenText). result.json stays under 1 MB (the ghost list has a count cap and a byte budget, and says
+# so). Nothing on the stick is written or read through a link (Test-StickReparsePoint).
 #
 # Needs ToolEngine (Invoke-ToolNative, Invoke-ToolJsonChild, Add-ToolFinding, Add-ToolLog, Write-ToolJsonFile,
 # Read-ToolJsonFile, Get-ToolStepTimeout, Get-ToolRemainingSeconds, Get-ToolStepName, Format-ToolExitCode,
@@ -46,6 +48,11 @@ $script:WuResetServices = @('wuauserv', 'bits', 'cryptsvc', 'msiserver', 'usosvc
 $script:WuDisabledReported = @('wuauserv', 'bits', 'cryptsvc', 'usosvc')
 $script:WuRenameTries = 3
 $script:WuRenamePauseSeconds = 3
+# A rename is not tried again with this little of the action's time left: the retry stops the services again, and
+# wuServicesStart (AlwaysRun) still needs its share before the window's kill (review M6).
+$script:WuRenameReserveSeconds = 180
+# Win32 errors (as HRESULTs) that mean the folder is in use: a sharing violation and a lock violation (review M8).
+$script:WuRenameLockedCodes = @(0x80070020, 0x80070021)
 
 # Ghost devices that are always left out (spec 6.7, builder check 8): Bluetooth by enumerator (a turned-off headset
 # is not present, yet still paired), audio endpoints (per-device audio settings), print queues and WSD printers; and by
@@ -56,9 +63,19 @@ $script:GhostExcludedClasses = @('Bluetooth', 'Printer', 'PrintQueue', 'AudioEnd
 $script:GhostBluetoothPrefixes = @('BTHENUM\', 'BTHLE\', 'BTHLEDEVICE\', 'BTHHFENUM\')
 $script:GhostAncestorLevels = 10
 # The grandchild answers at most GhostQueryMax ghosts (its answer stays under Invoke-ToolJsonChild's 1 MB), and the
-# window gets at most GhostListMax of them (result.json under the 1 MB the window reads; about 450 bytes a row).
+# window gets at most GhostListMax of them, and only as many as fit GhostListBudgetBytes (review M4): each row is
+# counted as GhostRowOverheadBytes (its keys and indentation in result.json; about 290 measured) plus its values as
+# they are written (Measure-ToolJsonText: six bytes for each \u escape). So result.json stays under the 1 MB the
+# window reads whatever the names, with room for the rest of it. A name is cut to GhostNameMax and a class to
+# GhostClassMax UTF-16 code units before its escapes (RD-R21: they keep their real text).
 $script:GhostQueryMax = 2000
 $script:GhostListMax = 1000
+$script:GhostListBudgetBytes = 800KB
+$script:GhostRowOverheadBytes = 320
+$script:GhostNameMax = 128
+$script:GhostClassMax = 64
+# An adapter's alias is cut to this many UTF-16 code units (it keeps its real text, RD-R21).
+$script:NetAliasMax = 64
 
 # A saved network backup holds at most this many adapters (Test-ToolNetBackup), each at most this many addresses,
 # gateways and DNS servers.
@@ -92,15 +109,20 @@ foreach ($job in @(Get-BitsTransfer -AllUsers)) {
 @{ Removed = $removed; Failed = $failed; Errors = $errors.ToArray() }
 '@
 
-# Every adapter's settings (spec 6.6): the addresses set by hand (PrefixOrigin Manual), the default routes kept in the
-# persistent store (the gateways set by hand), the DNS servers set by hand (the NameServer value of the adapter's
-# Tcpip and Tcpip6 interface keys; DHCP's own servers are DhcpNameServer, never saved), and whether DHCP is on per
-# address family. Enum names only. A failure other than "nothing found" fails the whole read: no verified backup, no
-# reset.
+# Every adapter's settings (spec 6.6): the addresses and the default routes kept in the persistent store (the ones set
+# by hand; review M1: the persistent store also holds them for an adapter whose cable is out, which has no active
+# address), the DNS servers set by hand (the NameServer value of the adapter's Tcpip and Tcpip6 interface keys; DHCP's
+# own servers are DhcpNameServer, never saved), and whether DHCP is on per address family. Enum names only. A failure
+# other than "nothing found" fails the whole read: no verified backup, no reset.
 $script:ToolNetSettingsCommand = @'
 $dhcp = @{}
 foreach ($i in @(Get-NetIPInterface)) { $dhcp[('{0}|{1}' -f [int]$i.ifIndex, [string]$i.AddressFamily)] = [string]$i.Dhcp }
-$manual = @(Get-NetIPAddress | Where-Object { [string]$_.PrefixOrigin -ceq 'Manual' })
+$manual = @()
+try {
+  $manual = @(Get-NetIPAddress -PolicyStore PersistentStore -ErrorAction Stop)
+} catch {
+  if ([string]$_.CategoryInfo.Category -cne 'ObjectNotFound') { throw }
+}
 $routes = @()
 try {
   $routes = @(Get-NetRoute -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { [string]$_.DestinationPrefix -in '0.0.0.0/0', '::/0' })
@@ -183,29 +205,48 @@ function Get-ToolWuFolders {
 }
 
 function Wait-ToolServiceStatus {
-  # Private. Up to toolStep.service minutes (Get-ToolStepTimeout) for service -Name to read -Status, in 2 s
+  # Private. Up to toolStep.service minutes (Get-ToolStepTimeout) for service -Name to read one of -Status, in 2 s
   # Wait-SetupDelay slices (counted, never the wall clock). $true when it does.
   [CmdletBinding()]
   [OutputType([bool])]
   param(
     [Parameter(Mandatory)][hashtable]$Run,
     [Parameter(Mandatory)][string]$Name,
-    [Parameter(Mandatory)][string]$Status
+    [Parameter(Mandatory)][string[]]$Status
   )
 
   $slices = [int][math]::Ceiling((Get-ToolStepTimeout -Run $Run -Name 'service') * 60 / 2)
   for ($i = 0; $i -le $slices; $i++) {
     if ($i -gt 0) { Wait-SetupDelay -Seconds 2 }
     $state = Get-ToolServiceState -Name $Name
-    if ($null -ne $state -and $state.Status -ceq $Status) { return $true }
+    if ($null -ne $state -and $state.Status -cin $Status) { return $true }
   }
   return $false
 }
 
+function Send-ToolServiceStop {
+  # Private. sc.exe stop -Name (toolStep.service): @{ Ok (exit 0, or 1062 "not started"); Exit (as 0x...) }. A service
+  # that cannot take a control now (1061: it is starting) is waited for until it runs or stops (toolStep.service), then
+  # asked once more (review M7).
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([Parameter(Mandatory)][hashtable]$Run, [Parameter(Mandatory)][string]$Name)
+
+  $sc = Get-ToolSystemTool -Name 'sc.exe'
+  $stop = Invoke-ToolNative -Run $Run -FilePath $sc -ArgumentList ('stop ' + $Name) -StepTimeout 'service'
+  if (-not $stop.TimedOut -and $stop.ExitCode -eq 1061) {
+    $null = Wait-ToolServiceStatus -Run $Run -Name $Name -Status 'Running', 'Stopped'
+    $state = Get-ToolServiceState -Name $Name
+    if ($null -ne $state -and $state.Status -ceq 'Stopped') { return @{ Ok = $true; Exit = 'stopped meanwhile' } }
+    $stop = Invoke-ToolNative -Run $Run -FilePath $sc -ArgumentList ('stop ' + $Name) -StepTimeout 'service'
+  }
+  return @{ Ok = ((-not $stop.TimedOut) -and ($stop.ExitCode -eq 0 -or $stop.ExitCode -eq 1062)); Exit = (Format-ToolExitCode -ExitCode $stop.ExitCode) }
+}
+
 function Stop-ToolWuServices {
-  # Private. sc.exe stop for each update service that is not Stopped now, in the list's order (exit 0, or 1062 "not
-  # started"), then up to toolStep.service minutes for Stopped; one already stopping (StopPending) is only waited for.
-  # Returns the names that did not stop.
+  # Private. sc.exe stop for each update service that is not Stopped now, in the list's order (Send-ToolServiceStop),
+  # then up to toolStep.service minutes for Stopped. One already stopping (StopPending) is only waited for; one still
+  # starting (StartPending) is first waited for until it runs (review M7). Returns the names that did not stop.
   [CmdletBinding()]
   [OutputType([string[]])]
   param([Parameter(Mandatory)][hashtable]$Run)
@@ -213,13 +254,17 @@ function Stop-ToolWuServices {
   $failed = New-Object System.Collections.Generic.List[string]
   foreach ($name in $script:WuResetServices) {
     $state = Get-ToolServiceState -Name $name
+    if ($null -ne $state -and $state.Status -ceq 'StartPending') {
+      $null = Wait-ToolServiceStatus -Run $Run -Name $name -Status 'Running', 'Stopped'
+      $state = Get-ToolServiceState -Name $name
+    }
     if ($null -eq $state -or $state.Status -ceq 'Stopped') { continue }
     $exit = 'not sent'
     $ok = $true
     if ($state.Status -cne 'StopPending') {
-      $stop = Invoke-ToolNative -Run $Run -FilePath (Get-ToolSystemTool -Name 'sc.exe') -ArgumentList ('stop ' + $name) -StepTimeout 'service'
-      $exit = Format-ToolExitCode -ExitCode $stop.ExitCode
-      $ok = (-not $stop.TimedOut) -and ($stop.ExitCode -eq 0 -or $stop.ExitCode -eq 1062)
+      $stop = Send-ToolServiceStop -Run $Run -Name $name
+      $exit = $stop.Exit
+      $ok = $stop.Ok
     }
     if ($ok) { $ok = Wait-ToolServiceStatus -Run $Run -Name $name -Status 'Stopped' }
     if (-not $ok) {
@@ -270,6 +315,22 @@ function Invoke-ToolStepWuServicesStop {
   return $status
 }
 
+function Get-ToolErrorCode {
+  # Private. The HRESULT of the innermost exception of -Exception's chain that carries a Win32 one (0x8007....), else
+  # of -Exception itself; $null without an exception. Language-independent, unlike the message.
+  [CmdletBinding()]
+  param([AllowNull()][Exception]$Exception)
+
+  if ($null -eq $Exception) { return $null }
+  $code = $Exception.HResult
+  $e = $Exception
+  while ($null -ne $e) {
+    if (($e.HResult -band 0xFFFF0000) -eq (0x80070000 -band 0xFFFF0000)) { $code = $e.HResult }
+    $e = $e.InnerException
+  }
+  return $code
+}
+
 function Invoke-ToolStepWuRename {
   <#
   .SYNOPSIS
@@ -277,9 +338,12 @@ function Invoke-ToolStepWuRename {
     <name>.bak-<yyyyMMdd-HHmmss> (Rename-Item -LiteralPath -NewName -ErrorAction Stop). Nothing is deleted.
   .DESCRIPTION
     Up to three tries, 3 s apart, the update services stopped again before each retry (a trigger may have started
-    one, and it locks the folder). Renamed: INFO wuRenamed (the old and the new name). Still locked: WARN
-    wuRenameFailed. A folder that is a reparse point is never renamed (WARN wuRenameLink); a folder that is not there
-    is skipped (logged). $Run.Data.WuRename = @{ <name> = <new name or ''> }.
+    one, and it locks the folder); no retry once 3 minutes or less of the action's time are left (review M6:
+    wuServicesStart still needs its share). A name already taken gets -2, -3, ... (review M10). Renamed: INFO
+    wuRenamed (the old and the new name). Not renamed: WARN wuRenameLocked when the last error's HRESULT is a sharing
+    or lock violation, else WARN wuRenameFailed with the HRESULT as 0x... (review M8; never the error's localized
+    text). A folder that is a reparse point is never renamed (WARN wuRenameLink); a folder that is not there is skipped
+    (logged). $Run.Data.WuRename = @{ <name> = <new name or ''> }.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -303,26 +367,39 @@ function Invoke-ToolStepWuRename {
     }
     $newName = ''
     $lastError = ''
+    $lastCode = $null
+    $parent = [IO.Path]::GetDirectoryName($path)
     for ($try = 1; $try -le $script:WuRenameTries; $try++) {
       if ($try -gt 1) {
+        if ((Get-ToolRemainingSeconds -Run $Run) -le $script:WuRenameReserveSeconds) {
+          Write-SetupLog -Level WARN -Message 'No more rename tries: the action is short of time' -Data @{ folder = $name; tries = ($try - 1) }
+          break
+        }
         $null = Stop-ToolWuServices -Run $Run
         Wait-SetupDelay -Seconds $script:WuRenamePauseSeconds
       }
-      $candidate = '{0}.bak-{1}' -f $name, (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+      $stamp = '{0}.bak-{1}' -f $name, (Get-Date).ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+      $candidate = $stamp
+      for ($n = 2; $n -le 9 -and (Test-Path -LiteralPath ([IO.Path]::Combine($parent, $candidate))); $n++) { $candidate = '{0}-{1}' -f $stamp, $n }
       try {
         Rename-Item -LiteralPath $path -NewName $candidate -ErrorAction Stop
         $newName = $candidate
         break
       } catch {
         $lastError = ConvertTo-ScreenText -Text $_.Exception.Message
+        $lastCode = Get-ToolErrorCode -Exception $_.Exception
       }
     }
     if ($newName -ne '') {
       $result[$name] = $newName
       Add-ToolFinding -Run $Run -Level INFO -Code 'wuRenamed' -Arguments @($name, $newName)
     } else {
-      Write-SetupLog -Level WARN -Message 'An update folder could not be renamed' -Data @{ folder = $name; tries = $script:WuRenameTries; error = $lastError }
-      Add-ToolFinding -Run $Run -Level WARN -Code 'wuRenameFailed' -Arguments @($name)
+      Write-SetupLog -Level WARN -Message 'An update folder could not be renamed' -Data @{ folder = $name; code = (Format-ToolExitCode -ExitCode $lastCode); error = $lastError }
+      if ($null -ne $lastCode -and $script:WuRenameLockedCodes -contains $lastCode) {
+        Add-ToolFinding -Run $Run -Level WARN -Code 'wuRenameLocked' -Arguments @($name)
+      } else {
+        Add-ToolFinding -Run $Run -Level WARN -Code 'wuRenameFailed' -Arguments @($name, (Format-ToolExitCode -ExitCode $lastCode))
+      }
       $status = 'warn'
     }
   }
@@ -416,12 +493,16 @@ function Invoke-ToolStepDiskCheckSchedule {
   .SYNOPSIS
     Step diskCheckSchedule (spec 6.5): fsutil.exe dirty set <system drive> (toolStep.native); scheduled only when the
     exit code is 0 AND Win32_Volume.DirtyBitSet reads $true afterwards (Get-ToolDiskCheckState): INFO
-    diskCheckScheduled and RestartRequired. Anything else is CRIT diskCheckNotScheduled with the reason.
+    diskCheckScheduled and RestartRequired. A timeout, another exit code or a dirty bit that reads $false is CRIT
+    diskCheckNotScheduled with the reason.
   .DESCRIPTION
     A drive this PC excludes from the start-up check (Session Manager BootExecute /k:, Get-ToolDiskCheckState) is not
     marked: autochk would skip it at every start, so the check would never run (CRIT, the reason says so). The
-    exclusion is only read, never changed (ruling RD-R1: no cancel). $Run.Data.DiskCheck = @{ Drive; ExitCode; Dirty;
-    Excluded }.
+    exclusion is only read, never changed (ruling RD-R1: no cancel).
+    What cannot be read is never read as an answer (review M5): exit 0 with a dirty bit that cannot be read, or a
+    marked volume whose start-up check list (BootExecute) cannot be read, is WARN diskCheckUnconfirmed ("probably
+    scheduled", with what could not be read) and RestartRequired (the volume is probably marked, and there is no
+    cancel). $Run.Data.DiskCheck = @{ Drive; ExitCode; Dirty; Excluded; ExcludedUnknown }.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -434,7 +515,8 @@ function Invoke-ToolStepDiskCheckSchedule {
   }
   $drive = $letter + ':'
   $before = Get-ToolDiskCheckState -Drive $drive
-  $record = @{ Drive = $drive; ExitCode = $null; Dirty = $before['Dirty']; Excluded = ($before['Excluded'] -eq $true) }
+  $record = @{ Drive = $drive; ExitCode = $null; Dirty = $before['Dirty']; Excluded = ($before['Excluded'] -eq $true)
+              ExcludedUnknown = ($before['ExcludedUnknown'] -eq $true) }
   $Run.Data['DiskCheck'] = $record
   if ($record['Excluded']) {
     Add-ToolFinding -Run $Run -Level CRIT -Code 'diskCheckNotScheduled' -Arguments @(('{0} is excluded from the start-up check on this PC' -f $drive))
@@ -453,13 +535,19 @@ function Invoke-ToolStepDiskCheckSchedule {
   }
   $after = Get-ToolDiskCheckState -Drive $drive
   $record['Dirty'] = $after['Dirty']
+  $unknownList = ($record['ExcludedUnknown'] -eq $true)
+  if ($null -eq $after['Dirty'] -or ($after['Dirty'] -eq $true -and $unknownList)) {
+    $what = if ($null -eq $after['Dirty']) { 'the dirty bit could not be read' } else { 'the start-up check list could not be read' }
+    Add-ToolFinding -Run $Run -Level WARN -Code 'diskCheckUnconfirmed' -Arguments @($what)
+    $Run.RestartRequired = $true
+    return 'warn'
+  }
   if ($after['Dirty'] -eq $true) {
     Add-ToolFinding -Run $Run -Level INFO -Code 'diskCheckScheduled'
     $Run.RestartRequired = $true
     return 'done'
   }
-  $reason = if ($null -eq $after['Dirty']) { 'the dirty bit could not be read' } else { 'the volume is not marked dirty' }
-  Add-ToolFinding -Run $Run -Level CRIT -Code 'diskCheckNotScheduled' -Arguments @($reason)
+  Add-ToolFinding -Run $Run -Level CRIT -Code 'diskCheckNotScheduled' -Arguments @('the volume is not marked dirty')
   return 'failed'
 }
 
@@ -543,8 +631,7 @@ function ConvertTo-ToolNetAdapter {
     if ($Strict -and $Row[$key] -isnot [bool]) { return $null }
     $flags[$key] = ($Row[$key] -eq $true)
   }
-  $alias = ConvertTo-ScreenText -Text ([string]$Row['Alias'])
-  if ($alias.Length -gt 64) { $alias = $alias.Substring(0, 64) }
+  $alias = ConvertTo-ToolDisplayText -Text $Row['Alias'] -MaxLength $script:NetAliasMax
 
   $addressList = Get-ToolNetList -Value $Row['Addresses']
   $gatewayList = Get-ToolNetList -Value $Row['Gateways']
@@ -564,7 +651,7 @@ function ConvertTo-ToolNetAdapter {
     $max = if ($ip.Contains(':')) { 128 } else { 32 }
     if ($ip -eq '' -or -not $whole -or [long]$prefix -lt 0 -or [long]$prefix -gt $max) {
       if ($Strict) { return $null }
-      Write-SetupLog -Level WARN -Message 'An adapter address was not read' -Data @{ adapter = $alias }
+      Write-SetupLog -Level WARN -Message 'An adapter address was not read' -Data @{ adapter = (ConvertTo-ScreenText -Text $alias) }
       continue
     }
     if ($seen.ContainsKey($ip)) { continue }
@@ -580,7 +667,7 @@ function ConvertTo-ToolNetAdapter {
       $ip = ConvertTo-ToolIpText -Value $entry -StripZone:(-not $Strict)
       if ($ip -eq '' -or $ip -ceq '0.0.0.0' -or $ip -ceq '::') {
         if ($Strict) { return $null }
-        if ($ip -eq '') { Write-SetupLog -Level WARN -Message 'An adapter gateway or DNS server was not read' -Data @{ adapter = $alias; kind = $kind } }
+        if ($ip -eq '') { Write-SetupLog -Level WARN -Message 'An adapter gateway or DNS server was not read' -Data @{ adapter = (ConvertTo-ScreenText -Text $alias); kind = $kind } }
         continue
       }
       if (-not $values.Contains($ip)) { $values.Add($ip) }
@@ -731,8 +818,9 @@ function Invoke-ToolStepNetBackup {
     adapters with static settings, a file that cannot be written or reads back different: CRIT netBackupFailed and
     'failed'. $Run.Data.Abort is set before anything else and cleared only on success, so the runner ends the action
     (no reset step runs) after a failure, and after a step that throws too. Over 16 adapters, the DHCP-only
-    ones are left out from the end (they hold nothing to restore). A backup without an identity key is saved, but Restore
-    never offers it (logged).
+    ones are left out from the end (they hold nothing to restore). A PC without an identity key (no serial, no usable
+    BIOS UUID) could never get a backup back (Test-ToolNetBackup never matches an empty key): CRIT netBackupNoIdentity,
+    nothing read, saved or reset (review M3).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -740,6 +828,12 @@ function Invoke-ToolStepNetBackup {
 
   # Abort first, cleared only at the very end: a step that throws (Invoke-ToolStep catches it) still ends the action.
   $Run.Data['Abort'] = $true
+  $key = [string](Get-ToolArgsEntry -Run $Run -Section 'Identity' -Name 'Key')
+  if ($key -eq '') {
+    Write-SetupLog -Level WARN -Message 'This PC has no identity key: a backup could never be restored, so nothing is reset'
+    Add-ToolFinding -Run $Run -Level CRIT -Code 'netBackupNoIdentity'
+    return 'failed'
+  }
   $problem = ''
   $path = ''
   $backup = $null
@@ -756,9 +850,7 @@ function Invoke-ToolStepNetBackup {
       if (-not (Test-ToolNetStatic -Adapter $kept[$i])) { $kept.RemoveAt($i) }
     }
     if ($kept.Count -gt $script:NetBackupMaxAdapters) { $problem = 'more than {0} adapters have static settings' -f $script:NetBackupMaxAdapters }
-    $key = [string](Get-ToolArgsEntry -Run $Run -Section 'Identity' -Name 'Key')
     $computer = ConvertTo-ScreenText -Text ([string](Get-ToolArgsEntry -Run $Run -Section 'Identity' -Name 'ComputerName'))
-    if ($key -eq '') { Write-SetupLog -Level WARN -Message 'This PC has no identity key: Restore network settings will not offer this backup' }
     $backup = [ordered]@{ Version = 1; CreatedAt = (Get-Date).ToString('s', [Globalization.CultureInfo]::InvariantCulture)
                           Identity = [ordered]@{ Key = $key; ComputerName = $computer }; Adapters = $kept.ToArray() }
   }
@@ -1001,8 +1093,9 @@ function Find-ToolNetBackup {
   .DESCRIPTION
     Looks at <StickRoot>BenTech-Reports\*\network-backup-<yyyyMMdd-HHmmss>.json, newest first by the stamp in the name
     (at most 64 files), and answers the first one that Test-ToolNetBackupPath accepts (no link, ASCII path),
-    Read-ToolNetBackupFile can read (under 1 MB) and Test-ToolNetBackup accepts for -IdentityKey (another PC's file, or
-    an invalid one, is passed over). No stick root, no key, no BenTech-Reports or a BenTech-Reports that is a link:
+    Read-ToolNetBackupFile can read (under 1 MB) and Test-ToolNetBackup accepts for -IdentityKey, and that holds at
+    least one static value (Test-ToolNetStatic; review M2). Another PC's file, an invalid one and one with nothing to
+    put back are passed over. No stick root, no key, no BenTech-Reports or a BenTech-Reports that is a link:
     $null. A failure is a WARN in the log and $null.
   #>
   [CmdletBinding()]
@@ -1031,6 +1124,9 @@ function Find-ToolNetBackup {
       if ($null -eq $read -or $null -eq $read['Value']) { continue }
       $backup = Test-ToolNetBackup -Value $read['Value'] -IdentityKey $IdentityKey
       if ($null -eq $backup) { continue }
+      # A backup without any static value has nothing to put back (a second reset on a PC already on DHCP): an older
+      # one that has is the one to offer (review M2).
+      if (@(foreach ($a in @($backup['Adapters'])) { if (Test-ToolNetStatic -Adapter $a) { $a } }).Count -eq 0) { continue }
       return @{ Path = $path; Sha256 = [string]$read['Sha256']; CreatedAt = [string]$backup['CreatedAt']; Adapters = $backup['Adapters'] }
     }
   } catch {
@@ -1116,9 +1212,11 @@ function Invoke-ToolStepNetRestore {
   <#
   .SYNOPSIS
     Step netRestore (spec 6.6, Restore network settings): Options = @{ File; Sha256 } (what the window showed). The file
-    must be a network backup under the stick's BenTech-Reports (Test-ToolNetBackupPath) and its SHA-256, read once
-    (Read-ToolNetBackupFile), must equal Options.Sha256: else CRIT netRestoreRefused. Those same bytes must be a valid
-    backup of this PC (Test-ToolNetBackup): else CRIT netRestoreInvalid. Nothing is applied in either case.
+    must be a network backup under the stick's BenTech-Reports (Test-ToolNetBackupPath; else CRIT netRestoreNotOnStick),
+    readable (else CRIT netRestoreUnreadable), and its SHA-256, read once (Read-ToolNetBackupFile), must equal
+    Options.Sha256 (else, or an Options.Sha256 that is no SHA-256, CRIT netRestoreRefused; review M8: each names its
+    cause). Those same bytes must be a valid backup of this PC (Test-ToolNetBackup): else CRIT netRestoreInvalid.
+    Nothing is applied in any of these cases.
   .DESCRIPTION
     Then the adapters with a static value (Test-ToolNetStatic: exactly the ones the confirmation listed; a DHCP-only
     adapter is left alone), each matched to an adapter of now (the grandchild netAdapters; by GUID, else MAC) and
@@ -1138,19 +1236,31 @@ function Invoke-ToolStepNetRestore {
     if ($options['Sha256'] -is [string]) { $sha = $options['Sha256'] }
   }
   $refused = ''
+  $code = ''
   $read = $null
   if ($sha -cnotmatch '^[0-9A-Fa-f]{64}\z') {
     $refused = 'the hash it was shown with is no SHA-256'
+    $code = 'netRestoreRefused'
   } elseif (-not (Test-ToolNetBackupPath -Path $file -StickRoot ([string]$Run.Args['StickRoot']))) {
-    $refused = 'the file is not a network backup under BenTech-Reports on the stick'
+    $refused = 'the file is not a network backup under BenTech-Reports on the stick, or a link is on its way'
+    $code = 'netRestoreNotOnStick'
   } else {
     $read = Read-ToolNetBackupFile -Path $file
-    if ($null -eq $read) { $refused = 'the file could not be read' }
-    elseif (-not [string]::Equals([string]$read['Sha256'], $sha, [StringComparison]::OrdinalIgnoreCase)) { $refused = 'its SHA-256 is not the one shown' }
+    if ($null -eq $read) {
+      $refused = 'the file could not be read'
+      $code = 'netRestoreUnreadable'
+    } elseif (-not [string]::Equals([string]$read['Sha256'], $sha, [StringComparison]::OrdinalIgnoreCase)) {
+      $refused = 'its SHA-256 is not the one shown'
+      $code = 'netRestoreRefused'
+    }
   }
   if ($refused -ne '') {
     Write-SetupLog -Level WARN -Message 'Network restore refused' -Data @{ reason = $refused; file = (ConvertTo-ScreenText -Text $file) }
-    Add-ToolFinding -Run $Run -Level CRIT -Code 'netRestoreRefused'
+    switch ($code) {
+      'netRestoreNotOnStick' { Add-ToolFinding -Run $Run -Level CRIT -Code 'netRestoreNotOnStick' }
+      'netRestoreUnreadable' { Add-ToolFinding -Run $Run -Level CRIT -Code 'netRestoreUnreadable' }
+      default { Add-ToolFinding -Run $Run -Level CRIT -Code 'netRestoreRefused' }
+    }
     return 'failed'
   }
   $backup = Test-ToolNetBackup -Value $read['Value'] -IdentityKey ([string](Get-ToolArgsEntry -Run $Run -Section 'Identity' -Name 'Key'))
@@ -1329,15 +1439,30 @@ function Get-ToolGhostDevices {
   return @{ Ok = $true; TimedOut = $false; Error = ''; Total = [math]::Max($total, $devices.Count); Items = $devices.ToArray() }
 }
 
+function Measure-ToolJsonText {
+  # Private. An upper bound of the bytes -Text takes inside a string of an ASCII JSON file (ConvertTo-Json, then
+  # ConvertTo-ToolAsciiJson): six for a character outside printable ASCII and for one ConvertTo-Json writes as \u00XX
+  # (& ' < >), two for " and \, one for the rest. Pure.
+  [CmdletBinding()]
+  [OutputType([int])]
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text)) { return 0 }
+  return ($Text.Length + 5 * [regex]::Matches($Text, "[^\x20-\x7E]|[&'<>]").Count + [regex]::Matches($Text, '["\\]').Count)
+}
+
 function Invoke-ToolStepGhostList {
   <#
   .SYNOPSIS
     Step ghostList (the info child the Ghost devices confirmation waits for): $Run.Data.Ghosts = @( @{ InstanceId;
-    Class; Name; Excluded } ) (ASCII; Excluded '' for a device that may be removed, else the reason), the ones that may
-    be removed first, at most $script:GhostListMax rows (result.json stays under the 1 MB the window reads): when the PC
-    has more, INFO ghostListCapped says so. No ghost is an empty list. $Run.Data.GhostCount = @{ Total; Listed; LeftOut }.
+    Class; Name; Excluded } ) (Excluded '' for a device that may be removed, else the reason), the ones that may be
+    removed first. No ghost is an empty list. $Run.Data.GhostCount = @{ Total; Listed; LeftOut }.
   .DESCRIPTION
-    A list that cannot be read: CRIT stepFailed and no Ghosts (the window shows the failure).
+    InstanceId and Excluded are ASCII; Name and Class keep their real text (ConvertTo-ToolDisplayText, RD-R21), cut to
+    $script:GhostNameMax and $script:GhostClassMax UTF-16 code units BEFORE their \u escapes. The list holds at most
+    $script:GhostListMax rows, and only as many as fit $script:GhostListBudgetBytes counted with Measure-ToolJsonText
+    (review M4), so result.json stays under the 1 MB the window reads whatever the names; when the PC has more, INFO
+    ghostListCapped says so. A list that cannot be read: CRIT stepFailed and no Ghosts (the window shows the failure).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -1353,10 +1478,16 @@ function Invoke-ToolStepGhostList {
   $leftOut = New-Object System.Collections.Generic.List[object]
   foreach ($device in $list['Items']) { if ([string]$device['Excluded'] -eq '') { $keep.Add($device) } else { $leftOut.Add($device) } }
   $rows = New-Object System.Collections.Generic.List[object]
+  $bytes = 0
   foreach ($device in @($keep.ToArray() + $leftOut.ToArray())) {
     if ($rows.Count -ge $script:GhostListMax) { break }
-    $rows.Add(@{ InstanceId = (ConvertTo-ScreenText -Text $device['InstanceId']); Class = (ConvertTo-ScreenText -Text $device['Class'])
-                 Name = (ConvertTo-ScreenText -Text $device['Name']); Excluded = [string]$device['Excluded'] })
+    $row = @{ InstanceId = (ConvertTo-ScreenText -Text $device['InstanceId']); Class = (ConvertTo-ToolDisplayText -Text $device['Class'] -MaxLength $script:GhostClassMax)
+              Name = (ConvertTo-ToolDisplayText -Text $device['Name'] -MaxLength $script:GhostNameMax); Excluded = [string]$device['Excluded'] }
+    $size = $script:GhostRowOverheadBytes + (Measure-ToolJsonText -Text $row['InstanceId']) + (Measure-ToolJsonText -Text $row['Class']) +
+      (Measure-ToolJsonText -Text $row['Name']) + (Measure-ToolJsonText -Text $row['Excluded'])
+    if ($bytes + $size -gt $script:GhostListBudgetBytes) { break }
+    $bytes += $size
+    $rows.Add($row)
   }
   $Run.Data['Ghosts'] = $rows.ToArray()
   $Run.Data['GhostCount'] = @{ Total = $list['Total']; Listed = $rows.Count; LeftOut = $leftOut.Count }
@@ -1401,6 +1532,18 @@ function Get-ToolGhostTicks {
   return , $ticks.ToArray()
 }
 
+function ConvertTo-ToolCsvText {
+  # Private. A CSV cell that Excel would run as a formula (it starts with = + - or @) gets a leading apostrophe, so it
+  # shows as text (review M9: a USB device chooses its own name). Control characters are already spaces. Pure.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Text)
+
+  $value = [string]$Text
+  if ($value -match '^[=+\-@]') { return "'" + $value }
+  return $value
+}
+
 function Invoke-ToolStepGhostCsv {
   <#
   .SYNOPSIS
@@ -1414,7 +1557,8 @@ function Invoke-ToolStepGhostCsv {
     list that cannot be read, a link or a file already there, or any failure: CRIT ghostCsvFailed and 'failed'.
     $Run.Data.Abort is set before anything else and cleared only on success, so ghostRemove never runs after a failure,
     nor after a step that throws. The names keep their real text here (a stick file, like the reports); a control
-    character becomes a space, so every device is one line.
+    character becomes a space, so every device is one line, and a name or class that starts with = + - or @ gets a
+    leading apostrophe, so Excel shows it as text instead of running it (review M9).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -1441,8 +1585,9 @@ function Invoke-ToolStepGhostCsv {
         if ($reason -ne '') { $rowStatus = 'excluded ({0})' -f $reason; $counts['Excluded']++ }
         elseif ($ticked.ContainsKey([string]$device['InstanceId'])) { $rowStatus = 'remove'; $counts['Remove']++ }
         else { $rowStatus = 'kept'; $counts['Kept']++ }
-        $rows.Add([pscustomobject][ordered]@{ Status = $rowStatus; InstanceId = [string]$device['InstanceId']; Class = [regex]::Replace([string]$device['Class'], '[\x00-\x1F]', ' ')
-                                               Name = [regex]::Replace([string]$device['Name'], '[\x00-\x1F]', ' ') })
+        $rows.Add([pscustomobject][ordered]@{ Status = $rowStatus; InstanceId = [string]$device['InstanceId']
+                                               Class = (ConvertTo-ToolCsvText -Text ([regex]::Replace([string]$device['Class'], '[\x00-\x1F]', ' ')))
+                                               Name = (ConvertTo-ToolCsvText -Text ([regex]::Replace([string]$device['Name'], '[\x00-\x1F]', ' '))) })
       }
       $counts['Devices'] = $rows.Count
       $lines = if ($rows.Count -gt 0) { @($rows.ToArray() | ConvertTo-Csv -NoTypeInformation) } else { @('"Status","InstanceId","Class","Name"') }

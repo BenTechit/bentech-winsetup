@@ -119,7 +119,7 @@ BeforeAll {
              Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1', '0.0.0.0'); Dns = @('8.8.8.8', '8.8.4.4') }
           @{ Alias = 'Wi-Fi'; Guid = '{5D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-57'; Index = 7; Ipv4Dhcp = $true; Ipv6Dhcp = $true
              Addresses = @(); Gateways = @(); Dns = @() }
-          @{ Alias = 'vEthernet'; Guid = '{7D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = ''; Index = 30; Ipv4Dhcp = $true; Ipv6Dhcp = $true
+          @{ Alias = 'vEthernet (מתג)'; Guid = '{7D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = ''; Index = 30; Ipv4Dhcp = $true; Ipv6Dhcp = $true
              Addresses = @(@{ Ip = 'fe80::1%30'; Prefix = 64 }); Gateways = @(); Dns = @('fec0:0:0:ffff::1') }) }
       # The adapters now: Ethernet by its GUID; Wi-Fi with a new GUID (a driver reinstall), found by its MAC; Ethernet 2
       # (DHCP in the backup) is never touched.
@@ -191,10 +191,10 @@ Describe 'ToolAdvanced (repair Task 7)' {
     $script:native = New-Object System.Collections.ArrayList
     $script:nativeLines = New-Object System.Collections.ArrayList
     $script:renamed = New-Object System.Collections.ArrayList
-    $script:exit = @{}
+    $script:exit = @{}; $script:exitQueue = @{}
     $script:gc = Get-DefaultAnswers; $script:gcFail = @{}; $script:gcCommands = @{}
     $script:services = Get-DefaultServices
-    $script:renameOk = $true; $script:scStops = $true
+    $script:renameOk = $true; $script:renameError = 'locked'; $script:scStops = $true
     $script:dirty = $true; $script:bootExecute = @('autocheck autochk *')
     $script:rdp = $false; $script:onStep = $null; $script:break = ''; $script:currentRun = $null
     $script:remaining = $null
@@ -220,6 +220,8 @@ Describe 'ToolAdvanced (repair Task 7)' {
       [void]$script:native.Add($file); [void]$script:nativeLines.Add(('{0} {1}' -f $file, $ArgumentList).Trim())
       $code = 0
       if ($script:exit.ContainsKey($file)) { $code = $script:exit[$file] }
+      $line = ('{0} {1}' -f $file, $ArgumentList).Trim()
+      if ($script:exitQueue.ContainsKey($line) -and $script:exitQueue[$line].Count -gt 0) { $code = $script:exitQueue[$line].Dequeue() }
       if ($file -eq 'sc.exe' -and $null -ne $code) {
         $verb, $service = ([string]$ArgumentList) -split ' ', 2
         if ($script:services.ContainsKey($service)) {
@@ -238,7 +240,12 @@ Describe 'ToolAdvanced (repair Task 7)' {
     Mock Get-ToolWuFolders { @(@{ Name = 'SoftwareDistribution'; Path = $script:softwareDistribution }, @{ Name = 'catroot2'; Path = $script:catroot2 }) }
     Mock Rename-Item {
       [void]$script:renamed.Add([pscustomobject]@{ LiteralPath = [string]$LiteralPath; NewName = [string]$NewName })
-      if (-not $script:renameOk) { Write-Error -Message 'The process cannot access the file because it is being used by another process.' -Category WriteError }
+      if (-not $script:renameOk) {
+        # As the FileSystem provider fails: a sharing violation (0x80070020), or access denied (0x80070005).
+        $e = if ($script:renameError -eq 'locked') { New-Object IO.IOException('The process cannot access the file because it is being used by another process.', -2147024864) }
+             else { New-Object UnauthorizedAccessException('Access to the path is denied.') }
+        Write-Error -Exception $e -Category WriteError
+      }
     }
     Mock Get-CimInstance {
       if ($ClassName -eq 'Win32_Volume') { return [pscustomobject]@{ DriveLetter = 'C:'; DirtyBitSet = $script:dirty } }
@@ -339,18 +346,23 @@ Describe 'ToolAdvanced (repair Task 7)' {
         'finding.wuServiceStopFailed'   = '{0} did not stop'
         'finding.wuServiceStartFailed'  = '{0} did not start again'
         'finding.wuRenamed'             = '{0} renamed to {1}'
-        'finding.wuRenameFailed'        = '{0} could not be renamed (locked): restart, then run it again'
+        'finding.wuRenameFailed'        = '{0} could not be renamed (error {1}): restart, then run it again'
+        'finding.wuRenameLocked'        = '{0} is in use and could not be renamed: restart, then run it again'
         'finding.wuRenameLink'          = '{0} is a link: it was not renamed'
         'finding.wuBitsCleared'         = '{0} Windows Update download jobs cleared'
         'finding.wuBitsFailed'          = 'The Windows Update download jobs could not be cleared ({0})'
         'finding.diskCheckScheduled'    = 'Disk check scheduled for the next start (it can take hours on a large HDD)'
         'finding.diskCheckNotScheduled' = 'The disk check could not be scheduled ({0})'
+        'finding.diskCheckUnconfirmed'  = 'The disk check is probably scheduled for the next start, but it could not be confirmed ({0})'
         'finding.netBackupSaved'        = 'Network settings saved to {0}'
         'finding.netBackupFailed'       = 'The network settings could not be saved and checked: nothing was reset'
+        'finding.netBackupNoIdentity'   = 'This PC has no serial number or usable BIOS UUID, so its saved settings could never be restored: nothing was reset'
         'finding.netResetStepFailed'    = '{0} returned {1}'
         'finding.netRestored'           = 'Network settings restored on {0} adapters'
         'finding.netRestoreFailed'      = '{0}: {1}'
-        'finding.netRestoreRefused'     = 'The backup file changed after it was shown: nothing was applied'
+        'finding.netRestoreRefused'     = 'The backup file does not match the one that was shown: nothing was applied'
+        'finding.netRestoreUnreadable'  = 'The backup file could not be read (is the stick still plugged in?): nothing was applied'
+        'finding.netRestoreNotOnStick'  = 'The backup file is not a network backup in BenTech-Reports on the stick, or it is a link: nothing was applied'
         'finding.netRestoreInvalid'     = 'The backup file is not valid: nothing was applied'
         'finding.ghostCsvFailed'        = 'The device list could not be saved: nothing was removed'
         'finding.ghostsRemoved'         = '{0} devices removed'
@@ -437,7 +449,7 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $r = New-ActionRun wuReset; $null = Invoke-ToolSteps -Run $r
       $script:nativeLines | Should -Contain 'sc.exe start wuauserv'
       @($script:renamed).Count | Should -Be 6    # three tries for each folder
-      @(Get-FindingCodes $r | Where-Object { $_ -eq 'wuRenameFailed' }).Count | Should -Be 2
+      @(Get-FindingCodes $r | Where-Object { $_ -eq 'wuRenameLocked' }).Count | Should -Be 2   # a sharing violation names the cause (review M8)
       Should -Invoke Wait-SetupDelay -ParameterFilter { $Seconds -eq 3 } -Times 4 -Exactly
       $script:nativeLines.Clear(); $script:services = Get-DefaultServices
       $r = New-ActionRun wuReset; $script:onStep = { if ($args[0] -eq 'wuServicesStop') { 'x' | Set-Content $r.StopPath } }
@@ -445,6 +457,40 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $r.Steps | Where-Object Id -eq 'wuServicesStart' | ForEach-Object Status | Should -Be 'done'
       @($r.Steps.Status) | Should -Be @('done', 'skipped', 'skipped', 'done', 'skipped')
       $script:nativeLines | Should -Contain 'sc.exe start wuauserv'
+    }
+    It 'a rename refused for another reason names its error code, language-independent (review M8)' {
+      $script:renameOk = $false; $script:renameError = 'denied'
+      $r = New-ActionRun wuReset; $null = Invoke-ToolSteps -Run $r
+      @(Get-FindingCodes $r | Where-Object { $_ -eq 'wuRenameLocked' }).Count | Should -Be 0
+      (Get-FindingArgs $r 'wuRenameFailed')[0] | Should -Be @('SoftwareDistribution', '0x80070005')
+    }
+    It 'a rename that fails is not retried when the action is short of time (review M6)' {
+      Mock Get-ToolElapsedSeconds { 36000 - 120 }   # two minutes left of the budget
+      $script:renameOk = $false
+      $r = New-ActionRun wuReset; $null = Invoke-ToolSteps -Run $r
+      @($script:renamed).Count | Should -Be 2   # one try for each folder
+      Should -Invoke Wait-SetupDelay -ParameterFilter { $Seconds -eq 3 } -Times 0 -Exactly
+      @(Get-FindingCodes $r | Where-Object { $_ -eq 'wuRenameLocked' }).Count | Should -Be 2
+      $script:nativeLines | Should -Contain 'sc.exe start wuauserv'
+    }
+    It 'a service still starting is waited for, then stopped; one that answers 1061 is waited for and asked once more (review M7)' {
+      $script:services['bits'] = @{ Status = 'StartPending'; StartType = 'Automatic' }
+      Mock Wait-SetupDelay { foreach ($s in $script:services.Values) { if ($s.Status -eq 'StartPending') { $s.Status = 'Running' } } }
+      $script:exitQueue['sc.exe stop usosvc'] = New-Object Collections.Queue (, [object[]]@(1061, 0))
+      $r = New-ActionRun wuReset; $null = Invoke-ToolSteps -Run $r
+      @($script:nativeLines | Where-Object { $_ -eq 'sc.exe stop bits' }).Count | Should -Be 1
+      @($script:nativeLines | Where-Object { $_ -eq 'sc.exe stop usosvc' }).Count | Should -Be 2
+      Get-FindingCodes $r | Should -Not -Contain 'wuServiceStopFailed'
+      $script:nativeLines | Should -Contain 'sc.exe start bits'   # it was starting before: it runs again afterwards
+    }
+    It 'a rename whose target name is taken gets the next free name (review M10)' {
+      Mock Get-Date { [datetime]::new(2026, 10, 22, 10, 15, 0) }
+      $taken = Join-Path $script:wuRoot 'SoftwareDistribution.bak-20261022-101500'
+      [void][IO.Directory]::CreateDirectory($taken)
+      try {
+        $r = New-ActionRun wuReset; $null = Invoke-ToolSteps -Run $r
+        @($script:renamed.NewName) | Should -Be @('SoftwareDistribution.bak-20261022-101500-2', 'catroot2.bak-20261022-101500')
+      } finally { [IO.Directory]::Delete($taken, $true) }
     }
     It 'the services start again after the deadline, with the 0.25-minute floor' {
       $script:elapsed = 0.0
@@ -489,6 +535,18 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $script:exit['fsutil.exe'] = $null; $q = New-ActionRun diskCheck; $null = Invoke-ToolSteps -Run $q
       Get-FindingCodes $q | Should -Be @('diskCheckNotScheduled'); $q.RestartRequired | Should -BeFalse
     }
+    It 'exit 0 but a dirty bit that cannot be read: probably scheduled, could not confirm (WARN), a restart needed (review M5)' {
+      $script:dirty = $null; $r = New-ActionRun diskCheck; $null = Invoke-ToolSteps -Run $r
+      $script:nativeLines | Should -Be @('fsutil.exe dirty set C:'); Get-FindingCodes $r | Should -Be @('diskCheckUnconfirmed')
+      ($r.Findings | Where-Object Code -eq 'diskCheckUnconfirmed').Level | Should -Be 'WARN'; $r.RestartRequired | Should -BeTrue
+      Get-StepStatus $r 'diskCheckSchedule' | Should -Be 'warn'
+    }
+    It 'a start-up check list (BootExecute) that cannot be read: the drive is marked, but could not confirm, never "not excluded" (review M5)' {
+      $script:bootExecute = $null; $script:dirty = $true; $r = New-ActionRun diskCheck; $null = Invoke-ToolSteps -Run $r
+      $script:nativeLines | Should -Be @('fsutil.exe dirty set C:'); Get-FindingCodes $r | Should -Be @('diskCheckUnconfirmed')
+      (Get-FindingArgs $r 'diskCheckUnconfirmed')[0] | Should -Match 'start-up check'; $r.RestartRequired | Should -BeTrue
+      $r.Data.DiskCheck.ExcludedUnknown | Should -BeTrue
+    }
     It 'a drive excluded from the start-up check on this PC is not marked: the check would never run' {
       $script:bootExecute = @('autocheck autochk /k:C *'); $r = New-ActionRun diskCheck; $null = Invoke-ToolSteps -Run $r
       @($script:nativeLines).Count | Should -Be 0; Get-FindingCodes $r | Should -Be @('diskCheckNotScheduled'); $r.RestartRequired | Should -BeFalse
@@ -512,6 +570,13 @@ Describe 'ToolAdvanced (repair Task 7)' {
       # An IPv6 address with its zone is saved without it; a MAC that is no MAC is saved empty.
       $saved.Adapters[2].Addresses[0].Ip | Should -Be 'fe80::1'; $saved.Adapters[2].Mac | Should -BeExactly ''
       Test-ToolNetBackup -Value $saved -IdentityKey 'SN-7HX2K93' | Should -Not -BeNullOrEmpty
+      # RD-R21: the Hebrew alias is kept, written as \u escapes (ASCII bytes), passes the read-back compare, the strict
+      # decode and Test-ToolNetBackup, and the file's hash is stable.
+      $saved.Adapters[2].Alias | Should -BeExactly 'vEthernet (מתג)'
+      @([IO.File]::ReadAllBytes($file[0].FullName) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      $once = Read-ToolNetBackupFile -Path $file[0].FullName; $twice = Read-ToolNetBackupFile -Path $file[0].FullName
+      $once.Sha256 | Should -BeExactly (Get-FileHash $file[0].FullName).Hash; $twice.Sha256 | Should -BeExactly $once.Sha256
+      (Test-ToolNetBackup -Value $once.Value -IdentityKey 'SN-7HX2K93').Adapters[2].Alias | Should -BeExactly 'vEthernet (מתג)'
       $r.RestartRequired | Should -BeTrue; Get-FindingCodes $r | Should -Be @('netBackupSaved', 'restartRequired')
       $r.Files.NetBackup | Should -Be $file[0].FullName; $r.Data.ContainsKey('Abort') | Should -BeFalse
       [IO.File]::ReadAllText($script:advancedFile) | Should -Not -Match '(?i)/release|/renew'
@@ -521,6 +586,23 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $r = New-ActionRun netReset; Invoke-ToolSteps -Run $r | Should -Be 'Done'
       $script:nativeLines | Should -BeNullOrEmpty; Get-FindingCodes $r | Should -Be @('stepFailed')
       @($r.Steps.Status) | Should -Be @('failed', 'skipped', 'skipped', 'skipped', 'skipped'); $r.Data.Abort | Should -BeTrue
+    }
+    It 'reads the static addresses from the persistent store, as the gateways: an unplugged static adapter is saved too (review M1)' {
+      $script:gc['netSettings']['Items'] += @{ Alias = 'Ethernet 3'; Guid = '{8D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-59'; Index = 31
+                                               Ipv4Dhcp = $false; Ipv6Dhcp = $true; Addresses = @(@{ Ip = '10.1.1.5'; Prefix = 24 }); Gateways = @('10.1.1.1'); Dns = @() }
+      $r = New-ActionRun netReset; $null = Invoke-ToolSteps -Run $r
+      $command = $script:gcCommands['netSettings']
+      $command | Should -Match 'Get-NetIPAddress -PolicyStore PersistentStore'; $command | Should -Match 'Get-NetRoute -PolicyStore PersistentStore'
+      $command | Should -Not -Match 'PrefixOrigin'   # every address in the persistent store was set by hand; the active store has none for a cable that is out
+      $saved = Read-ToolJsonFile -Path $r.Files.NetBackup
+      @($saved.Adapters | Where-Object { $_.Alias -eq 'Ethernet 3' })[0].Addresses[0].Ip | Should -Be '10.1.1.5'
+    }
+    It 'without an identity key no backup could ever be restored: nothing is saved and nothing is reset (review M3)' {
+      $r = New-ActionRun netReset; $r.Args['Identity']['Key'] = ''
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'
+      $script:nativeLines | Should -BeNullOrEmpty; Get-FindingCodes $r | Should -Be @('netBackupNoIdentity')
+      ($r.Findings | Where-Object Code -eq 'netBackupNoIdentity').Level | Should -Be 'CRIT'; $r.Data.Abort | Should -BeTrue
+      @(Get-ChildItem $r.SessionDir -Filter 'network-backup-*.json').Count | Should -Be 0; Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
     }
     It 'no verified backup, no reset: nothing after the backup step runs (Review Focus 3, <Why>)' -ForEach @(
       @{ Why = 'the write fails' }, @{ Why = 'the read-back differs' }, @{ Why = 'no stick: the local fallback folder' }) {
@@ -539,14 +621,15 @@ Describe 'ToolAdvanced (repair Task 7)' {
     It 'netInfo answers the static adapters only, with plain IP strings and the RDP session (RD-R2), in an ASCII result' {
       $script:rdp = $true; $r = New-ActionRun netInfo; Invoke-ToolSteps -Run $r | Should -Be 'Done'
       $info = $r.Data.NetInfo
-      @($info.Adapters).Count | Should -Be 2; @($info.Adapters.Alias) | Should -Be @('Ethernet', 'vEthernet')
+      @($info.Adapters).Count | Should -Be 2; @($info.Adapters.Alias) | Should -Be @('Ethernet', 'vEthernet (מתג)')
       @($info.Adapters[0].Gateways) | Should -Be @('192.168.1.1'); @($info.Adapters[0].Dns) | Should -Be @('8.8.8.8', '8.8.4.4')
       $info.Adapters[0].Gateways[0] | Should -BeOfType [string]
       @($info.Remote.Keys) | Should -Be @('Rdp'); $info.Remote.Rdp | Should -BeTrue
       $r.Files.ContainsKey('NetBackup') | Should -BeFalse; @($script:nativeLines).Count | Should -Be 0
       Write-ToolResult -Run $r -Outcome 'Done' | Should -BeTrue
-      [IO.File]::ReadAllText($r.ResultPath) | Should -Not -Match '[^\x00-\x7F]'
-      (Read-ToolJsonFile $r.ResultPath).Data.NetInfo.Adapters[0].Addresses[0].Ip | Should -Be '192.168.1.10'
+      @([IO.File]::ReadAllBytes($r.ResultPath) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0   # ASCII bytes (RD-R21)
+      $back = Read-ToolJsonFile $r.ResultPath
+      $back.Data.NetInfo.Adapters[0].Addresses[0].Ip | Should -Be '192.168.1.10'; $back.Data.NetInfo.Adapters[1].Alias | Should -BeExactly 'vEthernet (מתג)'
       # A PC without static settings answers an empty list, not nothing.
       $script:gc['netSettings'] = @{ Items = @($script:gc['netSettings']['Items'][1]) }
       $q = New-ActionRun netInfo; $null = Invoke-ToolSteps -Run $q; $q.Data.NetInfo.Adapters.Count | Should -Be 0
@@ -566,25 +649,27 @@ Describe 'ToolAdvanced (repair Task 7)' {
       Get-FindingCodes $r | Should -Be @('netRestoreInvalid'); Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
       Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'RED'
     }
-    It 'restore refuses Options that do not name a backup under the stick''s BenTech-Reports (<Why>)' -ForEach @(
-      @{ Why = 'a file elsewhere on the PC'; File = 'C:\Windows\Temp\network-backup-20261020-090500.json' }
-      @{ Why = 'a file at the stick''s root'; File = 'STICK\network-backup-20261020-090500.json' }
-      @{ Why = 'a path with ..'; File = 'REPORTS\PC1_7HX2K93_2026-10-20_0900\..\PC1_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json' }
-      @{ Why = 'another file name'; File = 'REPORTS\PC1_7HX2K93_2026-10-20_0900\settings.json' }
-      @{ Why = 'a relative path'; File = 'network-backup-20261020-090500.json' }
-      @{ Why = 'no file'; File = '' }
-      @{ Why = 'a Sha256 that is no hash'; File = 'VALID'; Sha256 = 'abc' }
+    It 'restore refuses Options that do not name a backup under the stick''s BenTech-Reports, naming the cause (<Why>; review M8)' -ForEach @(
+      @{ Why = 'a file elsewhere on the PC'; File = 'C:\Windows\Temp\network-backup-20261020-090500.json'; E = 'netRestoreNotOnStick' }
+      @{ Why = 'a file at the stick''s root'; File = 'STICK\network-backup-20261020-090500.json'; E = 'netRestoreNotOnStick' }
+      @{ Why = 'a path with ..'; File = 'REPORTS\PC1_7HX2K93_2026-10-20_0900\..\PC1_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json'; E = 'netRestoreNotOnStick' }
+      @{ Why = 'another file name'; File = 'REPORTS\PC1_7HX2K93_2026-10-20_0900\settings.json'; E = 'netRestoreNotOnStick' }
+      @{ Why = 'a relative path'; File = 'network-backup-20261020-090500.json'; E = 'netRestoreNotOnStick' }
+      @{ Why = 'no file'; File = ''; E = 'netRestoreNotOnStick' }
+      @{ Why = 'a file that is gone (the stick pulled)'; File = 'REPORTS\PC1_7HX2K93_2026-10-20_0900\network-backup-20261020-090600.json'; E = 'netRestoreUnreadable' }
+      @{ Why = 'a Sha256 that is no hash'; File = 'VALID'; Sha256 = 'abc'; E = 'netRestoreRefused' }
     ) {
       $path = $File.Replace('STICK\', $script:stickRoot).Replace('REPORTS\', $script:reports + '\')
       if ($File -eq 'VALID') { $path = $script:valid }
       $hash = if ($Sha256) { $Sha256 } else { (Get-FileHash $script:valid).Hash }
       $r = New-ActionRun netRestore -Options @{ File = $path; Sha256 = $hash }; $null = Invoke-ToolSteps -Run $r
-      Get-FindingCodes $r | Should -Be @('netRestoreRefused'); Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
+      Get-FindingCodes $r | Should -Be @($E); Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
+      ($r.Findings | Where-Object Code -eq $E).Level | Should -Be 'CRIT'
     }
     It 'restore refuses a backup file that is a link' {
       Mock Test-StickReparsePoint { $Path -eq $script:valid }
       $r = New-ActionRun netRestore -Options @{ File = $script:valid; Sha256 = (Get-FileHash $script:valid).Hash }; $null = Invoke-ToolSteps -Run $r
-      Get-FindingCodes $r | Should -Be @('netRestoreRefused'); Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
+      Get-FindingCodes $r | Should -Be @('netRestoreNotOnStick'); Should -Invoke Invoke-ToolJsonChild -Times 0 -Exactly
     }
     It 'Test-ToolNetBackup rejects <Why>' -ForEach @(
       @{ Why = 'a bad IP'; Path = 'Adapters[0].Addresses[0].Ip'; V = '192.168.1.300' }
@@ -683,6 +768,20 @@ Describe 'ToolAdvanced (repair Task 7)' {
       Find-ToolNetBackup -StickRoot $script:stickRoot -IdentityKey 'SN-7HX2K93' | Should -BeNullOrEmpty
       [IO.Directory]::Delete($other, $true)
     }
+    It 'Find-ToolNetBackup offers the newest backup that holds a static value, not a newer one without (review M2)' {
+      $later = Join-Path $script:reports 'PC1_7HX2K93_2026-10-21_0900'; [void][IO.Directory]::CreateDirectory($later)
+      try {
+        # A second reset on a PC already on DHCP saved a backup with nothing static in it: it is passed over.
+        $dhcpOnly = Set-JsonValue $script:validObject 'Version' 1; $dhcpOnly['Adapters'] = @($dhcpOnly['Adapters'][2])
+        $null = Write-ToolJsonFile -Path (Join-Path $later 'network-backup-20261021-090000.json') -InputObject $dhcpOnly
+        (Find-ToolNetBackup -StickRoot $script:stickRoot -IdentityKey 'SN-7HX2K93').Path | Should -Be $script:valid
+        # Two that hold static values: the newest.
+        $newest = Join-Path $later 'network-backup-20261021-100000.json'
+        $null = Write-ToolJsonFile -Path $newest -InputObject (Set-JsonValue $script:validObject 'Adapters[0].Addresses[0].Ip' '192.168.1.20')
+        $found = Find-ToolNetBackup -StickRoot $script:stickRoot -IdentityKey 'SN-7HX2K93'
+        $found.Path | Should -Be $newest; $found.Adapters[0].Addresses[0].Ip | Should -Be '192.168.1.20'
+      } finally { [IO.Directory]::Delete($later, $true) }
+    }
     It 'the safety child names the saved backup (safetyNetBackup), and none without a stick' {
       $r = New-ActionRun safety
       Invoke-ToolStepSafetyNetBackup -Run $r | Should -Be 'done'
@@ -728,16 +827,18 @@ Describe 'ToolAdvanced (repair Task 7)' {
       Test-GhostExcluded -Device @{ InstanceId = 'PCI\VEN_8086&DEV_15BC\3&11583659&0&FE'; Class = 'Net' } -Ancestors @() | Should -BeExactly ''
       Test-GhostExcluded -Device @{ InstanceId = 'PCI\VEN_8086&DEV_15BC\3&1'; Class = 'Net' } -Ancestors $null | Should -BeExactly ''
     }
-    It 'ghostList answers every non-present device with its reason, the ones that may go first, in an ASCII result (Task 5''s shape)' {
+    It 'ghostList answers every non-present device with its reason, the ones that may go first, in ASCII bytes with the real names (Task 5''s shape, RD-R21)' {
       $r = New-ActionRun ghostList; Invoke-ToolSteps -Run $r | Should -Be 'Done'
       $g = @($r.Data.Ghosts)
       @($g.InstanceId) | Should -Be @('USB\VID_0781&PID_5567\4C53', 'USBSTOR\DISK&VEN_SANDISK\4C53&0', 'BTHENUM\{0000110b}_X\7&1', 'HID\{00001124}_VID&0002046D\8&1', 'HID\VID_046D&PID_B023&COL01\9&1')
       @($g.Excluded) | Should -Be @('', '', 'bluetooth', 'bluetooth', 'bluetooth')
-      $g[0].Class | Should -Be 'USB'; $g[0].Name | Should -Be 'SanDisk Cruzer'; $g[2].Name | Should -Match '^[\x20-\x7E]+$'
+      $g[0].Class | Should -Be 'USB'; $g[0].Name | Should -Be 'SanDisk Cruzer'; $g[2].Name | Should -BeExactly 'אוזניות של דנה'
       $script:gcCommands['ghostList'] | Should -Match 'Get-PnpDevice'; $script:gcCommands['ghostList'] | Should -Match 'DEVPKEY_Device_Parent'
       @($script:nativeLines).Count | Should -Be 0; $r.Findings.Count | Should -Be 0
       Write-ToolResult -Run $r -Outcome 'Done' | Should -BeTrue
-      [IO.File]::ReadAllText($r.ResultPath) | Should -Not -Match '[^\x00-\x7F]'
+      @([IO.File]::ReadAllBytes($r.ResultPath) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      [IO.File]::ReadAllText($r.ResultPath) | Should -Match '\\u05d0\\u05d5\\u05d6'
+      @((Read-ToolJsonFile -Path $r.ResultPath).Data.Ghosts)[2].Name | Should -BeExactly 'אוזניות של דנה'
       # No ghost at all is an empty list, which the window accepts.
       $script:gc['ghostList'] = @{ Total = 0; Items = @(); Nodes = @() }
       $q = New-ActionRun ghostList; $null = Invoke-ToolSteps -Run $q; $null = Write-ToolResult -Run $q -Outcome 'Done'
@@ -757,6 +858,26 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $null = Write-ToolResult -Run $r -Outcome 'Done'; (Get-Item $r.ResultPath).Length | Should -BeLessThan 1MB
       (Read-ToolJsonFile $r.ResultPath).Data.Ghosts.Count | Should -Be $script:GhostListMax
     }
+    It 'the worst case still fits: Hebrew names and classes as \u escapes, ids full of escaped characters (review M4)' {
+      # Every character of these costs six bytes in result.json; the list stops at its byte budget, whatever the count.
+      $pair = [char]::ConvertFromUtf32(0x1F3A7)
+      $items = @(for ($i = 0; $i -lt 1500; $i++) {
+          @{ InstanceId = ('USB\' + ('&' * 190) + ('{0:D5}' -f $i)); Class = ('ב' * 200); Name = (($pair + 'א') * 400); Parent = '' } })
+      $script:gc['ghostList'] = @{ Total = 1500; Items = $items; Nodes = @() }
+      $r = New-ActionRun ghostList; $null = Invoke-ToolSteps -Run $r
+      $listed = @($r.Data.Ghosts).Count
+      $listed | Should -BeGreaterThan 100; $listed | Should -BeLessThan $script:GhostListMax
+      (Get-FindingArgs $r 'ghostListCapped')[0] | Should -Be @([string]$listed, '1500')
+      $first = @($r.Data.Ghosts)[0]; $first.Name.Length | Should -BeLessOrEqual 128; $first.Class.Length | Should -BeLessOrEqual 64
+      $null = Write-ToolResult -Run $r -Outcome 'Done'; (Get-Item $r.ResultPath).Length | Should -BeLessThan 1MB
+      @((Read-ToolJsonFile -Path $r.ResultPath).Data.Ghosts).Count | Should -Be $listed
+    }
+    It 'a ghost name is cut to 128 characters before its escapes, never between the halves of a surrogate pair (review M4)' {
+      $huge = ('א' * 127) + [char]::ConvertFromUtf32(0x1F3A7) + ('ב' * 10000)
+      $script:gc['ghostList'] = @{ Total = 1; Items = @(@{ InstanceId = 'USB\VID_1234&PID_0001\1'; Class = 'USB'; Name = $huge; Parent = '' }); Nodes = @() }
+      $r = New-ActionRun ghostList; $null = Invoke-ToolSteps -Run $r
+      @($r.Data.Ghosts)[0].Name | Should -BeExactly ('א' * 127)
+    }
     It 'a ghost list that cannot be read is no answer (the window shows the failure)' {
       $script:gcFail['ghostList'] = 'timed out'; $r = New-ActionRun ghostList; $null = Invoke-ToolSteps -Run $r
       $r.Data.ContainsKey('Ghosts') | Should -BeFalse; Get-StepStatus $r 'ghostList' | Should -Be 'timedout'
@@ -775,6 +896,20 @@ Describe 'ToolAdvanced (repair Task 7)' {
       ($rows | Where-Object InstanceId -eq 'USBSTOR\DISK&VEN_SANDISK\4C53&0').Status | Should -Be 'kept'
       ($rows | Where-Object InstanceId -eq 'BTHENUM\{0000110b}_X\7&1').Status | Should -Be 'excluded (bluetooth)'
       $script:nativeLines | Should -BeNullOrEmpty; Get-FindingCodes $r | Should -BeNullOrEmpty; $r.Files.GhostCsv | Should -Be $csv[0].FullName
+    }
+    It 'a device name or class that a spreadsheet would run as a formula is written as text (review M9)' {
+      foreach ($bad in '=HYPERLINK("http://x","y")', '+SUM(1)', '-2+3', '@A1') {
+        $script:gc['ghostList']['Items'] += @{ InstanceId = ('USB\VID_9999&PID_000{0}\X' -f $bad.Length); Class = $bad; Name = $bad; Parent = '' }
+      }
+      $r = New-ActionRun ghostRemove -Options @{ Ids = @() }
+      Invoke-ToolStepGhostCsv -Run $r | Should -Be 'done'
+      $text = [IO.File]::ReadAllText(@(Get-ChildItem $r.SessionDir -Filter 'ghost-devices-*.csv')[0].FullName)
+      $rows = @(ConvertFrom-Csv -InputObject @($text -split "`r`n" | Where-Object { $_ }))
+      foreach ($bad in '=HYPERLINK("http://x","y")', '+SUM(1)', '-2+3', '@A1') {
+        $row = $rows | Where-Object { $_.InstanceId -eq ('USB\VID_9999&PID_000{0}\X' -f $bad.Length) }
+        $row.Name | Should -BeExactly ("'" + $bad); $row.Class | Should -BeExactly ("'" + $bad)
+      }
+      ($rows | Where-Object InstanceId -eq 'USB\VID_0781&PID_5567\4C53').Name | Should -BeExactly 'SanDisk Cruzer'   # an ordinary name is unchanged
     }
     It 'a device list that cannot be saved removes nothing (Review Focus 3, <Why>)' -ForEach @(
       @{ Why = 'no stick: the local fallback folder' }, @{ Why = 'the list cannot be read' }) {

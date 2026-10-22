@@ -27,7 +27,10 @@
 #     the run early. DeadlineUtc is kept for the log only;
 #   - a step timeout is capped by the time the action has left, so the child stops before the window kills it;
 #   - progress.json, result.json and the child's log are English and ASCII (ConvertTo-ScreenText on every free value):
-#     the customer complaint in the args is never logged;
+#     the customer complaint in the args is never logged. The one exception is a display-only name (a ghost device's,
+#     a network adapter's; ruling RD-R21): it keeps its real text (ConvertTo-ToolDisplayText) and every JSON file is
+#     written in ASCII bytes with \uXXXX escapes (ConvertTo-ToolAsciiJson), so the window shows Hebrew; no decision
+#     reads such a name, and a log line takes ConvertTo-ScreenText of it;
 #   - nothing waits without a deadline; no sleep, no prompt, no console text in this file.
 #
 # Needs Logging (Write-SetupLog, Initialize-SetupLog), Activity (Read-FileTail, Register-SetupTick), Process
@@ -181,10 +184,53 @@ function Get-ToolStepName {
 
 # --- JSON files ---------------------------------------------------------------------------------------------------
 
+function ConvertTo-ToolAsciiJson {
+  <#
+  .SYNOPSIS
+    -Json with every character outside printable ASCII written as a \uXXXX escape (UTF-16 code units, so a surrogate
+    pair becomes two escapes), the rest unchanged. Pure. Ruling RD-R21.
+  .DESCRIPTION
+    JSON is ASCII outside its strings, so this is the same JSON in ASCII bytes: a display-only name keeps its real
+    (Hebrew) text through progress.json and result.json, and ConvertFrom-Json gives it back. Layout characters (new
+    lines, indentation) are printable or below 0x20 and stay; ConvertTo-Json has already escaped the control
+    characters inside strings.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Json)
+
+  if ([string]::IsNullOrEmpty($Json)) { return [string]$Json }
+  return [regex]::Replace($Json, '[^\x00-\x7E]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+}
+
+function ConvertTo-ToolDisplayText {
+  <#
+  .SYNOPSIS
+    A display-only name (a device's, an adapter's) with its real text kept for the window (RD-R21): every control
+    character becomes a space, the ends are trimmed, and it is cut to -MaxLength UTF-16 code units, never between
+    the two halves of a surrogate pair. $null is ''. No decision may read it; a log line still takes
+    ConvertTo-ScreenText of it.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [AllowNull()]$Text,
+    [Parameter(Mandatory)][ValidateRange(1, 4096)][int]$MaxLength
+  )
+
+  if ($null -eq $Text) { return '' }
+  $value = ([regex]::Replace([string]$Text, '[\x00-\x1F\x7F]', ' ')).Trim()
+  if ($value.Length -le $MaxLength) { return $value }
+  $cut = $MaxLength
+  if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }
+  return $value.Substring(0, $cut)
+}
+
 function Save-ToolJsonFile {
-  # Private. Writes -InputObject as JSON (UTF-8 without a BOM) to <Path>.tmp, then swaps it in: [IO.File]::Replace
-  # over an existing file ([NullString]::Value, because PowerShell would pass '' for $null), else a move. Folders
-  # are not created. Throws on failure; Write-ToolJsonFile, Write-ToolProgress and Write-ToolResult catch.
+  # Private. Writes -InputObject as JSON (UTF-8 without a BOM, ASCII bytes: ConvertTo-ToolAsciiJson) to <Path>.tmp,
+  # then swaps it in: [IO.File]::Replace over an existing file ([NullString]::Value, because PowerShell would pass ''
+  # for $null), else a move. Folders are not created. Throws on failure; Write-ToolJsonFile, Write-ToolProgress and
+  # Write-ToolResult catch.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$Path,
@@ -192,7 +238,7 @@ function Save-ToolJsonFile {
     [int]$Depth = 8
   )
 
-  $json = ConvertTo-Json -InputObject $InputObject -Depth $Depth
+  $json = ConvertTo-ToolAsciiJson -Json (ConvertTo-Json -InputObject $InputObject -Depth $Depth)
   $temporary = $Path + '.tmp'
   [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding $false))
   if ([IO.File]::Exists($Path)) {
@@ -205,8 +251,9 @@ function Save-ToolJsonFile {
 function Write-ToolJsonFile {
   <#
   .SYNOPSIS
-    Writes -InputObject as JSON (depth 8 by default, UTF-8 without a BOM) through <Path>.tmp, so a reader never sees
-    half a file. $true when written; a failure is a WARN in the log and $false. Never throws.
+    Writes -InputObject as JSON (depth 8 by default, UTF-8 without a BOM, in ASCII bytes: a character outside ASCII is
+    a \uXXXX escape, RD-R21) through <Path>.tmp, so a reader never sees half a file. $true when written; a failure is
+    a WARN in the log and $false. Never throws.
   #>
   [CmdletBinding()]
   [OutputType([bool])]

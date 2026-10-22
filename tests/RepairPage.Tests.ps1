@@ -573,7 +573,7 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty; @($script:logs | Where-Object Message -eq 'Toolbox action finished').Count | Should -Be 0 }
   It 'the safety child''s saved network backup (Data.NetBackup) shows Restore network settings; none hides it; no answer keeps it (repair Task 7)' {
     $backup = @{ Path = 'E:\BenTech-Reports\DESKTOP-4F7K2LQ_7HX2K93_2026-10-20_0900\network-backup-20261020-090500.json'; Sha256 = ('AB' * 32); CreatedAt = '2026-10-20T09:05:00'
-                 Adapters = @(@{ Alias = 'Ethernet'; Guid = '{4D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-56'; Ipv4Dhcp = $false; Ipv6Dhcp = $true
+                 Adapters = @(@{ Alias = 'אתרנט'; Guid = '{4D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = 'A4-BB-6D-12-34-56'; Ipv4Dhcp = $false; Ipv6Dhcp = $true
                                  Addresses = @(@{ Ip = '192.168.1.10'; Prefix = 24 }); Gateways = @('192.168.1.1'); Dns = @('8.8.8.8') }) }
     $chips = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
     $w = New-RunWindow -Set @{ State = 'loading' }; $w.FindName('NetRestoreButton').Visibility | Should -Be 'Collapsed'
@@ -581,7 +581,9 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; DiskCheck = @{ Dirty = $false; Excluded = $false }; NetBackup = $backup }; $script:fake.HasExited = $true; Send-RunTick $w
     $w.Tag.Model.Repair.NetBackup.Path | Should -BeExactly $backup.Path; $w.Tag.Model.Repair.NetBackup.Sha256 | Should -BeExactly ('AB' * 32)
     @($w.Tag.Model.Repair.NetBackup.Adapters).Count | Should -Be 1; $w.Tag.Model.Repair.NetBackup.Adapters[0].Addresses[0].Ip | Should -Be '192.168.1.10'
+    $w.Tag.Model.Repair.NetBackup.Adapters[0].Alias | Should -BeExactly 'אתרנט'   # RD-R21: through the escaped JSON
     $w.FindName('NetRestoreButton').Visibility | Should -Be 'Visible'
+    Click $w 'NetRestoreButton'; (Get-AllText $w.FindName('ConfirmItems')) | Should -Match 'אתרנט'; Click $w 'ConfirmCancelButton'
     # A safety child that ends without an answer (killed, or no result) keeps what the last one found.
     $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $script:fake.HasExited = $true; Send-RunTick $w
     $w.Tag.Model.Repair.NetBackup.Path | Should -BeExactly $backup.Path
@@ -863,11 +865,12 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     Click $w 'OpenFolderButton'; $w.Tag.Outcome | Should -BeNullOrEmpty; $script:ToolboxChildren.Count | Should -Be 0
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not open the folder' }).Count | Should -Be 2
     @($script:logs | Where-Object { $_.Message -eq 'Could not open the folder' })[-1].Data.error | Should -BeExactly 'no explorer ?' }
-  It 'the complaint reaches the child''s args (UTF-8) and never setup.log' {
+  It 'the complaint reaches the child''s args (as \u escapes in ASCII bytes, RD-R21) and never setup.log' {
     $w = New-WorkWindow; $w.FindName('ComplaintBox').Text = 'המחשב נכבה'; $w.Tag.Model.Repair.Complaint | Should -BeExactly 'המחשב נכבה'
     ClickTag $w 'a:Tile:health'
     $argsPath = ($script:started[-1].Args -replace '.*-ToolArgs "([^"]+)".*', '$1'); (Read-ToolJsonFile $argsPath).Complaint | Should -BeExactly 'המחשב נכבה'
-    [IO.File]::ReadAllText($argsPath, (New-Object Text.UTF8Encoding $false)) | Should -Match 'המחשב נכבה'
+    @([IO.File]::ReadAllBytes($argsPath) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+    [IO.File]::ReadAllText($argsPath) | Should -Match '\\u05d4\\u05de\\u05d7\\u05e9\\u05d1'
     ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
   It 'hovering a tile shows what it does (its MouseEnter is wired)' {
     $w = New-WorkWindow; Invoke-ToolboxAction -Sender $w.FindName('TileWuReset') -Action 'Hover'
@@ -1069,6 +1072,14 @@ Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling R
     (Get-AllText $w.FindName('ConfirmItems')) | Should -Match 'Ethernet: 192\.168\.1\.10/24, gateway 192\.168\.1\.1, DNS 8\.8\.8\.8'
     $w.FindName('YesBox').Text = 'YES'; Click $w 'ConfirmButton'; $script:started[-1].Args | Should -Match '-ToolAction netRestore'
     $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json'); $a.Options.File | Should -BeExactly $backup.Path; $a.Options.Sha256 | Should -BeExactly ('AB' * 32) }
+  It 'Hebrew names the child writes as \u escapes (ASCII bytes) show as Hebrew in the ghost list (ruling RD-R21)' {
+    $w = New-FixWindow; ClickTag $w 'a:Tile:ghosts'
+    Write-GhostAnswer $w @(@{ InstanceId = 'USB\VID_0781&PID_5567\4C53'; Class = 'USB'; Name = 'דיסק און קי של דנה'; Excluded = '' })
+    $file = Join-Path $w.Tag.Runs.Action.Dir 'result.json'
+    @([IO.File]::ReadAllBytes($file) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0; [IO.File]::ReadAllText($file) | Should -Match '\\u05d3'
+    $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.Confirm.Items[0].Name | Should -BeExactly 'דיסק און קי של דנה'
+    (Get-AllText $w.FindName('ConfirmItems')) | Should -Match 'דיסק און קי של דנה' }
   It 'an empty ghost list read back from result.json is an answer: nothing to remove, nothing "not valid" (M5)' {
     $w = New-FixWindow; ClickTag $w 'a:Tile:ghosts'; Write-GhostAnswer $w @()
     [IO.File]::ReadAllText((Join-Path $w.Tag.Runs.Action.Dir 'result.json')) | Should -Match '"Ghosts":\s*\[\s*\]'

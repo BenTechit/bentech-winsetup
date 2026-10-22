@@ -637,6 +637,12 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       (Get-ToolDiskCheckState -Drive 'C:').Excluded | Should -BeFalse
       Mock Get-CimInstance { Write-Error -Message 'Access denied' -Category PermissionDenied } -ParameterFilter { $ClassName -eq 'Win32_Volume' }
       $s = Get-ToolDiskCheckState -Drive 'C:'; $s.Dirty | Should -BeNullOrEmpty; $s.ContainsKey('Dirty') | Should -BeTrue
+      $s.ExcludedUnknown | Should -BeFalse
+    }
+    It 'disk check state: a BootExecute that cannot be read (Windows always has one) is ExcludedUnknown, never a plain "not excluded" (repair Task 7 review M5)' {
+      Mock Get-CimInstance { [pscustomobject]@{ DriveLetter = 'C:'; DirtyBitSet = $true } } -ParameterFilter { $ClassName -eq 'Win32_Volume' }
+      Mock Get-RebootRegistryValue { $null } -ParameterFilter { $Name -eq 'BootExecute' }
+      $s = Get-ToolDiskCheckState -Drive 'C:'; $s.ExcludedUnknown | Should -BeTrue; $s.Excluded | Should -BeFalse
     }
     It 'each chip lands in progress.Partial as soon as it is known' {
       $script:gcFail['disks'] = 'timed out'

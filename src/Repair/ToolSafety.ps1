@@ -676,11 +676,14 @@ function Get-ToolDiskChip {
 function Get-ToolDiskCheckState {
   <#
   .SYNOPSIS
-    The disk check state of -Drive (the system drive): @{ Dirty = <bool|$null>; Excluded = <bool> }. Never throws.
+    The disk check state of -Drive (the system drive): @{ Dirty = <bool|$null>; Excluded = <bool>;
+    ExcludedUnknown = <bool> }. Never throws.
   .DESCRIPTION
     Dirty: Win32_Volume.DirtyBitSet (CIM, -OperationTimeoutSec 15); $null when it cannot be read. Excluded: the
     Session Manager's BootExecute holds /k:<letter> (someone excluded the drive from the start-up check on this PC:
-    autochk skips it at every start). Read only: the toolbox never sets or clears an exclusion (ruling RD-R1).
+    autochk skips it at every start). ExcludedUnknown: BootExecute could not be read (Windows always has one, so a
+    missing value is a read that failed; repair Task 7 review M5): Excluded is then $false but unconfirmed. Read
+    only: the toolbox never sets or clears an exclusion (ruling RD-R1).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -694,17 +697,24 @@ function Get-ToolDiskCheckState {
     Write-SetupLog -Level WARN -Message 'The dirty bit could not be read' -Data @{ drive = $Drive; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
   $excluded = $false
+  $unknown = $false
   try {
     $letter = $Drive.TrimEnd(':')
     if ($letter -match '^[A-Za-z]\z') {
-      foreach ($line in @(Get-RebootRegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'BootExecute')) {
+      $value = Get-RebootRegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'BootExecute'
+      if ($null -eq $value) {
+        $unknown = $true
+        Write-SetupLog -Level WARN -Message 'BootExecute could not be read: whether the drive is excluded from the start-up check is unknown'
+      }
+      foreach ($line in @($value)) {
         if ([string]$line -match ('(?i)/k:[A-Z]*' + $letter)) { $excluded = $true }
       }
     }
   } catch {
+    $unknown = $true
     Write-SetupLog -Level WARN -Message 'BootExecute could not be read' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
-  return @{ Dirty = $dirty; Excluded = $excluded }
+  return @{ Dirty = $dirty; Excluded = $excluded; ExcludedUnknown = $unknown }
 }
 
 # --- The safety action's steps ------------------------------------------------------------------------------------
