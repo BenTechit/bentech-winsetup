@@ -767,7 +767,10 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       @{ Status = 'ScanErrorsFoundAndFixedOnline'; Finding = @('INFO|volumeFixedOnline'); Offer = $false; Step = 'done'; Color = 'GREEN' }
       @{ Status = 'ScanErrorsFoundNeedSpotFix'; Finding = @('CRIT|volumeSpotFix'); Offer = $true; Step = 'warn'; Color = 'RED' }
       @{ Status = 'NeedOfflineScanAndFix'; Finding = @('CRIT|volumeFullRepair'); Offer = $true; Step = 'warn'; Color = 'RED' }
-      @{ Status = 'ScanErrorsFixedOnlineAlsoNeedSpotFix'; Finding = @('WARN|volumeUnknown'); Offer = $false; Step = 'warn'; Color = 'YELLOW' }
+      # Ruling RD-R13: fixed online but a spot fix is still needed is red with the Disk-check offer; a scan that asks to
+      # be run again is yellow.
+      @{ Status = 'ScanErrorsFixedOnlineAlsoNeedSpotFix'; Finding = @('CRIT|volumeSpotFix'); Offer = $true; Step = 'warn'; Color = 'RED' }
+      @{ Status = 'ScanNeedsRetry'; Finding = @('WARN|volumeScanRetry'); Offer = $false; Step = 'warn'; Color = 'YELLOW' }
       @{ Status = 'Failed'; Finding = @('WARN|volumeUnknown'); Offer = $false; Step = 'warn'; Color = 'YELLOW' }) {
       $script:gc['volumeScan'] = @{ Result = $Status }
       $r = New-TestRun 'volumeScan'; Invoke-ToolSteps -Run $r | Should -Be 'Done'

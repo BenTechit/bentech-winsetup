@@ -47,27 +47,50 @@
 # spec 6.1; ToolChecks.ps1). Neither has a servicing step: read-only actions run with a restart pending (spec 5).
 # The Health check reads the disk state (volumeState, Get-Volume); volumeScan (Repair-Volume -Scan, which can fix
 # online) is Standard repair's and Post-clone's (ruling RD-R12; Task 6 adds those actions).
+#
+# Task 6: standard (spec 6.2: the kit's order), postClone (spec 6.3: standard's five, then the post-clone steps; devices
+# and activation are the Health check's own steps) and dismSource (the DISM retry with the local source the technician
+# picked from the offer, then SFC; builder check 6), in ToolRepairs.ps1. Their servicing steps (dism, sfc,
+# componentCleanup, dismSource) are re-checked for a pending servicing restart first (spec 5).
 $script:ToolActionCatalog = [ordered]@{
-  safety = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
-              Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck') }
-  health = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
-              Steps = [string[]]@('volumeState', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
+  safety     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
+                  Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck') }
+  health     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
+                  Steps = [string[]]@('volumeState', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
+  standard   = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
+                  Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix') }
+  postClone  = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
+                  Steps = [string[]]@('timeSync', 'volumeScan', 'dism', 'sfc', 'winreFix', 'pnpScan', 'devices', 'oemLeftovers', 'pageFile', 'trim',
+                                      'activation', 'componentCleanup', 'wuScan') }
+  dismSource = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
+                  Steps = [string[]]@('dismSource', 'sfc') }
 }
 $script:ToolSteps = @{
-  safetyRestart   = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
-  safetyFree      = @{ Function = 'Invoke-ToolStepSafetyFree'; Servicing = $false }
-  safetyBitLocker = @{ Function = 'Invoke-ToolStepSafetyBitLocker'; Servicing = $false }
-  safetyInternet  = @{ Function = 'Invoke-ToolStepSafetyInternet'; Servicing = $false }
-  safetyDisk      = @{ Function = 'Invoke-ToolStepSafetyDisk'; Servicing = $false }
-  safetyDiskCheck = @{ Function = 'Invoke-ToolStepSafetyDiskCheck'; Servicing = $false }
-  volumeState     = @{ Function = 'Invoke-ToolStepVolumeState'; Servicing = $false }
-  volumeScan      = @{ Function = 'Invoke-ToolStepVolumeScan'; Servicing = $false }
-  imageCheck      = @{ Function = 'Invoke-ToolStepImageCheck'; Servicing = $false }
-  imageScan       = @{ Function = 'Invoke-ToolStepImageScan'; Servicing = $false }
-  sfcVerify       = @{ Function = 'Invoke-ToolStepSfcVerify'; Servicing = $false }
-  winre           = @{ Function = 'Invoke-ToolStepWinre'; Servicing = $false }
-  devices         = @{ Function = 'Invoke-ToolStepDevices'; Servicing = $false }
-  activation      = @{ Function = 'Invoke-ToolStepActivation'; Servicing = $false }
+  safetyRestart    = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
+  safetyFree       = @{ Function = 'Invoke-ToolStepSafetyFree'; Servicing = $false }
+  safetyBitLocker  = @{ Function = 'Invoke-ToolStepSafetyBitLocker'; Servicing = $false }
+  safetyInternet   = @{ Function = 'Invoke-ToolStepSafetyInternet'; Servicing = $false }
+  safetyDisk       = @{ Function = 'Invoke-ToolStepSafetyDisk'; Servicing = $false }
+  safetyDiskCheck  = @{ Function = 'Invoke-ToolStepSafetyDiskCheck'; Servicing = $false }
+  volumeState      = @{ Function = 'Invoke-ToolStepVolumeState'; Servicing = $false }
+  volumeScan       = @{ Function = 'Invoke-ToolStepVolumeScan'; Servicing = $false }
+  imageCheck       = @{ Function = 'Invoke-ToolStepImageCheck'; Servicing = $false }
+  imageScan        = @{ Function = 'Invoke-ToolStepImageScan'; Servicing = $false }
+  sfcVerify        = @{ Function = 'Invoke-ToolStepSfcVerify'; Servicing = $false }
+  winre            = @{ Function = 'Invoke-ToolStepWinre'; Servicing = $false }
+  devices          = @{ Function = 'Invoke-ToolStepDevices'; Servicing = $false }
+  activation       = @{ Function = 'Invoke-ToolStepActivation'; Servicing = $false }
+  timeSync         = @{ Function = 'Invoke-ToolStepTimeSync'; Servicing = $false }
+  dism             = @{ Function = 'Invoke-ToolStepDism'; Servicing = $true }
+  sfc              = @{ Function = 'Invoke-ToolStepSfc'; Servicing = $true }
+  winreFix         = @{ Function = 'Invoke-ToolStepWinreFix'; Servicing = $false }
+  pnpScan          = @{ Function = 'Invoke-ToolStepPnpScan'; Servicing = $false }
+  oemLeftovers     = @{ Function = 'Invoke-ToolStepOemLeftovers'; Servicing = $false }
+  pageFile         = @{ Function = 'Invoke-ToolStepPageFile'; Servicing = $false }
+  trim             = @{ Function = 'Invoke-ToolStepTrim'; Servicing = $false }
+  componentCleanup = @{ Function = 'Invoke-ToolStepComponentCleanup'; Servicing = $true }
+  wuScan           = @{ Function = 'Invoke-ToolStepWuScan'; Servicing = $false }
+  dismSource       = @{ Function = 'Invoke-ToolStepDismSource'; Servicing = $true }
 }
 
 # A failed progress write, or a failed tick, is logged once per run (New-ToolRun resets both).

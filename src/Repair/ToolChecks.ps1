@@ -43,14 +43,18 @@ try {
 @{ HealthStatus = $raw['HealthStatus'].Value; OperationalStatus = @(foreach ($code in @($raw['OperationalStatus'].Value)) { [int]$code }); Dirty = $dirty }
 '@
 
-# Volume.RepairStatus (Storage\Volume.cdxml) -> the Standard repair verdict (ruling RD-R12). A name that is not
-# here is Unknown (yellow). tests\ToolChecks.Tests.ps1 checks every name against the installed Volume.cdxml.
+# Volume.RepairStatus (Storage\Volume.cdxml) -> the Standard repair verdict (rulings RD-R12, RD-R13). A name that is
+# not here is Unknown (yellow). tests\ToolChecks.Tests.ps1 checks every name against the installed Volume.cdxml.
+# RD-R13: errors fixed online that still need a spot fix are a spot fix (red, with the Disk-check offer), and a scan
+# that asks to be run again is NeedsRetry (yellow, "run the scan again").
 $script:ToolRepairStatusMap = @{
-  NoErrorsFound                 = 'Clean'
-  ScanNoErrorsFound             = 'Clean'
-  ScanErrorsFoundAndFixedOnline = 'FixedOnline'
-  ScanErrorsFoundNeedSpotFix    = 'SpotFixNeeded'
-  NeedOfflineScanAndFix         = 'FullRepairNeeded'
+  NoErrorsFound                        = 'Clean'
+  ScanNoErrorsFound                    = 'Clean'
+  ScanErrorsFoundAndFixedOnline        = 'FixedOnline'
+  ScanErrorsFoundNeedSpotFix           = 'SpotFixNeeded'
+  ScanErrorsFixedOnlineAlsoNeedSpotFix = 'SpotFixNeeded'
+  NeedOfflineScanAndFix                = 'FullRepairNeeded'
+  ScanNeedsRetry                       = 'NeedsRetry'
 }
 
 # Volume.HealthStatus and the three repair codes of Volume.OperationalStatus (Storage\Volume.cdxml; the test checks
@@ -164,8 +168,8 @@ function Get-ToolSystemLetter {
 function ConvertFrom-ToolRepairStatus {
   <#
   .SYNOPSIS
-    Repair-Volume -Scan's Volume.RepairStatus name -> 'Clean', 'FixedOnline', 'SpotFixNeeded', 'FullRepairNeeded', or
-    'Unknown' for any other name (ruling RD-R12, $script:ToolRepairStatusMap). Pure.
+    Repair-Volume -Scan's Volume.RepairStatus name -> 'Clean', 'FixedOnline', 'SpotFixNeeded', 'FullRepairNeeded',
+    'NeedsRetry', or 'Unknown' for any other name (rulings RD-R12, RD-R13; $script:ToolRepairStatusMap). Pure.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -551,6 +555,23 @@ function Get-ToolBcdState {
   return @{ Recovery = $recovery; SafeBoot = $safeBoot }
 }
 
+function Get-ToolWinReState {
+  <#
+  .SYNOPSIS
+    WinRE now: the BCD (Get-ToolBcdState) with ReAgent.xml as support (Get-ToolReAgentState), and their verdict
+    (Resolve-WinReVerdict): @{ Bcd; ReAgent; Verdict; CanEnable; SafeBoot }. Read-only; never throws. The Health
+    check's winre step reports it; Standard repair's winreFix acts on it (spec 6.1, 6.2.5).
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  $bcd = Get-ToolBcdState -Run $Run
+  $agent = Get-ToolReAgentState
+  $verdict = Resolve-WinReVerdict -Bcd $bcd.Recovery -ReAgent $agent
+  return @{ Bcd = [string]$bcd.Recovery; ReAgent = [string]$agent; Verdict = [string]$verdict.Verdict; CanEnable = [bool]$verdict.CanEnable; SafeBoot = $bcd.SafeBoot }
+}
+
 function Resolve-WinReVerdict {
   <#
   .SYNOPSIS
@@ -704,10 +725,11 @@ function Invoke-ToolStepVolumeScan {
     Volume.RepairStatus name, or 'Unknown'); Verdict (ConvertFrom-ToolRepairStatus) }.
   .DESCRIPTION
     Clean (NoErrorsFound, ScanNoErrorsFound): done. FixedOnline (ScanErrorsFoundAndFixedOnline): INFO
-    volumeFixedOnline. SpotFixNeeded (ScanErrorsFoundNeedSpotFix): CRIT volumeSpotFix. FullRepairNeeded
-    (NeedOfflineScanAndFix): CRIT volumeFullRepair. Both CRITs offer "Disk check at restart" ($Run.Offers.DiskCheck).
-    Any other status, or no result: WARN volumeUnknown with the status or the reason ('timedout' when the scan timed
-    out).
+    volumeFixedOnline. SpotFixNeeded (ScanErrorsFoundNeedSpotFix, and ScanErrorsFixedOnlineAlsoNeedSpotFix by ruling
+    RD-R13): CRIT volumeSpotFix. FullRepairNeeded (NeedOfflineScanAndFix): CRIT volumeFullRepair. Both CRITs offer
+    "Disk check at restart" ($Run.Offers.DiskCheck). NeedsRetry (ScanNeedsRetry, RD-R13): WARN volumeScanRetry (run
+    the scan again). Any other status, or no result: WARN volumeUnknown with the status or the reason ('timedout'
+    when the scan timed out).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -731,6 +753,10 @@ function Invoke-ToolStepVolumeScan {
     'FullRepairNeeded' {
       Add-ToolFinding -Run $Run -Level CRIT -Code 'volumeFullRepair'
       $Run.Offers['DiskCheck'] = $true
+      return 'warn'
+    }
+    'NeedsRetry' {
+      Add-ToolFinding -Run $Run -Level WARN -Code 'volumeScanRetry'
       return 'warn'
     }
   }
@@ -857,8 +883,8 @@ function Invoke-ToolStepSfcVerify {
 function Invoke-ToolStepWinre {
   <#
   .SYNOPSIS
-    Step winre (read-only): WinRE from the BCD (Get-ToolBcdState) with ReAgent.xml as support (Get-ToolReAgentState),
-    Resolve-WinReVerdict. $Run.Data.WinRe = @{ Bcd; ReAgent; Verdict; CanEnable; SafeBoot }.
+    Step winre (read-only): WinRE from the BCD with ReAgent.xml as support (Get-ToolWinReState). $Run.Data.WinRe =
+    @{ Bcd; ReAgent; Verdict; CanEnable; SafeBoot }.
   .DESCRIPTION
     On: done. Off: WARN winreOff. The BCD could not be read: WARN winreUnreadable with the reason (ruling RD-R10).
     The BCD and ReAgent.xml disagree: WARN winreUnknown. Nothing is changed; reagentc never runs here.
@@ -867,16 +893,14 @@ function Invoke-ToolStepWinre {
   [OutputType([string])]
   param([Parameter(Mandatory)][hashtable]$Run)
 
-  $bcd = Get-ToolBcdState -Run $Run
-  $agent = Get-ToolReAgentState
-  $verdict = Resolve-WinReVerdict -Bcd $bcd.Recovery -ReAgent $agent
-  $Run.Data['WinRe'] = @{ Bcd = $bcd.Recovery; ReAgent = $agent; Verdict = $verdict.Verdict; CanEnable = [bool]$verdict.CanEnable; SafeBoot = $bcd.SafeBoot }
-  Add-ToolLog -Run $Run -Text ('WinRE: boot configuration {0}, ReAgent.xml {1}: {2}' -f $bcd.Recovery, $agent, $verdict.Verdict)
-  if ($bcd.Recovery -ceq 'Unknown') {
+  $state = Get-ToolWinReState -Run $Run
+  $Run.Data['WinRe'] = $state
+  Add-ToolLog -Run $Run -Text ('WinRE: boot configuration {0}, ReAgent.xml {1}: {2}' -f $state.Bcd, $state.ReAgent, $state.Verdict)
+  if ($state.Bcd -ceq 'Unknown') {
     Add-ToolFinding -Run $Run -Level WARN -Code 'winreUnreadable' -Arguments @(Get-ToolCheckError -Run $Run -Name 'bcd')
     return 'warn'
   }
-  switch -CaseSensitive ($verdict.Verdict) {
+  switch -CaseSensitive ($state.Verdict) {
     'On' { return 'done' }
     'Off' {
       Add-ToolFinding -Run $Run -Level WARN -Code 'winreOff'
