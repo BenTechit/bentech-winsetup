@@ -1,8 +1,13 @@
 ﻿# src/Steps/WindowsUpdate.ps1
 # Step 13 (spec 8.3, 13): the bounded Windows Update loop over the native Windows Update Agent (WUA)
 # COM API. Needs StepResult.ps1, Logging.ps1, Process.ps1 (Invoke-External), State.ps1 (Read-RunState,
-# Save-RunState), Activity.ps1 (Read-FileTail, Set-SetupNow, Add-SetupActivity, Wait-SetupDelay) and
-# StartScreen.ps1 (ConvertTo-ScreenText); the bundle holds every file.
+# Save-RunState), Activity.ps1 (Read-FileTail, Set-SetupNow, Add-SetupActivity, Wait-SetupDelay),
+# StartScreen.ps1 (ConvertTo-ScreenText) and Catalog.ps1 (Get-WindowsUpdateChoice); the bundle holds every file.
+#
+# Wu spec 3.2: Choices.WindowsUpdate DRIVERS makes every round search Type='Driver' only (Invoke-WuRound
+# -Scope DRIVERS; the -WuRound entry reads the choice from state.json). Everything else stays as in FULL, except
+# that DRIVERS round 1 counts the optional drivers for setup.log at the end of the round, after it has written its
+# result (rulings WU-R1, WU-R3, WU-R5).
 #
 # Two halves:
 # - The parent step, Invoke-StepWindowsUpdate, runs in the runner. Each call is ONE round: it bumps
@@ -137,14 +142,21 @@ function Get-WuSearchCriteria {
   <#
   .SYNOPSIS
     The WUA search criteria for one update type: not installed, not hidden, not optional (BrowseOnly=0).
+  .DESCRIPTION
+    -Optional asks for the optional updates instead (BrowseOnly=1). Wu spec 3.2: DRIVERS round 1 counts the
+    optional drivers with it; they are never installed.
   #>
   [CmdletBinding()]
   [OutputType([string])]
-  param([Parameter(Mandatory)][ValidateSet('Software', 'Driver')][string]$Type)
+  param(
+    [Parameter(Mandatory)][ValidateSet('Software', 'Driver')][string]$Type,
+    [switch]$Optional
+  )
 
   # ValidateSet ignores case; the criteria always get the canonical spelling.
   $canonical = if ($Type -eq 'Driver') { 'Driver' } else { 'Software' }
-  return "IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and Type='$canonical'"
+  $browseOnly = if ($Optional) { 1 } else { 0 }
+  return "IsInstalled=0 and IsHidden=0 and BrowseOnly=$browseOnly and Type='$canonical'"
 }
 
 function ConvertTo-WuUpdateInfo {
@@ -612,7 +624,7 @@ function Update-WuProgress {
     Private. Updates the round's progress (spec 4.5) and writes it to Path. Never throws.
   .DESCRIPTION
     Progress is the ordered dictionary Invoke-WuRound keeps:
-      { Round; Mode 'OneAtATime'|'Batch'; Phase 'searching'|'downloading'|'installing'|'done';
+      { Round; Mode 'OneAtATime'|'Batch'; Phase 'searching'|'downloading'|'installing'|'counting'|'done';
         Current (1-based, 0 = none); Total; Updates [ { Kb; Title; SizeMB; Status } ]; UpdatedAt }
     Status is 'pending', 'downloading', 'installing', 'installed', 'failed' or 'skipped' (not attempted:
     the loop stopped at a round-ending code). -Phase and -Current are set when given; -Index (0-based,
@@ -818,6 +830,8 @@ function Invoke-WuRound {
        given: spec 9.2). Each driver update found is logged at INFO with its driverClass. Skipped
        updates are logged (WARN); deferred ones (firmware on battery) are logged at INFO and counted
        in FirmwareDeferred: they are neither installed nor failed.
+       -Scope DRIVERS (wu spec 3.2) searches Driver only; every later rule is the same as in FULL. Round 1
+       also counts the optional drivers, at the very end of the round (step 10).
     5. Hides the Hide set (they failed FailuresBeforeHide times; the parent reports them in red). Each
        hide is tried on its own (ruling R24b): one that throws (a mandatory update cannot be hidden)
        is logged with its code and listed in HideFailed, and the round goes on.
@@ -828,6 +842,20 @@ function Invoke-WuRound {
        (failed), 5 (aborted) and anything else are Failed with their code.
     9. RebootRequired = the install result's RebootRequired or Microsoft.Update.SystemInfo's. SystemInfo
        is read after the round in its own try/catch, on the exception path too (ruling R24a).
+    10. -Scope DRIVERS, round 1 only (ruling WU-R1: once per run), and only when the round ended without an
+       exception: one more search, Get-WuSearchCriteria -Type Driver -Optional. It runs last (rulings WU-R3 and
+       WU-R5), after the installs, the progress file's Phase 'done', SystemInfo and the written result (with
+       its 'Windows Update round result written' line), so a count search that hangs can only cost time (it
+       still runs into the round's deadline), never the round's drivers or its result: the parent reads a
+       result that was written before a timeout. While it runs the progress file's Phase is 'counting' (the
+       NOW area shows "Counting optional drivers"), and 'done' again when it ends. In its own try: INFO
+       'Optional driver updates skipped' with @{ round; count; titles; seconds } (at most the first 20
+       titles, each through ConvertTo-ScreenText; seconds is how long the search took), or on a throw WARN
+       'Optional driver updates could not be counted' with @{ round; errorCode; error (through
+       ConvertTo-ScreenText); seconds }; either way the result (already written) is the same. The optional
+       updates are never converted, added to Found or the result, selected, hidden or installed. A round that ended in an
+       exception skips the count (the agent just failed, and the count is only a diagnostic), so that run logs
+       none. FULL runs no such search.
     Any exception ends the round: its message is Error, and whatever was already done stays listed.
     ErrorCode (ruling R23) is the numeric HRESULT as '0x' + 8 hex digits, so the parent never depends
     on localized text: an exception's code (Get-WuExceptionErrorCode); otherwise, when the install
@@ -837,7 +865,9 @@ function Invoke-WuRound {
 
     -SearchOnly (smoke test only, WhatIf-style): changes nothing on the machine. It does not register
     Microsoft Update (it is an Error when it is not registered), does not un-hide, hide, download or
-    install; it searches, writes the Install selection as Installed, and reads SystemInfo.
+    install; it searches, writes the Install selection as Installed, and reads SystemInfo. With -Scope
+    DRIVERS in round 1 it also counts the optional drivers (step 10, read-only), at the same place: after
+    its selection, the one thing it does in place of the installs, and after the result is written.
 
     -OnAC (spec 9.2): whether the machine is on mains power; the -WuRound entry reads it at the start
     of the round. On battery, firmware driver updates are deferred.
@@ -851,13 +881,17 @@ function Invoke-WuRound {
     exception's own code is ErrorCode as for any exception. 'Batch' is v1's one download and one
     install. The hide, EULA and SearchOnly paths are the same in both modes.
 
+    -Scope (wu spec 3.2): 'FULL' (the default: software and drivers) or 'DRIVERS' (drivers only, see step 4).
+    The -WuRound entry passes Get-WindowsUpdateChoice of the state's Choices.
+
     Progress (spec 4.5): <ResultPath without .json>.progress.json (Get-WuProgressPath), written by
     Update-WuProgress and read by the parent's NOW on every tick: Phase 'searching' once the state is
     read; after the selection, Total and Updates (the Install set, all 'pending'; deferred firmware is
     never listed); Batch: Phase 'downloading' / 'installing' around the two batch calls and each
     update's final status from its code; OneAtATime: Invoke-WuInstallEach keeps Phase, Current and the
-    statuses; Phase 'done' in a finally, also after an exception. The result's folder is created first,
-    so the progress file can be written from the start. A progress file that cannot be written never
+    statuses; Phase 'done' in a finally, also after an exception (DRIVERS round 1 then sets 'counting'
+    while it counts the optional drivers, step 10, and 'done' again after). The result's folder is created
+    first, so the progress file can be written from the start. A progress file that cannot be written never
     breaks the round.
   #>
   [CmdletBinding()]
@@ -868,7 +902,8 @@ function Invoke-WuRound {
     [Parameter(Mandatory)][bool]$IsWindows10,
     [switch]$SearchOnly,
     [bool]$OnAC = $true,
-    [ValidateSet('OneAtATime', 'Batch')][string]$InstallMode = 'OneAtATime'
+    [ValidateSet('OneAtATime', 'Batch')][string]$InstallMode = 'OneAtATime',
+    [ValidateSet('FULL', 'DRIVERS')][string]$Scope = 'FULL'
   )
 
   $installed = New-Object 'System.Collections.Generic.List[object]'
@@ -888,6 +923,9 @@ function Invoke-WuRound {
   $eachOutcome = @{ RebootRequired = $false; ErrorCode = $null }
   # Final review C1: $true once this round un-hid the previous run's updates; the parent books it.
   $previousUnhideDone = $false
+  # Set inside the try; the optional-driver count at the end (step 10) needs both and checks them.
+  $round = 0
+  $session = $null
 
   $progressPath = Get-WuProgressPath -ResultPath $ResultPath
   $progress = [ordered]@{ Round = 0; Mode = $InstallMode; Phase = 'searching'; Current = 0; Total = 0; Updates = @(); UpdatedAt = $null }
@@ -902,7 +940,7 @@ function Invoke-WuRound {
     if ($failureCounts -isnot [System.Collections.IDictionary]) { $failureCounts = @{} }
     $previousHidden = @(ConvertTo-WuList -Value $state['PreviousHiddenUpdateIds'] | ForEach-Object { [string]$_ } | Where-Object { $_ })
     $round = Get-WuRoundNumber -State $state
-    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10; onAC = $OnAC; installMode = $InstallMode }
+    Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; searchOnly = [bool]$SearchOnly; failuresBeforeHide = $FailuresBeforeHide; isWindows10 = $IsWindows10; onAC = $OnAC; installMode = $InstallMode; scope = $Scope }
     $progress['Round'] = $round
     Update-WuProgress -Path $progressPath -Progress $progress -Phase 'searching'
 
@@ -924,7 +962,9 @@ function Invoke-WuRound {
 
     # Id -> IUpdate, so the selection (info objects) can be mapped back to the COM objects.
     $byId = @{}
-    foreach ($type in 'Software', 'Driver') {
+    # Wu spec 3.2: DRIVERS searches Type='Driver' only; FULL searches software, then drivers.
+    $searchTypes = if ($Scope -eq 'DRIVERS') { @('Driver') } else { @('Software', 'Driver') }
+    foreach ($type in $searchTypes) {
       foreach ($update in @(Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type $type))) {
         if ($null -eq $update) { continue }
         $info = ConvertTo-WuUpdateInfo -Update $update -Type $type
@@ -1061,6 +1101,9 @@ function Invoke-WuRound {
     Write-SetupLog -Message 'Windows Update restart flag could not be read' -Level WARN -Data @{ errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = $_.Exception.Message }
   }
 
+  # Ruling WU-R5: the result is written before the optional-driver count (step 10), so a count that hangs into the
+  # round's deadline leaves a result the parent still books (Invoke-StepWindowsUpdate reads it after a timeout).
+  # Nothing in the result depends on the count.
   $result = [ordered]@{
     Installed          = $installed.ToArray()
     Failed             = $failed.ToArray()
@@ -1076,6 +1119,28 @@ function Invoke-WuRound {
   }
   Write-WuRoundResult -Path $ResultPath -Result $result
   Write-SetupLog -Message 'Windows Update round result written' -Data @{ path = $ResultPath; installed = $installed.Count; failed = $failed.Count; hidden = $hidden.Count; hideFailed = $hideFailed.Count; firmwareDeferred = $firmwareDeferred; rebootRequired = $rebootRequired; error = $errorText; errorCode = $errorCode }
+
+  # Step 10 (wu spec 3.2, rulings WU-R1, WU-R3 and WU-R5): DRIVERS round 1 counts the optional drivers (BrowseOnly=1)
+  # for setup.log, so Ben can decide from real runs whether DRIVERS should take them. Last, after the round's
+  # installs and after its result is written, so a search that hangs can only cost time (up to the round's
+  # deadline), never the drivers or the round's result. Read-only and log-only: they are never converted, added to
+  # Found or the result, selected, hidden or installed; a failed count changes nothing.
+  # Skipped after an exception: the agent just failed, and the count is only a diagnostic. While it runs the
+  # progress Phase is 'counting' (the NOW area says so instead of "Round finished"), 'done' again after it.
+  if ($Scope -eq 'DRIVERS' -and $round -eq 1 -and $null -eq $errorText -and $null -ne $session) {
+    # The NOW area reads the progress file: say the count is running (the file was 'done' since the finally).
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'counting'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $optional = @(ConvertTo-WuList -Value (Search-WuUpdates -Session $session -Criteria (Get-WuSearchCriteria -Type Driver -Optional)))
+      $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+      $titles = [string[]]@($optional | Select-Object -First 20 | ForEach-Object { ConvertTo-ScreenText ([string]$_.Title) })
+      Write-SetupLog -Message 'Optional driver updates skipped' -Data @{ round = $round; count = $optional.Count; titles = $titles; seconds = $seconds }
+    } catch {
+      Write-SetupLog -Message 'Optional driver updates could not be counted' -Level WARN -Data @{ round = $round; errorCode = (Get-WuExceptionErrorCode -Exception $_.Exception); error = (ConvertTo-ScreenText $_.Exception.Message); seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1) }
+    }
+    Update-WuProgress -Path $progressPath -Progress $progress -Phase 'done'
+  }
 }
 
 # --- the parent step --------------------------------------------------------------------------
@@ -1129,7 +1194,8 @@ function Get-WuProgressLines {
     real one. The phase line:
       OneAtATime  'Downloading <Current> of <Total>' / 'Installing <Current> of <Total>'
       Batch       'Downloading <Total> updates' / 'Installing <Total> updates'
-      'Searching for updates' / 'Round finished' (either mode)
+      'Searching for updates' / 'Counting optional drivers' / 'Round finished' (either mode)
+    'Counting optional drivers' is DRIVERS round 1's optional-driver count (it runs after the installs).
     An unknown phase has no phase line; the updates are still listed.
   #>
   [CmdletBinding()]
@@ -1151,6 +1217,7 @@ function Get-WuProgressLines {
       'searching' { $lines.Add('Searching for updates') }
       'downloading' { $lines.Add($(if ($oneAtATime) { "Downloading $current of $total" } else { "Downloading $total updates" })) }
       'installing' { $lines.Add($(if ($oneAtATime) { "Installing $current of $total" } else { "Installing $total updates" })) }
+      'counting' { $lines.Add('Counting optional drivers') }
       'done' { $lines.Add('Round finished') }
     }
     foreach ($update in @(ConvertTo-WuList -Value $progress.Updates)) {
@@ -1359,9 +1426,14 @@ function Invoke-StepWindowsUpdate {
        file), then runs
        "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass
        -File "<ScriptPath>" -WuRound -ResultPath "<Logs>\wu-round<N>.json" with timeoutsMinutes.wuRound
-       (the whole process tree is killed on timeout). Timeout -> Failed('Windows Update round timed
-       out'); a child that cannot start -> Failed('Windows Update round could not be started: ...').
-    4. No readable result JSON -> Failed('Windows Update round produced no result').
+       (the whole process tree is killed on timeout). A child that cannot start -> Failed('Windows Update
+       round could not be started: ...').
+    4. Reads the result JSON (Read-WuRoundResult). On a timeout (ruling WU-R5): a readable result was
+       written by this round (the old file was removed in 3, and the child writes it only at the end of its
+       round, before DRIVERS round 1's optional-driver count), so WARN 'Windows Update round timed out after
+       its result was written' @{ round; path } and go on exactly as below; none, or one that cannot be read
+       -> Failed('Windows Update round timed out'). Without a timeout, no readable result JSON ->
+       Failed('Windows Update round produced no result').
     5. Books the result into the state (Update-WuRunState), even when it carries an Error, so an update
        the round hid before failing is still reported. On a round with one of the three mapped codes
        below, failed updates get their FailedTitles entry but NOT a WuFailureCounts increment (ruling
@@ -1380,6 +1452,11 @@ function Invoke-StepWindowsUpdate {
     8. Get-WuRoundOutcome: Done -> Done('Installed <total> updates in <rounds> rounds'), with the Note
        'Some Windows updates failed: <up to 3 titles>' when the round still listed failed updates
        (ruling R24d); Continue -> Continue, Reboot 'Now' when RebootRequired.
+    Wu spec 3.2, 3.3: Choices.WindowsUpdate (Get-WindowsUpdateChoice; missing or invalid is FULL) is logged as
+    the scope of every round. With DRIVERS, round 1 writes the activity line 'Windows Update: drivers only
+    (other updates left to Windows)' after step 2 (before NOW, the child and that round's own line), and Done's
+    message is 'Drivers only: installed <total> updates in <rounds> rounds'. The child reads the same choice
+    from state.json; everything else here is the same in both scopes.
     Spec 9.2: a round whose FirmwareDeferred is above 0 (firmware left alone on battery) carries the
     Note $script:WuBatteryNote on its Continue or Done result. Deferred updates are neither installed
     nor failed, so they never keep the loop going; the verdict shows the Note once (exact match, M1).
@@ -1396,6 +1473,9 @@ function Invoke-StepWindowsUpdate {
 
   $state = $Context.State
   $data = Get-WuStepData -State $state
+  # Wu spec 3.2: the child reads the same choice from state.json (Invoke-SetupWuRoundProcess).
+  $scope = Get-WindowsUpdateChoice -Choices $state['Choices']
+  $driversOnly = ($scope -eq 'DRIVERS')
   $cap = [int]$Context.Config.caps.maxWuRounds
   $round = [int]$data['Rounds'] + 1
   $data['Rounds'] = $round
@@ -1405,13 +1485,15 @@ function Invoke-StepWindowsUpdate {
   }
 
   Save-RunState -State $state -Root $Context.Root
+  # Wu plan call 4: said once, in round 1, before the child starts and before that round's own line.
+  if ($round -eq 1 -and $driversOnly) { Add-SetupActivity -Text 'Windows Update: drivers only (other updates left to Windows)' }
 
   $resultPath = Join-Path $Context.LogDir "wu-round$round.json"
   $progressPath = Get-WuProgressPath -ResultPath $resultPath
   $exe = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
   $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -WuRound -ResultPath "{1}"' -f $Context.ScriptPath, $resultPath
   $timeout = [double]$Context.Config.timeoutsMinutes.wuRound
-  Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; cap = $cap; resultPath = $resultPath }
+  Write-SetupLog -Message 'Windows Update round starting' -Data @{ round = $round; cap = $cap; resultPath = $resultPath; scope = $scope }
   try {
     if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force -ErrorAction Stop }
     # A stale progress file (Logs survive earlier runs) would show an old round on screen. It is display
@@ -1427,12 +1509,15 @@ function Invoke-StepWindowsUpdate {
     Write-SetupLog -Message 'Windows Update round could not be started' -Level ERROR -Data @{ round = $round; error = $_.Exception.Message }
     return New-StepResult -Status Failed -Message "Windows Update round could not be started: $($_.Exception.Message)" -Data (Get-WuResultData -Data $data)
   }
-  if ($run.TimedOut) {
-    return New-StepResult -Status Failed -Message 'Windows Update round timed out' -Data (Get-WuResultData -Data $data)
-  }
-
   $result = Read-WuRoundResult -Path $resultPath
-  if ($null -eq $result) {
+  if ($run.TimedOut) {
+    # Ruling WU-R5: the old result file was deleted above and the child writes its result only at the end of its round
+    # (before DRIVERS round 1's optional-driver count), so a readable one is this round's: book it like any round.
+    if ($null -eq $result) {
+      return New-StepResult -Status Failed -Message 'Windows Update round timed out' -Data (Get-WuResultData -Data $data)
+    }
+    Write-SetupLog -Message 'Windows Update round timed out after its result was written' -Level WARN -Data @{ round = $round; path = $resultPath }
+  } elseif ($null -eq $result) {
     Write-SetupLog -Message 'Windows Update round produced no result' -Level ERROR -Data @{ round = $round; exitCode = $run.ExitCode; path = $resultPath }
     return New-StepResult -Status Failed -Message 'Windows Update round produced no result' -Data (Get-WuResultData -Data $data)
   }
@@ -1486,7 +1571,10 @@ function Invoke-StepWindowsUpdate {
     $notes = @()
     if ($failedItems.Count -gt 0) { $notes = @(Format-WuFailedNote -Failed $failedItems) }
     $notes = @($notes) + $batteryNotes
-    return New-StepResult -Status Done -Message "Installed $([int]$data['Installed']) updates in $round rounds" -Notes $notes -Data (Get-WuResultData -Data $data)
+    # Wu plan call 3: the DRIVERS Done message says so; Continue and Failed messages are the same in both scopes.
+    $doneMessage = "Installed $([int]$data['Installed']) updates in $round rounds"
+    if ($driversOnly) { $doneMessage = "Drivers only: installed $([int]$data['Installed']) updates in $round rounds" }
+    return New-StepResult -Status Done -Message $doneMessage -Notes $notes -Data (Get-WuResultData -Data $data)
   }
   $reboot = if ($rebootNow) { 'Now' } else { 'None' }
   $message = "Windows Update round ${round}: $installedNow installed, $failedNow failed"

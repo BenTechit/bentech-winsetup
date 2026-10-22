@@ -99,6 +99,9 @@ Describe 'config.json' {
       'home|Home PC|CRAFT|ANYDESK|True|True|catalog', 'business|Business PC|BUSINESS|BOTH|True|True|catalog', 'clean|Clean Windows|OFF|ANYDESK|False|True|tweaks=')
     @($cfg.profiles.name.he) | Should -Be @('מחשב ביתי', 'מחשב עסקי', 'Windows נקי')   # also proves Read-SetupConfig reads UTF-8
   }
+  It 'pins defaults.windowsUpdate FULL; no shipped profile sets windowsUpdate (wu spec 3.1, Q37)' {
+    $cfg.defaults.windowsUpdate | Should -BeExactly 'FULL'
+    @($cfg.profiles | Where-Object { $null -ne $_.PSObject.Properties['windowsUpdate'] }).Count | Should -Be 0 }
   It 'lists the nine shipped tweaks with their defaults and rules (spec 6.3, Q27: file extensions off everywhere)' {
     @($cfg.tweaks | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.id, $_.default, [bool]$_.desktopOnly, [bool]$_.office365Only, [int]$_.minBuild }) | Should -Be @(
       'accessKeys|True|False|False|0', 'numLock|True|True|False|0', 'startClean|True|False|False|0', 'noAds|True|False|False|0',

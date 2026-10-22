@@ -11,7 +11,8 @@
 #
 # step.<id> names every step of the catalog (Engine\Catalog.ps1) for the window's "What will happen" column
 # (ruling TB-R5): the English one is exactly the catalog's Title (tests\Toolbox.Tests.ps1 pins it); the console,
-# setup.log and the report keep reading the catalog's English titles.
+# setup.log and the report keep reading the catalog's English titles. step.windows-update.drivers is no catalog id:
+# it names the windows-update step when the UPDATES row is on Drivers only (wu spec 3.1).
 $script:ToolboxStrings = @{
   en = @{
     'app.title'             = 'BENTECH TOOLBOX'
@@ -31,6 +32,7 @@ $script:ToolboxStrings = @{
     'row.type'              = 'TYPE'
     'row.office'            = 'OFFICE'
     'row.remote'            = 'REMOTE'
+    'row.updates'           = 'UPDATES'
     'row.apps'              = 'APPS'
     'row.tweaks'            = 'TWEAKS'
     'row.restore'           = 'RESTORE'
@@ -43,6 +45,8 @@ $script:ToolboxStrings = @{
     'remote.anydesk'        = 'AnyDesk'
     'remote.screenconnect'  = 'ScreenConnect'
     'remote.both'           = 'Both'
+    'updates.full'          = 'Full updates'
+    'updates.drivers'       = 'Drivers only'
     'apps.chrome'           = 'Chrome (always)'
     'apps.sevenZip'         = '7-Zip'
     'restore.label'         = 'Restore point at the end'
@@ -66,6 +70,7 @@ $script:ToolboxStrings = @{
     'step.vendor-pass1'     = 'Vendor drivers + BIOS (pass 1)'
     'step.office'           = 'Microsoft 365'
     'step.windows-update'   = 'Windows Update'
+    'step.windows-update.drivers' = 'Windows Update (drivers only)'
     'step.office-finish'    = 'Microsoft 365 (finish)'
     'step.vendor-pass2'     = 'Vendor drivers + BIOS (pass 2)'
     'step.consumer-app'     = 'Vendor app'
@@ -90,6 +95,7 @@ $script:ToolboxStrings = @{
     'row.type'              = 'סוג'
     'row.office'            = 'אופיס'
     'row.remote'            = 'גישה מרחוק'
+    'row.updates'           = 'עדכונים'
     'row.apps'              = 'תוכנות'
     'row.tweaks'            = 'שיפורים'
     'row.restore'           = 'שחזור'
@@ -102,6 +108,8 @@ $script:ToolboxStrings = @{
     'remote.anydesk'        = 'AnyDesk'
     'remote.screenconnect'  = 'ScreenConnect'
     'remote.both'           = 'שניהם'
+    'updates.full'          = 'עדכונים מלאים'
+    'updates.drivers'       = 'דרייברים בלבד'
     'apps.chrome'           = 'Chrome (תמיד)'
     'apps.sevenZip'         = '7-Zip'
     'restore.label'         = 'נקודת שחזור בסוף ההתקנה'
@@ -126,6 +134,7 @@ $script:ToolboxStrings = @{
     'step.vendor-pass1'     = 'דרייברי יצרן ו-BIOS (סבב 1)'
     'step.office'           = 'Microsoft 365'
     'step.windows-update'   = 'עדכוני Windows'
+    'step.windows-update.drivers' = 'עדכוני Windows (דרייברים בלבד)'
     'step.office-finish'    = 'Microsoft 365 (סיום)'
     'step.vendor-pass2'     = 'דרייברי יצרן ו-BIOS (סבב 2)'
     'step.consumer-app'     = 'אפליקציית היצרן'

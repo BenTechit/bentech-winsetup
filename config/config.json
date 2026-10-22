@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "defaults": { "sevenZip": true, "office": "CRAFT", "remote": "ANYDESK", "profile": "home" },
+  "defaults": { "sevenZip": true, "office": "CRAFT", "remote": "ANYDESK", "profile": "home", "windowsUpdate": "FULL" },
   "caps": { "maxReboots": 12, "maxWuRounds": 6, "maxStepAttempts": 3, "wuFailuresBeforeHide": 2 },
   "timeoutsMinutes": { "default": 30, "msi": 20, "office": 60, "vendor": 60, "wuRound": 90,
                        "wingetReady": 5, "bitlockerDecrypt": 120, "anydeskId": 2,

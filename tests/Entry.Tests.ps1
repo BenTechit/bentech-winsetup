@@ -22,6 +22,9 @@ BeforeAll {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
+  # The real state functions, kept before BeforeEach mocks them: the -WuRound round-trip test writes a state.json
+  # with Save-RunState and lets the child read it with Read-RunState (final review M2). Both only touch $TestDrive.
+  $script:RealState = @{ New = ${function:New-RunState}; Save = ${function:Save-RunState}; Read = ${function:Read-RunState} }
 
   # Runs the entry point against $TestDrive. The crash screen only records what it was asked to show.
   function Invoke-Entry {
@@ -436,6 +439,27 @@ Describe 'Start-BenTechSetup' {
       Mock Read-SetupConfig { $script:batchCfg }
       Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Out-Null
       Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $InstallMode -eq 'Batch' }
+    }
+    # Wu plan call 1: the child reads the choice from state.json; there is no new command-line switch.
+    It '-WuRound passes the state''s Windows Update choice; none, an invalid one or no state is FULL (Review Focus 1, 3)' -ForEach @(
+      @{ S = { $s = New-FakeState; $s.Choices = @{ WindowsUpdate = 'drivers' }; $s }; E = 'DRIVERS' }, @{ S = { New-FakeState }; E = 'FULL' }
+      @{ S = { $s = New-FakeState; $s.Choices = @{ WindowsUpdate = 'NONE' }; $s }; E = 'FULL' }, @{ S = { $null }; E = 'FULL' }) {
+      $script:wantScope = $E; Mock Read-RunState -MockWith $S; Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $Scope -ceq $script:wantScope }
+    }
+    # Final review M2: the same, end to end. The state is written by the real Save-RunState into $TestDrive and the
+    # child reads it with the real Read-RunState (a hashtable, so Main.ps1's guard passes): DRIVERS survives the
+    # round trip, and a state written without the key reads FULL.
+    It '-WuRound reads the scope from a state.json written by Save-RunState: DRIVERS stays DRIVERS, no key is FULL (final review M2)' -ForEach @(
+      @{ C = @{ Mode = 'LAPTOP'; WindowsUpdate = 'DRIVERS' }; E = 'DRIVERS' }, @{ C = @{ Mode = 'LAPTOP' }; E = 'FULL' }) {
+      $script:wantScope = $E
+      $s = & $script:RealState.New -Machine @{ IsWindows10 = $false } -Choices $C -Plan @('windows-update') -Version 'test'
+      & $script:RealState.Save -State $s -Root $TestDrive
+      Test-Path -LiteralPath (Join-Path $TestDrive 'state.json') | Should -BeTrue
+      Mock Read-RunState { & $script:RealState.Read -Root $Root }
+      Invoke-Entry -WuRound $true -ResultPath "$TestDrive\r.json" | Should -Be 0
+      Should -Invoke Invoke-WuRound -Times 1 -Exactly -ParameterFilter { $Scope -ceq $script:wantScope }
+      Remove-Item -LiteralPath (Join-Path $TestDrive 'state.json') -Force
     }
   }
 

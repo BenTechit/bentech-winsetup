@@ -2,6 +2,7 @@
 
 **Date:** 2026-10-18 · **Owner:** Ben Goldenberg (BENTECH IT) · **Status:** APPROVED by Ben, 18/10/2026. Implementation plan: `docs/superpowers/plans/2026-10-18-bentech-winsetup.md`
 **Working name:** `bentech-winsetup`
+Amended by [2026-10-22-windows-update-option-design.md](2026-10-22-windows-update-option-design.md): Windows Update "drivers only" and the final screen's U key.
 
 ---
 

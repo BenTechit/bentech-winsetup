@@ -238,11 +238,12 @@ Describe 'Format-SetupReport content' {
   It 'starts with the title and lists the header lines in order' {
     $expected = 'BenTech Windows Setup - Report', 'Tool version : ', 'Result       : ', 'Started      : ', 'Finished     : ', 'Duration     : ',
       'Machine      : ', 'PC name      : ', 'Mode         : ', 'Windows      : ', 'Activation   : ', 'BitLocker    : ', 'Smart App Control : ', 'AnyDesk ID   : ', 'ScreenConnect: ',
-      'Profile      : ', 'Tweaks       : ', 'Restore point: '
+      'Profile      : ', 'Tweaks       : ', 'Restore point: ', 'Updates      : '
     for ($i = 0; $i -lt $expected.Count; $i++) { $green[$i] | Should -BeLike ($expected[$i] + '*') }
     $green | Should -Contain 'ScreenConnect: not chosen'   # the state has Choices without Remote: AnyDesk only (spec 4.1)
     # ... and without Profile, Tweaks and RestorePoint (an older state: toolbox spec 5.2)
     $green | Should -Contain 'Profile      : none'; $green | Should -Contain 'Tweaks       : none'; $green | Should -Contain 'Restore point: not chosen'
+    $green | Should -Contain 'Updates      : full'   # ... and without WindowsUpdate (wu spec 3.1)
   }
   It 'shows Smart App Control as given, and Unknown when it was not passed (M8)' {
     $green | Should -Contain 'Smart App Control : Unknown'
@@ -1505,4 +1506,10 @@ Describe 'Format-SetupReport: profile, tweaks, restore point (toolbox spec 5.5)'
       $l = @(Format-SetupReport -State $s -Verdict (Get-RunVerdict -State $s) -Activation 'Activated' -BitLockerText 'Off' -AppVersions @{} -Config $script:rcfg)
       $l | Should -Contain $case.Line
       @($l | Where-Object { $_ -like 'Restore point:*' }).Count | Should -Be 1 } }
+  It 'Updates follows the restore point: full, or drivers only; an older state or an invalid value is full (wu spec 3.3, Review Focus 1)' {
+    foreach ($case in @{ V = 'DRIVERS'; L = 'Updates      : drivers only (other updates left to Windows)' }, @{ V = 'FULL'; L = 'Updates      : full' },
+                      @{ V = 'later'; L = 'Updates      : full' }, @{ V = $null; L = 'Updates      : full' }) {
+      $c = New-DefaultChoices -Machine $script:fm -Config $rcfg; if ($null -eq $case.V) { $c.Remove('WindowsUpdate') } else { $c.WindowsUpdate = $case.V }
+      $l = Get-ToolboxReport $c $null $false; $at = @(0..($l.Count - 1) | Where-Object { $l[$_] -like 'Restore point:*' })[0]
+      $l[$at + 1] | Should -BeExactly $case.L } }
 }
