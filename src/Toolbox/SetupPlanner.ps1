@@ -15,6 +15,10 @@
 # desktop) is never part of a profile: it is detected. Choices keep ASCII ids only, so
 # nothing Hebrew reaches state.json or setup.log; the Hebrew names stay in the profile.
 
+# The windows-update step's title in the "What will happen" column when the UPDATES row is on Drivers only (wu spec
+# 3.1); the window passes its language's step.windows-update.drivers instead (Get-ToolboxPlanLines -Titles).
+$script:WindowsUpdateDriversTitle = 'Windows Update (drivers only)'
+
 function Get-SetupProfiles {
   <#
   .SYNOPSIS
@@ -107,8 +111,8 @@ function Get-ProfileChoices {
   .SYNOPSIS
     The choices a profile fills in: @{ Profile; Office; Remote; SevenZip; RestorePoint; Tweaks }, plus
     WindowsUpdate only when the profile sets it (wu spec 3.1), or $null for an id that names no valid profile.
-    Never throws. Mode is not among them: the Type is detected. New-DefaultChoices copies every key returned,
-    so a profile without windowsUpdate leaves the choice as it is.
+    Never throws. Mode is not among them: the Type is detected. New-DefaultChoices and Update-ToolboxModel's
+    Profile click copy every key returned, so a profile without windowsUpdate leaves the choice as it is.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -274,9 +278,12 @@ function Update-ToolboxModel {
   .DESCRIPTION
     The input is never changed: the model, its Choices and the Tweaks array are copies. Actions and values are
     matched exactly (case-sensitive), as the window's a:<Action>:<Value> tags write them:
-      - Profile <id>: that profile's Office, Remote, SevenZip, RestorePoint, Tweaks and Profile (Get-ProfileChoices);
-        Mode stays (the Type is detected, never part of a profile). An unknown id changes nothing.
-      - Mode LAPTOP | DESKTOP, Office (one of $script:OfficeChoices), Remote (one of $script:RemoteChoices): set.
+      - Profile <id>: every key Get-ProfileChoices returns: that profile's Office, Remote, SevenZip, RestorePoint,
+        Tweaks and Profile, and WindowsUpdate only when the profile sets windowsUpdate; a profile that does not
+        leaves the UPDATES tile as it is (wu spec 3.1). Mode stays (the Type is detected, never part of a
+        profile). An unknown id changes nothing.
+      - Mode LAPTOP | DESKTOP, Office (one of $script:OfficeChoices), Remote (one of $script:RemoteChoices),
+        WindowsUpdate (one of $script:WindowsUpdateChoices: FULL | DRIVERS): set.
       - SevenZip, RestorePoint: toggled (the value is ignored).
       - Tweak <id>: that catalog id is toggled in the selection, which is then in catalog order, each id once.
         The selection is not filtered by the Type or Office rules (Get-EffectiveTweaks does that), so NumLock
@@ -303,11 +310,13 @@ function Update-ToolboxModel {
   switch -CaseSensitive ($Action) {
     'Profile' {
       $fill = Get-ProfileChoices -Config $Config -ProfileId $Value
-      if ($null -ne $fill) { foreach ($key in 'Office', 'Remote', 'SevenZip', 'RestorePoint', 'Tweaks', 'Profile') { $choices[$key] = $fill[$key] } }
+      # Every key the profile fills in: WindowsUpdate only when it sets windowsUpdate (wu spec 3.1).
+      if ($null -ne $fill) { foreach ($key in @($fill.Keys)) { $choices[$key] = $fill[$key] } }
     }
     'Mode' { if ($Value -cin 'LAPTOP', 'DESKTOP') { $choices['Mode'] = $Value } }
     'Office' { if ($script:OfficeChoices -ccontains $Value) { $choices['Office'] = $Value } }
     'Remote' { if ($script:RemoteChoices -ccontains $Value) { $choices['Remote'] = $Value } }
+    'WindowsUpdate' { if ($script:WindowsUpdateChoices -ccontains $Value) { $choices['WindowsUpdate'] = $Value } }
     'SevenZip' { $choices['SevenZip'] = -not [bool]$choices['SevenZip'] }
     'RestorePoint' { $choices['RestorePoint'] = -not [bool]$choices['RestorePoint'] }
     'Tweak' {
@@ -335,7 +344,9 @@ function Get-ToolboxPlanLines {
     The plan is Get-StepPlan on the Choices that Start would hand over (ConvertTo-ValidChoices on the model's
     Choices), so the column shows exactly what the run will do. Each title is -Titles[<step id>] (the window passes
     its language's step.<id> names, ruling TB-R5), else the catalog's English Title; without -Titles the lines are
-    the catalog's, which is what the console, setup.log and the report show. Emitted one by one: wrap the call in
+    the catalog's, which is what the console, setup.log and the report show. When those Choices' WindowsUpdate is
+    DRIVERS (wu spec 3.1), the windows-update line is -Titles['windows-update.drivers'] when that is not empty,
+    else $script:WindowsUpdateDriversTitle ('Windows Update (drivers only)'). Emitted one by one: wrap the call in
     @().
   #>
   [CmdletBinding()]
@@ -353,8 +364,10 @@ function Get-ToolboxPlanLines {
   $n = 0
   foreach ($id in @(Get-StepPlan -Machine $Machine -Choices $choices -Config $Config)) {
     $n++
+    $key = $id
     $title = $catalogTitles[$id]
-    if ($null -ne $Titles -and -not [string]::IsNullOrEmpty([string]$Titles[$id])) { $title = [string]$Titles[$id] }
+    if ($id -ceq 'windows-update' -and $choices['WindowsUpdate'] -ceq 'DRIVERS') { $key = 'windows-update.drivers'; $title = $script:WindowsUpdateDriversTitle }
+    if ($null -ne $Titles -and -not [string]::IsNullOrEmpty([string]$Titles[$key])) { $title = [string]$Titles[$key] }
     '{0,2}  {1}' -f $n, $title
   }
 }

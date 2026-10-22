@@ -72,7 +72,7 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $w = New-TestWindow
     foreach ($n in 'RootBorder','TitleBar','LangEn','LangHe','CloseButton','NavSetup','ContentScroll','MachineModel','MachineSerial','MachineNewName','MachinePower',
       'WarnPanel','WarnText','AdminBanner','ProfilePanel','TypeLaptop','TypeDesktop','OfficeCraft','OfficeBusiness','OfficeHome','OfficeOff','RemoteAnyDesk',
-      'RemoteScreenConnect','RemoteBoth','ScreenConnectWarn','SevenZipSwitch','TweakPanel','RestoreSwitch','PlanList','StartButton','CancelButton') { $w.FindName($n) | Should -Not -BeNullOrEmpty -Because $n }
+      'RemoteScreenConnect','RemoteBoth','ScreenConnectWarn','UpdatesFull','UpdatesDrivers','SevenZipSwitch','TweakPanel','RestoreSwitch','PlanList','StartButton','CancelButton') { $w.FindName($n) | Should -Not -BeNullOrEmpty -Because $n }
     $w.Width | Should -Be 1000; $w.Height | Should -Be 680; $w.Topmost | Should -BeTrue; $w.WindowStyle | Should -Be 'None'; $w.FontFamily.Source | Should -Be 'Segoe UI'
     $s = $w.FindName('StartButton'); $s.IsDefault | Should -BeFalse; $s.Focusable | Should -BeFalse
     foreach ($b in 'StartButton','CancelButton','CloseButton') { $w.FindName($b).IsCancel | Should -BeFalse }
@@ -170,6 +170,9 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $w.Tag.TweakRows['classicOutlook'].Row.Visibility | Should -Be 'Visible'; $w.FindName('ScreenConnectWarn').Visibility | Should -Be 'Visible'
     $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'; $w.FindName('StartButton').IsEnabled | Should -BeFalse
     (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match 'Microsoft 365' }
+  It 'the UPDATES row sits between REMOTE and APPS; Full is checked by default (wu spec 3.1)' {
+    $x = $script:ToolboxXaml; $x.IndexOf('t:row.remote') | Should -BeLessThan $x.IndexOf('t:row.updates'); $x.IndexOf('t:row.updates') | Should -BeLessThan $x.IndexOf('t:row.apps')
+    $w = New-TestWindow; $w.FindName('UpdatesFull').IsChecked | Should -BeTrue; $w.FindName('UpdatesDrivers').IsChecked | Should -BeFalse }
 }
 Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
   BeforeEach { Set-ToolboxTestMocks }
@@ -198,9 +201,17 @@ Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
     $w = New-LiveWindow; Click $w 'TypeDesktop'; Click $w 'StartButton'
     $w.Tag.Outcome | Should -Be 'Start'; $w.Tag.Closing | Should -BeTrue
     @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate')
+    $w.Tag.Choices.WindowsUpdate | Should -BeExactly 'FULL'
     @($w.Tag.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds')
     foreach ($b in 'CancelButton', 'CloseButton') { $c = New-LiveWindow; Click $c $b; $c.Tag.Outcome | Should -Be 'Cancel'; $c.Tag.Choices | Should -BeNullOrEmpty }
     $x = New-LiveWindow; $x.Close(); $x.Tag.Outcome | Should -Be 'Cancel' }   # Alt+F4 and the window's X end in Closing
+  It 'Drivers only: the tile, the plan line in both languages, a profile click keeps it, Start hands it over (wu spec 3.1)' {
+    $w = New-LiveWindow; ClickTag $w 'a:WindowsUpdate:DRIVERS'
+    $w.Tag.Model.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'; $w.FindName('UpdatesDrivers').IsChecked | Should -BeTrue; $w.FindName('UpdatesFull').IsChecked | Should -BeFalse
+    (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match '(?m)  Windows Update \(drivers only\)$'
+    Click $w 'LangHe'; (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match ('(?m)  ' + [regex]::Escape($script:ToolboxStrings.he['step.windows-update.drivers']) + '$')
+    ClickTag $w 'a:Profile:business'; $w.Tag.Model.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'; $w.FindName('UpdatesDrivers').IsChecked | Should -BeTrue
+    Click $w 'StartButton'; $w.Tag.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' }
   It 'Administrator protection On: red banner, Start disabled, a raised click refused (Review Focus 4)' {
     $w = New-TestWindow -Protection 'On'; Register-ToolboxHandlers -Window $w
     $s = $w.FindName('StartButton'); $s.IsEnabled | Should -BeFalse; $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'
@@ -527,9 +538,9 @@ Describe 'every test passes the WPF seams (final review M5)' {
     $script:callsSeen | Should -BeGreaterOrEqual 5 }   # not vacuous: it sees the real calls in Toolbox.Tests and Entry.Tests
 }
 Describe 'tools\Preview-Toolbox.ps1' {
-  It 'renders the four PNGs at 1000x680 without showing a window' {
+  It 'renders the six PNGs at 1000x680 without showing a window' {
     $out = Join-Path $TestDrive 'preview'; & "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out | Out-Null
-    foreach ($f in 'toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png') {
+    foreach ($f in 'toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png', 'toolbox-en-drivers.png', 'toolbox-he-drivers.png') {
       $s = [IO.File]::OpenRead((Join-Path $out $f))
       try { $frame = [Windows.Media.Imaging.BitmapDecoder]::Create($s, 'None', 'OnLoad').Frames[0]; $frame.PixelWidth | Should -Be 1000; $frame.PixelHeight | Should -Be 680 }
       finally { $s.Dispose() } } }

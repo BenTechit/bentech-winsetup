@@ -42,8 +42,8 @@
 # Needs: Toolbox\Strings.ps1 ($script:ToolboxStrings), Toolbox\Xaml.ps1 ($script:ToolboxXaml),
 # Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, New-ToolboxModel, Update-ToolboxModel, ConvertTo-ValidChoices,
 # Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog, Test-TweakAllowed, Get-RemoteChoice,
-# $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and Show-StartScreen:
-# Get-SetupChoices' console fallback), Common\Logging.ps1
+# Get-WindowsUpdateChoice, $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and
+# Show-StartScreen: Get-SetupChoices' console fallback), Common\Logging.ps1
 # (Write-SetupLog), Detect\Detection.ps1 (Test-OnACPower, Test-AdminProtection: Show-ToolboxWindow's seam
 # defaults) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds
 # every file.
@@ -350,13 +350,14 @@ function Update-ToolboxView {
   .SYNOPSIS
     Renders Tag.Model into the window (spec 4.1). Returns nothing.
   .DESCRIPTION
-    The language (Set-ToolboxLanguage); every tile's IsChecked (profiles, Type, Office, Remote, EN | HE) and both
-    switches; each tweak row's visibility (Test-TweakAllowed) and switch; the ScreenConnect reminder (Remote is not
-    ANYDESK); the yellow banner, one line per warning (not fresh, the previous run through Format-PreviousRun with
-    the fallback words in the window's language, on battery), collapsed when there is none; the red
-    Administrator-protection banner and Start (disabled when protection is On); the power chip; the plan column,
-    rebuilt from Get-ToolboxPlanLines with the language's step names, its rows in the language's direction. The
-    machine values are New-ToolboxWindow's, set once.
+    The language (Set-ToolboxLanguage); every tile's IsChecked (profiles, Type, Office, Remote, Updates through
+    Get-WindowsUpdateChoice, EN | HE) and both switches; each tweak row's visibility (Test-TweakAllowed) and
+    switch; the ScreenConnect reminder (Remote is not ANYDESK); the yellow banner, one line per warning (not
+    fresh, the previous run through Format-PreviousRun with the fallback words in the window's language, on
+    battery), collapsed when there is none; the red Administrator-protection banner and Start (disabled when
+    protection is On); the power chip; the plan column, rebuilt from Get-ToolboxPlanLines with the language's step
+    names (plus step.windows-update.drivers, the step's name on Drivers only: wu spec 3.1), its rows in the
+    language's direction. The machine values are New-ToolboxWindow's, set once.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -372,11 +373,13 @@ function Update-ToolboxView {
 
   foreach ($id in @($state.ProfileTiles.Keys)) { $state.ProfileTiles[$id].IsChecked = ([string]$choices['Profile'] -ceq $id) }
   $remote = Get-RemoteChoice -Choices $choices
+  $updates = Get-WindowsUpdateChoice -Choices $choices
   $office = ([string]$choices['Office']).ToUpperInvariant()
   $checks = @{
     TypeLaptop = ($choices['Mode'] -eq 'LAPTOP'); TypeDesktop = ($choices['Mode'] -eq 'DESKTOP')
     OfficeCraft = ($office -eq 'CRAFT'); OfficeBusiness = ($office -eq 'BUSINESS'); OfficeHome = ($office -eq 'HOME'); OfficeOff = ($office -eq 'OFF')
     RemoteAnyDesk = ($remote -eq 'ANYDESK'); RemoteScreenConnect = ($remote -eq 'SCREENCONNECT'); RemoteBoth = ($remote -eq 'BOTH')
+    UpdatesFull = ($updates -eq 'FULL'); UpdatesDrivers = ($updates -eq 'DRIVERS')
     SevenZipSwitch = ($choices['SevenZip'] -eq $true); RestoreSwitch = ($choices['RestorePoint'] -eq $true)
     LangEn = ($language -ne 'he'); LangHe = ($language -eq 'he')
   }
@@ -422,6 +425,7 @@ function Update-ToolboxView {
   # shows its number on the right and the name to its left.
   $stepNames = @{}
   foreach ($step in $script:StepCatalog) { $stepNames[$step.Id] = Get-ToolboxString -Table $state.Strings -Language $language -Key "step.$($step.Id)" }
+  $stepNames['windows-update.drivers'] = Get-ToolboxString -Table $state.Strings -Language $language -Key 'step.windows-update.drivers'
   $rowDirection = if ($language -eq 'he') { [System.Windows.FlowDirection]::RightToLeft } else { [System.Windows.FlowDirection]::LeftToRight }
   foreach ($line in @(Get-ToolboxPlanLines -Model $model -Machine $state.Machine -Config $state.Config -Titles $stepNames)) {
     $block = New-Object System.Windows.Controls.TextBlock
@@ -498,7 +502,7 @@ function Invoke-ToolboxAction {
         otherwise the model (Update-ToolboxModel -Action Power), then the view.
       - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
         handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
-      - Any other action (Profile, Mode, Office, Remote, SevenZip, RestorePoint, Tweak, Language):
+      - Any other action (Profile, Mode, Office, Remote, WindowsUpdate, SevenZip, RestorePoint, Tweak, Language):
         Update-ToolboxModel, then Update-ToolboxView. A control never decides its own state: the model does.
     Any exception: the window closes as Failed with the message in ASCII (Close-ToolboxWindow), and setup.log
     gets one ERROR line 'Toolbox action failed' with @{ action; error; type } (ASCII; type is the exception's

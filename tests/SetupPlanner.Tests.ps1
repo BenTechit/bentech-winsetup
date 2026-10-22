@@ -82,6 +82,11 @@ Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
     $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg `
       -Titles @{ prepare = 'Step one'; bitlocker = '' })
     $l[0] | Should -BeExactly ' 1  Step one'; $l[1] | Should -BeExactly ' 2  Turn off BitLocker' }
+  It 'DRIVERS titles the Windows Update line "(drivers only)", or with the window''s title for it (wu spec 3.1)' {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'; $dell = @{ Brand = 'DELL'; OsBuild = 26200 }
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1; @($l | Where-Object { $_ -match '  Windows Update$' }).Count | Should -Be 0
+    @(@(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg -Titles @{ 'windows-update' = 'WU'; 'windows-update.drivers' = 'WU drivers' }) -match '  WU drivers$').Count | Should -Be 1 }
 }
 Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
   BeforeEach { $script:mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off' }
@@ -95,7 +100,8 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'fileExtensions' -Config $cfg
     @($r.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds', 'classicOutlook', 'fileExtensions')
     @((Update-ToolboxModel -Model $r -Action 'Tweak' -Value 'accessKeys' -Config $cfg).Choices.Tweaks)[0] | Should -Be 'numLock'
-    foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''))) {
+    foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''),
+                     @('WindowsUpdate', 'drivers'), @('WindowsUpdate', 'NONE'))) {
       ConvertTo-SortedJson (Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg) | Should -Be (ConvertTo-SortedJson $mo) -Because ($a -join ' ') } }
   It 'toggles 7-Zip and the restore point, sets the language and the power' {
     (Update-ToolboxModel -Model $mo -Action 'SevenZip' -Config $cfg).Choices.SevenZip | Should -BeFalse
@@ -109,4 +115,10 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     ($mo | ConvertTo-Json -Depth 5) | Should -Be $before   # the input itself: same table, same order
     [object]::ReferenceEquals($r.Choices, $mo.Choices) | Should -BeFalse; [object]::ReferenceEquals($r.Choices.Tweaks, $mo.Choices.Tweaks) | Should -BeFalse
     @($r.Choices.Tweaks) | Should -Not -Contain 'accessKeys'; @($mo.Choices.Tweaks) | Should -Contain 'accessKeys' }
+  It 'sets the Windows Update choice from the tile; a profile without windowsUpdate keeps it, one with it fills it (wu spec 3.1, Review Focus 2)' {
+    $d = Update-ToolboxModel -Model $mo -Action 'WindowsUpdate' -Value 'DRIVERS' -Config $cfg
+    $d.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'; $d.Choices.Profile | Should -Be 'home'; $mo.Choices.WindowsUpdate | Should -BeExactly 'FULL'
+    foreach ($p in 'home', 'business', 'clean') { (Update-ToolboxModel -Model $d -Action 'Profile' -Value $p -Config $cfg).Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' -Because $p }
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'FULL'
+    (Update-ToolboxModel -Model $d -Action 'Profile' -Value 'clean' -Config $x).Choices.WindowsUpdate | Should -BeExactly 'FULL' }
 }
