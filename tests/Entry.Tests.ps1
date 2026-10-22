@@ -18,7 +18,7 @@ BeforeAll {
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
                  'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
                  'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen',
-                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Entry\Cleanup', 'Entry\Main') {
+                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Entry\Cleanup', 'Repair\ToolEngine', 'Entry\Main') {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
@@ -32,9 +32,12 @@ BeforeAll {
       [string]$ResultPath = '',
       [bool]$WuUnhide = $false,
       [string]$UpdateIds = '',
+      [string]$ToolAction = '',
+      [string]$ToolArgs = '',
       [scriptblock]$CrashScreen = { param($text) $null = $script:crashes.Add($text) }
     )
-    Start-BenTechSetup -Resume $Resume -WuRound $WuRound -SearchOnly $SearchOnly -ResultPath $ResultPath -WuUnhide $WuUnhide -UpdateIds $UpdateIds -Root $TestDrive -NoWait -CrashScreen $CrashScreen
+    Start-BenTechSetup -Resume $Resume -WuRound $WuRound -SearchOnly $SearchOnly -ResultPath $ResultPath -WuUnhide $WuUnhide -UpdateIds $UpdateIds `
+      -ToolAction $ToolAction -ToolArgs $ToolArgs -Root $TestDrive -NoWait -CrashScreen $CrashScreen
   }
 
   # A run state as Read-RunState returns it (only the fields the entry point reads).
@@ -480,6 +483,20 @@ Describe 'Start-BenTechSetup' {
     It 'returns 1 when the result cannot be written' {
       Invoke-Entry -WuUnhide $true -ResultPath '' -UpdateIds $script:u1 | Should -Be 1
     }
+  }
+
+  # Repair Task 1 (repair spec 7, 10): the action child the toolbox window starts (-ToolAction <id> -ToolArgs <args.json>).
+  # Invoke-SetupToolProcess is mocked: it is tested in tests\ToolEngine.Tests.ps1.
+  Context '-ToolAction' {
+    It 'dispatches to Invoke-SetupToolProcess and takes no lock, transcript, console change or start screen' {
+      Mock Invoke-SetupToolProcess { 0 }; Invoke-Entry -ToolAction 'health' -ToolArgs "$TestDrive\Tool\r\args.json" | Should -Be 0
+      Should -Invoke Invoke-SetupToolProcess -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive -and $ActionId -eq 'health' -and $ArgsPath -like '*\Tool\r\args.json' }
+      foreach ($c in 'Enter-RunLock','Start-Transcript','Disable-ConsoleQuickEdit','Resize-SetupConsole','Get-SetupChoices','Initialize-SetupActivity',
+                     'Initialize-SetupLog','Read-RunState','Invoke-SetupRun','Invoke-SetupCleanup') { Should -Invoke $c -Times 0 -Exactly -Because $c } }
+    It 'returns the child''s exit code' { Mock Invoke-SetupToolProcess { 1 }; Invoke-Entry -ToolAction 'health' -ToolArgs 'x' | Should -Be 1 }
+    It 'an empty -ToolAction is a normal start, not the child' {
+      Mock Invoke-SetupToolProcess { 0 }; Invoke-Entry -ToolAction '' -ToolArgs 'x' | Should -Be 0
+      Should -Invoke Invoke-SetupToolProcess -Times 0 -Exactly; Should -Invoke Enter-RunLock -Times 1 -Exactly }
   }
 
   # Final review I3: in the classic console host one click into the window starts a QuickEdit selection,

@@ -70,6 +70,7 @@ $BundleOrder = @(
   'Steps\WindowsUpdate.ps1'
   'Steps\Finalize.ps1'
   'Report\Report.ps1'
+  'Repair\ToolEngine.ps1'
   'UI\ConsoleFrame.ps1'
   'UI\StartScreen.ps1'
   'UI\ProgressScreen.ps1'

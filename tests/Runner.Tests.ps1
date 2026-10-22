@@ -550,6 +550,51 @@ Describe 'Get-PendingRebootSignals' {
   }
 }
 
+# Repair Task 1 (repair spec 5): only the signals that break servicing block DISM and SFC.
+Describe 'Get-ServicingRebootSignals' {
+  It 'returns the six signals as booleans without throwing (real registry, read only)' {
+    $s = Get-ServicingRebootSignals
+    @($s.Keys | Sort-Object) -join ',' | Should -Be 'CbsPackagesPending,CbsRebootPending,ComputerRenamePending,PendingFileRename,PendingXml,WuRebootRequired'
+    foreach ($v in $s.Values) { $v | Should -BeOfType [bool] }
+  }
+  It 'reads the PackagesPending key and WinSxS\pending.xml besides the four reboot signals' {
+    Mock Test-Path { $false }
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*Component Based Servicing\PackagesPending' }
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*\WinSxS\pending.xml' -and $PathType -eq 'Leaf' }
+    Mock Get-ItemProperty { throw 'Property does not exist' }
+    $s = Get-ServicingRebootSignals
+    $s.CbsPackagesPending | Should -BeTrue; $s.PendingXml | Should -BeTrue
+    $s.CbsRebootPending | Should -BeFalse; $s.WuRebootRequired | Should -BeFalse; $s.PendingFileRename | Should -BeFalse; $s.ComputerRenamePending | Should -BeFalse
+    Should -Invoke Test-Path -ParameterFilter { $LiteralPath -eq (Join-Path $env:windir 'WinSxS\pending.xml') }
+  }
+  It 'passes the four reboot signals through' {
+    Mock Get-PendingRebootSignals { @{ CbsRebootPending = $true; WuRebootRequired = $true; PendingFileRename = $true; ComputerRenamePending = $true } }
+    Mock Test-Path { $false }
+    $s = Get-ServicingRebootSignals
+    $s.CbsRebootPending | Should -BeTrue; $s.WuRebootRequired | Should -BeTrue; $s.PendingFileRename | Should -BeTrue; $s.ComputerRenamePending | Should -BeTrue
+    $s.CbsPackagesPending | Should -BeFalse; $s.PendingXml | Should -BeFalse
+  }
+  It 'never throws: a failed read is no signal' {
+    Mock Get-PendingRebootSignals { throw 'registry gone' }
+    Mock Test-Path { throw 'access denied' }
+    { Get-ServicingRebootSignals } | Should -Not -Throw
+    $s = Get-ServicingRebootSignals
+    @($s.Values | Where-Object { $_ -ne $false }).Count | Should -Be 0; $s.Count | Should -Be 6
+  }
+}
+
+Describe 'Test-ServicingRebootPending' {
+  BeforeAll {
+    function New-Signals { param([string]$On) $s = @{ CbsRebootPending = $false; CbsPackagesPending = $false; PendingXml = $false; WuRebootRequired = $false; PendingFileRename = $false; ComputerRenamePending = $false }; if ($On) { $s[$On] = $true }; $s }
+  }
+  It '<On> blocks servicing' -ForEach @(@{ On = 'CbsRebootPending' }, @{ On = 'CbsPackagesPending' }, @{ On = 'PendingXml' }, @{ On = 'WuRebootRequired' }) {
+    Test-ServicingRebootPending -Signals (New-Signals $On) | Should -BeTrue
+  }
+  It '<On> alone is a note only, never a block' -ForEach @(@{ On = 'PendingFileRename' }, @{ On = 'ComputerRenamePending' }, @{ On = '' }) {
+    Test-ServicingRebootPending -Signals (New-Signals $On) | Should -BeFalse
+  }
+}
+
 Describe 'New-SetupContext' {
   It 'builds the Context shape' {
     $cfg = [pscustomobject]@{ caps = $null }; $st = @{ Plan = @() }

@@ -5,7 +5,9 @@
 #   - as the Windows Update child process the windows-update step starts (-WuRound -ResultPath <p>):
 #     one round, no lock, no screen;
 #   - as the un-hide child Finalize starts at the end of the run (-WuUnhide -ResultPath <p> -UpdateIds <ids>):
-#     no lock, no screen.
+#     no lock, no screen;
+#   - as the action child the toolbox window's Repair & diagnostics page starts (-ToolAction <id> -ToolArgs
+#     <args.json>, Invoke-SetupToolProcess in src\Repair\ToolEngine.ps1): no lock, no screen.
 #
 # The call itself, `exit (Start-BenTechSetup ...)`, is not in this file: it is src/Entry/Run.ps1, which
 # only tools\Build-Bundle.ps1 appends, as the bundle's last statement. That keeps this file safe to
@@ -346,6 +348,11 @@ function Start-BenTechSetup {
     -ResultPath and -UpdateIds (Invoke-SetupWuUnhideProcess): the same rules as -WuRound (no lock, no
     transcript, no screen, no state); 0 when its result JSON was written, 1 when not.
 
+    -ToolAction (repair spec 7, 10): the action child the toolbox window starts for one Repair & diagnostics
+    action, with -ToolArgs, the path of its args.json (Invoke-SetupToolProcess). The same rules as -WuRound: no
+    lock, no transcript, no QuickEdit change, no screen, no activity feed; it never prompts. 0 when its
+    result.json was written, 1 when not. An empty -ToolAction is a normal start.
+
     Otherwise:
       1. Logging: Initialize-SetupLog <Root>\Logs; the activity feed (Initialize-SetupActivity, its
          history from <Root>\Logs\activity.txt); QuickEdit turned off for this console
@@ -397,6 +404,8 @@ function Start-BenTechSetup {
     [AllowNull()][AllowEmptyString()][string]$ResultPath,
     [bool]$WuUnhide,
     [AllowNull()][AllowEmptyString()][string]$UpdateIds,
+    [AllowNull()][AllowEmptyString()][string]$ToolAction,
+    [AllowNull()][AllowEmptyString()][string]$ToolArgs,
     [ValidateNotNullOrEmpty()][string]$Root = 'C:\BenTech\Setup',
     [AllowNull()][AllowEmptyString()][string]$ScriptPath,
     [scriptblock]$CrashScreen = {
@@ -415,6 +424,7 @@ function Start-BenTechSetup {
 
   if ($WuRound) { return (Invoke-SetupWuRoundProcess -Root $Root -ResultPath $ResultPath -SearchOnly $SearchOnly) }
   if ($WuUnhide) { return (Invoke-SetupWuUnhideProcess -Root $Root -ResultPath $ResultPath -UpdateIds $UpdateIds) }
+  if (-not [string]::IsNullOrEmpty($ToolAction)) { return (Invoke-SetupToolProcess -Root $Root -ActionId $ToolAction -ArgsPath $ToolArgs) }
 
   if ([string]::IsNullOrEmpty($ScriptPath)) { $ScriptPath = Join-Path $Root 'setup.ps1' }
   $version = if ([string]::IsNullOrEmpty([string]$script:SetupVersion)) { 'dev' } else { [string]$script:SetupVersion }

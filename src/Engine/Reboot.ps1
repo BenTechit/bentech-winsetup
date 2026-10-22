@@ -86,6 +86,64 @@ function Test-PendingReboot {
   return $false
 }
 
+function Get-ServicingRebootSignals {
+  <#
+  .SYNOPSIS
+    The pending-restart signals the repair page and the action child read (repair spec 5). Never throws.
+  .DESCRIPTION
+    @{ CbsRebootPending; CbsPackagesPending; PendingXml; WuRebootRequired; PendingFileRename; ComputerRenamePending },
+    every value a bool:
+      CbsPackagesPending : the Component Based Servicing\PackagesPending key exists.
+      PendingXml         : %windir%\WinSxS\pending.xml exists.
+      the other four     : as Get-PendingRebootSignals reads them.
+    Only the first four break servicing (Test-ServicingRebootPending); a pending file or computer rename is set on
+    most PCs and is a grey note only. A read that fails is "no signal", like Get-PendingRebootSignals.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param()
+
+  $signals = @{
+    CbsRebootPending      = $false
+    CbsPackagesPending    = $false
+    PendingXml            = $false
+    WuRebootRequired      = $false
+    PendingFileRename     = $false
+    ComputerRenamePending = $false
+  }
+  try {
+    $reboot = Get-PendingRebootSignals
+    foreach ($name in 'CbsRebootPending', 'WuRebootRequired', 'PendingFileRename', 'ComputerRenamePending') {
+      $signals[$name] = ($reboot[$name] -eq $true)
+    }
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Could not read the pending-restart signals; treating them as none' -Data @{ error = $_.Exception.Message }
+  }
+  $signals['CbsPackagesPending'] = Test-RebootRegistryKey -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+  try {
+    $signals['PendingXml'] = [bool](Test-Path -LiteralPath (Join-Path $env:windir 'WinSxS\pending.xml') -PathType Leaf -ErrorAction Stop)
+  } catch {
+    $signals['PendingXml'] = $false
+  }
+  return $signals
+}
+
+function Test-ServicingRebootPending {
+  <#
+  .SYNOPSIS
+    $true when a signal that breaks servicing is set: CbsRebootPending, CbsPackagesPending, PendingXml or
+    WuRebootRequired (repair spec 5). A pending file or computer rename alone is $false.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][hashtable]$Signals)
+
+  foreach ($name in 'CbsRebootPending', 'CbsPackagesPending', 'PendingXml', 'WuRebootRequired') {
+    if ($Signals[$name] -eq $true) { return $true }
+  }
+  return $false
+}
+
 function Invoke-ControlledReboot {
   <#
   .SYNOPSIS

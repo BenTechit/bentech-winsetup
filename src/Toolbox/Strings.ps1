@@ -12,6 +12,9 @@
 # step.<id> names every step of the catalog (Engine\Catalog.ps1) for the window's "What will happen" column
 # (ruling TB-R5): the English one is exactly the catalog's Title (tests\Toolbox.Tests.ps1 pins it); the console,
 # setup.log and the report keep reading the catalog's English titles.
+#
+# finding.<Code> (Repair & diagnostics, repair plan "Findings"): the action child (src\Repair\ToolEngine.ps1) formats the
+# English text into result.json (Get-ToolText); the window shows the language's text with the same Args.
 $script:ToolboxStrings = @{
   en = @{
     'app.title'             = 'BENTECH TOOLBOX'
@@ -71,6 +74,12 @@ $script:ToolboxStrings = @{
     'step.consumer-app'     = 'Vendor app'
     'step.vendor-cleanup'   = 'Remove business updater'
     'step.finalize'         = 'Finalize'
+    'finding.stepFailed'     = '{0} failed: {1}'
+    'finding.stepTimedOut'   = '{0} timed out after {1} min'
+    'finding.stopped'        = 'Stopped after {0}'
+    'finding.actionTimedOut' = 'The action reached its deadline ({0} min) and was stopped'
+    'finding.restartFirst'   = 'A Windows servicing restart is pending: restart, then run it again'
+    'finding.sessionLink'    = 'BenTech-Reports on the stick is a link: the files were kept in {0}'
   }
   he = @{
     'app.title'             = 'ארגז הכלים של BENTECH'
@@ -131,5 +140,11 @@ $script:ToolboxStrings = @{
     'step.consumer-app'     = 'אפליקציית היצרן'
     'step.vendor-cleanup'   = 'הסרת כלי העדכון העסקי'
     'step.finalize'         = 'סיום'
+    'finding.stepFailed'     = '{0} נכשל: {1}'
+    'finding.stepTimedOut'   = '{0} חרג מהזמן אחרי {1} דקות'
+    'finding.stopped'        = 'נעצר אחרי {0}'
+    'finding.actionTimedOut' = 'הפעולה הגיעה למגבלת הזמן ({0} דקות) ונעצרה'
+    'finding.restartFirst'   = 'ממתינה הפעלה מחדש להשלמת עדכוני Windows: יש להפעיל מחדש ואז להריץ שוב'
+    'finding.sessionLink'    = 'התיקייה BenTech-Reports בדיסק און קי היא קישור: הקבצים נשמרו ב-{0}'
   }
 }
