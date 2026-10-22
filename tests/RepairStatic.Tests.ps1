@@ -11,8 +11,13 @@
 BeforeAll {
   $script:srcRoot = (Resolve-Path "$PSScriptRoot\..\src").Path
   $script:repairFiles = @(Get-ChildItem -LiteralPath (Join-Path $script:srcRoot 'Repair') -Recurse -File -Filter *.ps1)
-  # Later tasks add Read-ToolCbsLog, Get-ToolReAgentState and Read-ToolLogErrors.
-  $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs')
+  # Task 2 adds the CBS.log reader (SFC's verdict, always English) and the ReAgent.xml reader (WinRE's supporting
+  # evidence, read by attribute); Task 8 adds Read-ToolLogErrors.
+  $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs', 'Read-ToolCbsLog', 'Get-ToolReAgentState')
+  # A key protector's password: the WMI method that returns it, or the property / parameter that holds it
+  # ($kp.RecoveryPassword, -RecoveryPassword...). The protector TYPE's name 'RecoveryPassword' as a plain label (the
+  # BitLocker chip lists the types) is not a read, so the pattern needs the '.' or '-' in front.
+  $script:secretPattern = '(?i)GetKeyProtectorNumericalPassword|[.\-]RecoveryPassword'
 
   function Get-EnclosingFunction {
     param([Parameter(Mandatory)][Management.Automation.Language.Ast]$Node)
@@ -81,8 +86,22 @@ $top = [IO.File]::ReadAllText('x')
   }
   It 'no repair file runs /release, /renew, /ResetBase or reads a key protector''s password' {
     foreach ($f in $script:repairFiles) {
-      [IO.File]::ReadAllText($f.FullName) | Should -Not -Match '(?i)/release|/renew|ResetBase|GetKeyProtectorNumericalPassword|RecoveryPassword' -Because $f.Name
+      $text = [IO.File]::ReadAllText($f.FullName)
+      $text | Should -Not -Match '(?i)/release|/renew|ResetBase' -Because $f.Name
+      $text | Should -Not -Match $script:secretPattern -Because $f.Name
     }
+  }
+  It 'the password pattern flags a read of the password and passes the protector type''s name' {
+    foreach ($bad in '$kp.RecoveryPassword', 'Add-BitLockerKeyProtector -RecoveryPasswordProtector', "Invoke-CimMethod -MethodName 'GetKeyProtectorNumericalPassword'") {
+      $bad | Should -Match $script:secretPattern
+    }
+    "@{ 3 = 'RecoveryPassword' }" | Should -Not -Match $script:secretPattern
+  }
+  It 'the CBS.log and ReAgent.xml readers exist in src\Repair (the allow-list names real functions)' {
+    $names = @(foreach ($f in $script:repairFiles) {
+        $ast = [Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name } })
+    foreach ($n in $script:allowedReads) { $names | Should -Contain $n }
   }
   It 'no src file calls the disk-check exclusion tool (ruling RD-R1)' {
     $tool = 'chk' + 'ntfs'

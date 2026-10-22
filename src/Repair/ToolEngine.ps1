@@ -42,8 +42,30 @@
 #                                      Servicing = <bool: re-checked for a pending servicing restart first> }
 # A step function takes -Run <hashtable> and returns exactly one of 'done', 'warn', 'failed', 'skipped' (or
 # 'timedout'); findings go through Add-ToolFinding, shared data into $Run.Data.
-$script:ToolActionCatalog = [ordered]@{}
-$script:ToolSteps = @{}
+#
+# Task 2: safety (the strip, computed in this child: spec 5; ToolSafety.ps1) and health (the read-only Health check:
+# spec 6.1; ToolChecks.ps1). Neither has a servicing step: read-only actions run with a restart pending (spec 5).
+$script:ToolActionCatalog = [ordered]@{
+  safety = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
+              Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck') }
+  health = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
+              Steps = [string[]]@('volumeScan', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
+}
+$script:ToolSteps = @{
+  safetyRestart   = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
+  safetyFree      = @{ Function = 'Invoke-ToolStepSafetyFree'; Servicing = $false }
+  safetyBitLocker = @{ Function = 'Invoke-ToolStepSafetyBitLocker'; Servicing = $false }
+  safetyInternet  = @{ Function = 'Invoke-ToolStepSafetyInternet'; Servicing = $false }
+  safetyDisk      = @{ Function = 'Invoke-ToolStepSafetyDisk'; Servicing = $false }
+  safetyDiskCheck = @{ Function = 'Invoke-ToolStepSafetyDiskCheck'; Servicing = $false }
+  volumeScan      = @{ Function = 'Invoke-ToolStepVolumeScan'; Servicing = $false }
+  imageCheck      = @{ Function = 'Invoke-ToolStepImageCheck'; Servicing = $false }
+  imageScan       = @{ Function = 'Invoke-ToolStepImageScan'; Servicing = $false }
+  sfcVerify       = @{ Function = 'Invoke-ToolStepSfcVerify'; Servicing = $false }
+  winre           = @{ Function = 'Invoke-ToolStepWinre'; Servicing = $false }
+  devices         = @{ Function = 'Invoke-ToolStepDevices'; Servicing = $false }
+  activation      = @{ Function = 'Invoke-ToolStepActivation'; Servicing = $false }
+}
 
 # A failed progress write, or a failed tick, is logged once per run (New-ToolRun resets both).
 $script:ToolProgressWarned = $false
@@ -672,10 +694,12 @@ function Get-ToolActionMinutes {
 function Invoke-ToolStep {
   # Private. Runs step -Index of the run: 'running' and progress, the step function, its status and progress. An
   # exception, a step without a function, or a result that is not exactly one of the step results is 'failed' with
-  # the CRIT finding stepFailed. A step that ends 'failed' or 'timedout' without adding any finding gets a generic
-  # CRIT one (stepFailed '<name> failed: see the log', or stepTimedOut with the step's minutes on the run's clock), so
-  # a failure is never GREEN (fix round 1). The step runs inside a one-shot loop: a stray break or continue in step
-  # code ends only that step (as Invoke-SetupTick), never the runner's loop.
+  # the CRIT finding stepFailed. A step that ends 'failed' or 'timedout' without adding a CRIT or WARN finding of its
+  # own (INFO findings do not count) gets a generic CRIT one (stepFailed '<name> failed: see the log', or stepTimedOut
+  # with the step's minutes on the run's clock), so a failure is never GREEN (fix round 1; Task 1 re-review: a step
+  # that adds only an INFO finding and then fails is still red). A step's own WARN keeps an intentional timeout yellow
+  # (sfcTimedOut). The step runs inside a one-shot loop: a stray break or continue in step code ends only that step
+  # (as Invoke-SetupTick), never the runner's loop.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Run,
@@ -719,13 +743,18 @@ function Invoke-ToolStep {
     $failure = 'break or continue outside a loop'
     Write-SetupLog -Level ERROR -Message 'Tool step used break or continue outside a loop' -Data @{ step = $id }
   }
+  # The CRIT and WARN findings the step added (an INFO alone would leave a failed step GREEN).
+  $serious = 0
+  for ($i = $findingsBefore; $i -lt $Run.Findings.Count; $i++) {
+    if ([string]$Run.Findings[$i]['Level'] -cin 'CRIT', 'WARN') { $serious++ }
+  }
   if ($null -ne $failure) {
     $status = 'failed'
     Add-ToolFinding -Run $Run -Level CRIT -Code 'stepFailed' -Arguments @($name, $failure)
-  } elseif ($Run.Findings.Count -eq $findingsBefore -and $status -eq 'failed') {
+  } elseif ($serious -eq 0 -and $status -eq 'failed') {
     Write-SetupLog -Level WARN -Message 'Tool step failed without a finding; adding a generic one' -Data @{ step = $id }
     Add-ToolFinding -Run $Run -Level CRIT -Code 'stepFailed' -Arguments @($name, 'see the log')
-  } elseif ($Run.Findings.Count -eq $findingsBefore -and $status -eq 'timedout') {
+  } elseif ($serious -eq 0 -and $status -eq 'timedout') {
     Write-SetupLog -Level WARN -Message 'Tool step timed out without a finding; adding a generic one' -Data @{ step = $id }
     $minutes = [math]::Round([math]::Max(0, (Get-ToolElapsedSeconds -Run $Run) - $startedSeconds) / 60, 1)
     Add-ToolFinding -Run $Run -Level CRIT -Code 'stepTimedOut' -Arguments @($name, $minutes)

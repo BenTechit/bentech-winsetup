@@ -60,6 +60,52 @@ Describe 'New-PcName' {
     @($names | Sort-Object -Unique).Count | Should -BeGreaterThan 1     # random each time, so two such PCs differ
   }
 }
+# Repair spec 6.8, section 13 call 22: "the same PC" is its serial, or its BIOS UUID when the serial is a placeholder,
+# by exactly New-PcName's placeholder rule (Test-PlaceholderSerial).
+Describe 'Get-MachineIdentity (repair spec 6.8)' {
+  It 'Get-MachineIdentity: <Why>' -ForEach @(
+    @{ Why = 'a real serial'; Serial = '7HX2K93'; Uuid = '4C4C4544-0037-4810-8058-B7C04F4B3933'; Key = 'SN-7HX2K93'; Folder = '7HX2K93' }
+    @{ Why = 'a real serial with spaces, dashes and lower case'; Serial = ' pf-3a b7c '; Uuid = ''; Key = 'SN-PF3AB7C'; Folder = 'PF3AB7C' }
+    @{ Why = 'a placeholder serial with a usable UUID'; Serial = 'To Be Filled By O.E.M.'; Uuid = '4C4C4544-0037-4810-8058-B7C04F4B3933'
+       Key = 'UUID-4C4C4544003748108058B7C04F4B3933'; Folder = 'UUID-B7C04F4B3933' }
+    @{ Why = 'a placeholder serial with a UUID in braces and lower case'; Serial = 'System Serial Number'; Uuid = '{4c4c4544-0037-4810-8058-b7c04f4b3933}'
+       Key = 'UUID-4C4C4544003748108058B7C04F4B3933'; Folder = 'UUID-B7C04F4B3933' }
+    @{ Why = 'a placeholder serial and the AMI default UUID'; Serial = 'Default string'; Uuid = '03000200-0400-0500-0006-000700080009'; Key = ''; Folder = 'NOSERIAL' }
+    @{ Why = 'a placeholder serial and an all-F UUID'; Serial = '0123456789'; Uuid = 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF'; Key = ''; Folder = 'NOSERIAL' }
+    @{ Why = 'no serial and no UUID'; Serial = $null; Uuid = $null; Key = ''; Folder = 'NOSERIAL' }
+  ) {
+    $id = Get-MachineIdentity -Machine @{ Serial = $Serial; BiosUuid = $Uuid; Brand = 'OTHER' }
+    $id.Key | Should -BeExactly $Key
+    $id.FolderPart | Should -BeExactly $Folder
+    $id.Serial | Should -BeExactly ("$Serial".Trim())
+    $id.BiosUuid | Should -BeExactly ("$Uuid".Trim())
+  }
+  It 'two whiteboxes with the same placeholder serial and different UUIDs get different keys' {
+    $a = Get-MachineIdentity -Machine @{ Serial = 'To Be Filled By O.E.M.'; BiosUuid = '4C4C4544-0037-4810-8058-B7C04F4B3933' }
+    $b = Get-MachineIdentity -Machine @{ Serial = 'To Be Filled By O.E.M.'; BiosUuid = '4C4C4544-0037-4810-8058-B7C04F4B3934' }
+    $a.Key | Should -Not -BeNullOrEmpty; $b.Key | Should -Not -BeNullOrEmpty
+    $a.Key | Should -Not -Be $b.Key
+  }
+  It 'keeps the right-most 20 characters of a long serial for the folder, the whole serial for the key' {
+    $id = Get-MachineIdentity -Machine @{ Serial = 'ABCDEFGHIJ1234567890XYZ'; BiosUuid = '' }
+    $id.Key | Should -BeExactly 'SN-ABCDEFGHIJ1234567890XYZ'; $id.FolderPart | Should -BeExactly 'DEFGHIJ1234567890XYZ'
+  }
+  It 'Test-PlaceholderSerial is New-PcName''s junk rule: <Serial> is <E>' -ForEach @(
+    @{ Serial = 'To be filled by O.E.M.'; E = $true }, @{ Serial = 'Default string'; E = $true }, @{ Serial = 'N/A'; E = $true }
+    @{ Serial = 'XXXXXXXX'; E = $true }, @{ Serial = ''; E = $true }, @{ Serial = $null; E = $true }, @{ Serial = '0123-4567-89'; E = $true }
+    @{ Serial = '7HX2K93'; E = $false }, @{ Serial = 'PF123456789'; E = $false }, @{ Serial = '11111112'; E = $false }) {
+    Test-PlaceholderSerial -Serial $Serial | Should -Be $E
+    # The PC name agrees: a placeholder gets PC-<uuid tail>, a real serial keeps its brand code.
+    (New-PcName -Brand DELL -Serial $Serial -BiosUuid '4C4C4544-0037-4810-8058-B7C04F4B3933') -eq 'PC-4B3933' | Should -Be $E
+  }
+  It 'Test-UsableBiosUuid: <Uuid> is <E>' -ForEach @(
+    @{ Uuid = '4C4C4544-0037-4810-8058-B7C04F4B3933'; E = $true }, @{ Uuid = '{4c4c4544-0037-4810-8058-b7c04f4b3933}'; E = $true }
+    @{ Uuid = '03000200-0400-0500-0006-000700080009'; E = $false }, @{ Uuid = '00000000-0000-0000-0000-000000000000'; E = $false }
+    @{ Uuid = '4C4C4544-0037-4810-8058'; E = $false }, @{ Uuid = '4C4C4544-0037-4810-8058-B7C04F4B393G'; E = $false }
+    @{ Uuid = ''; E = $false }, @{ Uuid = $null; E = $false }) {
+    Test-UsableBiosUuid -BiosUuid $Uuid | Should -Be $E
+  }
+}
 Describe 'Test-AdminProtection (toolbox spec 5.3)' {
   It '<Why> is <E>' -ForEach @(
     @{ Why = 'the same account';                 P = 'PC1\Dana'; S = 'pc1\dana';  E = 'Off' }

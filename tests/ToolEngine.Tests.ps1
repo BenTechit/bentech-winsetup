@@ -375,6 +375,22 @@ Describe 'ToolEngine (repair Task 1)' {
         'CRIT|stepFailed|fakeA failed: see the log', 'CRIT|stepTimedOut|fakeB timed out after 90 min')
       Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'RED'
     }
+    It 'a step that adds only an INFO finding and then fails or times out still gets the generic CRIT finding (never GREEN)' {
+      $script:stepResults = @{ fakeA = 'failed'; fakeB = 'timedout' }
+      $r = New-TestRun 'fakeA', 'fakeB'
+      $script:onCall = { Add-ToolFinding -Run $r -Level INFO -Code 'stopped' -Arguments @($args[0]) }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'; @($r.Steps.Status) | Should -Be @('failed', 'timedout')
+      @($r.Findings | ForEach-Object { '{0}|{1}' -f $_.Level, $_.Code }) | Should -Be @('INFO|stopped', 'CRIT|stepFailed', 'INFO|stopped', 'CRIT|stepTimedOut')
+      Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'RED'
+    }
+    It 'a WARN finding of its own, added before the step times out, keeps the result yellow (an intentional timeout, as SFC''s)' {
+      $script:stepResults = @{ fakeA = 'timedout' }
+      $r = New-TestRun 'fakeA'
+      $script:onCall = { Add-ToolFinding -Run $r -Level WARN -Code 'restartFirst' }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'
+      @($r.Findings.Code) | Should -Be @('restartFirst')
+      Get-ToolResultColor -Outcome 'Done' -Findings $r.Findings | Should -Be 'YELLOW'
+    }
     It 'a break in a step stays inside that step' {
       $script:onCall = { if ($args[0] -eq 'fakeA') { break } }
       $r = New-TestRun 'fakeA', 'fakeB'

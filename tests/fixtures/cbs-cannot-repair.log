@@ -1,0 +1,14 @@
+2026-10-21 03:12:40, Info                  CSI    00000041 [SR] Verifying 100 components
+2026-10-21 03:12:43, Info                  CSI    00000043 [SR] Cannot repair member file [l:7]'old.dll' of Microsoft-Windows-Old, version 10.0.26100.1, arch amd64, nonSxS, pkt {l:8 b:31bf3856ad364e35} in the store, hash mismatch
+2026-10-21 03:12:44, Info                  CSI    00000045 [SR] Verify complete
+2026-10-22 10:00:02, Info                  CBS    TI: --- Initializing Trusted Installer ---
+2026-10-22 10:00:05, Info                  CSI    00000001 [SR] Verifying 100 components
+2026-10-22 10:00:05, Info                  CSI    00000002 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:08, Info                  CSI    00000004 [SR] Cannot repair member file [l:12]'CNBJ2530.DPB' of prncacla.inf, version 10.0.26100.1, arch amd64, nonSxS, pkt {l:8 b:31bf3856ad364e35} in the store, hash mismatch
+2026-10-22 10:00:08, Info                  CSI    00000005 [SR] This component was referenced by [l:115]'Microsoft-Windows-Printer-Drivers-Package~31bf3856ad364e35~amd64~~10.0.26100.1.Microsoft-Windows-Printer-Drivers'
+2026-10-22 10:00:09, Info                  CSI    00000007 [SR] Cannot repair member file [l:10]'wuaueng.dll' of Microsoft-Windows-WindowsUpdateClient-Core, version 10.0.26100.1, arch amd64, nonSxS, pkt {l:8 b:31bf3856ad364e35} in the store, hash mismatch
+2026-10-22 10:00:09, Info                  CSI    00000008 [SR] This component was referenced by [l:88]'Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.1.1.RollupFix'
+2026-10-22 10:00:11, Info                  CSI    0000000a [SR] Verify complete
+2026-10-22 10:00:11, Info                  CSI    0000000b [SR] Repairing 0 components
+2026-10-22 10:00:11, Info                  CSI    0000000c [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:11, Info                  CSI    0000000e [SR] Repair complete

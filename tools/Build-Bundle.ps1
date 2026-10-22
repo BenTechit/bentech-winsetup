@@ -71,6 +71,8 @@ $BundleOrder = @(
   'Steps\Finalize.ps1'
   'Report\Report.ps1'
   'Repair\ToolEngine.ps1'
+  'Repair\ToolChecks.ps1'
+  'Repair\ToolSafety.ps1'
   'UI\ConsoleFrame.ps1'
   'UI\StartScreen.ps1'
   'UI\ProgressScreen.ps1'

@@ -1,0 +1,21 @@
+2026-10-21 03:12:38, Info                  CBS    Starting TrustedInstaller initialization.
+2026-10-21 03:12:40, Info                  CSI    00000041 [SR] Verifying 100 components
+2026-10-21 03:12:40, Info                  CSI    00000042 [SR] Beginning Verify and Repair transaction
+2026-10-21 03:12:44, Info                  CSI    00000044 [SR] Cannot repair member file [l:7]'old.dll' of Microsoft-Windows-Old, version 10.0.26100.1, arch amd64, nonSxS, pkt {l:8 b:31bf3856ad364e35} in the store, hash mismatch
+2026-10-21 03:12:44, Info                  CSI    00000045 [SR] Verify complete
+2026-10-22 09:59:41, Info                  CSI    00000046 [SR] Repairing 2 components
+2026-10-22 10:00:02, Info                  CBS    TI: --- Initializing Trusted Installer ---
+2026-10-22 10:00:03, Info                  CBS    Starting TrustedInstaller initialization.
+2026-10-22 10:00:05, Info                  CSI    00000001 [SR] Verifying 100 components
+2026-10-22 10:00:05, Info                  CSI    00000002 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:09, Info                  CSI    00000004 [SR] Verify complete
+2026-10-22 10:00:09, Info                  CSI    00000005 [SR] Verifying 100 components
+2026-10-22 10:00:09, Info                  CSI    00000006 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:14, Info                  CSI    00000008 [SR] Verify complete
+2026-10-22 10:00:14, Info                  CSI    00000009 [SR] Verifying 38 components
+2026-10-22 10:00:14, Info                  CSI    0000000a [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:17, Info                  CSI    0000000c [SR] Verify complete
+2026-10-22 10:00:17, Info                  CSI    0000000d [SR] Repairing 0 components
+2026-10-22 10:00:17, Info                  CSI    0000000e [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:17, Info                  CSI    00000010 [SR] Repair complete
+2026-10-22 10:00:18, Info                  CBS    TrustedInstaller service starts successfully.
