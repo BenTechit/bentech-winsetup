@@ -388,9 +388,11 @@ function Invoke-StepZoom {
     costs minutes, not timeoutsMinutes.default.
       - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When a
         token was missing or dropped Zoom still installs, with the yellow Note 'Zoom auto-update not set'.
-      - Already installed (winget 0x8A150061: nothing ran, so auto-update was not touched) is Done
-        '<id>: already installed' with the Note 'Zoom was already installed: auto-update not changed' and the
-        activity line 'Zoom already installed'. A customer's own per-user Zoom is left alone.
+      - Already installed (Data.AlreadyInstalled: winget 0x8A150061, or 0x8A15002B "no applicable update" for a
+        Zoom that is up to date or installed per user, ruling Z-R3; nothing ran, so auto-update was not
+        touched) is Done '<id>: already installed' with the Note 'Zoom was already installed: auto-update not
+        changed' and the activity line 'Zoom already installed'. A customer's own per-user Zoom is left alone.
+        An older per-machine Zoom is upgraded by `winget install`, with the tokens: a fresh install below.
       - A timed-out install is Failed 'Zoom install timed out'.
       - Anything else (another Failed, Skipped) is winget's own result, unchanged; a failure is red.
     It never opens Zoom, signs in, or creates or removes shortcuts (Q52).

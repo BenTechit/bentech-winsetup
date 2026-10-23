@@ -231,6 +231,11 @@ function Invoke-WingetOperation {
     result, not a throw. Two answers carry Data for the caller (zoom spec 3.2): a Done from 0x8A150061
     (the package was already installed and winget ran nothing) has @{ AlreadyInstalled = $true }, and
     a run that timed out has @{ TimedOut = $true }.
+    Ruling Z-R3, install only: `winget install` of a package it finds installed tries an upgrade, and when
+    none applies (the installed version is current, or it is installed in another scope) it answers
+    0x8A15002B (UPDATE_NOT_APPLICABLE), not 0x8A150061 (which needs --no-upgrade). For the install verb
+    that is the same Done '<id>: installed' with @{ AlreadyInstalled = $true }. Convert-WingetExitCode,
+    and so uninstall, still read 0x8A15002B as Failed.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -259,6 +264,14 @@ function Invoke-WingetOperation {
     if ($null -eq $run.ExitCode) { return New-StepResult -Status Failed -Message "${Id}: winget returned no exit code" }
 
     $outcome = Convert-WingetExitCode -ExitCode $run.ExitCode
+    $hex = Format-WingetExitCode -ExitCode $run.ExitCode
+    # 0x8A150061: already installed, nothing ran. 0x8A15002B on install (ruling Z-R3): installed already, and
+    # the upgrade winget tried found nothing to apply. Either way no custom argument was applied.
+    $alreadyInstalled = ($hex -ceq '0x8A150061') -or ($Verb -eq 'install' -and $hex -ceq '0x8A15002B')
+    if ($alreadyInstalled -and $outcome -ne 'Done') {
+      Write-SetupLog -Message "winget $Verb found the package installed with no applicable update; read as already installed" -Data @{ id = $Id; exitCode = $hex }
+      $outcome = 'Done'
+    }
     if ($outcome -eq 'SourceReset' -and -not $resetDone) {
       $resetDone = $true
       Write-SetupLog -Message "winget $Verb needs its sources reset; resetting once and retrying" -Level WARN -Data @{ id = $Id }
@@ -276,10 +289,9 @@ function Invoke-WingetOperation {
     switch ($outcome) {
       'Done' {
         $doneText = if ($Verb -eq 'install') { 'installed' } else { 'uninstalled' }
-        # 0x8A150061: already installed, nothing ran (so no custom argument was applied). The message stays
-        # as it always was; the caller that cares reads Data.
+        # The message stays as it always was; the caller that cares reads Data.
         $data = @{}
-        if ((Format-WingetExitCode -ExitCode $run.ExitCode) -ceq '0x8A150061') { $data['AlreadyInstalled'] = $true }
+        if ($alreadyInstalled) { $data['AlreadyInstalled'] = $true }
         return New-StepResult -Status Done -Message "${Id}: $doneText" -Data $data
       }
       'DoneReboot' {
@@ -292,7 +304,6 @@ function Invoke-WingetOperation {
       }
       default {
         # Failed, or SourceReset again after the one reset.
-        $hex = Format-WingetExitCode -ExitCode $run.ExitCode
         Write-SetupLog -Message "winget $Verb failed" -Level WARN -Data @{ id = $Id; exitCode = $hex; tail = (Get-OutputTail -Output $run.Output) }
         return New-StepResult -Status Failed -Message "${Id}: winget $hex"
       }

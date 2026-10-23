@@ -74,6 +74,10 @@ Describe 'Convert-WingetExitCode' {
     Convert-WingetExitCode -ExitCode 1 | Should -Be 'Failed'
     Convert-WingetExitCode -ExitCode -1 | Should -Be 'Failed'
   }
+  It 'keeps 0x8A15002B (no applicable update) Failed for every verb: only the install path reads it (ruling Z-R3)' {
+    Convert-WingetExitCode -ExitCode -1978335189 | Should -Be 'Failed'
+    Convert-WingetExitCode -ExitCode 2316632107 | Should -Be 'Failed'
+  }
 }
 
 Describe 'Get-WingetInstallArgs' {
@@ -368,6 +372,24 @@ Describe 'Invoke-WingetInstall' {
     Set-ExternalQueue @(New-ExternalResult 0)
     (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.Contains('AlreadyInstalled') | Should -BeFalse
   }
+  # Ruling Z-R3: `winget install` of a package it finds installed tries an upgrade, and with nothing applicable it
+  # answers 0x8A15002B (UPDATE_NOT_APPLICABLE); 0x8A150061 (PACKAGE_ALREADY_INSTALLED) needs --no-upgrade. For
+  # the install verb both mean "already installed": Done, winget's own "installed" message, Data.AlreadyInstalled.
+  It '<Id>: <Hex> as <Code> is Done "<Id>: installed" with Data.AlreadyInstalled, and no failure is logged (ruling Z-R3)' -ForEach @(
+    @{ Id = 'Zoom.Zoom'; Hex = '0x8A15002B'; Code = -1978335189 }, @{ Id = 'Zoom.Zoom'; Hex = '0x8A15002B'; Code = 2316632107 }
+    @{ Id = 'Zoom.Zoom'; Hex = '0x8A150061'; Code = -1978335135 }, @{ Id = 'Zoom.Zoom'; Hex = '0x8A150061'; Code = 2316632161 }
+    @{ Id = '7zip.7zip'; Hex = '0x8A15002B'; Code = -1978335189 }, @{ Id = '7zip.7zip'; Hex = '0x8A15002B'; Code = 2316632107 }
+    @{ Id = '7zip.7zip'; Hex = '0x8A150061'; Code = -1978335135 }, @{ Id = '7zip.7zip'; Hex = '0x8A150061'; Code = 2316632161 }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult $Code)
+    $r = Invoke-WingetInstall -Id $Id -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly "${Id}: installed"
+    $r.Reboot | Should -Be 'None'
+    $r.Data.AlreadyInstalled | Should -BeTrue
+    $extCalls.Count | Should -Be 1
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install failed' } -Times 0 -Exactly
+  }
   It 'a timed-out run carries Data.TimedOut, on the first run and on the retry' {
     Set-ExternalQueue @(New-ExternalResult $null $true)
     $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -TimeoutMinutes 10 -Context $ctx
@@ -427,6 +449,15 @@ Describe 'Invoke-WingetUninstall' {
   It 'is Failed "timed out" when winget times out' {
     Set-ExternalQueue @(New-ExternalResult $null $true)
     (Invoke-WingetUninstall -Id 'Lenovo.SystemUpdate' -Context $ctx).Message | Should -Be 'Lenovo.SystemUpdate: winget timed out'
+  }
+  It 'keeps 0x8A15002B Failed for uninstall, as <Code> (ruling Z-R3: only install reads it as already installed)' -ForEach @(
+    @{ Code = -1978335189 }, @{ Code = 2316632107 }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult $Code)
+    $r = Invoke-WingetUninstall -Id 'Lenovo.SystemUpdate' -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Lenovo.SystemUpdate: winget 0x8A15002B'
+    $r.Data.Contains('AlreadyInstalled') | Should -BeFalse
   }
   It 'resets the sources once and retries once on 0x8A15000F' {
     Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult 0))

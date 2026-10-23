@@ -59,6 +59,7 @@ Some customers need Zoom for work or family calls. Today Ben installs it by hand
 |---|---|
 | The APPS row: Chrome (always) and 7-Zip | **Zoom** is added as a third item, off by default. |
 | `Get-WingetInstallArgs` takes only an id and a source | It also takes an optional custom string from the signed config, checked against a strict pattern. |
+| winget `0x8A15002B` (no applicable update) is Failed | **For `install` only** it is Done, already installed, like `0x8A150061` (ruling Z-R3): `winget install` of a package it finds installed tries an upgrade and answers this code when none applies. It also keeps 7-Zip green on a PC that already has it. `uninstall` keeps Failed. |
 
 ## 5. To prove on a real machine (`docs/testing.md`; the first laptop with Zoom on, Q55)
 - **Install:** Zoom installs per-machine from winget on x64 (and on ARM64 when one is at hand), with no window and no prompt during the run, well inside the 10-minute bound.

@@ -5,8 +5,9 @@
 # change file associations and policies. Nothing here may do any of that. Every test that reaches
 # the system runs after Initialize-AppMocks (each Describe calls it from BeforeEach), which replaces
 # EVERY command the steps can reach with a recorder: Invoke-External, Start-BackgroundExternal (the Office
-# setup.exe never starts), Get-RemoteFile, Get-RemoteText,
-# Test-FileSignature, Invoke-WingetInstall, Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
+# setup.exe never starts), Get-RemoteFile, Get-RemoteText, Get-WingetPath,
+# Test-FileSignature, Invoke-WingetInstall (kept real with -RealWinget, so winget's exit-code mapping runs
+# against the Invoke-External recorder), Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
 # Get-Content, Start-Sleep, Write-SetupLog and Get-ShellDefaultBrowserProgId (the AssocQueryString
 # P/Invoke wrapper). The Office wait Describes also mock Get-Process, Stop-ProcessTree, Save-RunState and
 # Wait-SetupDelay, so no real process is looked up or killed. The only real file I/O is inside
@@ -66,6 +67,7 @@ BeforeAll {
   #   $script:activity    one hashtable (Text, LogText) per Add-SetupActivity call
   #   $script:bg          one hashtable (FilePath, ArgumentList) per Start-BackgroundExternal call
   function Initialize-AppMocks {
+    param([switch]$RealWinget)
     $script:activity = New-Object System.Collections.ArrayList
     $script:bg = New-Object System.Collections.ArrayList
     $script:OfficeBackgroundProcess = $null
@@ -125,9 +127,12 @@ BeforeAll {
       [void]$script:sigCalls.Add(@{ Path = $Path; Signers = @($AllowedSigners) })
       return (-not ($script:sigBad -contains (Split-Path -Leaf $Path)))
     }
-    Mock Invoke-WingetInstall {
-      [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source; Custom = $Custom; TimeoutMinutes = $TimeoutMinutes })
-      return $script:wingetResult
+    Mock Get-WingetPath { 'C:\fake\winget.exe' }
+    if (-not $RealWinget) {
+      Mock Invoke-WingetInstall {
+        [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source; Custom = $Custom; TimeoutMinutes = $TimeoutMinutes })
+        return $script:wingetResult
+      }
     }
     Mock Get-ItemProperty {
       if ($script:regReadThrows) { throw 'Requested registry access is not allowed' }
@@ -776,6 +781,47 @@ Describe 'Invoke-StepZoom' {
     $r = Invoke-StepZoom -Context $script:ctx
     $r | Should -Be $script:wingetResult
     $script:activity.Count | Should -Be 0
+  }
+}
+
+# --- winget's "no applicable update" on a PC that already has the app (ruling Z-R3) -------------------
+# The real Invoke-WingetInstall against the Invoke-External recorder: a second run on the same PC, where
+# `winget install` tries an upgrade and finds none (0x8A15002B), must be as green as 0x8A150061.
+Describe 'winget 0x8A15002B on a PC that already has the app (ruling Z-R3)' {
+  BeforeEach {
+    Initialize-AppMocks -RealWinget
+    $script:ctx = New-AppContext -Dir (New-TestDir)
+    $script:wingetCode = 0
+    $script:extHandler = { param($c) @{ ExitCode = $script:wingetCode; TimedOut = $false; Output = '' } }
+  }
+  It '7-Zip: <Hex> as <Code> is green "7zip.7zip: installed", with its activity line and today''s command line' -ForEach @(
+    @{ Hex = '0x8A15002B'; Code = -1978335189 }, @{ Hex = '0x8A150061'; Code = -1978335135 }
+  ) {
+    $script:wingetCode = $Code
+    $r = Invoke-StepSevenZip -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly '7zip.7zip: installed'
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('7-Zip installed')
+    @($script:ext | Where-Object { $_.ArgumentList -like 'install *' }).Count | Should -Be 1
+    $script:ext[-1].ArgumentList | Should -BeExactly 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+  }
+  It 'Zoom: <Hex> as <Code> is green with the yellow already-installed Note' -ForEach @(
+    @{ Hex = '0x8A15002B'; Code = -1978335189 }, @{ Hex = '0x8A150061'; Code = -1978335135 }
+  ) {
+    $script:wingetCode = $Code
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: already installed'
+    @($r.Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('Zoom already installed')
+  }
+  It 'another code is still red: winget''s own message' {
+    $script:wingetCode = -1978335202   # 0x8A15001E
+    $r = Invoke-StepSevenZip -Context $script:ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly '7zip.7zip: winget 0x8A15001E'
   }
 }
 
