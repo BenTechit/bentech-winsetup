@@ -147,6 +147,25 @@ function Test-ServicingRebootPending {
   return $false
 }
 
+function Invoke-ShutdownRestart {
+  <#
+  .SYNOPSIS
+    Private. The fallback restart of Invoke-ControlledReboot and Invoke-StatelessRestart: shutdown.exe /r /t 5 /f through
+    Invoke-External, bounded at 1 minute (nothing waits without a deadline; final wave item 13: never Start-Process
+    -Wait). Returns nothing; throws 'shutdown.exe exited with code <n>' unless the exit code is 0 (restart scheduled),
+    1115 (ERROR_SHUTDOWN_IN_PROGRESS) or 1190 (ERROR_SHUTDOWN_IS_SCHEDULED): the machine restarts either way. A timeout
+    (no exit code) throws too.
+  #>
+  [CmdletBinding()]
+  param()
+
+  $shutdown = Invoke-External -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -TimeoutMinutes 1
+  if ($null -eq $shutdown -or $shutdown['TimedOut'] -eq $true -or $null -eq $shutdown['ExitCode'] -or [int]$shutdown['ExitCode'] -notin 0, 1115, 1190) {
+    $code = if ($null -ne $shutdown -and $null -ne $shutdown['ExitCode']) { [string]$shutdown['ExitCode'] } else { 'none (timed out)' }
+    throw ('shutdown.exe exited with code {0}' -f $code)
+  }
+}
+
 function Invoke-ControlledReboot {
   <#
   .SYNOPSIS
@@ -168,8 +187,9 @@ function Invoke-ControlledReboot {
     once per second (only when CountdownSeconds is above 0) and calls RestartAction.
     A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
     failure (hence -ErrorAction Stop). When it throws, a WARN is logged and FallbackRestartAction
-    (shutdown.exe /r /t 5 /f; exit code 0, 1190 "shutdown already scheduled" or 1115 "shutdown in
-    progress" is success, anything else a failure) is tried. Either one succeeding
+    (Invoke-ShutdownRestart: shutdown.exe /r /t 5 /f through Invoke-External, bounded at 1 minute; exit
+    code 0, 1190 "shutdown already scheduled" or 1115 "shutdown in progress" is success, anything else
+    or a timeout a failure) is tried. Either one succeeding
     returns $true; the caller must then return straight away, because Windows is shutting down.
     When both fail: "Restart failed: ..." is appended to State.Errors, the state is saved, an ERROR
     is logged and $false is returned. RebootCount stays incremented and RebootCapHit stays $false,
@@ -181,14 +201,7 @@ function Invoke-ControlledReboot {
     [Parameter(Mandatory)][hashtable]$Context,
     [int]$CountdownSeconds = 15,
     [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
-    [scriptblock]$FallbackRestartAction = {
-      $shutdown = Start-Process -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -Wait -PassThru -NoNewWindow
-      # 0 = restart scheduled; 1190 = ERROR_SHUTDOWN_IS_SCHEDULED and 1115 = ERROR_SHUTDOWN_IN_PROGRESS:
-      # a restart is already pending, so the machine will reboot either way. Anything else fails.
-      if ($null -eq $shutdown -or $shutdown.ExitCode -notin 0, 1115, 1190) {
-        throw ('shutdown.exe exited with code {0}' -f $(if ($null -ne $shutdown) { $shutdown.ExitCode } else { 'unknown' }))
-      }
-    }
+    [scriptblock]$FallbackRestartAction = { Invoke-ShutdownRestart }
   )
 
   $runState = $Context.State
@@ -260,25 +273,18 @@ function Invoke-StatelessRestart {
     when no earlier run exists). Not Invoke-ControlledReboot: there is no run state, so no reboot cap, no
     RebootCount, no resume task and no countdown (the technician confirmed in the window).
     RestartAction first (Restart-Computer -Force; it must throw on failure, hence -ErrorAction Stop); when it throws,
-    a WARN and FallbackRestartAction (shutdown.exe /r /t 5 /f through Invoke-External, bounded at 1 minute; exit
-    code 0, 1115 "shutdown in progress" or 1190 "shutdown already scheduled" is success, anything else or a timeout
-    throws). When both fail: an ERROR, one line 'Could not restart the PC: <reasons in ASCII>' White on DarkRed (the
-    window is gone, and after a cleanup the log is too, so the console is the one place it shows), and $false.
+    a WARN and FallbackRestartAction (Invoke-ShutdownRestart: shutdown.exe /r /t 5 /f through Invoke-External, bounded
+    at 1 minute; exit code 0, 1115 "shutdown in progress" or 1190 "shutdown already scheduled" is success, anything
+    else or a timeout throws). When both fail: an ERROR, one line 'Could not restart the PC: <reasons in ASCII>' White
+    on DarkRed (the window is gone, and after a cleanup the log is too, so the console is the one place it shows), and
+    $false.
     Logging is a no-op after the cleanup stopped it.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param(
     [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
-    [scriptblock]$FallbackRestartAction = {
-      $shutdown = Invoke-External -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -TimeoutMinutes 1
-      # 0 = restart scheduled; 1190 = ERROR_SHUTDOWN_IS_SCHEDULED and 1115 = ERROR_SHUTDOWN_IN_PROGRESS: the machine
-      # restarts either way. A timeout (no exit code) or anything else fails.
-      if ($null -eq $shutdown -or $shutdown['TimedOut'] -eq $true -or $null -eq $shutdown['ExitCode'] -or [int]$shutdown['ExitCode'] -notin 0, 1115, 1190) {
-        $code = if ($null -ne $shutdown -and $null -ne $shutdown['ExitCode']) { [string]$shutdown['ExitCode'] } else { 'none (timed out)' }
-        throw ('shutdown.exe exited with code {0}' -f $code)
-      }
-    }
+    [scriptblock]$FallbackRestartAction = { Invoke-ShutdownRestart }
   )
 
   $primaryError = ''

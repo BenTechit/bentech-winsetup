@@ -338,21 +338,38 @@ Describe 'Restart failures (R10)' {
     $c.State.RebootCapHit | Should -BeFalse
     $c.State.Steps.b.Status | Should -Be 'Done'
   }
-  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats any exit code other than 0/1115/1190 as failure' {
+  # Final wave item 13: the fallback runs through Invoke-External, bounded at 1 minute (never Start-Process -Wait).
+  It 'the default fallback runs shutdown.exe /r /t 5 /f through Invoke-External (1 minute) and treats any exit code other than 0/1115/1190, or a timeout, as failure' {
     $savedWindir = $env:windir
-    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked call cannot find shutdown.exe
     try {
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+      Mock Start-Process { throw 'blocked by the test: Start-Process' }
+      Mock Invoke-External { @{ ExitCode = 0; TimedOut = $false } }
       $c = New-Ctx @('a')
       Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeTrue
-      Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
-        $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $Wait -and $PassThru -and $NoNewWindow
+      Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter {
+        $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $TimeoutMinutes -eq 1
       }
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 5 } }   # ERROR_ACCESS_DENIED
+      Mock Invoke-External { @{ ExitCode = 5; TimedOut = $false } }   # ERROR_ACCESS_DENIED
       $c = New-Ctx @('a')
       Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
       @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*code 5*' }).Count | Should -Be 1
+      Mock Invoke-External { @{ ExitCode = $null; TimedOut = $true } }   # shutdown.exe never answered: no wait without a deadline
+      $c = New-Ctx @('a')
+      Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
+      @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*timed out*' }).Count | Should -Be 1
+      Should -Invoke Start-Process -Times 0 -Exactly
     } finally { $env:windir = $savedWindir }
+  }
+  It 'the default fallbacks of Invoke-ControlledReboot and Invoke-StatelessRestart are the one bounded shutdown (Invoke-ShutdownRestart)' {
+    foreach ($name in 'Invoke-ControlledReboot', 'Invoke-StatelessRestart') {
+      $ast = (Get-Command $name).ScriptBlock.Ast
+      if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $ast = $ast.Body }
+      $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'FallbackRestartAction' }
+      $param.DefaultValue.Extent.Text | Should -Be '{ Invoke-ShutdownRestart }' -Because $name
+    }
+    $file = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$PSScriptRoot\..\src\Engine\Reboot.ps1").Path, [ref]$null, [ref]$null)
+    @($file.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Process' }, $true)).Count | Should -Be 0
   }
   It 'Invoke-SetupRun: shutdown.exe exit code <Code> (<Meaning>) counts as a restart' -ForEach @(
     @{ Code = 1190; Meaning = 'ERROR_SHUTDOWN_IS_SCHEDULED' }
@@ -360,13 +377,14 @@ Describe 'Restart failures (R10)' {
   ) {
     function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
     $savedWindir = $env:windir
-    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked call cannot find shutdown.exe
     try {
       $script:mockExitCode = $Code
-      Mock Start-Process { [pscustomobject]@{ ExitCode = $script:mockExitCode } }
+      Mock Start-Process { throw 'blocked by the test: Start-Process' }
+      Mock Invoke-External { @{ ExitCode = $script:mockExitCode; TimedOut = $false } }
       $c = New-Ctx @('a','b')
       Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -CountdownSeconds 0 | Should -Be 'Rebooting'
-      Should -Invoke Start-Process -Times 1 -Exactly
+      Should -Invoke Invoke-External -Times 1 -Exactly
       @($c.State.Errors).Count | Should -Be 0
       $c.State.Steps.a.Status | Should -Be 'pending'; $c.State.RebootCapHit | Should -BeFalse
     } finally { $env:windir = $savedWindir }
