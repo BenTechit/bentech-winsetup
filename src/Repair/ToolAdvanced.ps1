@@ -1502,13 +1502,14 @@ function Invoke-ToolStepGhostList {
 
 function Test-ToolDeviceId {
   # Private. $true when -Id has the shape of a device instance id that can be quoted on pnputil's command line:
-  # printable ASCII without a space, at most 512 characters, no double quote, not ending in a backslash (which would
-  # escape the closing quote).
+  # printable ASCII and space (a USB serial number can hold a space), 1 to 512 characters, neither starting nor ending
+  # with a space, no double quote, not ending in a backslash (which would escape the closing quote). The step passes
+  # it as one quoted argument straight through Invoke-External (no cmd), so a space needs nothing more.
   [CmdletBinding()]
   [OutputType([bool])]
   param([AllowNull()][AllowEmptyString()][string]$Id)
 
-  return ($Id -cmatch '^[\x21-\x7E]{1,512}\z' -and -not $Id.Contains('"') -and -not $Id.EndsWith('\'))
+  return ($Id -cmatch '^[\x21-\x7E](?:[\x20-\x7E]{0,510}[\x21-\x7E])?\z' -and -not $Id.Contains('"') -and -not $Id.EndsWith('\'))
 }
 
 function Get-ToolGhostTicks {
@@ -1632,10 +1633,12 @@ function Invoke-ToolStepGhostRemove {
     (toolStep.pnputil). Exit 0 or 3010 is removed (3010 also RestartRequired); another exit or a timeout is WARN
     ghostRemoveFailed (the id, why). INFO ghostsRemoved with the count.
   .DESCRIPTION
-    An id that is not a device id (Test-ToolDeviceId: one holding a double quote among them) is never passed on: WARN
-    ghostRemoveFailed. A ticked id that is present again, left out or gone is skipped (logged). Less than a minute left
-    of the action's time: the rest are not started (WARN ghostRemoveFailed with how many). A list that cannot be read
-    again: CRIT stepFailed, nothing removed. When the PC has more ghosts than the window lists, INFO ghostListCapped.
+    An id that is not a device id (Test-ToolDeviceId: one holding a double quote, ending in a backslash or starting or
+    ending with a space among them; a space inside an id is fine) is never passed on: WARN ghostRemoveFailed. The id
+    goes to pnputil as one quoted argument through Invoke-External (no cmd). A ticked id that is present again, left
+    out or gone is skipped (logged). Less than a minute left of the action's time: the rest are not started (WARN
+    ghostRemoveFailed with how many). A list that cannot be read again: CRIT stepFailed, nothing removed. When the PC
+    has more ghosts than the window lists, INFO ghostListCapped.
     $Run.Data.GhostRemove = @{ Ticked; Removed; Skipped }.
   #>
   [CmdletBinding()]

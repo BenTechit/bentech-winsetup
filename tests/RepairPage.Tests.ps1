@@ -432,6 +432,23 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     $a = Read-ToolJsonFile (Join-Path $w.Tag.Runs.Action.Dir 'args.json')
     $a.BudgetSeconds | Should -Be 1800; $w.Tag.Runs.Action.BudgetSeconds | Should -Be 1800; $a.StickRoot | Should -BeExactly ''; $a.Strip.Disk | Should -Be 'unknown'
     $a.SessionDir | Should -BeExactly (Join-Path "$TestDrive\Root\Logs\Repair" ('DESKTOP-4F7K2LQ_7HX2K93_' + $w.Tag.Model.Repair.SessionStamp)) }
+  # Pre-PR code review item 2: Read-ToolArgs confines SessionDir to <StickRoot>\BenTech-Reports (or Root\Logs\Repair with no
+  # stick). Nothing the window builds may be refused: the stick and the no-stick forms, for the LogLocal actions (safety,
+  # netInfo, ghostList: the run folder, then the session) and a repair action, in the Action and the Safety slot.
+  It 'every args.json the window builds passes the child''s own SessionDir check, with and without a stick, for the LogLocal actions too' {
+    foreach ($withStick in $true, $false) {
+      foreach ($case in @(@{ Id = 'safety'; Slot = 'Safety' }, @{ Id = 'netInfo'; Slot = 'Action' }, @{ Id = 'ghostList'; Slot = 'Action' }, @{ Id = 'standard'; Slot = 'Action' })) {
+        $w = if ($withStick) { New-RunWindow } else { New-RunWindow -Set @{ Stick = $null } }
+        $null = Start-ToolboxRun -Window $w -ActionId $case.Id -Slot $case.Slot
+        $run = $w.Tag.Runs[$case.Slot]; $run | Should -Not -BeNullOrEmpty -Because "$($case.Id) started"
+        $argsPath = Join-Path $run.Dir 'args.json'
+        $a = Read-ToolArgs -Path $argsPath -Root "$TestDrive\Root" -ActionId $case.Id
+        $a.SessionDir | Should -Not -BeNullOrEmpty -Because "$($case.Id), stick $withStick"
+        if ($withStick) { $a.StickRoot | Should -BeExactly 'E:\'; $a.SessionDir | Should -BeLike 'E:\BenTech-Reports\*' }
+        else { $a.StickRoot | Should -BeExactly ''; $a.SessionDir | Should -BeLike "$TestDrive\Root\Logs\Repair\*" }
+      }
+    }
+  }
   It 'the visit folder''s name keeps only letters, digits and dashes of the PC name and the serial (spec 8, RD-R6)' {
     $w = New-RunWindow; $w.Tag.Machine = $w.Tag.Machine.Clone(); $w.Tag.Machine.ComputerName = 'PC_' + [char]0x05D0 + ' 1'; $w.Tag.Machine.Serial = 'AB 12/34'
     Get-ToolboxSessionDir -State $w.Tag | Should -BeExactly ('E:\BenTech-Reports\PC1_AB1234_' + $w.Tag.Model.Repair.SessionStamp) }
@@ -538,6 +555,18 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     $w.FindName('NavSetup').IsChecked | Should -BeFalse; $w.FindName('NavRepair').IsChecked | Should -BeTrue; $w.Tag.Closing | Should -BeFalse
     foreach ($msg in 'Start refused: an action is running', 'Page change refused: an action is running', 'Restart refused: an action is running') {
       @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq $msg }).Count | Should -BeGreaterThan 0 -Because $msg } }
+  # Pre-PR code review item 3: a refusal by the gate (here a run in the model while no child runs) names the gate's reason key;
+  # only a running child keeps the old line.
+  It 'Restart PC refused by its gate, not by a running child: the WARN names the gate''s reason (pre-PR review item 3)' {
+    $w = New-RunWindow; $w.Tag.Model['Repair'] = New-RepairRunModel -Repair $w.Tag.Model['Repair'] -ActionId 'health' -RunId 'r1'
+    Test-ToolboxActionRunning -State $w.Tag | Should -BeFalse
+    (Get-RepairGate -Model $w.Tag.Model -ActionId 'restart').Reason | Should -BeExactly 'reason.running'
+    Click $w 'RestartButton'
+    $w.Tag.Model.Repair.Confirm | Should -BeNullOrEmpty
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -ceq 'Restart refused: reason.running' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Message -ceq 'Restart refused: an action is running' }).Count | Should -Be 0
+    $script:logs.Clear(); $w2 = New-RunWindow; $null = Start-ToolboxRun -Window $w2 -ActionId 'health'; Click $w2 'RestartButton'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -ceq 'Restart refused: an action is running' }).Count | Should -Be 1 }
   It 'Restart PC asks first; Cancel closes the question, Confirm closes the window as Restart' {
     $w = New-RunWindow; Click $w 'RestartButton'
     $w.Tag.Model.Repair.Confirm.Kind | Should -Be 'restart'; $w.FindName('ConfirmPanel').Visibility | Should -Be 'Visible'

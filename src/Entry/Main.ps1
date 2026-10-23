@@ -393,8 +393,9 @@ function Start-BenTechSetup {
     toolbox's, or Escape on the console) with no earlier run state runs -Mode Cancel (C:\BenTech deleted,
     because nothing ran). A crash, 'Rebooting', 'NoState', a cancel after an unfinished earlier run and a
     lock held by another run delete nothing.
-    No cleanup runs while a process the toolbox window started still runs (Test-ToolboxChildrenRunning: one its
-    kills could not end): WARN, the folder is kept (repair Task 4 review M3).
+    While a process the toolbox window started still runs (Test-ToolboxChildrenRunning: one its kills could not
+    end), C:\BenTech is never removed: WARN, and the cleanup runs with -KeepFolder, so the logs still go to the
+    stick and the Desktop launcher is still deleted (repair Task 4 review M3; pre-PR code review item 1).
     Last, Restart PC in the toolbox (repair spec 6.9, ruling RD-R5): a 'Cancelled' flow whose Restart is set
     restarts the PC through Invoke-StatelessRestart, after the cleanup when there was one (after an unfinished
     earlier run its folder stays, and the restart still happens). Never after a crash. When both restarts fail
@@ -526,10 +527,11 @@ function Start-BenTechSetup {
   # Only now: the tick is gone, the run lock and its mutex are released and the transcript (a file in
   # Logs) is closed, so nothing of this run holds the folder open.
   # Repair Task 4 review M3: a toolbox child that its kills could not end may still write into C:\BenTech; then the
-  # folder is kept (its own deadline ends it; the next run's cleanup removes the folder).
+  # folder is kept (its own deadline ends it; the next run's cleanup removes the folder). Only the removal is skipped
+  # (-KeepFolder): the logs still go to the stick and a Desktop launcher is still deleted (pre-PR code review item 1).
   if ($null -ne $cleanup -and (Test-ToolboxChildrenRunning)) {
     Write-SetupLog -Level WARN -Message 'A toolbox child process is still running; the setup folder is kept' -Data @{ mode = $cleanup.Mode }
-    $cleanup = $null
+    $cleanup['KeepFolder'] = $true
   }
   if ($null -ne $cleanup) {
     try {

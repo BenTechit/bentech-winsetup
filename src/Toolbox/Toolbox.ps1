@@ -593,7 +593,8 @@ function Invoke-ToolboxAction {
         (Update-ToolboxStick: the full search on the first visit) and the first visit starts the safety child that
         reads the strip (Start-ToolboxSafetyRun; once per window).
       - RunTick: the run timer's tick (Update-ToolboxRuns, RepairPage.ps1). Stop: Request-ToolboxStop.
-      - Restart (Restart PC): refused while an action runs (WARN 'Restart refused: an action is running');
+      - Restart (Restart PC): refused while an action runs (WARN 'Restart refused: an action is running') and when its
+        gate refuses (WARN 'Restart refused: <the gate's reason key>', e.g. reason.running);
         otherwise the restart question opens (Model.Repair.Confirm, Kind 'restart', spec 6.9: it always asks).
         Confirm on it closes the window as Restart when Test-RepairConfirmReady still allows it (nothing runs).
       - Repair Task 5, through Update-RepairModel (RepairPlanner.ps1), then the repair page is rendered:
@@ -741,8 +742,13 @@ function Invoke-ToolboxAction {
       }
       'OpenFolder' { Open-ToolboxFolder -Window $window }
       'Restart' {
-        if ((Test-ToolboxActionRunning -State $state) -or -not (Get-RepairGate -Model $state.Model -ActionId 'restart').Enabled) {
+        $restartGate = Get-RepairGate -Model $state.Model -ActionId 'restart'
+        if (Test-ToolboxActionRunning -State $state) {
           Write-SetupLog -Level WARN -Message 'Restart refused: an action is running'
+        } elseif (-not $restartGate.Enabled) {
+          # Pre-PR code review item 3: the gate's own reason key (ASCII, e.g. reason.running), not a guess.
+          $restartReason = if ([string]$restartGate.Reason -ne '') { [string]$restartGate.Reason } else { 'the gate is closed' }
+          Write-SetupLog -Level WARN -Message ('Restart refused: ' + $restartReason)
         } else {
           # Spec 6.9: Restart PC always asks first.
           Set-ToolboxRepair -State $state -Values @{ Confirm = @{ Action = 'restart'; Kind = 'restart'; Typed = ''; AtPc = $false; Loading = $false

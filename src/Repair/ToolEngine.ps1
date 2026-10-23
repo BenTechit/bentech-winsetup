@@ -420,6 +420,45 @@ function ConvertFrom-ToolDeadline {
   return [datetime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
 }
 
+function Test-ToolSessionDir {
+  <#
+  .SYNOPSIS
+    Private (Read-ToolArgs). $true when -SessionDir is one folder directly under <-StickRoot>BenTech-Reports, or, with no
+    stick (-StickRoot empty), one folder directly under <-Root>\Logs\Repair: the two shapes Get-ToolboxSessionDir builds.
+    Never throws.
+  .DESCRIPTION
+    Pre-PR code review item 2: the child creates folders and writes reports at SessionDir, so args.json cannot name any
+    other place. -SessionDir must already be in its full form (it equals [IO.Path]::GetFullPath of itself, case-insensitive:
+    no '..' or '.' segment, no doubled or forward slash, no trailing backslash, dot or space), fully qualified with a drive
+    letter, and its parent must be the folder named above (compared case-insensitively). With a stick, -StickRoot must be
+    fully qualified too (the window builds it as a drive root such as 'E:\'). An empty -SessionDir is not decided here.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [AllowNull()][AllowEmptyString()][string]$SessionDir,
+    [AllowNull()][AllowEmptyString()][string]$StickRoot,
+    [Parameter(Mandatory)][string]$Root
+  )
+
+  try {
+    if ([string]::IsNullOrEmpty($SessionDir) -or $SessionDir -notmatch '^[A-Za-z]:\\') { return $false }
+    $full = [IO.Path]::GetFullPath($SessionDir)
+    if (-not [string]::Equals($full, $SessionDir, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ([string]::IsNullOrEmpty([IO.Path]::GetFileName($full))) { return $false }
+    if ([string]::IsNullOrEmpty($StickRoot)) {
+      $parent = [IO.Path]::Combine([IO.Path]::GetFullPath($Root), 'Logs', 'Repair')
+    } else {
+      if ($StickRoot -notmatch '^[A-Za-z]:\\') { return $false }
+      $parent = [IO.Path]::Combine([IO.Path]::GetFullPath($StickRoot), 'BenTech-Reports')
+    }
+    $actual = [IO.Path]::GetDirectoryName($full)
+    return ((-not [string]::IsNullOrEmpty($actual)) -and [string]::Equals($actual.TrimEnd('\'), $parent.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase))
+  } catch {
+    return $false
+  }
+}
+
 function Read-ToolArgs {
   <#
   .SYNOPSIS
@@ -434,8 +473,10 @@ function Read-ToolArgs {
       <Root>\Tool\<RunId>\, and the child derives its files from it).
     - BudgetSeconds (the action's whole time, which the child measures on its own Stopwatch, ruling RD-R8) is a
       number above 0 and at most 7 days; DeadlineUtc (for the log only) is a round-trip date.
-    - SessionDir is fully qualified or empty (missing = ''); Complaint is text of at most 2000 characters
-      (missing = ''); Options is an object (missing = @{}).
+    - SessionDir is empty (missing = '') or one folder directly under <StickRoot>BenTech-Reports, in its full form
+      (Test-ToolSessionDir: pre-PR code review item 2); with no stick (StickRoot empty, as the window writes it) the
+      folder is directly under <Root>\Logs\Repair. Anything else is refused. Complaint is text of at most 2000
+      characters (missing = ''); Options is an object (missing = @{}).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -492,6 +533,11 @@ function Read-ToolArgs {
   $session = $data['SessionDir']
   if ($null -eq $session) { $session = '' }
   if ($session -isnot [string] -or ($session -ne '' -and $session -notmatch '^[A-Za-z]:\\')) { throw 'SessionDir is not a fully qualified path' }
+  $stickRoot = $data['StickRoot']
+  if ($null -eq $stickRoot) { $stickRoot = '' }
+  if ($session -ne '' -and ($stickRoot -isnot [string] -or -not (Test-ToolSessionDir -SessionDir $session -StickRoot $stickRoot -Root $Root))) {
+    throw "SessionDir is not under the stick's BenTech-Reports"
+  }
   $data['SessionDir'] = $session
 
   $complaint = $data['Complaint']

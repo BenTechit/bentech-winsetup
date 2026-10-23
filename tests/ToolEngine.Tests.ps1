@@ -728,6 +728,68 @@ Describe 'ToolEngine (repair Task 1)' {
       $a | Should -BeOfType [hashtable]; $a.Action | Should -BeExactly 'test'; $a.RunId | Should -Be $script:runId
       $a.Complaint | Should -BeExactly ''; $a.SessionDir | Should -BeExactly ''; $a.Options | Should -BeOfType [hashtable]; $a.Identity.FolderPart | Should -Be 'SN123'
     }
+    # Pre-PR code review item 2: SessionDir is where the child writes (and, on the stick, where it creates folders), so it is
+    # '' or one folder directly under <Args.StickRoot>\BenTech-Reports (the stick as the window builds it), or, with no
+    # stick (Args.StickRoot ''), one folder directly under <Root>\Logs\Repair (Get-ToolboxSessionDir's local form).
+    It 'refuses a SessionDir that is not one folder directly under the stick''s BenTech-Reports (or Root\Logs\Repair with no stick)' {
+      $stick = (Join-Path $TestDrive 'Stick') + '\'; $reports = $stick + 'BenTech-Reports'; $local = "$TestDrive\Root\Logs\Repair"; $name = 'PC1_SN123_2026-10-22_1015'
+      $cases = [ordered]@{
+        'the Windows folder'                        = @($stick, 'C:\Windows\System32')
+        'the stick''s root'                         = @($stick, $stick.TrimEnd('\'))
+        'BenTech-Reports itself'                    = @($stick, $reports)
+        'a folder beside BenTech-Reports'           = @($stick, ($stick + 'Other\' + $name))
+        'a sibling that only starts like it'        = @($stick, ($reports + '2\' + $name))
+        'a folder two levels down'                  = @($stick, "$reports\$name\logs")
+        'a ".." that climbs out'                    = @($stick, "$reports\..\Evil")
+        'a ".." that climbs back in'                = @($stick, "$reports\x\..\$name")
+        'a "." segment'                             = @($stick, "$reports\.\$name")
+        'a doubled backslash'                       = @($stick, "$reports\\$name")
+        'a forward slash'                           = @($stick, "$reports/$name")
+        'a trailing backslash'                      = @($stick, "$reports\$name\")
+        'a trailing dot'                            = @($stick, "$reports\$name.")
+        'another drive than the stick'              = @($stick, "Z:\BenTech-Reports\$name")
+        'a stick path while no stick is given'      = @('', "$reports\$name")
+        'a stick root that is not fully qualified'  = @('Stick\', "$reports\$name")
+        'a local folder while a stick is given'     = @($stick, "$local\$name")
+        'a folder two levels below Root\Logs\Repair' = @('', "$local\a\$name")
+        'Root\Logs itself'                          = @('', "$TestDrive\Root\Logs\$name")
+        'another Root'                              = @('', "$TestDrive\Other\Logs\Repair\$name")
+      }
+      foreach ($why in $cases.Keys) {
+        $script:caseStick = $cases[$why][0]; $script:caseSession = $cases[$why][1]
+        $p = Write-TestArgs -Mutate { param($a) $a.StickRoot = $script:caseStick; $a.SessionDir = $script:caseSession }
+        { Read-ToolArgs -Path $p -Root "$TestDrive\Root" -ActionId 'test' } | Should -Throw "*SessionDir is not under the stick's BenTech-Reports*" -Because $why
+      }
+      # A UNC path has no drive letter: refused by the earlier fully-qualified check.
+      $script:caseStick = $stick; $script:caseSession = "\\server\share\BenTech-Reports\$name"
+      $p = Write-TestArgs -Mutate { param($a) $a.StickRoot = $script:caseStick; $a.SessionDir = $script:caseSession }
+      { Read-ToolArgs -Path $p -Root "$TestDrive\Root" -ActionId 'test' } | Should -Throw '*SessionDir is not a fully qualified path*'
+    }
+    It 'accepts an empty SessionDir, one folder directly under StickRoot\BenTech-Reports (any case; the stick as a drive root too) and, with no stick, one under Root\Logs\Repair' {
+      $stick = (Join-Path $TestDrive 'Stick') + '\'; $name = 'PC1_SN123_2026-10-22_1015'
+      $cases = [ordered]@{
+        'empty, with a stick'          = @($stick, '')
+        'empty, without a stick'       = @('', '')
+        'the folder under the stick'   = @($stick, ($stick + "BenTech-Reports\$name"))
+        'any letter case'              = @($stick, ($stick + 'bentech-REPORTS\' + $name.ToLowerInvariant()))
+        'a stick that is a drive root' = @('E:\', "E:\BenTech-Reports\$name")
+        'a lower-case drive root'      = @('e:\', "E:\BenTech-Reports\$name")
+        'no stick: Root\Logs\Repair'   = @('', "$TestDrive\Root\Logs\Repair\$name")
+      }
+      foreach ($why in $cases.Keys) {
+        $script:caseStick = $cases[$why][0]; $script:caseSession = $cases[$why][1]
+        $p = Write-TestArgs -Mutate { param($a) $a.StickRoot = $script:caseStick; $a.SessionDir = $script:caseSession }
+        { $script:got = Read-ToolArgs -Path $p -Root "$TestDrive\Root" -ActionId 'test' } | Should -Not -Throw -Because $why
+        $script:got.SessionDir | Should -BeExactly $script:caseSession -Because $why
+      }
+    }
+    It 'a refused SessionDir stops the child before anything is created (no step, no result, nothing under the folder)' {
+      $argsPath = Write-TestArgs -Mutate { param($a) $a.SessionDir = "$TestDrive\Stick\BenTech-Reports\..\Evil" }
+      Invoke-SetupToolProcess -Root "$TestDrive\Root" -ActionId 'test' -ArgsPath $argsPath | Should -Be 1
+      $script:calls.Count | Should -Be 0; "$script:runDir\result.json" | Should -Not -Exist
+      "$TestDrive\Stick" | Should -Not -Exist; "$TestDrive\Evil" | Should -Not -Exist
+      [IO.File]::ReadAllText("$script:root\Tool\setup.log") | Should -Match 'Tool action refused.*SessionDir is not under the stick'
+    }
     It 'runs the steps, writes the result and returns 0; Hebrew in the complaint never reaches the log' {
       $argsPath = Write-TestArgs -Mutate { param($a) $a.Complaint = 'המחשב איטי' }
       Invoke-SetupToolProcess -Root "$TestDrive\Root" -ActionId 'test' -ArgsPath $argsPath | Should -Be 0

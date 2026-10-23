@@ -350,6 +350,13 @@ function Invoke-SetupCleanup {
     Cancel (Esc on the start screen, no earlier run) runs 1 and 4-6 only.
     Both waits empty the key buffer first (-FlushInput), so a key pressed earlier cannot skip them.
 
+    -KeepFolder (pre-PR code review item 1): Start-BenTechSetup passes it while a process the toolbox started still
+    runs (Test-ToolboxChildrenRunning), because rd under a running child would fight it for the folder. It skips
+    only step 5, the removal of C:\BenTech, and the Task Scheduler call that belongs to it; one line says the folder
+    is kept. Everything else is unchanged: Finish still copies the logs to the stick (a failed copy still waits for
+    Enter, the prompt then reads 'Press ENTER to continue (C:\BenTech is kept)') and still deletes a Desktop
+    launcher, Cancel still stops logging and removes an empty -ProgramDataFolder.
+
     The seams (production defaults shown): -ReadKey waits for a key and returns its [ConsoleKey] name;
     -Write writes one line of text; -FlushInput throws away waiting key presses.
   #>
@@ -361,7 +368,8 @@ function Invoke-SetupCleanup {
     [scriptblock]$ReadKey = { [Console]::ReadKey($true).Key.ToString() },
     [scriptblock]$Write = { param($t) Write-Host $t -ForegroundColor White -BackgroundColor Black },
     [string]$ProgramDataFolder = (Join-Path $env:ProgramData 'BenTech'),
-    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } }
+    [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } },
+    [switch]$KeepFolder
   )
 
   $say = {
@@ -381,7 +389,8 @@ function Invoke-SetupCleanup {
   }
 
   $folder = Split-Path -Parent $Root
-  Write-SetupLog -Message 'Cleanup: saving the logs and removing C:\BenTech' -Data @{ mode = $Mode; folder = $folder }
+  $logLine = if ($KeepFolder) { 'Cleanup: saving the logs; C:\BenTech is kept' } else { 'Cleanup: saving the logs and removing C:\BenTech' }
+  Write-SetupLog -Message $logLine -Data @{ mode = $Mode; folder = $folder }
   $script:SetupLogPath = $null
   $script:SetupActivityPath = $null
 
@@ -400,7 +409,7 @@ function Invoke-SetupCleanup {
         $copy = Copy-SetupLogsToStick -LogDir (Join-Path $Root 'Logs') -StickRoot ([string]$stick['Root']) -PcName $pcName -StatePath (Join-Path $Root 'state.json')
         if (-not $copy['Ok']) {
           & $say ('Logs could not be saved to the USB stick: {0}' -f $copy['Error'])
-          & $say ('Press ENTER to delete {0} anyway' -f $folder)
+          if ($KeepFolder) { & $say ('Press ENTER to continue ({0} is kept)' -f $folder) } else { & $say ('Press ENTER to delete {0} anyway' -f $folder) }
           & $waitKey $true
         } else {
           if (-not [string]::IsNullOrEmpty([string]$copy['StateError'])) { & $say ('state.json could not be saved to the USB stick: {0}' -f $copy['StateError']) }
@@ -442,10 +451,13 @@ function Invoke-SetupCleanup {
   # Final review I1: the resume task runs <folder>\Setup\setup.ps1 elevated at every logon. The admin-only
   # folder is what keeps anyone else from putting a setup.ps1 there, so it stays while the task does.
   $taskGone = $false
-  if ($isSetupFolder) {
+  if ($isSetupFolder -and -not $KeepFolder) {
     try { $taskGone = ((Unregister-ResumeTask) -eq $true) } catch { $taskGone = $false }
   }
-  if (-not $isSetupFolder) {
+  if ($KeepFolder) {
+    # A process the toolbox started still runs: the folder stays (Main.ps1 logged the WARN before this call).
+    & $say ('Kept {0}: a process the toolbox started is still running' -f $folder)
+  } elseif (-not $isSetupFolder) {
     & $say ('Not deleting {0}: not {1}' -f $folder, $expected)
   } elseif (-not $taskGone) {
     & $say ('Resume task BenTechSetup-Resume is still registered: {0} kept - delete the task, then the folder, as administrator' -f $folder)

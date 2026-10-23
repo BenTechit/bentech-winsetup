@@ -963,6 +963,50 @@ Describe 'ToolAdvanced (repair Task 7)' {
       (Get-FindingArgs $r 'ghostsRemoved')[0] | Should -Be @('1'); $r.RestartRequired | Should -BeFalse
       Get-StepStatus $r 'ghostRemove' | Should -Be 'warn'
     }
+    # Pre-PR code review item 4: a device instance id may hold a space inside it (a USB serial number does); pnputil gets it as
+    # one quoted argument, straight through Invoke-External (no cmd, so no cmd metacharacter handling is involved).
+    It 'Test-ToolDeviceId allows a space inside the id, and refuses a quote, a trailing backslash, a leading or trailing space, control and non-ASCII characters and a length outside 1-512' {
+      foreach ($ok in 'USB\VID_0781&PID_5567\4C53', 'USBSTOR\DISK&VEN_SANDISK&PROD_CRUZER&REV_1.00\4C53 0001&0', 'A B', 'A', ('X' + (' ' * 510) + 'Y'), ('R\' + ('A' * 510)), ('A' * 512)) {
+        Test-ToolDeviceId -Id $ok | Should -BeTrue -Because "'$ok' is a device id"
+      }
+      $bad = [ordered]@{
+        'empty'                   = ''
+        'a single space'          = ' '
+        'only spaces'             = '   '
+        'a leading space'         = ' USB\VID_1\1'
+        'a trailing space'        = 'USB\VID_1\1 '
+        'a double quote'          = 'USB\VID_1\4C "53'
+        'a trailing backslash'    = 'USB\VID_1\4C 53\'
+        'a tab'                   = "USB\VID_1\4C`t53"
+        'a line break'            = "USB\VID_1\4C`r`n53"
+        'DEL'                     = "USB\VID_1\4C$([char]0x7F)53"
+        'a Hebrew letter'         = ('USB\VID_1\' + [char]0x05D0)
+        '513 characters'          = ('A' * 513)
+        '512 characters ending in a space' = (('A' * 511) + ' ')
+      }
+      foreach ($why in $bad.Keys) { Test-ToolDeviceId -Id $bad[$why] | Should -BeFalse -Because $why }
+      Test-ToolDeviceId -Id $null | Should -BeFalse
+    }
+    It 'an id with a space is removed: pnputil gets it as one quoted argument straight through Invoke-External, never a cmd line' {
+      $spaced = 'USB\VID_0781&PID_5567\4C53 0001'
+      $script:gc['ghostList']['Items'] += @{ InstanceId = $spaced; Class = 'USB'; Name = 'Old card reader'; Parent = 'USB\ROOT_HUB30\4&1' }
+      $r = New-ActionRun ghostRemove -Options @{ Ids = @($spaced) }
+      Invoke-ToolSteps -Run $r | Should -Be 'Done'
+      $script:nativeLines | Should -Be @('pnputil.exe /remove-device "USB\VID_0781&PID_5567\4C53 0001"')
+      Should -Invoke Invoke-ToolNative -Times 1 -Exactly -ParameterFilter { $ArgumentList -ceq '/remove-device "USB\VID_0781&PID_5567\4C53 0001"' -and -not $OutputName -and $StepTimeout -ceq 'pnputil' }
+      Get-FindingCodes $r | Should -Not -Contain 'ghostRemoveFailed'; (Get-FindingArgs $r 'ghostsRemoved')[0] | Should -Be @('1')
+      # Invoke-ToolNative without -OutputName runs the tool itself through Invoke-External (ToolEngine tests); the step must not ask for the cmd route.
+      $ast = (Get-Command Invoke-ToolStepGhostRemove).ScriptBlock.Ast
+      $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-ToolNative' }, $true)
+      @($calls).Count | Should -Be 1
+      @($calls[0].CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -in 'OutputName', 'OutputFolder' }).Count | Should -Be 0
+    }
+    It 'a ticked id with a quote, a trailing backslash or a leading or trailing space is still never passed on' {
+      $r = New-ActionRun ghostRemove -Options @{ Ids = @(' USB\VID_0781&PID_5567\4C53', 'USB\VID_0781&PID_5567\4C53 ', 'USB\X Y\', 'USB\X "Y\1') }
+      $null = Invoke-ToolSteps -Run $r
+      $script:nativeLines | Should -BeNullOrEmpty
+      (Get-FindingArgs $r 'ghostRemoveFailed').Count | Should -Be 4; Get-StepStatus $r 'ghostRemove' | Should -Be 'warn'
+    }
     It 'Options that are no list of ids remove nothing' {
       $r = New-ActionRun ghostRemove -Options @{ Ids = @{ x = 1 } }; $null = Invoke-ToolSteps -Run $r
       @($script:nativeLines).Count | Should -Be 0; (Get-FindingArgs $r 'ghostsRemoved')[0] | Should -Be @('0')
