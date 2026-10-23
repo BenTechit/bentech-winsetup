@@ -1490,32 +1490,75 @@ function Get-ToolboxStickPresence {
     The full search (Find-SetupStick, by volume serial) runs only when this text changes (Update-ToolboxStick).
     The two seams (Task 5 review M1, ruling RD-R19) let the tests check the filters without this PC's drives: -Drives
     gives objects with Name, DriveType (an [IO.DriveType] or its name), IsReady, VolumeLabel and TotalSize.
+    The launcher's drive counts under any file name only where Find-SetupStick would match it by the launcher's volume
+    serial (final wave item 12): the launcher has a VolumeSerial and is no Desktop launcher (-IsDesktopLauncher; by
+    default Test-DesktopLauncher). Otherwise it is judged like any drive (its root file), so the presence never names a
+    drive the full search rejects by rule, and Update-ToolboxStick's once-a-minute retry never runs for one (a Desktop
+    launcher on a redirected non-system drive would have run a CIM query every minute on the window's thread).
+    -Known is the window's memory between checks (Tag.StickKnown; final review Minor 4): with it a dying second disk
+    cannot stall the window every 5 seconds, because a Fixed drive's root is looked at (IsReady, then the file) only
+    when its letter appears, and again on every check only while it is the stick: it counted last time, or it is
+    Known.StickDrive (the page's stick, 'E:'), or it is the launcher's drive. Removable drives (where sticks come and
+    go) are looked at on every check. The launcher's Desktop test runs once per -Known. Without -Known every drive is
+    looked at on every check.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param(
     [AllowNull()][hashtable]$Launcher,
+    [AllowNull()][hashtable]$Known,
     [AllowEmptyString()][string]$SystemDrive = $env:SystemDrive,
     [scriptblock]$Drives = { [IO.DriveInfo]::GetDrives() },
-    [scriptblock]$FileExists = { param($path) [IO.File]::Exists($path) }
+    [scriptblock]$FileExists = { param($path) [IO.File]::Exists($path) },
+    [scriptblock]$IsDesktopLauncher = { param($path) Test-DesktopLauncher -Path $path }
   )
 
   $parts = New-Object System.Collections.Generic.List[string]
+  if ($null -eq $Known) { $Known = @{} }
   try {
     $system = ([string]$SystemDrive).TrimEnd('\').ToUpperInvariant()
-    $launcherDrive = if ($null -ne $Launcher) { ([string]$Launcher['Drive']).TrimEnd('\').ToUpperInvariant() } else { '' }
+    if (-not $Known.ContainsKey('LauncherDrive')) {
+      $counted = ''
+      if ($null -ne $Launcher -and -not [string]::IsNullOrWhiteSpace([string]$Launcher['VolumeSerial'])) {
+        try {
+          if ((& $IsDesktopLauncher ([string]$Launcher['Path'])) -ne $true) { $counted = ([string]$Launcher['Drive']).TrimEnd('\').ToUpperInvariant() }
+        } catch {
+          $counted = ''
+        }
+      }
+      $Known['LauncherDrive'] = $counted
+    }
+    $launcherDrive = [string]$Known['LauncherDrive']
+    $stickDrive = ([string]$Known['StickDrive']).TrimEnd('\').ToUpperInvariant()
+    if ($Known['Fixed'] -isnot [hashtable]) { $Known['Fixed'] = @{} }
+    $fixed = $Known['Fixed']
+    $seen = @{}
     foreach ($drive in @(& $Drives)) {
       try {
-        if ([string]$drive.DriveType -cnotin 'Removable', 'Fixed') { continue }
+        $type = [string]$drive.DriveType
+        if ($type -cnotin 'Removable', 'Fixed') { continue }
         $name = [string]$drive.Name
         $letter = $name.TrimEnd('\').ToUpperInvariant()
-        if ($letter -eq '' -or $letter -eq $system -or $drive.IsReady -ne $true) { continue }
-        if ($letter -ne $launcherDrive -and (& $FileExists ([IO.Path]::Combine($name, 'BenTechSetup.cmd'))) -ne $true) { continue }
+        if ($letter -eq '' -or $letter -eq $system) { continue }
+        $isLauncher = ($letter -ne '' -and $letter -eq $launcherDrive)
+        $remember = ($type -ceq 'Fixed' -and -not $isLauncher)
+        if ($remember) {
+          $seen[$letter] = $true
+          # Looked at once; again only while it is the stick. Until this look succeeds it counts as no stick, so a
+          # look that throws or stalls is not repeated on every check.
+          if ($fixed.ContainsKey($letter) -and $fixed[$letter] -ne $true -and $letter -ne $stickDrive) { continue }
+          $fixed[$letter] = $false
+        }
+        if ($drive.IsReady -ne $true) { continue }
+        if (-not $isLauncher -and (& $FileExists ([IO.Path]::Combine($name, 'BenTechSetup.cmd'))) -ne $true) { continue }
+        if ($remember) { $fixed[$letter] = $true }
         $parts.Add(('{0}|{1}|{2}' -f $name.ToUpperInvariant(), $drive.VolumeLabel, $drive.TotalSize))
       } catch {
         continue
       }
     }
+    # A letter that went away is looked at again when it comes back (another disk may have it then).
+    foreach ($letter in @($fixed.Keys)) { if (-not $seen.ContainsKey($letter)) { $fixed.Remove($letter) } }
   } catch {
     return ''
   }
@@ -1549,10 +1592,12 @@ function Update-ToolboxStick {
     The stick, checked again (spec 8, ruling RD-R3): on the power timer's 5-second tick and when the page opens. Only
     on the repair page, and never while an action runs. Returns nothing; never throws. Does not render.
   .DESCRIPTION
-    Tag.StickPresent (Get-ToolboxStickPresence: [IO.DriveInfo], no CIM) answers first; only when its answer differs
-    from the last one, or on the first check, Tag.FindStick (Find-SetupStick: the full search by the launcher's volume
-    serial, one bounded CIM query) runs. Also (review M2, ruling RD-R19): while the presence answer names a stick and
-    the page has none (a search that timed out reads as "no stick"), the full search runs again once a minute
+    Tag.StickPresent (Get-ToolboxStickPresence: [IO.DriveInfo], no CIM; with Tag.StickKnown, its memory between
+    ticks, told the page's stick drive, so a fixed disk is looked at once, not every 5 s) answers first; only when its
+    answer differs from the last one, or on the first check, Tag.FindStick (Find-SetupStick: the full search by the
+    launcher's volume serial, one bounded CIM query) runs. Also (review M2, ruling RD-R19): while the presence answer
+    names a stick and the page has none (a search that timed out reads as "no stick"; the presence names no drive the
+    search rejects by rule, final wave item 12), the full search runs again once a minute
     ($script:ToolboxStickRetrySeconds on Get-ToolboxStickSearchSeconds; never more often). A stick it finds on another
     root than the model's replaces Repair.Stick, and the change is logged once: INFO 'Toolbox stick changed' with
     @{ drive } ('none' when it is gone; ASCII); a search that changes nothing logs nothing. A presence check or a search
@@ -1566,9 +1611,13 @@ function Update-ToolboxStick {
 
   $state = $Window.Tag
   if ([string]$state.Model['Page'] -cne 'repair' -or (Test-ToolboxActionRunning -State $state)) { return }
+  # The presence check's memory between ticks (final review Minor 4), told which drive is the page's stick now.
+  if ($state['StickKnown'] -isnot [hashtable]) { $state['StickKnown'] = @{} }
+  $pageStick = $state.Model['Repair']['Stick']
+  $state['StickKnown']['StickDrive'] = $(if ($pageStick -is [System.Collections.IDictionary]) { [string]$pageStick['Drive'] } else { '' })
   $presence = ''
   try {
-    $presence = [string](& $state['StickPresent'] $state['Launcher'])
+    $presence = [string](& $state['StickPresent'] $state['Launcher'] $state['StickKnown'])
   } catch {
     if ($state['StickWarned'] -ne $true) {
       $state['StickWarned'] = $true

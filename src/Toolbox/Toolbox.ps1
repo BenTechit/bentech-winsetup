@@ -286,7 +286,8 @@ function New-ToolboxWindow {
     running, RepairPage.ps1) and RunTimer (Show-ToolboxWindow's 500 ms timer; $null until it makes one). The seams'
     defaults are Show-ToolboxWindow's. KillChecks (final wave item 11): the children the run tick killed that had not
     ended yet, judged on the next ticks (Add-ToolboxKillCheck, Update-ToolboxKillChecks).
-    Repair Task 5: the seam StickPresent (the cheap 5-second stick presence check, ruling RD-R3) with its last answer
+    Repair Task 5: the seam StickPresent (the cheap 5-second stick presence check, ruling RD-R3; it gets the launcher
+    and StickKnown, its memory between checks: final review Minor 4) with its last answer
     (StickPresence; StickChecked $false until the first check, StickWarned / StickSearchWarned once a failure is
     logged), SafetyStarted ($false until the page's first visit starts the strip's child) and RepairItemsShape (what
     the confirmation's items show, so they are rebuilt only when it changes).
@@ -304,7 +305,7 @@ function New-ToolboxWindow {
     [AllowNull()][hashtable]$Launcher = $null,
     [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
     [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
-    [scriptblock]$StickPresent = { param($l) Get-ToolboxStickPresence -Launcher $l }
+    [scriptblock]$StickPresent = { param($l, $k) Get-ToolboxStickPresence -Launcher $l -Known $k }
   )
 
   $window = [System.Windows.Markup.XamlReader]::Parse($script:ToolboxXaml, (New-ToolboxParserContext))
@@ -346,7 +347,7 @@ function New-ToolboxWindow {
     RepairConfirmKey = ''; RepairItemsShape = ''
     Root = $Root; ScriptPath = $ScriptPath; Launcher = $Launcher; StartChild = $StartChild; FindStick = $FindStick
     Runs = @{ Action = $null; Safety = $null }; RunTimer = $null; KillChecks = (New-Object 'System.Collections.Generic.List[object]')
-    StickPresent = $StickPresent; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false; StickSearchClock = $null
+    StickPresent = $StickPresent; StickKnown = @{}; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false; StickSearchClock = $null
     SafetyStarted = $false
   }
   Update-ToolboxView -Window $window
@@ -988,7 +989,7 @@ function Show-ToolboxWindow {
     [scriptblock]$Launcher = { Get-LauncherInfo -Path $env:BT_SELF },
     [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
     [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
-    [scriptblock]$StickPresent = { param($l) Get-ToolboxStickPresence -Launcher $l }
+    [scriptblock]$StickPresent = { param($l, $k) Get-ToolboxStickPresence -Launcher $l -Known $k }
   )
 
   try {

@@ -1003,10 +1003,13 @@ Describe 'the stick presence check (ruling RD-R3; Task 5 review M1, ruling RD-R1
     $script:checked = New-Object Collections.Generic.List[string]
     $script:exists = { param($p) $script:checked.Add($p); if ($p -like 'J:*') { throw 'the drive went away' }; $script:files -contains $p }
     $script:launcherF = @{ Path = 'F:\BenTechSetup (2).cmd'; Drive = 'F:'; VolumeSerial = '1A2B3C4D' }
+    # The launcher's Desktop test reads this PC's Desktop folder: never here (each test passes -IsDesktopLauncher).
+    Mock Test-DesktopLauncher { throw 'blocked by the test: Test-DesktopLauncher' }
+    $script:notDesktop = { param($p) $false }
   }
 
   It 'keeps the ready Removable and Fixed drives with BenTechSetup.cmd in the root, and the launcher''s drive under any file name' {
-    Get-ToolboxStickPresence -Launcher $launcherF -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists |
+    Get-ToolboxStickPresence -Launcher $launcherF -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists -IsDesktopLauncher $script:notDesktop |
       Should -BeExactly 'E:\|BENTECH|32010928128;F:\|LAUNCHER|16000000000'
     # Never the system drive, a network share, a CD-ROM, a drive that is not ready, or the launcher's own drive (it counts as it is).
     @($script:checked) | Should -Be @('D:\BenTechSetup.cmd', 'E:\BenTechSetup.cmd', 'J:\BenTechSetup.cmd') }
@@ -1018,6 +1021,45 @@ Describe 'the stick presence check (ruling RD-R3; Task 5 review M1, ruling RD-R1
     Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { throw 'no drives' } -FileExists { param($p) $true } | Should -BeExactly ''
     Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { @() } -FileExists { param($p) $true } | Should -BeExactly ''
     Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { $script:drives } -FileExists { param($p) throw 'access denied' } | Should -BeExactly '' }
+  It 'the launcher''s drive counts under any file name only where Find-SetupStick matches by serial: never a Desktop launcher''s or one without a serial (item 12)' {
+    $desktop = @{ Path = 'F:\Users\Ben\Desktop\BenTechSetup.cmd'; Drive = 'F:'; VolumeSerial = '1A2B3C4D' }   # a Desktop redirected to F:
+    Get-ToolboxStickPresence -Launcher $desktop -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists -IsDesktopLauncher { param($p) $true } |
+      Should -BeExactly 'E:\|BENTECH|32010928128'
+    $script:checked | Should -Contain 'F:\BenTechSetup.cmd'   # judged like any drive: by its root file
+    $noSerial = @{ Path = 'F:\BenTechSetup (2).cmd'; Drive = 'F:'; VolumeSerial = $null }
+    Get-ToolboxStickPresence -Launcher $noSerial -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists -IsDesktopLauncher $script:notDesktop |
+      Should -BeExactly 'E:\|BENTECH|32010928128'
+    # A Desktop test that throws counts the drive by its file only; with the window's memory it runs once.
+    Get-ToolboxStickPresence -Launcher $launcherF -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists -IsDesktopLauncher { param($p) throw 'no desktop' } |
+      Should -BeExactly 'E:\|BENTECH|32010928128'
+    $known = @{}; $script:desktopReads = 0
+    foreach ($i in 1..3) { $null = Get-ToolboxStickPresence -Launcher $launcherF -Known $known -SystemDrive 'C:' -Drives { $script:drives } -FileExists $script:exists -IsDesktopLauncher { param($p) $script:desktopReads++; $false } }
+    $script:desktopReads | Should -Be 1 }
+  It 'with the window''s memory a fixed disk is looked at once, when its letter appears; the stick''s own drive and removable drives on every check (final review Minor 4)' {
+    $script:dReads = 0
+    $d = [pscustomobject]@{ Name = 'D:\'; DriveType = [IO.DriveType]::Fixed; VolumeLabel = 'DATA'; TotalSize = 1000000000000 }
+    $d | Add-Member -MemberType ScriptProperty -Name IsReady -Value { $script:dReads++; $true }   # a dying data disk: every look costs
+    $k = New-FakeDrive 'K:\' ([IO.DriveType]::Fixed) $true 'USBSSD' 500107862016   # a stick the system calls Fixed
+    $c = New-FakeDrive 'C:\' ([IO.DriveType]::Fixed) $true 'OS' 512000000000
+    $e = New-FakeDrive 'E:\' ([IO.DriveType]::Removable) $true 'BENTECH' 32010928128
+    $script:set = @($c, $d, $e, $k); $script:files = @('E:\BenTechSetup.cmd', 'K:\BenTechSetup.cmd')
+    $known = @{}
+    $check = { $script:checked.Clear(); Get-ToolboxStickPresence -Launcher $null -Known $known -SystemDrive 'C:' -Drives { $script:set } -FileExists $script:exists -IsDesktopLauncher $script:notDesktop }
+    & $check | Should -BeExactly 'E:\|BENTECH|32010928128;K:\|USBSSD|500107862016'
+    @($script:checked) | Should -Be @('D:\BenTechSetup.cmd', 'E:\BenTechSetup.cmd', 'K:\BenTechSetup.cmd'); $script:dReads | Should -Be 1
+    foreach ($i in 1..3) { & $check | Should -BeExactly 'E:\|BENTECH|32010928128;K:\|USBSSD|500107862016' }
+    @($script:checked) | Should -Be @('E:\BenTechSetup.cmd', 'K:\BenTechSetup.cmd'); $script:dReads | Should -Be 1   # D: never again
+    # D: goes and comes back (another disk may have its letter then): looked at once more.
+    $script:set = @($c, $e, $k); $null = & $check; $script:set = @($c, $d, $e, $k); $null = & $check
+    @($script:checked) | Should -Contain 'D:\BenTechSetup.cmd'; $script:dReads | Should -Be 2
+    # The fixed stick loses its file: no longer counted, and no longer looked at.
+    $script:files = @('E:\BenTechSetup.cmd'); & $check | Should -BeExactly 'E:\|BENTECH|32010928128'; @($script:checked) | Should -Contain 'K:\BenTechSetup.cmd'
+    $null = & $check; @($script:checked) | Should -Not -Contain 'K:\BenTechSetup.cmd'
+    # The page's stick (Known.StickDrive) is looked at on every check, even on a fixed disk.
+    $known['StickDrive'] = 'D:'; $null = & $check; $null = & $check; $script:dReads | Should -Be 4
+    # Without the memory, every drive on every check (as before).
+    $script:dReads = 0; foreach ($i in 1..2) { $null = Get-ToolboxStickPresence -Launcher $null -SystemDrive 'C:' -Drives { $script:set } -FileExists $script:exists }
+    $script:dReads | Should -Be 2 }
 }
 
 Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling RD-R19)' {
@@ -1210,8 +1252,47 @@ Describe 'the final wave (final-fixes.md): the window' {
     Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) $script:ToolboxChildren.Add($script:endsSoon); $script:ToolboxChildren.Add($script:survives); @{ Outcome = 'Cancel' } } `
       -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { $script:order.Add('shutdown') } | Should -BeNullOrEmpty
     @($script:waits) | Should -Be @(2000, 2000); $script:order | Should -Be @('kill:4242', 'kill:4243', 'shutdown')
+    $script:ToolboxCloseGraceMilliseconds | Should -Be 2000
     @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox child process stopped' -and $_.Data.processId -eq 4242 }).Count | Should -Be 1
     $warn = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' })
     $warn.Count | Should -Be 1; $warn[0].Data.processId | Should -Be 4243
     @($script:ToolboxChildren.ToArray()) | Should -Be @($script:survives) }
+
+  # Items 4 and 12: the stick.
+  It 'the 5-second check gets the window''s memory, told the page''s stick drive, the same table on every tick (item 4)' {
+    $script:knownSeen = New-Object Collections.ArrayList
+    Mock Get-ToolboxStickPresence { [void]$script:knownSeen.Add(@{ Known = $Known; Stick = [string]$Known['StickDrive'] }); 'E:\|BENTECH|32010928128' }
+    $w = New-RunWindow; $tick = New-ToolboxPowerTimer -Window $w   # the default StickPresent seam
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; Invoke-ToolboxAction -Sender $tick -Action 'Power'
+    $script:knownSeen.Count | Should -Be 2; $script:knownSeen[0].Known | Should -BeOfType [hashtable]
+    [object]::ReferenceEquals($script:knownSeen[0].Known, $script:knownSeen[1].Known) | Should -BeTrue
+    [object]::ReferenceEquals($script:knownSeen[0].Known, $w.Tag.StickKnown) | Should -BeTrue
+    @($script:knownSeen | ForEach-Object { $_.Stick }) | Should -Be @('E:', 'E:') }
+  It 'a Desktop launcher on a redirected non-system drive never makes the full search run again every minute (item 12)' {
+    # The real presence check with its seams (no drive of this PC is read): F: holds the Desktop, not BenTechSetup.cmd.
+    $script:real = (Get-Item 'function:Get-ToolboxStickPresence').ScriptBlock
+    $script:fDrive = [pscustomobject]@{ Name = 'F:\'; DriveType = [IO.DriveType]::Fixed; IsReady = $true; VolumeLabel = 'DATA'; TotalSize = 1000 }
+    $w = New-RunWindow -Set @{ Stick = $null }; $w.Tag.Launcher = @{ Path = 'F:\Users\Ben\Desktop\BenTechSetup.cmd'; Drive = 'F:'; VolumeSerial = '1A2B3C4D' }
+    $w.Tag.StickPresent = { param($l, $k) & $script:real -Launcher $l -Known $k -SystemDrive 'C:' -Drives { @($script:fDrive) } -FileExists { param($p) $false } -IsDesktopLauncher { param($p) $true } }
+    $script:sticks = 0; $w.Tag.FindStick = { param($l) $script:sticks++; @{ Root = $null; Drive = $null } }
+    $tick = New-ToolboxPowerTimer -Window $w
+    Invoke-ToolboxAction -Sender $tick -Action 'Power'; $script:sticks | Should -Be 1   # the first check searches once
+    Mock Get-ToolboxStickSearchSeconds { 61 }
+    foreach ($i in 1..3) { Invoke-ToolboxAction -Sender $tick -Action 'Power' }
+    $script:sticks | Should -Be 1; $w.Tag.StickPresence | Should -BeExactly ''; $w.FindName('ChipStickText').Text | Should -Be 'No stick' }
+  It 'Open folder refuses an 8.3 short name and a \\.\ device path of the setup folder or the stick''s folder: nothing starts (item 12)' {
+    $w = New-RunWindow -Set @{ Stick = @{ Root = 'E:\'; Drive = 'E:' } }
+    $before = @($script:started).Count
+    foreach ($folder in 'C:\BENTEC~1\Setup\Logs\Repair\x', 'c:\bentec~1', '\\.\C:\BenTech\Setup\Logs\Repair\x', '\\.\E:\BenTech-Reports\PC_visit', '\\?\E:\BenTech-Reports\PC_visit') {
+      $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = $folder } }
+      Open-ToolboxFolder -Window $w -SystemDrive 'C:'
+    }
+    @($script:started).Count | Should -Be $before
+    $errors = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Could not open the folder' } | ForEach-Object { $_.Data.error })
+    $errors.Count | Should -Be 5
+    # An 8.3 name is refused by the setup-folder fence when Windows expands it, else by the stick fence; never opened.
+    foreach ($e in $errors[0..1]) { $e | Should -BeIn @('the folder is in the admin-only setup folder', 'the folder is not on the stick') }
+    @($errors[2..4] | Select-Object -Unique) | Should -Be @('the folder path cannot be read')
+    $w.Tag.Model.Repair.Result = @{ Action = 'health'; Outcome = 'Done'; Color = 'GREEN'; Findings = @(); Files = @{ Folder = '\\.\E:\BenTech-Reports\PC_visit' } }
+    Update-ToolboxView -Window $w; $w.FindName('OpenFolderButton').Visibility | Should -Be 'Collapsed' }
 }
