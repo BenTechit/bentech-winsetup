@@ -81,7 +81,7 @@ function Stop-ProcessTree {
   } catch {
     # Last resort: Get-ProcessTreeId handles failed queries itself, so this means something
     # unexpected. The root must still be killed.
-    Write-SetupLog -Message "Could not walk the process tree; killing the root only: $($_.Exception.Message)" -Level WARN -Data @{ processId = $ProcessId }
+    Write-SetupLog -Message "Could not walk the process tree; killing the root only: $(ConvertTo-ScreenText -Text $_.Exception.Message)" -Level WARN -Data @{ processId = $ProcessId }
     $ids = @($ProcessId)
   }
   # Root first, so it cannot start replacements while the children are being killed.
@@ -94,6 +94,33 @@ function Stop-ProcessTree {
         Write-SetupLog -Message 'Could not kill process' -Level WARN -Data @{ processId = $id; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
       }
     }
+  }
+}
+
+function Wait-ProcessExit {
+  <#
+  .SYNOPSIS
+    $true once -Process has ended, waiting at most -Milliseconds (0 to 10000) for it. Never throws.
+  .DESCRIPTION
+    A kill is asynchronous (TerminateProcess returns before the process has ended), so a caller that would call a
+    child "still running" right after its kill first waits here, briefly and bounded (repair final wave item 11). A
+    real [Diagnostics.Process] is waited on with WaitForExit(-Milliseconds); any other object (a test's stand-in) has
+    its HasExited read once. $null has ended; a wait or a read that fails has not. The toolbox calls it only after its
+    window is gone (Get-SetupChoices' finally): the window never waits while it is shown.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [AllowNull()]$Process,
+    [ValidateRange(0, 10000)][int]$Milliseconds = 0
+  )
+
+  if ($null -eq $Process) { return $true }
+  try {
+    if ($Process -is [Diagnostics.Process]) { return [bool]$Process.WaitForExit($Milliseconds) }
+    return [bool]$Process.HasExited
+  } catch {
+    return $false
   }
 }
 

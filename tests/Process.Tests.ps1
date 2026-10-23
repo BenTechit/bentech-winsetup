@@ -321,6 +321,13 @@ Describe 'exception texts reach setup.log in ASCII (a Hebrew Windows localizes t
     @(Get-ProcessTreeId -RootId 999999) | Should -Be @(999999)
     $script:logs.Count | Should -Be 1; $script:logs[0].Message | Should -BeExactly 'Could not enumerate children of 999999: WMI ??'
   }
+  It 'a process-tree walk that throws: the root is still killed, and the reason is logged in ASCII (final wave item 10)' {
+    Mock Get-ProcessTreeId { throw ('walk ' + [char]0x05D0 + [char]0x05D1) }; Mock Stop-Process { }; Mock Get-Process { $null }
+    { Stop-ProcessTree -ProcessId 999999 } | Should -Not -Throw
+    Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 999999 }
+    $w = @($script:logs | Where-Object { $_.Level -eq 'WARN' }); $w.Count | Should -Be 1
+    $w[0].Message | Should -BeExactly 'Could not walk the process tree; killing the root only: walk ??'
+  }
   It 'a kill that fails while the process still runs' {
     Mock Get-ProcessTreeId { @(999999) }; Mock Stop-Process { throw ('denied ' + [char]0x05D0) }; Mock Get-Process { [pscustomobject]@{ Id = 999999 } }
     { Stop-ProcessTree -ProcessId 999999 } | Should -Not -Throw
@@ -330,6 +337,23 @@ Describe 'exception texts reach setup.log in ASCII (a Hebrew Windows localizes t
     Mock ConvertTo-ScreenText { 'ascii:' + $Text }
     { Start-BackgroundExternal -FilePath "$TestDrive\nope.exe" } | Should -Throw '*Cannot start*'
     $w = @($script:logs | Where-Object { $_.Message -eq 'Background process failed to start' }); $w.Count | Should -Be 1; $w[0].Data.error | Should -BeLike 'ascii:*'
+  }
+}
+
+Describe 'Wait-ProcessExit (a kill is asynchronous: final wave item 11)' {
+  # SAFETY: nothing is started or killed; the one real process is this test process itself, waited on for 0 ms.
+  It 'no process has ended; a stand-in object has its HasExited read once; one that cannot be read has not ended' {
+    Wait-ProcessExit -Process $null -Milliseconds 2000 | Should -BeTrue
+    Wait-ProcessExit -Process ([pscustomobject]@{ Id = 1; HasExited = $true }) -Milliseconds 2000 | Should -BeTrue
+    Wait-ProcessExit -Process ([pscustomobject]@{ Id = 1; HasExited = $false }) -Milliseconds 2000 | Should -BeFalse
+    $broken = [pscustomobject]@{ Id = 1 }; $broken | Add-Member -MemberType ScriptProperty -Name HasExited -Value { throw 'access denied' }
+    Wait-ProcessExit -Process $broken -Milliseconds 2000 | Should -BeFalse
+  }
+  It 'a real process is waited on for at most -Milliseconds (this one runs on: $false within the bound)' {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Wait-ProcessExit -Process ([Diagnostics.Process]::GetCurrentProcess()) -Milliseconds 300 | Should -BeFalse
+    $clock.Elapsed.TotalMilliseconds | Should -BeLessThan 3000
+    { Wait-ProcessExit -Process $null -Milliseconds 10001 } | Should -Throw   # the bound itself is bounded
   }
 }
 

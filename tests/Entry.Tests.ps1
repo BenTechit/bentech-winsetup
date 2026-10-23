@@ -565,6 +565,13 @@ Describe 'Start-BenTechSetup' {
       Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'A toolbox child process is still running; the setup folder is kept' }
       Mock Get-ToolboxRestartRequest { $true }; $script:order.Clear()
       Invoke-Entry | Should -Be 0; @($script:order | Where-Object { $_ -like 'cleanup:*' -or $_ -eq 'restart' }) | Should -Be @('restart') }
+    It 'a toolbox child still running keeps C:\BenTech after a finished run too: no Finish cleanup, a WARN (RD-R17; final wave item 11)' {
+      Mock Test-ToolboxChildrenRunning { $true }
+      Invoke-Entry | Should -Be 0; Should -Invoke Invoke-SetupRun -Times 1 -Exactly; Should -Invoke Invoke-SetupCleanup -Times 0 -Exactly
+      Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'A toolbox child process is still running; the setup folder is kept' -and $Data.mode -eq 'Finish' }
+      Should -Invoke Invoke-StatelessRestart -Times 0 -Exactly
+      Mock Test-ToolboxChildrenRunning { $false }; Invoke-Entry | Should -Be 0   # the same run once the child has ended cleans up
+      Should -Invoke Invoke-SetupCleanup -Times 1 -Exactly -ParameterFilter { $Mode -eq 'Finish' } }
     It 'passes Root and ScriptPath to Get-SetupChoices' {
       Invoke-Entry | Out-Null
       Should -Invoke Get-SetupChoices -Times 1 -Exactly -ParameterFilter { $Root -eq $TestDrive -and $ScriptPath -like '*\setup.ps1' }

@@ -168,6 +168,20 @@ $e = Invoke-CimMethod -InputObject $v -MethodName 'GetKeyProtectorNumericalPassw
     $probe = [Management.Automation.Language.Parser]::ParseInput('function F { Get-PhysicalDisk; $p.WaitForExit() }', [ref]$null, [ref]$null)
     @($probe.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $banned -contains $_ }) | Should -Be @('Get-PhysicalDisk')
   }
+  It 'the one bounded wait for a killed child (Wait-ProcessExit) runs only after the window is gone: Get-SetupChoices'' finally (final wave item 11)' {
+    # A kill is asynchronous, so the last close waits briefly before it calls a child "still running"; while the window
+    # is shown (the run tick, Show-ToolboxWindow's finally) a kill is judged on later ticks or by that last close.
+    $calls = New-Object Collections.Generic.List[string]
+    foreach ($f in @(Get-ChildItem "$PSScriptRoot\..\src\Toolbox" -Filter *.ps1)) {
+      $ast = [Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+      foreach ($c in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in 'Wait-ProcessExit', 'Stop-ToolboxChild', 'Stop-ToolboxChildren' }, $true)) {
+        $fn = $c.Parent; while ($null -ne $fn -and $fn -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $fn = $fn.Parent }
+        $grace = @($c.CommandElements | Where-Object { $_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'GraceMilliseconds' }).Count -gt 0
+        if ($c.GetCommandName() -eq 'Wait-ProcessExit' -or $grace) { $calls.Add(('{0} in {1}' -f $c.GetCommandName(), $(if ($fn) { $fn.Name } else { '<top>' }))) }
+      }
+    }
+    @($calls.ToArray() | Sort-Object) | Should -Be @('Stop-ToolboxChild in Stop-ToolboxChildren', 'Stop-ToolboxChildren in Get-SetupChoices', 'Wait-ProcessExit in Stop-ToolboxChild')
+  }
   It 'the ghost exclusion lists hold every enumerator of spec 6.7 (repair Task 7)' {
     $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $script:srcRoot 'Repair\ToolAdvanced.ps1'), [ref]$null, [ref]$null)
     $values = @{}

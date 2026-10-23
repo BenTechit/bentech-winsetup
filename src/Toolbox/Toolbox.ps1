@@ -284,7 +284,8 @@ function New-ToolboxWindow {
     runs from; empty: no action can start), Launcher (Get-LauncherInfo's answer, read once), the seams StartChild
     (starts a child without waiting) and FindStick (the full stick search), Runs = @{ Action; Safety } (the children
     running, RepairPage.ps1) and RunTimer (Show-ToolboxWindow's 500 ms timer; $null until it makes one). The seams'
-    defaults are Show-ToolboxWindow's.
+    defaults are Show-ToolboxWindow's. KillChecks (final wave item 11): the children the run tick killed that had not
+    ended yet, judged on the next ticks (Add-ToolboxKillCheck, Update-ToolboxKillChecks).
     Repair Task 5: the seam StickPresent (the cheap 5-second stick presence check, ruling RD-R3) with its last answer
     (StickPresence; StickChecked $false until the first check, StickWarned / StickSearchWarned once a failure is
     logged), SafetyStarted ($false until the page's first visit starts the strip's child) and RepairItemsShape (what
@@ -344,7 +345,7 @@ function New-ToolboxWindow {
     Outcome = $null; Choices = $null; Error = $null; Closing = $false
     RepairConfirmKey = ''; RepairItemsShape = ''
     Root = $Root; ScriptPath = $ScriptPath; Launcher = $Launcher; StartChild = $StartChild; FindStick = $FindStick
-    Runs = @{ Action = $null; Safety = $null }; RunTimer = $null
+    Runs = @{ Action = $null; Safety = $null }; RunTimer = $null; KillChecks = (New-Object 'System.Collections.Generic.List[object]')
     StickPresent = $StickPresent; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false; StickSearchClock = $null
     SafetyStarted = $false
   }
@@ -949,7 +950,8 @@ function Show-ToolboxWindow {
          other way) is Failed at once, BEFORE the cleanup below closes the window, so the Closing handler (which
          reads an empty Outcome as Cancel) can never turn it into Cancel (review M1: failure is never Cancel, by
          construction);
-      7. finally: both timers stop; every child the window started is killed (Stop-ToolboxChildren) BEFORE the
+      7. finally: both timers stop; every child the window started is killed (Stop-ToolboxChildren -Quiet: no wait;
+         one not ended yet stays tracked for Get-SetupChoices' finally to judge) BEFORE the
          window is closed (repair spec 4.4, Review Focus 2); an Outcome still empty (the dialog threw) is Failed, so
          the close guard lets the window go; the backstop is removed, $script:ToolboxOpenWindow is cleared and the
          window is closed (a Close() that fails is logged WARN).
@@ -1040,7 +1042,8 @@ function Show-ToolboxWindow {
       if ($null -ne $timer) { $timer.Stop() }
       if ($null -ne $runTimer) { $runTimer.Stop() }
       # Repair spec 4.4 (Review Focus 2): no child of the window may run on once it is gone; killed before it closes.
-      Stop-ToolboxChildren
+      # Quiet: the window is still there, so nothing waits; Get-SetupChoices' finally judges a child not ended yet.
+      Stop-ToolboxChildren -Quiet
       # A dialog that threw (the catch below reports it) is Failed here too, so the close guard lets the window go.
       if ($null -eq $window.Tag.Outcome) {
         $window.Tag.Outcome = 'Failed'
@@ -1130,7 +1133,8 @@ function Get-SetupChoices {
          with @{ reason }, then the console (step 4).
       2. The window (Show-ToolboxWindow), in try/finally. An exception becomes Failed (its message in ASCII).
          Whatever happens, every child the window started is killed first (Stop-ToolboxChildren: repair spec 4.4,
-         Review Focus 2, before WPF stops, the console fallback and any cleanup), then the WPF dispatcher is
+         Review Focus 2, before WPF stops, the console fallback and any cleanup; it waits at most 2 s for each kill to
+         land, $script:ToolboxCloseGraceMilliseconds, the window being gone), then the WPF dispatcher is
          stopped exactly once, so the main thread does not keep a hidden WPF window for the hours the run takes
          (spec 5.1); a failure of that stop is only a WARN.
       3. The outcome:
@@ -1197,8 +1201,10 @@ function Get-SetupChoices {
       $result = @{ Outcome = 'Failed'; Error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
       $thrownType = ConvertTo-ScreenText -Text $_.Exception.GetType().FullName
     } finally {
-      # Repair spec 4.4 (Review Focus 2): a child left by the window is killed before anything else happens.
-      Stop-ToolboxChildren
+      # Repair spec 4.4 (Review Focus 2): a child left by the window is killed before anything else happens. The window
+      # is gone, so this last close may wait briefly (bounded) for each kill to land before it calls a child still
+      # running (a kill is asynchronous; final wave item 11).
+      Stop-ToolboxChildren -GraceMilliseconds $script:ToolboxCloseGraceMilliseconds
       try {
         $null = & $ShutdownDispatcher
       } catch {

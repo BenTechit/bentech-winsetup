@@ -714,6 +714,9 @@ Describe 'run hardening (Task 4 review, ruling RD-R16)' {
     $w = New-RunWindow; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake
     Mock Get-ToolboxRunSeconds { 150 * 60 + 181 }; Send-RunTick $w
     $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.Tag.Model.Repair.Result.Outcome | Should -Be 'TimedOut'; $script:ToolboxChildren | Should -Contain $proc
+    # The kill is asynchronous: judged on a later tick (final wave item 11), here 5 s after it.
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }).Count | Should -Be 0
+    Mock Get-ToolboxKillCheckSeconds { 6 }; Send-RunTick $w
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }).Count | Should -Be 1
     Test-ToolboxChildrenRunning | Should -BeTrue
     # The close guard holds only for a running action: a child that has no slot never holds the window.
@@ -1164,4 +1167,51 @@ Describe 'the final wave (final-fixes.md): the window' {
     [string]::Equals($x.FindName('StoppingText').Text, ($script:ToolboxStrings.he['run.stopping'] -f $script:ToolboxStrings.he['tool.step.dism']), [StringComparison]::Ordinal) | Should -BeTrue
     $e = New-RepairWindow @{ Run = $run }
     [string]::Equals($e.FindName('StoppingText').Text, ($script:ToolboxStrings.en['run.stopping'] -f 'mysteryStep'), [StringComparison]::Ordinal) | Should -BeTrue }
+
+  # Item 11 (Task 4 re-review): the survivor path.
+  It 'Stop-ToolboxChild without a process, or with one that has no id, kills nothing (never the tree of process 0)' {
+    Stop-ToolboxChild -Process $null | Should -BeTrue
+    $noId = [pscustomobject]@{ Id = $null; HasExited = $false; ExitCode = 0 }
+    Stop-ToolboxChild -Process $noId -Quiet | Should -BeFalse; $script:ToolboxChildren | Should -Contain $noId   # it may run: it stays tracked
+    @($script:killed).Count | Should -Be 0 }
+  It 'a deadline kill that has not landed yet is judged on later ticks: no WARN once it ends (INFO stopped); one WARN after 5 s, and it stays tracked' {
+    $script:killWorks = $false
+    $w = New-RunWindow -Set @{ State = 'loading'; Restart = $null; Free = $null; BitLocker = $null; Internet = $null; Disk = $null }
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $proc = $script:fake
+    Mock Get-ToolboxRunSeconds { 3 * 60 + 181 }; Send-RunTick $w
+    $script:killed | Should -Be @(4242); $w.Tag.Runs.Safety | Should -BeNullOrEmpty; $script:ToolboxChildren | Should -Contain $proc
+    $warns = { @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }) }
+    (& $warns).Count | Should -Be 0   # TerminateProcess is asynchronous: not judged at once
+    Send-RunTick $w; (& $warns).Count | Should -Be 0
+    $proc.HasExited = $true; Send-RunTick $w   # the kill landed
+    $script:ToolboxChildren | Should -Not -Contain $proc; (& $warns).Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox child process stopped' -and $_.Data.processId -eq 4242 }).Count | Should -Be 1
+    # One that does not end: after 5 s on the check's own Stopwatch, one WARN (never a second), and it stays tracked.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $proc2 = $script:fake; Send-RunTick $w
+    @($script:killed) | Should -Be @(4242, 4243); (& $warns).Count | Should -Be 0
+    Mock Get-ToolboxKillCheckSeconds { 6 }; Send-RunTick $w; Send-RunTick $w
+    @(& $warns).Count | Should -Be 1; @(& $warns)[0].Data.processId | Should -Be 4243; $script:ToolboxChildren | Should -Contain $proc2
+    Test-ToolboxChildrenRunning | Should -BeTrue; $w.Tag.Outcome | Should -BeNullOrEmpty }
+  It 'Show-ToolboxWindow''s own finally retries the kill of a child the deadline kill could not end, without waiting or a WARN; it stays tracked' {
+    $script:killWorks = $false
+    Mock Get-ToolboxRunSeconds { 3 * 60 + 181 }
+    Mock Wait-ProcessExit { throw 'the window must not wait while it is shown' }
+    $r = Show-ToolboxWindow @showArgs -ShowDialog { param($w) $script:shown = $w; $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; Send-RunTick $w; $w.Close() }
+    $r.Outcome | Should -Be 'Cancel'   # a child without a slot never holds the window
+    @($script:killed | Where-Object { $_ -eq 4242 }).Count | Should -Be 2   # the deadline kill, then the finally's retry
+    $script:ToolboxChildren | Should -Contain $script:fake
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' }).Count | Should -Be 0 }
+  It 'Get-SetupChoices'' finally waits a bounded time for each child its kill has not ended yet, then judges: stopped, or one WARN' {
+    $script:killWorks = $false
+    $script:waits = New-Object Collections.Generic.List[int]
+    Mock Wait-ProcessExit { $script:waits.Add($Milliseconds); if ($Process.Id -eq 4242) { $Process.HasExited = $true }; [bool]$Process.HasExited }
+    $script:endsSoon = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }
+    $script:survives = [pscustomobject]@{ Id = 4243; HasExited = $false; ExitCode = 0 }
+    Get-SetupChoices @choiceArgs -TestHost { @{ Ok = $true } } -ShowToolbox { param($p) $script:ToolboxChildren.Add($script:endsSoon); $script:ToolboxChildren.Add($script:survives); @{ Outcome = 'Cancel' } } `
+      -ShowConsole { param($p) throw 'must not open' } -ShutdownDispatcher { $script:order.Add('shutdown') } | Should -BeNullOrEmpty
+    @($script:waits) | Should -Be @(2000, 2000); $script:order | Should -Be @('kill:4242', 'kill:4243', 'shutdown')
+    @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox child process stopped' -and $_.Data.processId -eq 4242 }).Count | Should -Be 1
+    $warn = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' })
+    $warn.Count | Should -Be 1; $warn[0].Data.processId | Should -Be 4243
+    @($script:ToolboxChildren.ToArray()) | Should -Be @($script:survives) }
 }

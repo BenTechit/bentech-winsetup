@@ -814,20 +814,54 @@ function Remove-ToolboxChild {
   }
 }
 
+function Get-ToolboxChildId {
+  # Private. -Process's id when it is a whole number above 0, else $null (no process, no id, or one that cannot be
+  # read). Never 0: [int]$null is 0, and a tree kill of 0 would walk the System Idle process (Task 4 re-review).
+  [CmdletBinding()]
+  param([AllowNull()]$Process)
+
+  if ($null -eq $Process) { return $null }
+  try {
+    $raw = $Process.Id
+    if ($null -ne $raw -and [int]$raw -gt 0) { return [int]$raw }
+  } catch {
+    return $null
+  }
+  return $null
+}
+
 function Stop-ToolboxChild {
-  # Private. Kills -Process's tree (Stop-ProcessTree, which never throws) and returns $true when the process has ended:
-  # it then leaves $script:ToolboxChildren. One that still runs (or whose state cannot be read) stays tracked, WARN
-  # 'Toolbox child still running after the kill', so every later close retries it and Start-BenTechSetup removes no
-  # folder under it (Test-ToolboxChildrenRunning; Task 4 review M3).
+  <#
+  .SYNOPSIS
+    Private. Kills -Process's tree (Stop-ProcessTree, which never throws) and returns $true when the process has ended:
+    it then leaves $script:ToolboxChildren. No process is $true (nothing to kill); a process without an id is never
+    killed (Get-ToolboxChildId).
+  .DESCRIPTION
+    A kill is asynchronous (TerminateProcess returns before the process has ended; Task 4 re-review), so whether it
+    ended is read at once, or, with -GraceMilliseconds above 0, after waiting at most that long (Wait-ProcessExit; only
+    Get-SetupChoices' last close passes it, once the window is gone: a static test pins that). One that still runs (or
+    whose state cannot be read) stays tracked, so every later close retries it and Start-BenTechSetup removes no folder
+    under it (Test-ToolboxChildrenRunning; Task 4 review M3), with WARN 'Toolbox child still running after the kill';
+    -Quiet leaves that judgement to the caller (the run tick judges on later ticks: Add-ToolboxKillCheck).
+  #>
   [CmdletBinding()]
   [OutputType([bool])]
-  param([AllowNull()]$Process, [AllowEmptyString()][string]$Action = '')
+  param(
+    [AllowNull()]$Process,
+    [AllowEmptyString()][string]$Action = '',
+    [ValidateRange(0, 10000)][int]$GraceMilliseconds = 0,
+    [switch]$Quiet
+  )
 
-  $id = $null
-  try { $id = [int]$Process.Id } catch { $id = $null }
+  if ($null -eq $Process) { return $true }
+  $id = Get-ToolboxChildId -Process $Process
   if ($null -ne $id) { Stop-ProcessTree -ProcessId $id }
   $exited = $false
-  try { $exited = [bool]$Process.HasExited } catch { $exited = $false }
+  if ($GraceMilliseconds -gt 0) {
+    $exited = Wait-ProcessExit -Process $Process -Milliseconds $GraceMilliseconds
+  } else {
+    try { $exited = [bool]$Process.HasExited } catch { $exited = $false }
+  }
   if ($exited) {
     Remove-ToolboxChild -Process $Process
     return $true
@@ -835,8 +869,64 @@ function Stop-ToolboxChild {
   $tracked = $false
   foreach ($child in $script:ToolboxChildren.ToArray()) { if ([object]::ReferenceEquals($child, $Process)) { $tracked = $true } }
   if (-not $tracked) { $script:ToolboxChildren.Add($Process) }
-  Write-SetupLog -Level WARN -Message 'Toolbox child still running after the kill' -Data @{ processId = $(if ($null -ne $id) { $id } else { 'unknown' }); action = $Action }
+  if (-not $Quiet) {
+    Write-SetupLog -Level WARN -Message 'Toolbox child still running after the kill' -Data @{ processId = $(if ($null -ne $id) { $id } else { 'unknown' }); action = $Action }
+  }
   return $false
+}
+
+# How long after a kill on the run tick a child that has not ended yet is called "still running" (seconds, on the
+# check's own Stopwatch; Task 4 re-review: TerminateProcess is asynchronous), and how long Get-SetupChoices' last close
+# waits for each child its kill has not ended yet (milliseconds; the window is gone by then).
+$script:ToolboxKillCheckSeconds = 5
+$script:ToolboxCloseGraceMilliseconds = 2000
+
+function Add-ToolboxKillCheck {
+  # Private. A child the run tick killed that has not ended yet (Stop-ToolboxChild -Quiet gave $false): judged on the
+  # next ticks (Update-ToolboxKillChecks) instead of at once, and never by waiting. It stays in $script:ToolboxChildren.
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][hashtable]$State, [AllowNull()]$Process, [AllowEmptyString()][string]$Action = '')
+
+  if ($null -eq $Process) { return }
+  if ($State['KillChecks'] -isnot [System.Collections.Generic.List[object]]) { $State['KillChecks'] = New-Object 'System.Collections.Generic.List[object]' }
+  $State['KillChecks'].Add(@{ Process = $Process; Action = $Action; Clock = [Diagnostics.Stopwatch]::StartNew() })
+}
+
+function Get-ToolboxKillCheckSeconds {
+  # The seconds since a kill check began, on its own Stopwatch (never the wall clock). Tests mock this seam.
+  [CmdletBinding()]
+  [OutputType([double])]
+  param([AllowNull()]$Check)
+
+  if ($Check -is [System.Collections.IDictionary] -and $Check['Clock'] -is [Diagnostics.Stopwatch]) { return [double]$Check['Clock'].Elapsed.TotalSeconds }
+  return [double]::MaxValue
+}
+
+function Update-ToolboxKillChecks {
+  # Private, on every run tick (Update-ToolboxRuns), never waiting: each killed child that has ended since leaves
+  # $script:ToolboxChildren (INFO 'Toolbox child process stopped'); one still running $script:ToolboxKillCheckSeconds
+  # after its kill is WARN 'Toolbox child still running after the kill', once, and stays tracked (every close retries
+  # it; Start-BenTechSetup removes no folder under it). Renders nothing.
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][hashtable]$State)
+
+  $checks = $State['KillChecks']
+  if ($checks -isnot [System.Collections.Generic.List[object]] -or $checks.Count -eq 0) { return }
+  foreach ($check in $checks.ToArray()) {
+    $process = $check['Process']
+    $id = Get-ToolboxChildId -Process $process
+    $logId = $(if ($null -ne $id) { $id } else { 'unknown' })
+    $exited = $false
+    try { $exited = [bool]$process.HasExited } catch { $exited = $false }
+    if ($exited) {
+      Remove-ToolboxChild -Process $process
+      $null = $checks.Remove($check)
+      Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $logId; action = [string]$check['Action'] }
+    } elseif ((Get-ToolboxKillCheckSeconds -Check $check) -ge $script:ToolboxKillCheckSeconds) {
+      $null = $checks.Remove($check)
+      Write-SetupLog -Level WARN -Message 'Toolbox child still running after the kill' -Data @{ processId = $logId; action = [string]$check['Action'] }
+    }
+  }
 }
 
 function Start-ToolboxSafetyRun {
@@ -991,9 +1081,12 @@ function Start-ToolboxRun {
     $outputs = @(& $state['StartChild'] "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" $arguments)
     if ($outputs.Count -ne 1 -or $null -eq $outputs[0]) {
       # A stray value beside a process: every process among the outputs is tracked and killed, never left running
-      # untracked (Task 4 review M5); one the kill does not end stays tracked.
+      # untracked (Task 4 review M5); one the kill does not end stays tracked, judged on the next ticks.
       foreach ($stray in $outputs) {
-        if ($stray -is [Diagnostics.Process]) { $script:ToolboxChildren.Add($stray); $null = Stop-ToolboxChild -Process $stray -Action $action }
+        if ($stray -is [Diagnostics.Process]) {
+          $script:ToolboxChildren.Add($stray)
+          if (-not (Stop-ToolboxChild -Process $stray -Action $action -Quiet)) { Add-ToolboxKillCheck -State $state -Process $stray -Action $action }
+        }
       }
       throw ('the child start gave {0} values instead of one process' -f $outputs.Count)
     }
@@ -1040,18 +1133,22 @@ function Update-ToolboxRuns {
         one: WARN 'Toolbox action ended without a result' with the exit code; Action: Failed, red, childNoResult with
         the exit code; Safety: the last partial chips, the others unknown;
       - still running past its budget + 3 minutes on the run's own Stopwatch (Get-ToolboxRunSeconds; RD-R8, RD-R9):
-        Stop-ToolboxChild (a child the kill does not end stays tracked), WARN 'Toolbox action killed at its deadline',
+        Stop-ToolboxChild (a child the kill has not ended yet stays tracked and is judged on the next ticks,
+        Add-ToolboxKillCheck: the kill is asynchronous), WARN 'Toolbox action killed at its deadline',
         the slot cleared; Action: TimedOut, red, actionTimedOut with the budget's minutes, the running step timedout
         and the pending ones skipped (New-RepairWindowResult); Safety: the last partial chips, the others unknown
         (spec 5: blocks nothing).
       A safety child marked Reread (an action ended while it ran) is never the strip's reading: when it ends, a fresh
       one starts (Start-ToolboxSafetyRun; review M7). Malformed files never throw here (review M1, M6).
     Then the repair page alone is rendered again (Update-RepairView; plan call: not the whole window every 500 ms).
+    First, on every tick, the children killed earlier that had not ended yet are judged (Update-ToolboxKillChecks;
+    renders nothing).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
 
   $state = $Window.Tag
+  Update-ToolboxKillChecks -State $state
   $runs = $state['Runs']
   if ($runs -isnot [System.Collections.IDictionary]) { return }
   # The slots busy now: a safety child an ending action starts below waits for the next tick.
@@ -1116,8 +1213,9 @@ function Update-ToolboxRuns {
       }
     } elseif ($seconds -gt ([double]$run['BudgetSeconds'] + $script:ToolboxKillGraceSeconds)) {
       # One the kill does not end stays tracked (Stop-ToolboxChild): the slot is free and the result timed out, but
-      # every close retries the kill and no cleanup removes C:\BenTech under it (review M3).
-      $null = Stop-ToolboxChild -Process $run['Process'] -Action $action
+      # every close retries the kill and no cleanup removes C:\BenTech under it (review M3). The kill is asynchronous:
+      # one that has not ended yet is judged on the next ticks (Add-ToolboxKillCheck), never by waiting here.
+      if (-not (Stop-ToolboxChild -Process $run['Process'] -Action $action -Quiet)) { Add-ToolboxKillCheck -State $state -Process $run['Process'] -Action $action }
       $runs[$slot] = $null
       $minutes = [int][math]::Round([double]$run['BudgetSeconds'] / 60)
       Write-SetupLog -Level WARN -Message 'Toolbox action killed at its deadline' -Data @{ action = $action; runId = $runId; budgetMinutes = $minutes }
@@ -1179,9 +1277,17 @@ function Stop-ToolboxChildren {
     Each kill that ends the child is INFO 'Toolbox child process stopped' (its id). A child still running afterwards
     stays tracked (WARN 'Toolbox child still running after the kill'): the next call retries it, and
     Start-BenTechSetup removes no folder while one runs (Test-ToolboxChildrenRunning; Task 4 review M3).
+    A kill is asynchronous (Task 4 re-review), so the two calls differ (final wave item 11):
+      - Show-ToolboxWindow's (-Quiet; the window is still there, so nothing waits): a child the kill has not ended
+        yet stays tracked without a WARN; Get-SetupChoices' call judges it;
+      - Get-SetupChoices' (-GraceMilliseconds $script:ToolboxCloseGraceMilliseconds, 2 s; the window is gone): it
+        waits at most that long for each child it kills (Wait-ProcessExit) before calling it still running.
   #>
   [CmdletBinding()]
-  param()
+  param(
+    [ValidateRange(0, 10000)][int]$GraceMilliseconds = 0,
+    [switch]$Quiet
+  )
 
   try {
     if ($null -eq $script:ToolboxChildren) { return }
@@ -1189,9 +1295,8 @@ function Stop-ToolboxChildren {
       $exited = ($null -eq $process)
       if (-not $exited) { try { $exited = [bool]$process.HasExited } catch { $exited = $false } }
       if ($exited) { Remove-ToolboxChild -Process $process; continue }
-      $id = $null
-      try { $id = [int]$process.Id } catch { $id = $null }
-      if (Stop-ToolboxChild -Process $process) { Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id } }
+      $id = Get-ToolboxChildId -Process $process
+      if (Stop-ToolboxChild -Process $process -GraceMilliseconds $GraceMilliseconds -Quiet:$Quiet) { Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id } }
     }
   } catch {
     Write-SetupLog -Level WARN -Message 'Could not stop the toolbox child processes' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
