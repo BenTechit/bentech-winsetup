@@ -1,6 +1,6 @@
 # bentech-winsetup: Zoom as an optional app
 
-**Status:** Draft for Ben's approval (decisions Q49-Q52 and Q55, 22-23/10/2026).
+**Status:** Approved by Ben on 23/10/2026 (Q56; decisions Q49-Q52 and Q55).
 **Amends:** the v1 spec, the toolbox spec ([2026-10-21-toolbox-design.md](2026-10-21-toolbox-design.md)) and the drivers-only spec ([2026-10-22-windows-update-option-design.md](2026-10-22-windows-update-option-design.md)). They stay binding wherever this document does not change them.
 **Builds on:** main as released in v2026.10.22.2 (drivers-only), which touches the same toolbox files. The repair page (`feat/repair-tool`) touches them too; whichever of the two merges second takes the other in first.
 
