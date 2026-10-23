@@ -663,6 +663,12 @@ function Update-RepairView {
 # exception to "no outer variables", plan WPF rules; no handler reads it).
 $script:ToolboxChildren = New-Object 'System.Collections.Generic.List[object]'
 
+# The tracked children a kill was sent that had not ended them yet (by reference; Stop-ToolboxChild adds, Remove-
+# ToolboxChild forgets). A kill is asynchronous, so one can land after a pass has read HasExited and before the next
+# pass: that pass finds the child gone and, only for a child in this list, writes the INFO line that records the kill
+# (ruling RD-R28). A child that ended on its own leaves without one.
+$script:ToolboxKillTried = New-Object 'System.Collections.Generic.List[object]'
+
 # How long past its budget a child may still run before the window kills its process tree (ruling RD-R9).
 $script:ToolboxKillGraceSeconds = 180
 
@@ -812,6 +818,22 @@ function Remove-ToolboxChild {
   for ($i = $script:ToolboxChildren.Count - 1; $i -ge 0; $i--) {
     if ([object]::ReferenceEquals($script:ToolboxChildren[$i], $Process)) { $script:ToolboxChildren.RemoveAt($i) }
   }
+  if ($null -ne $script:ToolboxKillTried) {
+    for ($i = $script:ToolboxKillTried.Count - 1; $i -ge 0; $i--) {
+      if ([object]::ReferenceEquals($script:ToolboxKillTried[$i], $Process)) { $script:ToolboxKillTried.RemoveAt($i) }
+    }
+  }
+}
+
+function Test-ToolboxKillTried {
+  # Private. $true when -Process is a tracked child a kill was sent that had not ended it yet (by reference).
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()]$Process)
+
+  if ($null -eq $Process -or $null -eq $script:ToolboxKillTried) { return $false }
+  foreach ($tried in $script:ToolboxKillTried.ToArray()) { if ([object]::ReferenceEquals($tried, $Process)) { return $true } }
+  return $false
 }
 
 function Get-ToolboxChildId {
@@ -869,6 +891,7 @@ function Stop-ToolboxChild {
   $tracked = $false
   foreach ($child in $script:ToolboxChildren.ToArray()) { if ([object]::ReferenceEquals($child, $Process)) { $tracked = $true } }
   if (-not $tracked) { $script:ToolboxChildren.Add($Process) }
+  if ($null -ne $id -and $null -ne $script:ToolboxKillTried -and -not (Test-ToolboxKillTried -Process $Process)) { $script:ToolboxKillTried.Add($Process) }
   if (-not $Quiet) {
     Write-SetupLog -Level WARN -Message 'Toolbox child still running after the kill' -Data @{ processId = $(if ($null -ne $id) { $id } else { 'unknown' }); action = $Action }
   }
@@ -1274,9 +1297,11 @@ function Stop-ToolboxChildren {
   .DESCRIPTION
     Show-ToolboxWindow's finally calls it before the window closes, Get-SetupChoices' finally before WPF stops (spec
     4.4, Review Focus 2): no child may run on while the console fallback or the Cancel cleanup removes C:\BenTech.
-    Each kill that ends the child is INFO 'Toolbox child process stopped' (its id). A child still running afterwards
-    stays tracked (WARN 'Toolbox child still running after the kill'): the next call retries it, and
-    Start-BenTechSetup removes no folder while one runs (Test-ToolboxChildrenRunning; Task 4 review M3).
+    Each kill that ends the child is INFO 'Toolbox child process stopped' (its id). So is one that lands between two
+    passes: the pass that finds gone a child an earlier pass tried to kill writes the line (ruling RD-R28), so
+    setup.log has the kill. A child still running afterwards stays tracked (WARN 'Toolbox child still running after
+    the kill'): the next call retries it, and Start-BenTechSetup removes no folder while one runs
+    (Test-ToolboxChildrenRunning; Task 4 review M3).
     A kill is asynchronous (Task 4 re-review), so the two calls differ (final wave item 11):
       - Show-ToolboxWindow's (-Quiet; the window is still there, so nothing waits): a child the kill has not ended
         yet stays tracked without a WARN; Get-SetupChoices' call judges it;
@@ -1294,7 +1319,16 @@ function Stop-ToolboxChildren {
     foreach ($process in $script:ToolboxChildren.ToArray()) {
       $exited = ($null -eq $process)
       if (-not $exited) { try { $exited = [bool]$process.HasExited } catch { $exited = $false } }
-      if ($exited) { Remove-ToolboxChild -Process $process; continue }
+      if ($exited) {
+        # A child an earlier pass tried to kill, and whose kill has landed since: say so now, once (ruling RD-R28).
+        $killed = Test-ToolboxKillTried -Process $process
+        Remove-ToolboxChild -Process $process
+        if ($killed) {
+          $endedId = Get-ToolboxChildId -Process $process
+          Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $(if ($null -ne $endedId) { $endedId } else { 'unknown' }) }
+        }
+        continue
+      }
       $id = Get-ToolboxChildId -Process $process
       if (Stop-ToolboxChild -Process $process -GraceMilliseconds $GraceMilliseconds -Quiet:$Quiet) { Write-SetupLog -Level INFO -Message 'Toolbox child process stopped' -Data @{ processId = $id } }
     }

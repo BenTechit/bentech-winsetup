@@ -111,6 +111,11 @@ function Find-ToolEarlierReport {
     every readable data file of this PC (within the read limits) is read, and the one returned has the latest CreatedAt
     minus its own ClockOffsetMinutes (the offset that report measured; none measured counts as 0); a tie keeps the
     stamp order.
+    -ExistenceOnly (the safety strip's "is there an earlier report of this PC", ruling RD-R28) only establishes that one
+    readable data file of this PC exists: the search stops at the first one that qualifies (newest by stamp first), so
+    the strip never reads up to $script:ToolEarlierMaxReads files on every read, and it never writes the 'stopped after
+    the newest files' WARN. The returned data is that file's, not necessarily the newest by Microsoft's time: only
+    Compare, which leaves the switch off, orders.
     -Skipped (optional) gets, newest first, everything of this PC that could not be read before the first one read
     (RD-R23: never a silent "nothing"; ruling RD-R25, review M5): '<file> (a link)', '<file> (too big)',
     '<file> (not a report data file)'; a visit folder that is a link is never listed ('<folder> (a link)'), one that
@@ -123,7 +128,8 @@ function Find-ToolEarlierReport {
     [AllowNull()][AllowEmptyString()][string]$StickRoot,
     [AllowNull()][AllowEmptyString()][string]$IdentityKey,
     [AllowNull()][AllowEmptyString()][string]$CurrentSessionDir,
-    [AllowNull()][System.Collections.Generic.List[string]]$Skipped
+    [AllowNull()][System.Collections.Generic.List[string]]$Skipped,
+    [switch]$ExistenceOnly
   )
 
   $part = Get-ToolIdentityFolderPart -IdentityKey $IdentityKey
@@ -181,7 +187,7 @@ function Find-ToolEarlierReport {
     $bestTime = $null
     foreach ($c in $newest) {
       if ($reads -ge $script:ToolEarlierMaxReads -or $bytes -ge $script:ToolEarlierMaxBytes) {
-        Write-SetupLog -Level WARN -Message 'Earlier reports: stopped after the newest files' -Data @{ read = $reads; bytes = $bytes }
+        if (-not $ExistenceOnly) { Write-SetupLog -Level WARN -Message 'Earlier reports: stopped after the newest files' -Data @{ read = $reads; bytes = $bytes } }
         break
       }
       $why = [string]$c['Why']
@@ -219,6 +225,7 @@ function Find-ToolEarlierReport {
             $real = $created
             if ($null -ne $offset -and [math]::Abs([double]$offset) -lt 3650 * 1440) { $real = $created.AddMinutes(-[double]$offset) }
             if ($null -eq $best -or $real -gt $bestTime) { $best = $value; $bestTime = $real }
+            if ($ExistenceOnly) { break }   # one is all the strip needs (ruling RD-R28); only Compare orders them
             continue
           } else {
             continue   # another PC whose folder part is this one's (two white boxes): never merged, nothing to say

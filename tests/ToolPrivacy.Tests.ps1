@@ -761,4 +761,55 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
       }
     }
   }
+
+  Describe 'the strip''s earlier-report check reads one file; Compare keeps its full ordering (ruling RD-R28)' {
+    BeforeAll {
+      # New-CompareStick's three visits of the Dell (one is today's own), plus 40 more readable data files of this PC.
+      $script:many = New-CompareStick -Name 'CmpStickMany'
+      foreach ($i in 1..40) {
+        $day = ([datetime]'2026-07-01').AddDays($i - 1)
+        $stamp = $day.ToString('yyyy-MM-dd') + '_0900'
+        $copy = Copy-ReportValue -Value $earlier; $copy['CreatedAt'] = $day.ToString('yyyy-MM-dd') + 'T09:00:00'
+        $null = Write-DataFile -Folder (Join-Path $script:many.Reports "DELL-7HX2K93_7HX2K93_$stamp") -Name "REPORT_DELL-7HX2K93_${stamp}_data.json" -Data $copy
+      }
+    }
+    BeforeEach {
+      # Every data file reads as a valid report of the Dell; the mock counts the reads and logs are recorded.
+      $script:readCount = 0
+      Mock Read-ToolJsonFile { $script:readCount++; Copy-ReportValue -Value $script:earlier }
+      Mock Write-SetupLog { }
+      Mock Write-ToolProgress { }
+    }
+    It 'the strip''s check (-ExistenceOnly) stops at the first readable file of this PC and never writes the "stopped after the newest files" WARN' {
+      $found = Find-ToolEarlierReport -StickRoot $script:many.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $script:many.Current -ExistenceOnly
+      $found | Should -Not -BeNullOrEmpty
+      $script:readCount | Should -BeLessOrEqual 2
+      Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'WARN' }
+      # Nothing of this PC on the stick: still $null, still no WARN.
+      $script:readCount = 0
+      Find-ToolEarlierReport -StickRoot $script:many.Root -IdentityKey 'SN-OTHER99' -CurrentSessionDir $script:many.Current -ExistenceOnly | Should -BeNullOrEmpty
+      $script:readCount | Should -Be 0
+      # An unreadable newer file of this PC is named in -Skipped and does not stop the search for a readable one.
+      $s = New-CompareStick -Name 'CmpStickOne'
+      $bad = Join-Path $s.Reports 'DELL-7HX2K93_7HX2K93_2026-10-06_0900'; [void][IO.Directory]::CreateDirectory($bad)
+      [IO.File]::WriteAllText((Join-Path $bad 'REPORT_DELL-7HX2K93_2026-10-06_0900_data.json'), '{not json')
+      Mock Read-ToolJsonFile { $script:readCount++; if ($Path -like '*2026-10-06_0900*') { return 'not json' }; Copy-ReportValue -Value $script:earlier }
+      $skipped = New-Object System.Collections.Generic.List[string]; $script:readCount = 0
+      $one = Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current -Skipped $skipped -ExistenceOnly
+      $one.File | Should -Match '2026-10-01_0900_data\.json$'; $script:readCount | Should -Be 2
+      @($skipped) | Should -Be @('REPORT_DELL-7HX2K93_2026-10-06_0900_data.json (not a report data file)')
+    }
+    It 'the safety child''s safetyEarlier step uses it: with 40 data files it reads at most a couple and logs no WARN' {
+      $run = @{ Args = @{ StickRoot = $script:many.Root; SessionDir = $script:many.Current; Identity = @{ Key = 'SN-7HX2K93' } }; Data = @{}; Partial = @{}; Log = (New-Object System.Collections.Generic.List[string]) }
+      Invoke-ToolStepSafetyEarlier -Run $run | Should -Be 'done'; $run.Data.HasEarlierReport | Should -BeTrue
+      $script:readCount | Should -BeLessOrEqual 2
+      Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'WARN' }
+    }
+    It 'Compare''s search (no switch) is unchanged: it reads up to the 32-file limit, keeps the stamp order on a tie and writes its one WARN past the limit' {
+      $found = Find-ToolEarlierReport -StickRoot $script:many.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $script:many.Current
+      $script:readCount | Should -Be $script:ToolEarlierMaxReads
+      $found.File | Should -Match '2026-10-01_0900_data\.json$'
+      Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Earlier reports: stopped after the newest files' }
+    }
+  }
 }

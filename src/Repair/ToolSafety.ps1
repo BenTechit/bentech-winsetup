@@ -913,6 +913,8 @@ function Invoke-ToolStepSafetyEarlier {
     Step safetyEarlier (repair Task 9, spec 6.8): $Run.Data.HasEarlierReport = $true when the stick (Args.StickRoot) holds
     an earlier report of this PC (Args.Identity.Key) outside this visit's folder (Args.SessionDir): one Find-ToolEarlierReport
     (ToolCompare.ps1) can read, or one of this PC it cannot read (Compare then says why: never a silent "none", RD-R23).
+    It asks with -ExistenceOnly: the search stops at the first readable file of this PC and writes no limit WARN, so the
+    strip never parses up to 32 data files on every read (ruling RD-R28); only Compare orders the earlier reports.
     $false without a stick, without an identity key, or when the search fails (a WARN in the log). The window enables
     Compare with last visit only with it. Always 'done': the safety action never ends red because of it.
   #>
@@ -928,7 +930,7 @@ function Invoke-ToolStepSafetyEarlier {
   if ($stickRoot -ne '' -and $key -ne '') {
     try {
       $skipped = New-Object System.Collections.Generic.List[string]
-      $earlier = Find-ToolEarlierReport -StickRoot $stickRoot -IdentityKey $key -CurrentSessionDir ([string]$Run.Args['SessionDir']) -Skipped $skipped
+      $earlier = Find-ToolEarlierReport -StickRoot $stickRoot -IdentityKey $key -CurrentSessionDir ([string]$Run.Args['SessionDir']) -Skipped $skipped -ExistenceOnly
       $has = ($null -ne $earlier) -or ($skipped.Count -gt 0)
     } catch {
       $has = $false

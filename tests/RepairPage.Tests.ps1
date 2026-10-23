@@ -1257,6 +1257,25 @@ Describe 'the final wave (final-fixes.md): the window' {
     $warn = @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Toolbox child still running after the kill' })
     $warn.Count | Should -Be 1; $warn[0].Data.processId | Should -Be 4243
     @($script:ToolboxChildren.ToArray()) | Should -Be @($script:survives) }
+  It 'a kill that lands between the two close passes is logged: the second pass writes INFO stopped, once, and kills nothing again (ruling RD-R28)' {
+    $script:killWorks = $false
+    $proc = [pscustomobject]@{ Id = 4242; HasExited = $false; ExitCode = 0 }; $script:ToolboxChildren.Add($proc)
+    $stopped = { @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox child process stopped' }) }
+    Stop-ToolboxChildren -Quiet   # Show-ToolboxWindow's pass: the kill is issued, has not landed, nothing is judged
+    @($script:killed) | Should -Be @(4242); $script:ToolboxChildren | Should -Contain $proc; @(& $stopped).Count | Should -Be 0
+    $proc.HasExited = $true       # the kill lands between the two passes
+    Stop-ToolboxChildren -GraceMilliseconds $script:ToolboxCloseGraceMilliseconds   # Get-SetupChoices' pass
+    $script:ToolboxChildren | Should -Not -Contain $proc; @($script:killed).Count | Should -Be 1
+    @(& $stopped).Count | Should -Be 1; @(& $stopped)[0].Data.processId | Should -Be 4242
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 0
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]'
+    Stop-ToolboxChildren; @(& $stopped).Count | Should -Be 1   # a third pass has nothing left to say
+    Test-ToolboxChildrenRunning | Should -BeFalse }
+  It 'a child that ended on its own, no close pass ever tried to kill, leaves without a stopped line (ruling RD-R28)' {
+    $own = [pscustomobject]@{ Id = 4300; HasExited = $true; ExitCode = 0 }; $script:ToolboxChildren.Add($own)
+    Stop-ToolboxChildren
+    $script:ToolboxChildren | Should -Not -Contain $own; @($script:killed).Count | Should -Be 0
+    @($script:logs | Where-Object { $_.Message -eq 'Toolbox child process stopped' }).Count | Should -Be 0 }
 
   # Item 15: a finding's display argument keeps its real text through result.json.
   It 'a Hebrew adapter name inside "Restore failed for ..." shows as Hebrew in the result, in both languages (item 15, RD-R21)' {
