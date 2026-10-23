@@ -215,6 +215,31 @@ Describe 'ToolEngine (repair Task 1)' {
       $cut.Length | Should -Be 63; $cut | Should -BeExactly ('א' * 63)   # the pair would not fit whole
       (ConvertTo-ToolDisplayText -Text ('x' * 500) -MaxLength 128).Length | Should -Be 128
     }
+    It 'ConvertTo-ToolDisplayText turns an unpaired surrogate into ''?'', so a value read back from its JSON is the same text (final wave item 16)' {
+      $hi = [string][char]0xD83C; $lo = [string][char]0xDFA7; $pair = [char]::ConvertFromUtf32(0x1F3A7)
+      ConvertTo-ToolDisplayText -Text ('ab' + $hi + 'cd') -MaxLength 64 | Should -BeExactly 'ab?cd'
+      ConvertTo-ToolDisplayText -Text ('ab' + $lo) -MaxLength 64 | Should -BeExactly 'ab?'
+      ConvertTo-ToolDisplayText -Text ($hi) -MaxLength 64 | Should -BeExactly '?'
+      ConvertTo-ToolDisplayText -Text ($lo + $hi) -MaxLength 64 | Should -BeExactly '??'   # a reversed pair is two lone halves
+      ConvertTo-ToolDisplayText -Text ('x' + $pair + 'y') -MaxLength 64 | Should -BeExactly ('x' + $pair + 'y')   # a real pair stays
+      # Windows PowerShell's ConvertFrom-Json reads a lone surrogate back as U+FFFD: after this, the read-back compare holds.
+      $shown = ConvertTo-ToolDisplayText -Text ('Wi-Fi ' + $hi) -MaxLength 64
+      $p = Join-Path $script:dir 'lone.json'; Write-ToolJsonFile -Path $p -InputObject @{ Alias = $shown } | Should -BeTrue
+      [string]::Equals((Read-ToolJsonFile -Path $p).Alias, $shown, [StringComparison]::Ordinal) | Should -BeTrue
+    }
+    It 'ConvertTo-ToolDisplayText drops the direction marks also without StartScreen''s pattern (final wave item 18, N2)' {
+      $saved = $script:DirectionMarksPattern
+      try {
+        $script:DirectionMarksPattern = $null
+        $marked = ([string][char]0x200F) + 'Wi-Fi' + [char]0x202A + ' 2' + [char]0x2069 + [char]0x200E
+        [string]::Equals((ConvertTo-ToolDisplayText -Text $marked -MaxLength 64), 'Wi-Fi 2', [StringComparison]::Ordinal) | Should -BeTrue
+      } finally { $script:DirectionMarksPattern = $saved }
+      # The literal class is the same set as StartScreen's (every code point 0x2000-0x206F, and Latin-1).
+      foreach ($cp in @(0x0000..0x00FF) + @(0x2000..0x206F)) {
+        $c = [string][char]$cp
+        ([regex]::IsMatch($c, $script:ToolDirectionMarksClass)) | Should -Be ([regex]::IsMatch($c, $saved)) -Because ('U+{0:X4}' -f $cp)
+      }
+    }
     It 'reads a file over -MaxBytes as $null, and a file with a BOM' {
       $p = Join-Path $script:dir 'big.json'; [IO.File]::WriteAllText($p, ('{"A":"' + ('x' * 2000) + '"}'), (New-Object Text.UTF8Encoding $false))
       Read-ToolJsonFile -Path $p -MaxBytes 1000 | Should -BeNullOrEmpty
@@ -255,6 +280,24 @@ Describe 'ToolEngine (repair Task 1)' {
       @($f.Args) | Should -Be @('DISM', '5'); $f.Args[1] | Should -BeOfType [string]
       @($r.Findings[1].Args).Count | Should -Be 0
       { Add-ToolFinding -Run $r -Level 'BAD' -Code 'x' } | Should -Throw
+    }
+    It 'a display argument (-DisplayArguments) keeps its real text for the window; the English text and the log stay ASCII (final wave item 15)' {
+      $r = New-TestRun 'fakeA'; Mock Write-SetupLog { }
+      $alias = 'אתרנט ' + [char]0x200F + '2'
+      Add-ToolFinding -Run $r -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, ('adapter not found ' + [char]0x05D0)) -DisplayArguments 0
+      $f = $r.Findings[0]
+      @($f.Args) | Should -Be @('אתרנט 2', 'adapter not found ?')   # the name keeps its text (direction mark dropped); the rest ASCII
+      $f.Text | Should -BeExactly '????? 2: adapter not found ?'
+      Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Message -notmatch '[^\x00-\x7F]' -and $Message -match 'netRestoreFailed' }
+      # Through result.json (RD-R21: ASCII bytes, \u escapes) the window gets the real name.
+      $p = Join-Path $TestDrive 'finding.json'; Write-ToolJsonFile -Path $p -InputObject @{ Findings = $r.Findings.ToArray() } | Should -BeTrue
+      @([IO.File]::ReadAllBytes($p) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      @((Read-ToolJsonFile -Path $p).Findings)[0].Args[0] | Should -BeExactly 'אתרנט 2'
+      # Long names are cut (256), an index past the arguments is ignored, and without the switch nothing changes.
+      Add-ToolFinding -Run $r -Level WARN -Code 'netRestoreFailed' -Arguments @(('א' * 300), 'x') -DisplayArguments 0, 5
+      $r.Findings[1].Args[0].Length | Should -Be 256; @($r.Findings[1].Args).Count | Should -Be 2
+      Add-ToolFinding -Run $r -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, 'x')
+      $r.Findings[2].Args[0] | Should -BeExactly '????? 2'
     }
     It 'the log keeps the last 12 lines, ASCII, and writes each to the child''s log' {
       $r = New-TestRun 'fakeA'; Mock Write-SetupLog { }

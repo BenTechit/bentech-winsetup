@@ -1258,6 +1258,21 @@ Describe 'the final wave (final-fixes.md): the window' {
     $warn.Count | Should -Be 1; $warn[0].Data.processId | Should -Be 4243
     @($script:ToolboxChildren.ToArray()) | Should -Be @($script:survives) }
 
+  # Item 15: a finding's display argument keeps its real text through result.json.
+  It 'a Hebrew adapter name inside "Restore failed for ..." shows as Hebrew in the result, in both languages (item 15, RD-R21)' {
+    foreach ($language in 'en', 'he') {
+      $w = New-RunWindow -Set @{ Language = $language }; $null = Start-ToolboxRun -Window $w -ActionId 'health'; $run = $w.Tag.Runs.Action
+      $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'result.json') -InputObject @{ Action = 'health'; RunId = $run.RunId; Outcome = 'Done'; Color = 'YELLOW'
+        Steps = @(); Findings = @(@{ Level = 'WARN'; Code = 'netRestoreFailed'; Text = '?????: adapter not found'; Args = @('אתרנט', 'adapter not found') })
+        RestartRequired = $false; Offers = @{ DiskCheck = $false; DismSource = $null }; Files = @{}; Data = @{} }
+      @([IO.File]::ReadAllBytes((Join-Path $run.Dir 'result.json')) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      $script:fake.HasExited = $true; Send-RunTick $w
+      $row = $w.FindName('ResultFindings').Children[0].Text
+      $row | Should -Match 'אתרנט'; $row | Should -Not -Match '\?\?\?'
+      $row | Should -BeLike ('*' + ($script:ToolboxStrings[$language]['finding.netRestoreFailed'] -f 'אתרנט', 'X').Split(':')[0] + '*')
+    }
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match '[^\x00-\x7F]' }
+
   # Items 4 and 12: the stick.
   It 'the 5-second check gets the window''s memory, told the page''s stick drive, the same table on every tick (item 4)' {
     $script:knownSeen = New-Object Collections.ArrayList

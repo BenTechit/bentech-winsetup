@@ -738,6 +738,18 @@ Describe 'ToolAdvanced (repair Task 7)' {
       $q = New-ActionRun netRestore -Options @{ File = $script:valid; Sha256 = (Get-FileHash $script:valid).Hash }; $null = Invoke-ToolSteps -Run $q
       Get-ToolResultColor -Outcome 'Done' -Findings $q.Findings | Should -Be 'RED'; $script:gcCommands.Keys | Should -Not -Contain 'netApply-1'
     }
+    It 'a restore that fails for an adapter with a Hebrew name shows that name in the window''s finding; the log and the English text stay ASCII (final wave item 15)' {
+      $hebrew = Set-JsonValue $script:validObject 'Adapters[0].Alias' 'אתרנט'
+      $file = Join-Path $script:earlier 'network-backup-20261020-091000.json'
+      Write-ToolJsonFile -Path $file -InputObject $hebrew -Utf8 | Should -BeTrue
+      $script:gc['netAdapters'] = @{ Items = @(@{ Alias = 'Wi-Fi'; Guid = '{00000000-0000-0000-0000-000000000000}'; Mac = '00-00-00-00-00-00'; Index = 7 }) }   # neither adapter is found
+      Mock Write-SetupLog { [void]$script:logLines.Add($Message + ' ' + ($Data | ConvertTo-Json -Compress -Depth 4)) }; $script:logLines = New-Object Collections.ArrayList
+      $r = New-ActionRun netRestore -Options @{ File = $file; Sha256 = (Get-FileHash $file).Hash }; $null = Invoke-ToolSteps -Run $r
+      $failed = Get-FindingArgs $r 'netRestoreFailed'
+      $failed[0] | Should -Be @('אתרנט', 'adapter not found')
+      @($r.Findings | Where-Object { $_.Code -eq 'netRestoreFailed' })[0].Text | Should -BeExactly '?????: adapter not found'
+      @($script:logLines | Where-Object { $_ -match '[^\x00-\x7F]' }).Count | Should -Be 0
+    }
     It 'New-ToolNetApplyCommand: a gateway without a static address of its family, or a second one, is reported, never applied' {
       $a = @{ Alias = 'Lan'; Guid = '{4D36E972-E325-11CE-BFC1-08002BE10318}'; Mac = ''; Ipv4Dhcp = $false; Ipv6Dhcp = $false
               Addresses = @(@{ Ip = '10.0.0.5'; Prefix = 8 }, @{ Ip = '10.0.0.6'; Prefix = 8 }, @{ Ip = '2001:db8::5'; Prefix = 64 })

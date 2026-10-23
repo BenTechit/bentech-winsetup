@@ -1224,8 +1224,9 @@ function Invoke-ToolStepNetRestore {
     Then the adapters with a static value (Test-ToolNetStatic: exactly the ones the confirmation listed; a DHCP-only
     adapter is left alone), each matched to an adapter of now (the grandchild netAdapters; by GUID, else MAC) and
     restored by its own grandchild netApply-<position in the file> (New-ToolNetApplyCommand). An adapter not found, a
-    grandchild that fails, an error inside it, or a value that cannot be applied: WARN netRestoreFailed (the alias and
-    why). INFO netRestored with the adapters restored in full. No adapter list: CRIT stepFailed. $Run.Data.NetRestore.
+    grandchild that fails, an error inside it, or a value that cannot be applied: WARN netRestoreFailed (the alias, in
+    its real text for the window: -DisplayArguments, final wave item 15; and why). INFO netRestored with the adapters
+    restored in full. No adapter list: CRIT stepFailed. $Run.Data.NetRestore.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -1296,13 +1297,13 @@ function Invoke-ToolStepNetRestore {
     if ($alias -eq '') { $alias = if ([string]$adapter['Mac'] -ne '') { [string]$adapter['Mac'] } else { [string]$adapter['Guid'] } }
     $match = Find-ToolNetAdapterMatch -Adapter $adapter -Current $now
     if ($null -eq $match) {
-      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, 'adapter not found')
+      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, 'adapter not found') -DisplayArguments 0
       $status = 'warn'
       continue
     }
     $index = 0
     if (-not [int]::TryParse([string]$match['Index'], [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$index) -or $index -le 0) {
-      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, 'adapter not found')
+      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, 'adapter not found') -DisplayArguments 0
       $status = 'warn'
       continue
     }
@@ -1311,19 +1312,19 @@ function Invoke-ToolStepNetRestore {
     if ($apply['Command'] -ne '') {
       $result = Invoke-ToolJsonChild -Run $Run -Name ('netApply-{0}' -f ($i + 1)) -Command $apply['Command'] -StepTimeout 'grandchild'
       if (-not $result.Ok) {
-        Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, $result.Error)
+        Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, $result.Error) -DisplayArguments 0
         $ok = $false
       } else {
         foreach ($e in @($result.Data['Errors'])) {
           if ($null -ne $e -and [string]$e -ne '') {
-            Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, [string]$e)
+            Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, [string]$e) -DisplayArguments 0
             $ok = $false
           }
         }
       }
     }
     foreach ($problem in $apply['Problems']) {
-      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, $problem)
+      Add-ToolFinding -Run $Run -Level WARN -Code 'netRestoreFailed' -Arguments @($alias, $problem) -DisplayArguments 0
       $ok = $false
     }
     if ($ok) { $restored++ } else { $status = 'warn' }

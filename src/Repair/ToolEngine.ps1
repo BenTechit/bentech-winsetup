@@ -271,12 +271,22 @@ function ConvertFrom-ToolJsonHtmlEscapes {
     })
 }
 
+# The direction and format marks (U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) as an ASCII regex class: the same set
+# as StartScreen's $script:DirectionMarksPattern, which ConvertTo-ToolDisplayText uses when it is there (final wave
+# item 18, Task 8 re-review N2: without it [regex]::Replace with a $null pattern silently left the marks in).
+$script:ToolDirectionMarksClass = '[\u200E\u200F\u202A-\u202E\u2066-\u2069]'
+
+# An unpaired UTF-16 surrogate (a high one without its low half after it, or a low one without its high half before it).
+$script:ToolLoneSurrogatePattern = '[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
+
 function ConvertTo-ToolDisplayText {
   <#
   .SYNOPSIS
     A display-only name (a device's, an adapter's, a report value's) with its real text kept for the window and the
-    report (RD-R21): the direction marks Hebrew Windows adds are dropped ($script:DirectionMarksPattern, StartScreen),
-    every control character becomes a space, the ends are trimmed, and it is cut to -MaxLength UTF-16 code units,
+    report (RD-R21): the direction marks Hebrew Windows adds are dropped ($script:DirectionMarksPattern, StartScreen;
+    $script:ToolDirectionMarksClass when that is missing), every control character becomes a space, an unpaired
+    surrogate becomes '?' (final wave item 16: Windows PowerShell's ConvertFrom-Json reads one back as U+FFFD, so a
+    read-back compare of the value would fail), the ends are trimmed, and it is cut to -MaxLength UTF-16 code units,
     never between the two halves of a surrogate pair. $null is ''. No decision may read it; a log line still takes
     ConvertTo-ScreenText of it.
   #>
@@ -288,7 +298,10 @@ function ConvertTo-ToolDisplayText {
   )
 
   if ($null -eq $Text) { return '' }
-  $value = [regex]::Replace([string]$Text, $script:DirectionMarksPattern, '')
+  $marks = $script:DirectionMarksPattern
+  if ([string]::IsNullOrEmpty($marks)) { $marks = $script:ToolDirectionMarksClass }
+  $value = [regex]::Replace([string]$Text, $marks, '')
+  $value = [regex]::Replace($value, $script:ToolLoneSurrogatePattern, '?')
   $value = ([regex]::Replace($value, '[\x00-\x1F\x7F]', ' ')).Trim()
   if ($value.Length -le $MaxLength) { return $value }
   $cut = $MaxLength
@@ -646,19 +659,29 @@ function Add-ToolFinding {
   .SYNOPSIS
     Adds a finding to the run: @{ Level; Code; Text = the English finding.<Code> text; Args = [string[]] (ASCII) }.
     The window shows finding.<Code> from the string table in its own language, with the same Args.
+  .DESCRIPTION
+    -DisplayArguments (final wave item 15): the indexes of arguments that are display-only names (an adapter's alias).
+    In Args they keep their real text (ConvertTo-ToolDisplayText, at most 256 characters; result.json carries it as
+    \uXXXX escapes, RD-R21), so a Hebrew name shows in the window, never '?'. Text and the log line stay ASCII
+    (ConvertTo-ScreenText of every argument). No decision reads Args.
   #>
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Run,
     [Parameter(Mandatory)][ValidateSet('CRIT', 'WARN', 'INFO')][string]$Level,
     [Parameter(Mandatory)][string]$Code,
-    [AllowNull()][object[]]$Arguments
+    [AllowNull()][object[]]$Arguments,
+    [int[]]$DisplayArguments
   )
 
   $values = [string[]]@()
   if ($null -ne $Arguments) { $values = [string[]]@(foreach ($a in $Arguments) { ConvertTo-ScreenText -Text $a }) }
   $text = Get-ToolText -Key ('finding.' + $Code) -Arguments $values
-  $Run.Findings.Add([ordered]@{ Level = $Level; Code = $Code; Text = $text; Args = $values })
+  $shown = [string[]]$values.Clone()
+  foreach ($i in @($DisplayArguments)) {
+    if ($null -ne $i -and $i -ge 0 -and $i -lt $shown.Count) { $shown[$i] = ConvertTo-ToolDisplayText -Text $Arguments[$i] -MaxLength 256 }
+  }
+  $Run.Findings.Add([ordered]@{ Level = $Level; Code = $Code; Text = $text; Args = $shown })
   Write-SetupLog -Message ('Finding {0} {1}: {2}' -f $Level, $Code, $text)
 }
 
