@@ -263,9 +263,11 @@ function Resolve-ToolDismResult {
                                           review M1);
       a source failure ($DismSourceFailureCodes), from Windows Update (no -LocalSource): WARN dismSourceMissing and
                                           the offer of a local source (Find-ToolInstallSource -> $Run.Offers.DismSource);
-                                          without one, INFO dismNoMatchingImage (install files were found, none for
-                                          this PC: its edition and architecture) or INFO dismNoSource (no install file
-                                          at all); 'warn'. The retry is never run here (builder check 6);
+                                          without one, INFO dismSourceUnreadable (install files were found and none
+                                          could be read: final wave item 14), INFO dismNoMatchingImage (install files
+                                          were found, none for this PC: its edition and architecture) or INFO
+                                          dismNoSource (no install file at all); 'warn'. The retry is never run here
+                                          (builder check 6);
       anything else, and a source failure of the retry itself (-LocalSource: the file the technician picked could not
       repair this PC; nothing is offered again): CRIT dismFailed with the code, 'failed'.
   #>
@@ -311,7 +313,12 @@ function Resolve-ToolDismResult {
       Add-ToolLog -Run $Run -Text ('A local source can be offered: {0} index {1}' -f $source['Path'], $source['Index'])
     } else {
       $search = $Run.Data['DismSourceSearch']
-      if ($search -is [System.Collections.IDictionary] -and @($search['Files']).Count -gt 0) {
+      $found = 0
+      $unreadable = 0
+      if ($search -is [System.Collections.IDictionary]) { $found = @($search['Files']).Count; $unreadable = [int]$search['Unreadable'] }
+      if ($found -gt 0 -and $unreadable -ge $found) {
+        Add-ToolFinding -Run $Run -Level INFO -Code 'dismSourceUnreadable'
+      } elseif ($found -gt 0) {
         Add-ToolFinding -Run $Run -Level INFO -Code 'dismNoMatchingImage' -Arguments @($search['Edition'], $search['Arch'])
       } else {
         Add-ToolFinding -Run $Run -Level INFO -Code 'dismNoSource'
@@ -415,14 +422,15 @@ function Find-ToolInstallSource {
     third part of its version) is not this PC's (Args.Machine.OsBuild); LanguageDiffers: its languages lack this PC's
     install language (PcLanguage). Without this PC's edition or architecture nothing is offered.
     What was looked at is kept in $Run.Data.DismSourceSearch = @{ Files = [string[]] (the candidate files found);
-    Edition; Arch ('unknown' when not known) }, so the dism step can tell "no install file" (dismNoSource) from
-    "install files, none for this PC" (dismNoMatchingImage; review M2).
+    Edition; Arch ('unknown' when not known); Unreadable (how many of the files the installImage grandchild could not
+    read) }, so the dism step can tell "no install file" (dismNoSource) from "install files, none for this PC"
+    (dismNoMatchingImage; review M2) and "install files, none readable" (dismSourceUnreadable; final wave item 14).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][hashtable]$Run)
 
   $files = New-Object System.Collections.Generic.List[string]
-  $search = @{ Files = [string[]]@(); Edition = 'unknown'; Arch = 'unknown' }
+  $search = @{ Files = [string[]]@(); Edition = 'unknown'; Arch = 'unknown'; Unreadable = 0 }
   $Run.Data['DismSourceSearch'] = $search
   try {
     $edition = ([string](Get-RebootRegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'EditionID')).Trim()
@@ -451,6 +459,7 @@ function Find-ToolInstallSource {
       $child = Invoke-ToolJsonChild -Run $Run -Name 'installImage' -Command ($script:ToolInstallImageCommand.Replace('<P>', (ConvertTo-PowerShellLiteral -Text $path))) -StepTimeout 'grandchild'
       if (-not $child.Ok) {
         Add-ToolLog -Run $Run -Text ('{0} could not be read: {1}' -f $path, $child.Error)
+        $search['Unreadable'] = [int]$search['Unreadable'] + 1
         continue
       }
       foreach ($image in @($child.Data['Items'])) {
@@ -973,7 +982,10 @@ function Invoke-ToolStepWuScan {
     (toolStep.wuScan; Plan call: a WUA search rather than UsoClient, so the result is known). Nothing is downloaded or
     installed. $Run.Data.WuScan = @{ ResultCode; Count }.
   .DESCRIPTION
-    No internet on the strip (Args.Strip.Internet 'crit'): INFO wuScanSkipped, 'skipped', no search. Updates found:
+    No internet on the strip (Args.Strip.Internet 'crit'): INFO wuScanSkipped, 'skipped', no search. A clock the
+    action's time sync could not fix and that is too far off for HTTPS ($Run.Data.TimeSync: Synced $false, a
+    ClockOffsetSeconds above repair.thresholds.clockWrongMinutes, 60; Post-clone: final wave item 14): INFO
+    wuScanClockSkipped, 'skipped', no search (it would fail; clockOff already names the cause). Updates found:
     INFO updatesAvailable with the count. A search that fails, times out or ends with a ResultCode other than 2
     (succeeded) or 3 (succeeded with errors): WARN wuScanFailed.
   #>
@@ -984,6 +996,14 @@ function Invoke-ToolStepWuScan {
   if ([string](Get-ToolArgsEntry -Run $Run -Section 'Strip' -Name 'Internet') -ceq 'crit') {
     Add-ToolFinding -Run $Run -Level INFO -Code 'wuScanSkipped'
     return 'skipped'
+  }
+  $sync = $Run.Data['TimeSync']
+  if ($sync -is [System.Collections.IDictionary] -and $sync['Synced'] -ne $true -and $null -ne $sync['ClockOffsetSeconds']) {
+    $wrongMinutes = Get-ToolRepairNumber -Config $Run.Config -Path 'thresholds', 'clockWrongMinutes' -Default 60
+    if (([math]::Abs([double]$sync['ClockOffsetSeconds']) / 60) -gt $wrongMinutes) {
+      Add-ToolFinding -Run $Run -Level INFO -Code 'wuScanClockSkipped'
+      return 'skipped'
+    }
   }
   $search = Invoke-ToolJsonChild -Run $Run -Name 'wuScan' -Command $script:ToolWuScanCommand -StepTimeout 'wuScan'
   if (-not $search.Ok) {

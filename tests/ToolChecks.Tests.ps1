@@ -617,6 +617,52 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch { param($u, $ms) @{ Ok = $true; Date = [datetime]::UtcNow.AddMinutes(-3) } } -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = [datetime]::UtcNow.AddDays(730) } }
       $t.Chip.Level | Should -Be 'ok'; [math]::Round($t.ClockOffsetSeconds / 60) | Should -Be 3; $t.Chip.Detail.Clock | Should -BeFalse
     }
+    It 'internet: "Clock wrong" needs more than thresholds.clockWrongMinutes (60): a TLS-breaking proxy with a clock a few minutes off is no internet (final wave item 14)' {
+      $tlsFails = { param($u, $ms) @{ Ok = $false; Date = $null } }
+      $script:probeDate = [datetime]::UtcNow.AddMinutes(3)
+      $probe = { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = $script:probeDate } }
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe $probe
+      $t.Chip.Level | Should -Be 'crit'; $t.Clock | Should -BeFalse; $t.Chip.Detail.Clock | Should -BeFalse; [math]::Round($t.ClockOffsetSeconds / 60) | Should -Be -3
+      $script:probeDate = [datetime]::UtcNow.AddMinutes(59); (Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe $probe).Clock | Should -BeFalse
+      $script:probeDate = [datetime]::UtcNow.AddMinutes(90); $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe $probe
+      $t.Chip.Level | Should -Be 'warn'; $t.Clock | Should -BeTrue
+      $script:cfg.repair.thresholds.clockWrongMinutes | Should -Be 60; $script:cfg.repair.thresholds.clockOffsetMinutes | Should -Be 2
+      # A config without the value uses 60.
+      $script:probeDate = [datetime]::UtcNow.AddMinutes(61); (Test-ToolInternet -Config ([pscustomobject]@{}) -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe $probe).Clock | Should -BeTrue
+      $script:probeDate = [datetime]::UtcNow.AddMinutes(30); (Test-ToolInternet -Config ([pscustomobject]@{}) -Connect { param($h, $ms) $true } -Fetch $tlsFails -Probe $probe).Clock | Should -BeFalse
+    }
+    It 'internet: HTTPS that works fills the clock offset from its Date; without one, from Microsoft''s HTTP page; the chip stays ok (final wave item 14)' {
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch { param($u, $ms) @{ Ok = $true; Date = [datetime]::UtcNow.AddMinutes(-7) } } -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test' } }
+      $t.Chip.Level | Should -Be 'ok'; [math]::Round($t.ClockOffsetSeconds / 60) | Should -Be 7; $t.Clock | Should -BeFalse
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch { param($u, $ms) @{ Ok = $true; Date = $null } } -Probe { param($u, $ms) @{ Answered = $true; Content = 'Microsoft Connect Test'; Date = [datetime]::UtcNow.AddMinutes(10) } }
+      $t.Chip.Level | Should -Be 'ok'; [math]::Round($t.ClockOffsetSeconds / 60) | Should -Be -10; $t.Clock | Should -BeFalse
+      $t.Chip.Detail.ClockOffsetSeconds | Should -Be $t.ClockOffsetSeconds; $t.Chip.Detail.Clock | Should -BeFalse
+      # A portal's page never gives the clock, HTTPS or not.
+      $t = Test-ToolInternet -Config $script:cfg -Connect { param($h, $ms) $true } -Fetch { param($u, $ms) @{ Ok = $true; Date = $null } } -Probe { param($u, $ms) @{ Answered = $true; Content = 'login'; Date = [datetime]::UtcNow.AddMinutes(10) } }
+      $t.ClockOffsetSeconds | Should -BeNullOrEmpty; $t.Chip.Level | Should -Be 'warn'
+    }
+    It 'disk: a clock ahead (the Internet step''s offset) moves the 30-day event window back by it, so a failing disk is not "Disk OK"; a clock behind keeps the wall clock (final review Minor 5)' {
+      # This PC's clock is two years ahead; the disk failed 5 real days ago, logged with the clock still right.
+      $ago = (Get-Date).AddDays(-735)
+      $script:events = @([pscustomobject]@{ ProviderName = 'disk'; Id = 153; TimeCreated = $ago; Properties = @([pscustomobject]@{ Value = '\Device\Harddisk0\DR0' }, [pscustomobject]@{ Value = 'x' }) })
+      Mock Get-WinEvent {
+        $hits = @($script:events | Where-Object { $_.TimeCreated -ge $FilterHashtable.StartTime })
+        if ($hits.Count -gt 0) { $hits } else { Write-Error -Message 'No events were found that match the specified selection criteria.' -ErrorId 'NoMatchingEventsFound' -Category ObjectNotFound }
+      }
+      $run = New-TestRun 'safetyDisk'
+      (Get-ToolDiskChip -Run $run).Level | Should -Be 'ok'   # no offset known (no internet): the wall clock's 30 days miss it
+      $run.Data['ClockOffsetSeconds'] = 730 * 86400.0
+      $c = Get-ToolDiskChip -Run $run; $c.Level | Should -Be 'crit'; $c.Detail.Reasons | Should -Contain 'events'; $c.Detail.Events | Should -Be 1
+      Should -Invoke Get-WinEvent -Times 1 -Exactly -ParameterFilter { [math]::Abs(((Get-Date) - $FilterHashtable.StartTime).TotalDays - 760) -lt 0.01 }
+      # A clock behind already reaches further back (it can only count more): the wall clock's window stays.
+      $run.Data['ClockOffsetSeconds'] = -730 * 86400.0; $null = Get-ToolDiskChip -Run $run
+      Should -Invoke Get-WinEvent -Times 2 -Exactly -ParameterFilter { [math]::Abs(((Get-Date) - $FilterHashtable.StartTime).TotalDays - 30) -lt 0.01 }
+      # The Internet step keeps the offset it measured for the Disk step.
+      Mock Test-ToolInternet { @{ Tcp = $true; Https = $false; Probe = 'ok'; ClockOffsetSeconds = 63072000.0; Clock = $true; Chip = (New-TestChip 'warn') } }
+      $s = New-TestRun 'safetyInternet'; $null = Invoke-ToolStepSafetyInternet -Run $s; $s.Data['ClockOffsetSeconds'] | Should -Be 63072000.0
+      Mock Test-ToolInternet { @{ Tcp = $false; Https = $false; Probe = 'skipped'; ClockOffsetSeconds = $null; Clock = $false; Chip = (New-TestChip 'crit') } }
+      $s = New-TestRun 'safetyInternet'; $null = Invoke-ToolStepSafetyInternet -Run $s; $s.Data.ContainsKey('ClockOffsetSeconds') | Should -BeFalse
+    }
     It 'internet: the Date header is read as RFC 1123 UTC; anything else is no date' {
       $d = ConvertFrom-ToolHttpDate -Text 'Thu, 22 Oct 2026 11:42:50 GMT'
       $d.Kind | Should -Be 'Utc'; $d.Hour | Should -Be 11; $d.Day | Should -Be 22

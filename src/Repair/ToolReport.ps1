@@ -789,7 +789,9 @@ function ConvertTo-ReportData {
   <#
   .SYNOPSIS
     The data JSON of a report (written plain UTF-8, RD-R23; Compare and the SAFE copy of Task 9 read it):
-    [ordered]@{ Version = 1; Kind; CreatedAt; ToolVersion; Identity; Facts (section 00's key facts, name -> value);
+    [ordered]@{ Version = 1; Kind; CreatedAt; ClockOffsetMinutes (this PC's clock minus Microsoft's when the report
+    measured it, else $null: Compare puts a visit made on a wrong clock in its real place, final review Minor 6);
+    ToolVersion; Identity; Facts (section 00's key facts, name -> value);
     Findings = @( @{ Code; Level; Args; Section } ); Disks = [ordered] <serial, else 'Disk <n>'> -> @{ Number; System;
     Model; Health; Wear; Temperature; ReadErrors; WriteErrors; PowerOnHours }; FreeGB; FreePercent;
     ProblemDevices = @( @{ Id; Name; Code } ); Programs = @( '<name>|<version>' ); Crashes = @{ KernelPower; BugCheck;
@@ -823,6 +825,7 @@ function ConvertTo-ReportData {
     Version        = 1
     Kind           = [string](Get-ReportEntry -From $Report -Name 'Kind')
     CreatedAt      = [string](Get-ReportEntry -From $Report -Name 'CreatedAt')
+    ClockOffsetMinutes = (ConvertTo-ReportNumber -Value (Get-ReportEntry -From $items -Name 'ClockOffsetMinutes'))
     ToolVersion    = [string](Get-ReportEntry -From $Report -Name 'ToolVersion')
     Identity       = (Get-ReportEntry -From $Report -Name 'Identity')
     Facts          = $facts

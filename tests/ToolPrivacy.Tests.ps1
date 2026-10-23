@@ -199,6 +199,27 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
       (Find-ToolEarlierReport -StickRoot $stick -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $current).File | Should -Match 'REPORT_DELL-7HX2K93_2026-10-01_0900_data\.json$'
       Find-ToolEarlierReport -StickRoot '' -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $current | Should -BeNullOrEmpty
       Find-ToolEarlierReport -StickRoot (Join-Path $TestDrive 'NoSuchStick') -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $current | Should -BeNullOrEmpty }
+    It 'the newest earlier visit is the newest by Microsoft''s time: a visit made on a wrong clock is put right by its own measured offset (final review Minor 6)' {
+      $s = New-CompareStick -Name 'CmpStickClock'
+      # A visit on a clock two years ahead (a BIOS clock set wrong): its stamps say 2028, its report measured +730 days.
+      $ahead = Copy-ReportValue -Value $earlier; $ahead['CreatedAt'] = '2028-09-20T09:00:00'; $ahead['ClockOffsetMinutes'] = 730 * 1440.0
+      $null = Write-DataFile -Folder (Join-Path $s.Reports 'DELL-7HX2K93_7HX2K93_2028-09-20_0900') -Name 'REPORT_DELL-7HX2K93_2028-09-20_0900_data.json' -Data $ahead
+      # Really on 20/09/2026: older than the 01/10/2026 visit, though its stamp sorts newest.
+      (Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current).CreatedAt | Should -Be '2026-10-01T09:00:00'
+      # A visit on a dead clock two years behind (a dead BIOS battery), really on 15/10/2026: the newest, though its stamp sorts oldest.
+      $behind = Copy-ReportValue -Value $earlier; $behind['CreatedAt'] = '2024-10-15T10:00:00'; $behind['ClockOffsetMinutes'] = -730 * 1440.0
+      $null = Write-DataFile -Folder (Join-Path $s.Reports 'DELL-7HX2K93_7HX2K93_2024-10-15_1000') -Name 'REPORT_DELL-7HX2K93_2024-10-15_1000_data.json' -Data $behind
+      $found = Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current
+      $found.CreatedAt | Should -Be '2024-10-15T10:00:00'; $found.File | Should -Match '2024-10-15_1000_data\.json$'
+      # Without a measured offset (no internet then, or a file from before this field) the visit's own time counts.
+      $behind.Remove('ClockOffsetMinutes')
+      $null = Write-DataFile -Folder (Join-Path $s.Reports 'DELL-7HX2K93_7HX2K93_2024-10-15_1000') -Name 'REPORT_DELL-7HX2K93_2024-10-15_1000_data.json' -Data $behind
+      (Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current).CreatedAt | Should -Be '2026-10-01T09:00:00'
+      # A report records the offset it measured (section 01's ClockOffsetMinutes; $null when it measured none).
+      $data = ConvertTo-ReportData -Report $script:sample; $data.Contains('ClockOffsetMinutes') | Should -BeTrue
+      $copy = Copy-ReportValue -Value $script:sample; $copy['Items']['ClockOffsetMinutes'] = -5.5
+      (ConvertTo-ReportData -Report $copy).ClockOffsetMinutes | Should -Be -5.5
+      $copy['Items'].Remove('ClockOffsetMinutes'); (ConvertTo-ReportData -Report $copy).ClockOffsetMinutes | Should -BeNullOrEmpty }
     It 'two whiteboxes with the same placeholder serial are never merged' { Find-ToolEarlierReport -StickRoot $stick -IdentityKey (Get-MachineIdentity -Machine $whiteboxB).Key -CurrentSessionDir 'x' | Should -BeNullOrEmpty
       # B's folder part is A's (the same last 12 hex of the UUID): A's file is read, refused by its key, and is no "unreadable" file.
       (Get-MachineIdentity -Machine $whiteboxB).FolderPart | Should -BeExactly 'UUID-3456789ABCDE'

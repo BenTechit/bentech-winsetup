@@ -106,7 +106,12 @@ function Find-ToolEarlierReport {
     first by the stamp in the file name, at most $script:ToolEarlierMaxReads files and $script:ToolEarlierMaxBytes bytes
     read. A file is read with Read-ToolJsonFile -MaxBytes $script:ToolReportDataMaxBytes (16 MB, ruling RD-R23). An empty
     or unknown key, no stick root or no BenTech-Reports: $null.
-    -Skipped (optional) gets, newest first, everything of this PC that could not be read before the one returned
+    "Newest" is by Microsoft's time, not by the stamp (final review Minor 6): a stamp comes from the PC's clock, and a
+    visit made on a wrong clock (a dead BIOS battery, a clock set years ahead) would sort as very old or very new. So
+    every readable data file of this PC (within the read limits) is read, and the one returned has the latest CreatedAt
+    minus its own ClockOffsetMinutes (the offset that report measured; none measured counts as 0); a tie keeps the
+    stamp order.
+    -Skipped (optional) gets, newest first, everything of this PC that could not be read before the first one read
     (RD-R23: never a silent "nothing"; ruling RD-R25, review M5): '<file> (a link)', '<file> (too big)',
     '<file> (not a report data file)'; a visit folder that is a link is never listed ('<folder> (a link)'), one that
     cannot be listed is '<folder> (could not be listed)'; and 'BenTech-Reports (a link)' or 'BenTech-Reports (could not
@@ -172,6 +177,8 @@ function Find-ToolEarlierReport {
     $newest = @($candidates.ToArray() | Sort-Object -Property @{ Expression = { [string]$_['Sort'] }; Descending = $true }, @{ Expression = { [string]$_['Path'] }; Descending = $true })
     $reads = 0
     [long]$bytes = 0
+    $best = $null
+    $bestTime = $null
     foreach ($c in $newest) {
       if ($reads -ge $script:ToolEarlierMaxReads -or $bytes -ge $script:ToolEarlierMaxBytes) {
         Write-SetupLog -Level WARN -Message 'Earlier reports: stopped after the newest files' -Data @{ read = $reads; bytes = $bytes }
@@ -202,23 +209,30 @@ function Find-ToolEarlierReport {
           $bytes += $length
           $value = Read-ToolJsonFile -Path $path -MaxBytes $script:ToolReportDataMaxBytes
           $key = Get-ReportEntry -From (Get-ReportEntry -From $value -Name 'Identity') -Name 'Key'
-          if ($value -isnot [System.Collections.IDictionary] -or $key -isnot [string] -or $null -eq (ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $value -Name 'CreatedAt'))) {
+          $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $value -Name 'CreatedAt')
+          if ($value -isnot [System.Collections.IDictionary] -or $key -isnot [string] -or $null -eq $created) {
             $why = 'not a report data file'
           } elseif ([string]::Equals($key, $IdentityKey, [StringComparison]::Ordinal)) {
             $value['File'] = $path
-            return $value
+            # Microsoft's time of this visit: its stamp minus the clock offset its report measured (none: 0).
+            $offset = ConvertTo-ReportNumber -Value (Get-ReportEntry -From $value -Name 'ClockOffsetMinutes')
+            $real = $created
+            if ($null -ne $offset -and [math]::Abs([double]$offset) -lt 3650 * 1440) { $real = $created.AddMinutes(-[double]$offset) }
+            if ($null -eq $best -or $real -gt $bestTime) { $best = $value; $bestTime = $real }
+            continue
           } else {
             continue   # another PC whose folder part is this one's (two white boxes): never merged, nothing to say
           }
         }
       }
-      & $say $c['Name'] $why
+      # Named only before the first file read (as when the search stopped there); later ones are passed over.
+      if ($null -eq $best) { & $say $c['Name'] $why }
     }
   } catch {
     Write-SetupLog -Level WARN -Message 'Earlier reports could not be looked for' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     & $say 'BenTech-Reports' 'could not be listed'
   }
-  return $null
+  return $best
 }
 
 function Find-ToolRunEarlierReport {

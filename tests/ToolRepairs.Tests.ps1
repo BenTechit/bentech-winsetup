@@ -293,6 +293,18 @@ Describe 'ToolRepairs (repair Task 6)' {
           Should -Be (([regex]::Matches($expected[$k], '\{\d\}') | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ',') -Because $k
       }
     }
+    It 'holds the final wave''s findings (item 14), exactly in English, and in Hebrew with the same arguments' {
+      $expected = @{
+        'finding.dismSourceUnreadable' = 'An install.wim or install.esd was found, but it could not be read: see the log'
+        'finding.wuScanClockSkipped'   = 'The clock is wrong and the time sync failed: the Windows Update scan was skipped (it would fail)'
+      }
+      foreach ($k in $expected.Keys) {
+        $script:ToolboxStrings.en[$k] | Should -BeExactly $expected[$k] -Because $k
+        $script:ToolboxStrings.he[$k] | Should -Match '[א-ת]' -Because $k
+        $script:ToolboxStrings.he[$k] | Should -Not -Match "'" -Because $k
+        $script:ToolboxStrings.he[$k] | Should -Not -Match '\{\d\}' -Because $k
+      }
+    }
     It 'every finding code the checks and the repairs add has its text in English and Hebrew' {
       $codes = foreach ($file in 'ToolRepairs.ps1', 'ToolChecks.ps1') {
         $ast = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$PSScriptRoot\..\src\Repair\$file").Path, [ref]$null, [ref]$null)
@@ -672,6 +684,20 @@ Describe 'ToolRepairs (repair Task 6)' {
       Invoke-ToolStepWuScan -Run $r | Should -Be 'skipped'
       Get-FindingCodes $r | Should -Be @('wuScanSkipped'); Should -Invoke Invoke-ToolJsonChild -Times 0 -ParameterFilter { $Name -eq 'wuScan' }
     }
+    It 'a clock too far off for HTTPS that the time sync could not fix skips the update scan (it would fail); synced, or only minutes off, still scans (final wave item 14)' {
+      $r = New-ActionRun postClone; $r.Data['TimeSync'] = @{ Synced = $false; ClockOffsetSeconds = -63072000.0; StartType = 'Manual' }
+      Invoke-ToolStepWuScan -Run $r | Should -Be 'skipped'
+      Get-FindingCodes $r | Should -Be @('wuScanClockSkipped'); Should -Invoke Invoke-ToolJsonChild -Times 0 -ParameterFilter { $Name -eq 'wuScan' }
+      foreach ($sync in @{ Synced = $true; ClockOffsetSeconds = -63072000.0 }, @{ Synced = $false; ClockOffsetSeconds = 300.0 }, @{ Synced = $false; ClockOffsetSeconds = $null }) {
+        $script:gc['wuScan'] = @{ ResultCode = 2; Count = 0 }
+        $r = New-ActionRun postClone; $r.Data['TimeSync'] = $sync; Invoke-ToolStepWuScan -Run $r | Should -Be 'done'
+        Get-FindingCodes $r | Should -Not -Contain 'wuScanClockSkipped'
+      }
+      Should -Invoke Invoke-ToolJsonChild -Times 3 -Exactly -ParameterFilter { $Name -eq 'wuScan' }
+      # No internet still wins (its own finding), and Windows Update reset (no time sync step) scans as before.
+      $r = New-ActionRun postClone; $r.Args.Strip.Internet = 'crit'; $r.Data['TimeSync'] = @{ Synced = $false; ClockOffsetSeconds = -63072000.0 }
+      $null = Invoke-ToolStepWuScan -Run $r; Get-FindingCodes $r | Should -Be @('wuScanSkipped')
+    }
     It 'the update scan is a Windows Update search: <Why>' -ForEach @(
       @{ Why = '3 updates'; Answer = @{ ResultCode = 2; Count = 3 }; Fail = $null; Rows = @('INFO|updatesAvailable'); Status = 'done' }
       @{ Why = 'none'; Answer = @{ ResultCode = 2; Count = 0 }; Fail = $null; Rows = @(); Status = 'done' }
@@ -744,6 +770,18 @@ Describe 'ToolRepairs (repair Task 6)' {
       Get-FindingArgs $r 'dismNoMatchingImage' | Should -Be @('unknown', 'x64')
       $script:existing = @(); $r = New-ActionRun standard; $null = Invoke-ToolStepDism -Run $r
       Get-FindingRows $r | Should -Be @('WARN|dismSourceMissing', 'INFO|dismNoSource')
+    }
+    It 'install files of which none could be read are dismSourceUnreadable, never "none of its images matches" (final wave item 14)' {
+      $script:sourceRoots = @('E:\', 'D:\'); $script:existing = @('E:\sources\install.wim', 'D:\sources\install.esd'); $script:exit['dism.exe'] = -2146498529
+      $script:gcFail['installImage'] = 'The file is not a WIM'
+      $r = New-ActionRun standard; Invoke-ToolStepDism -Run $r | Should -Be 'warn'
+      Get-FindingRows $r | Should -Be @('WARN|dismSourceMissing', 'INFO|dismSourceUnreadable'); $r.Offers.DismSource | Should -BeNullOrEmpty
+      $r.Data.DismSourceSearch.Unreadable | Should -Be 2
+      # One read without a match and one unreadable: the one read decides (none of its images matches).
+      $script:gcFail.Clear(); $script:gc['installImage'] = @{ Items = @(@{ Index = 1; EditionId = 'Enterprise'; Architecture = '9'; Languages = @('en-US'); Version = '10.0.26200.1' }) }
+      Mock Invoke-ToolJsonChild { if ($Command -match 'D:\\sources') { @{ Ok = $false; TimedOut = $true; Data = $null; Error = 'timed out' } } else { @{ Ok = $true; TimedOut = $false; Data = $script:gc['installImage']; Error = $null } } } -ParameterFilter { $Name -eq 'installImage' }
+      $r = New-ActionRun standard; $null = Invoke-ToolStepDism -Run $r
+      Get-FindingRows $r | Should -Be @('WARN|dismSourceMissing', 'INFO|dismNoMatchingImage'); $r.Data.DismSourceSearch.Unreadable | Should -Be 1
     }
     It 'a source the retry cannot use is dismFailed, with no second offer' {
       $script:existing = @('E:\sources\install.wim'); $script:exit['dism.exe'] = -2146498529

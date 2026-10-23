@@ -101,7 +101,7 @@
                   "probeContent": "Microsoft Connect Test", "seconds": 5 },
     "freeSpace": { "minPercent": 10, "minGB": 15 },
     "reportMaxKB": 150,
-    "thresholds": { "clockOffsetMinutes": 2, "diskWearPercent": 80, "diskTemperatureC": 60, "diskEventDays": 30,
+    "thresholds": { "clockOffsetMinutes": 2, "clockWrongMinutes": 60, "diskWearPercent": 80, "diskTemperatureC": 60, "diskEventDays": 30,
                     "crashDays": 60, "kernelPowerWarn": 3, "appCrashesWarn": 10, "defenderSignatureDays": 7,
                     "batteryWearPercent": 40, "ramMinGB": 8, "ghostDevicesInfo": 150, "eventDays": 14,
                     "quickEventDays": 7, "uptimeDays": 7 },

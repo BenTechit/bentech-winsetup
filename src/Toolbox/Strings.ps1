@@ -160,6 +160,9 @@ $script:ToolboxStrings = @{
     'finding.trimMediaUnknown'       = 'The system disk''s type is not known ({0}): it was not optimized'
     'finding.analyzeFailed'          = 'Optimize-Volume -Analyze failed ({0})'
     'finding.pageFileUnknown'        = 'The page file settings could not be read ({0})'
+    # The final wave (item 14): every install file unreadable; the update scan skipped on a clock the sync could not fix.
+    'finding.dismSourceUnreadable'   = 'An install.wim or install.esd was found, but it could not be read: see the log'
+    'finding.wuScanClockSkipped'     = 'The clock is wrong and the time sync failed: the Windows Update scan was skipped (it would fail)'
     # Task 7: Windows Update reset, Disk check at restart, Network reset and restore, Ghost devices (repair plan,
     # Findings); wuRenameLink and ghostListCapped are Task 7's own; wuRenameLocked, diskCheckUnconfirmed,
     # netBackupNoIdentity, netRestoreUnreadable and netRestoreNotOnStick come from its review (M3, M5, M8).
@@ -563,6 +566,8 @@ $script:ToolboxStrings = @{
     'finding.trimMediaUnknown'       = 'סוג דיסק המערכת לא ידוע ({0}): הוא לא עבר אופטימיזציה'
     'finding.analyzeFailed'          = 'בדיקת הדיסק עם Optimize-Volume -Analyze נכשלה ({0})'
     'finding.pageFileUnknown'        = 'לא ניתן היה לקרוא את הגדרות קובץ ההחלפה ({0})'
+    'finding.dismSourceUnreadable'   = 'נמצא install.wim או install.esd, אבל לא ניתן היה לקרוא אותו: הפרטים ביומן'
+    'finding.wuScanClockSkipped'     = 'השעון שגוי והסנכרון נכשל: בדיקת העדכונים של Windows דולגה (היא הייתה נכשלת)'
     'finding.wuServiceDisabled'      = 'השירות {0} מושבת (סוג ההפעלה): Windows Update לא יכול לעבוד'
     'finding.wuServiceStopFailed'    = 'השירות {0} לא נעצר'
     'finding.wuServiceStartFailed'   = 'השירות {0} לא הופעל שוב'

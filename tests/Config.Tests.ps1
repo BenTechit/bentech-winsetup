@@ -144,7 +144,7 @@ Describe 'config.json' {
     $r.internet.host | Should -BeExactly 'www.microsoft.com'; $r.internet.url | Should -BeExactly 'https://www.microsoft.com/'
     $r.internet.probeUrl | Should -BeExactly 'http://www.msftconnecttest.com/connecttest.txt'; $r.internet.probeContent | Should -BeExactly 'Microsoft Connect Test'
     $r.internet.seconds | Should -Be 5; $r.freeSpace.minPercent | Should -Be 10; $r.freeSpace.minGB | Should -Be 15
-    $r.reportMaxKB | Should -Be 150; $r.thresholds.clockOffsetMinutes | Should -Be 2
+    $r.reportMaxKB | Should -Be 150; $r.thresholds.clockOffsetMinutes | Should -Be 2; $r.thresholds.clockWrongMinutes | Should -Be 60
     # The fifteen action ids of the plan's table (ruling RD-R1 removed diskCheckCancel).
     @($cfg.timeoutsMinutes.tool.PSObject.Properties.Name) | Should -Be @('safety', 'health', 'standard', 'postClone', 'dismSource', 'wuReset', 'diskCheck',
       'netInfo', 'netReset', 'netRestore', 'ghostList', 'ghostRemove', 'quickReport', 'fullReport', 'compare')

@@ -410,12 +410,14 @@ function Test-ToolInternet {
        (Microsoft Connect Test). Probe is 'ok', 'different' (another page: a captive portal or a proxy), or 'failed'
        (no answer). It runs after TCP even when HTTPS failed, so the detail can tell a portal from no internet.
     Each is bounded by repair.internet.seconds (5).
-    The clock (review M3, ruling RD-R20): when HTTPS gave no Date (it failed) and the probe answered Microsoft's own
-    page ('ok'), the probe's Date header gives ClockOffsetSeconds instead (plain HTTP has no certificate). A clock days
-    off (a dead BIOS battery) makes every certificate look not yet valid or expired, so HTTPS fails while plain HTTP
-    works: when that offset is above repair.thresholds.clockOffsetMinutes (2), Clock is $true and the chip is 'warn'
-    with Detail.Clock (the window says "Clock wrong", never "No internet"; the time sync runs first in Standard repair
-    and is never blocked by this chip).
+    The clock (review M3, ruling RD-R20): when HTTPS gave no Date (it failed, or its answer had none) and the probe
+    answered Microsoft's own page ('ok'), the probe's Date header gives ClockOffsetSeconds instead (plain HTTP has no
+    certificate). A clock days off (a dead BIOS battery) makes every certificate look not yet valid or expired, so HTTPS
+    fails while plain HTTP works: when HTTPS failed and that offset is above repair.thresholds.clockWrongMinutes (60;
+    final wave item 14: not the 2-minute clockOffsetMinutes, since a clock minutes off breaks no certificate, so a
+    TLS-breaking proxy on a slightly-off clock stays "No internet"), Clock is $true and the chip is 'warn' with
+    Detail.Clock (the window says "Clock wrong", never "No internet"; the time sync runs first in Standard repair and is
+    never blocked by this chip).
     The chip: 'crit' when TCP failed, or HTTPS failed without the clock reason; 'warn' for the clock, or when the probe
     was not 'ok' ("captive portal or proxy", the captivePortal finding's text); else 'ok'. Detail = @{ Tcp; Https;
     Probe; ClockOffsetSeconds; Clock }.
@@ -483,7 +485,7 @@ function Test-ToolInternet {
     if ($probeDate.Kind -eq [DateTimeKind]::Local) { $probeDate = $probeDate.ToUniversalTime() }
     $offset = [math]::Round(([datetime]::UtcNow - [datetime]::SpecifyKind($probeDate, [DateTimeKind]::Utc)).TotalSeconds, 1)
   }
-  $clockLimit = Get-ToolRepairNumber -Config $Config -Path 'thresholds', 'clockOffsetMinutes' -Default 2
+  $clockLimit = Get-ToolRepairNumber -Config $Config -Path 'thresholds', 'clockWrongMinutes' -Default 60
   $clock = $tcp -and -not $https -and $null -ne $offset -and ([math]::Abs([double]$offset) / 60) -gt $clockLimit
   $level = 'ok'
   if (-not $tcp -or (-not $https -and -not $clock)) { $level = 'crit' } elseif ($clock -or $probeResult -ne 'ok') { $level = 'warn' }
@@ -516,20 +518,31 @@ function Get-ToolDiskEventCount {
       - a disk event counts when it is \Device\Harddisk<N>\... with N one of -SystemDisks;
       - NTFS 55 counts when its DriveName is -SystemDrive ('C:').
     NoMatchingEventsFound is 0 events; any other error is Ok = $false.
+    -ClockOffsetSeconds (final review Minor 5): this PC's clock minus Microsoft's (the Internet step's measure; $null when
+    none). A clock ahead would start the window after the real last -Days days (a clock years ahead counts nothing: "Disk
+    OK" on a failing disk), so the window starts that much earlier. A clock behind keeps the wall clock's start, which
+    already reaches further back (it can only count more: red, never a missed failure).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][int]$Days,
     [AllowNull()][int[]]$SystemDisks,
-    [AllowNull()][AllowEmptyString()][string]$SystemDrive
+    [AllowNull()][AllowEmptyString()][string]$SystemDrive,
+    [AllowNull()]$ClockOffsetSeconds
   )
 
   if ($null -eq $SystemDisks) { $SystemDisks = [int[]]@() }
   $drive = ([string]$SystemDrive).Trim().TrimEnd('\')
+  $ahead = 0.0
+  if ($null -ne $ClockOffsetSeconds) {
+    $number = 0.0
+    if ([double]::TryParse([string]$ClockOffsetSeconds, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and
+        -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number) -and $number -gt 0) { $ahead = [math]::Min($number, 3650 * 86400.0) }
+  }
   $events = @()
   try {
-    $filter = @{ LogName = 'System'; Id = @(7, 51, 153, 55); StartTime = (Get-Date).AddDays(-$Days) }
+    $filter = @{ LogName = 'System'; Id = @(7, 51, 153, 55); StartTime = (Get-Date).AddSeconds(-$ahead).AddDays(-$Days) }
     $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents 5000 -ErrorAction Stop)
   } catch {
     if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return @{ Ok = $true; Count = 0; Other = 0; Ids = [string[]]@() } }
@@ -596,7 +609,8 @@ function Get-ToolDiskChip {
     Sources: the grandchild 'disks' (Get-PhysicalDisk, and the system volume's disk numbers from Get-Partition), the
     grandchild 'reliability' (Get-StorageReliabilityCounter; run only when the disk list came back with disks, as it
     would hang or fail the same way), both bounded by toolStep.disks (review M7: a hung disk must not keep the strip
-    loading for minutes), and Get-ToolDiskEventCount for repair.thresholds.diskEventDays (30).
+    loading for minutes), and Get-ToolDiskEventCount for repair.thresholds.diskEventDays (30; the window moved back by
+    a clock ahead, $Run.Data.ClockOffsetSeconds from the Internet step: final review Minor 5).
     Only the system disk(s) are judged:
       crit    : HealthStatus Warning or Unhealthy, uncorrected read or write errors above 0, or a listed event on the
                 system disk or volume (the reason 'health', 'errors' or 'events');
@@ -652,7 +666,13 @@ function Get-ToolDiskChip {
     }
     $systemDrive = ''
     if ($letter -ne '') { $systemDrive = $letter + ':' }
-    $events = Get-ToolDiskEventCount -Days $days -SystemDisks $systemDisks -SystemDrive $systemDrive
+    # The Internet step ran first and kept its clock offset: a clock ahead moves the event window back (final review
+    # Minor 5); without internet the wall clock decides (docs\testing.md 1.21).
+    $offset = $Run.Data['ClockOffsetSeconds']
+    if ($null -ne $offset -and [double]$offset -gt 0) {
+      Add-ToolLog -Run $Run -Text ('The clock is {0} min ahead: the disk events are counted from Microsoft''s time' -f ([math]::Round([double]$offset / 60, 1)).ToString([Globalization.CultureInfo]::InvariantCulture))
+    }
+    $events = Get-ToolDiskEventCount -Days $days -SystemDisks $systemDisks -SystemDrive $systemDrive -ClockOffsetSeconds $offset
     if (-not $events.Ok) { $failed.Add('events') } elseif ($events.Count -gt 0) { $reasons.Add('events') }
 
     $rows = New-Object System.Collections.Generic.List[object]
@@ -804,7 +824,8 @@ function Invoke-ToolStepSafetyBitLocker {
 }
 
 function Invoke-ToolStepSafetyInternet {
-  # Step safetyInternet: the Internet chip (Test-ToolInternet with the default seams).
+  # Step safetyInternet: the Internet chip (Test-ToolInternet with the default seams). The clock offset it measured
+  # goes to $Run.Data.ClockOffsetSeconds for the Disk step's event window (final review Minor 5); none, none kept.
   [CmdletBinding()]
   [OutputType([string])]
   param([Parameter(Mandatory)][hashtable]$Run)
@@ -812,6 +833,7 @@ function Invoke-ToolStepSafetyInternet {
   try {
     $check = Test-ToolInternet -Config $Run.Config
     $chip = $check['Chip']
+    if ($null -ne $check['ClockOffsetSeconds']) { $Run.Data['ClockOffsetSeconds'] = [double]$check['ClockOffsetSeconds'] }
   } catch {
     $chip = New-ToolUnknownChip -Name 'Internet' -Reason $_.Exception.Message
   }
