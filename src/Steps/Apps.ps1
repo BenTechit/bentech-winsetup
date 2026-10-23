@@ -398,7 +398,7 @@ function Invoke-StepZoom {
         Zoom that is up to date or installed per user, ruling Z-R3; nothing ran, so auto-update was not
         touched) is Done '<id>: already installed' with the Note 'Zoom was already installed: auto-update not
         changed' and the activity line 'Zoom already installed'. A customer's own per-user Zoom is left alone.
-        An older per-machine Zoom is upgraded by `winget install`, with the tokens: a fresh install below.
+        An older per-machine Zoom is upgraded by `winget install`, with the tokens: that reads as a fresh install.
       - A timed-out install is Failed 'Zoom install timed out'.
       - Anything else (another Failed, Skipped) is winget's own result, unchanged; a failure is red.
     It never opens Zoom, signs in, or creates or removes shortcuts (Q52).
