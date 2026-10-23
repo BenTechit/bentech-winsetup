@@ -14,14 +14,25 @@
 # keyed by its 12 hex digits in upper case, an IP address by its parsed form, an e-mail address in lower case, a phone
 # number by its digits (+972 as 0), a SID in upper case; every other value case-insensitively.
 #
-# Plan calls: known values under 3 characters are never masked; a known user or network name, and any known value
-# under 6 characters, is masked only as a whole word (no letter or digit beside it: "Ben" never turns "Bench" into
-# "user1ch"); every other known value is masked wherever it appears, longest first (a serial inside the PC name is
-# masked as the PC name, then everywhere else as the serial). Built-in account and profile names (Administrator, Guest,
-# Public, Default, ...) are no personal values and stay, and so do the PC's own Guest, DefaultAccount and
-# WDAGUtilityAccount whatever their (localized) names, found by SID (section 11's BuiltinUsers); a built-in
-# Administrator under another name is masked (it may have been renamed after a person). A SAFE copy says on its second
-# line what the tokens are.
+# Plan calls (and ruling RD-R25, the Task 9 review):
+#   - known values under 3 characters are never masked;
+#   - generic values are never masked (Test-SafeGenericValue): the stop-list $script:SafeStopWords (User, Admin,
+#     Owner, Home, Office, Network, Temp, Windows, the brand names, ...), the built-in account and profile names
+#     (Administrator, Guest, Public, Default, ...), and Windows' own names of a network without one ("Network",
+#     "Network 2", "Unidentified network", and the Hebrew ones). So the PC's own Guest, DefaultAccount and
+#     WDAGUtilityAccount stay whatever their (localized) names, found by SID (section 11's BuiltinUsers); a built-in
+#     Administrator under another name is masked (it may have been renamed after a person);
+#   - a numeric value (a battery's serial "1234") under 6 digits is never masked, and from 6 digits on only as a whole
+#     number (no digit beside it);
+#   - a user or network name, a computer or domain name made of letters only, and any value under 6 characters is
+#     masked only as a whole word (no letter or digit beside it: "Ben" never turns "Bench" into "user1ch", a PC named
+#     COHENPC never cuts "cohenpcx"). A whole word that starts with a Hebrew letter may carry up to three of the Hebrew
+#     prefix letters (b, h, v, k, l, m, sh: "to Dana" is one word in Hebrew), which stay outside the token;
+#   - every other known value is masked wherever it appears, longest first (a serial inside the PC name is masked as
+#     the PC name, then everywhere else as the serial);
+#   - a token that a letter or a digit follows gets an underscore after it ("SERIAL-2_99", never "SERIAL-299", which
+#     would read as another token).
+# A SAFE copy says on its second line what the tokens are.
 #
 # Needs ToolEngine (ConvertTo-ToolDisplayText), ToolReport (Get-ReportEntry, ConvertTo-ReportList, Save-ToolReportText,
 # ConvertTo-ReportReason), PcName (Test-PlaceholderSerial, Test-UsableBiosUuid, New-PcName), Cleanup
@@ -48,23 +59,48 @@ $script:SafeTokenPattern = '^(user|PC-|DOMAIN-|SERIAL-|MAC-|IP-|IP6-|SSID-|EMAIL
 $script:SafeGenericAccounts = @('Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'defaultuser0', 'defaultuser100000', 'Public', 'Default',
   'Default User', 'All Users', 'SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'LocalService', 'NetworkService', 'Administrators', 'Users',
   'Authenticated Users', 'INTERACTIVE', 'Domain Admins', 'Domain Users', 'Enterprise Admins')
+# Words that are never a personal value, whatever the report read them as (ruling RD-R25, review I2): common account
+# names, Windows' and a home router's generic names, and the brand names. Compared whole, case-insensitively.
+$script:SafeStopWords = @('user', 'users', 'admin', 'administrator', 'owner', 'guest', 'home', 'office', 'network', 'temp', 'tmp', 'test', 'pc', 'laptop',
+  'desktop', 'computer', 'windows', 'microsoft', 'workgroup', 'mshome', 'lan', 'local', 'localdomain', 'home.arpa', 'wifi', 'wi-fi', 'internet', 'default',
+  'public', 'system', 'service', 'server', 'client', 'unknown', 'none', 'dell', 'hp', 'lenovo', 'asus', 'acer', 'msi', 'surface', 'samsung', 'toshiba',
+  'apple', 'intel', 'huawei', 'xiaomi', 'gigabyte')
+# Windows' own names of a network that has no name of its own (the Hebrew network and unidentified network built
+# from code points: this file stays ASCII), with an optional number (Network 2).
+$script:SafeHebrewNetwork = [string]::new([char[]]@(0x05E8, 0x05E9, 0x05EA))
+$script:SafeHebrewUnidentified = [string]::new([char[]]@(0x05DC, 0x05D0, 0x20, 0x05DE, 0x05D6, 0x05D5, 0x05D4, 0x05D4))
+$script:SafeGenericNetworkPattern = '\A(?:Network|Unidentified network|' + $script:SafeHebrewNetwork + '(?: ' + $script:SafeHebrewUnidentified + ')?)(?: [0-9]+)?\z'
+# The Hebrew prefix letters a word may carry (b, h, v, k, l, m, sh), up to three of them, before a Hebrew name.
+$script:SafeHebrewPrefixBoundary = '(?<=(?:^|[^\p{L}\p{Nd}])[' + [string]::new([char[]]@(0x05D1, 0x05D4, 0x05D5, 0x05DB, 0x05DC, 0x05DE, 0x05E9)) + ']{0,3})'
+# A Hebrew letter (alef to tav), for the left boundary's choice.
+$script:SafeHebrewLetter = '\A[' + [char]0x05D0 + '-' + [char]0x05EA + ']'
 # The part before '\' of an account that names no domain of the customer's.
 $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'MicrosoftAccount', 'NT SERVICE', 'Window Manager', 'Font Driver Host',
   'IIS APPPOOL', 'NT VIRTUAL MACHINE')
 
-# The patterns, in the order they run (after the known values). Spec 6.8 and the Task 8 review: e-mail; SID (before
-# the phone numbers: a SID holds long digit runs); MAC with ':' or '-'; MAC as 12 hex digits (only beside no letter,
-# digit or '-', so a GUID's last group and a 0x number stay, and only with a hex letter in it unless it is a known
-# MAC, so a 12-digit number stays); IPv4 (a sentence's full stop after it does not hide it; five-part versions stay);
-# IPv6; a profile folder (the name before the next '\', or a word); an Israeli phone number.
-$script:SafeEmailPattern = '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
-$script:SafeSidPattern = '(?<![A-Za-z0-9-])S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
+# The patterns, in the order they run (after the known values). Spec 6.8, the Task 8 review and ruling RD-R25:
+#   e-mail (also URL-encoded, %40);
+#   SID (S-1-5-21-..., S-1-12-1-...) wherever it is, after a letter or a dash too (a per-user task's name holds one),
+#     before the phone numbers (a SID holds long digit runs); well-known SIDs (S-1-5-18, S-1-5-32-544) stay;
+#   MAC with ':' or '-'; MAC as aaaa.bbbb.cccc; MAC as 12 hex digits (only beside no letter, digit or '-', so a GUID's
+#     last group and a 0x number stay); the last two only with a hex letter in them unless the MAC is known, so plain
+#     numbers stay;
+#   IPv4 (a sentence's full stop after it does not hide it; five-part versions stay); IPv6 (also right after a colon:
+#     "Address:2a00::1");
+#   a profile folder: <drive>:\Users\<name>, c$\Users\<name>, %SystemDrive%\Users\<name>, with '\', '/' or a JSON-
+#     doubled '\\' (the name up to the next separator, or to the end of the line, or a word);
+#   an Israeli phone number: the spec's pinned pattern widened (review M1) to 972 / 00972 / +972 (with an optional
+#     "(0)"), an area code in parentheses, '.' or ' - ' as separators, and the 3-4 and 3-2-2 groupings of the last
+#     seven digits. Every number the pinned pattern finds, this one finds.
+$script:SafeEmailPattern = '[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
+$script:SafeSidPattern = '(?<![0-9])S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
 $script:SafeMacPattern = '(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])'
+$script:SafeMacDottedPattern = '(?<![0-9A-Za-z.])[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}(?![0-9A-Za-z]|\.[0-9A-Za-z])'
 $script:SafeMacCompactPattern = '(?<![0-9A-Za-z-])[0-9A-Fa-f]{12}(?![0-9A-Za-z-])'
 $script:SafeIpv4Pattern = '(?<!\d)(?<!\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)'
-$script:SafeIpv6Pattern = '(?<![0-9A-Za-z:.%])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{1,4}|(?:\d{1,3}\.){3}\d{1,3})?(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:%]|\.\d)'
-$script:SafeProfilePattern = '(?<drive>[A-Za-z]:\\Users\\)(?:(?<name>[^\\/:*?"<>|\r\n]+)(?=\\)|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
-$script:SafePhonePattern = '(?<!\d)(?:\+972[- ]?|0)(?:[23489]|5\d|7\d)[- ]?\d{3}[- ]?\d{4}(?!\d)'
+$script:SafeIpv6Pattern = '(?<![0-9A-Za-z.%])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{1,4}|(?:\d{1,3}\.){3}\d{1,3})?(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:%]|\.\d)'
+$script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]+)(?=[\\/])|(?<name>[^\\/:*?"<>|\r\n]+?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
+$script:SafePhonePattern = '(?<![\d+])(?:(?:\+|00)?972[-. ]{0,3}(?:\(0\)[-. ]{0,2})?|\(?0)(?:[23489]|5\d|7\d)\)?[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2})(?!\d)'
 
 # The second line of a SAFE copy (ASCII), for the AI and for Ben.
 $script:SafeCopyNote = 'PRIVACY-SAFE COPY: names, e-mail addresses, serial numbers, MAC and IP addresses, network names, SIDs and phone numbers are replaced by tokens (user1, PC-1, SERIAL-1, MAC-1, IP-1, SSID-1, EMAIL-1, PHONE-1, SID-1, ...); one token is always the same value.'
@@ -84,6 +120,7 @@ function Add-SafeIdentifier {
     if ($null -eq $v -or $v -is [System.Collections.IDictionary]) { continue }
     $text = ([string]$v).Trim()
     if ($text -eq '') { continue }
+    if ($Category -cin $script:SafeLiteralCategories -and (Test-SafeGenericValue -Value $text)) { continue }
     $list = $Lists[$Category]
     $known = $false
     foreach ($x in $list) { if ([string]::Equals($x, $text, [StringComparison]::OrdinalIgnoreCase)) { $known = $true; break } }
@@ -99,6 +136,37 @@ function Test-SafeGenericName {
 
   foreach ($g in $script:SafeGenericAccounts) { if ([string]::Equals($g, ([string]$Name).Trim(), [StringComparison]::OrdinalIgnoreCase)) { return $true } }
   return $false
+}
+
+function Test-SafeGenericValue {
+  <#
+  .SYNOPSIS
+    Private, pure. $true when -Value is never a personal value (ruling RD-R25, review I2): a built-in account or profile
+    name (Test-SafeGenericName), a word of $script:SafeStopWords, Windows' own name of a network without one
+    ($script:SafeGenericNetworkPattern: "Network", "Network 2", "Unidentified network", the Hebrew ones), or a number
+    under 6 digits (a battery's "1234" would mask every "1234" of the report). Compared whole, case-insensitively.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()][AllowEmptyString()][string]$Value)
+
+  $text = ([string]$Value).Trim()
+  if (Test-SafeGenericName -Name $text) { return $true }
+  foreach ($w in $script:SafeStopWords) { if ([string]::Equals($w, $text, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+  if ($text -match $script:SafeGenericNetworkPattern) { return $true }
+  if ($text -match '\A[0-9]{1,5}\z') { return $true }
+  return $false
+}
+
+function Get-SafeTokenText {
+  # Private, pure. -Token as written into -Source in place of the text that ends at -End: with an underscore after it
+  # when a letter or a digit follows (review M4: "SERIAL-2_99", never "SERIAL-299").
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$Token, [AllowNull()][AllowEmptyString()][string]$Source, [int]$End)
+
+  if ($null -ne $Source -and $End -ge 0 -and $End -lt $Source.Length -and [char]::IsLetterOrDigit($Source[$End])) { return $Token + '_' }
+  return $Token
 }
 
 function Add-SafeAccount {
@@ -120,7 +188,7 @@ function Add-SafeAccount {
     foreach ($c in $Lists['Computer']) { if ([string]::Equals($c, $authority, [StringComparison]::OrdinalIgnoreCase)) { $generic = $true } }
     if (-not $generic) { Add-SafeIdentifier -Lists $Lists -Category 'Domain' -Value $authority }
   }
-  if ($name -eq '' -or (Test-SafeGenericName -Name $name)) { return }
+  if ($name -eq '' -or (Test-SafeGenericValue -Value $name)) { return }
   foreach ($b in @($Builtin)) { if ([string]::Equals([string]$b, $name, [StringComparison]::OrdinalIgnoreCase)) { return } }
   if ($name -match ('\A' + $script:SafeEmailPattern + '\z')) { Add-SafeIdentifier -Lists $Lists -Category 'Email' -Value $name; return }
   Add-SafeIdentifier -Lists $Lists -Category 'User' -Value $name
@@ -313,10 +381,15 @@ function New-SafeMasker {
     Get-ReportIdentifiers' shape; a missing list is none) numbered in their lists' order, and the state the patterns
     add to (ConvertTo-SafeText). Use one masker per report, so a value has one token in the whole file.
   .DESCRIPTION
-    Known values under 3 characters are ignored (Plan call). A known e-mail, SID, computer, domain, user, serial or
-    network name is masked as text (its display form too, ConvertTo-ToolDisplayText); a user or network name, and any
-    value under 6 characters, only as a whole word. Known MACs and IP addresses take the first numbers of their
-    categories; the patterns mask every spelling of them.
+    Known values under 3 characters and generic values (Test-SafeGenericValue: stop words, built-in names, Windows' own
+    network names, numbers under 6 digits) are ignored. A known e-mail, SID, computer, domain, user, serial or network
+    name is masked as text (its display form too, ConvertTo-ToolDisplayText), in one of three modes:
+      - Number (a value of digits only, 6 or more): only where no digit is beside it;
+      - Word (a user or network name, a computer or domain name of letters only, any value under 6 characters): only
+        where no letter or digit is beside it; one that starts with a Hebrew letter may carry up to three Hebrew prefix
+        letters before it ($script:SafeHebrewPrefixBoundary), which stay;
+      - anywhere (every other value).
+    Known MACs and IP addresses take the first numbers of their categories; the patterns mask every spelling of them.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -332,14 +405,18 @@ function New-SafeMasker {
     foreach ($v in (ConvertTo-ReportList -Value (Get-ReportEntry -From $Known -Name $category))) {
       if ($null -eq $v -or $v -is [System.Collections.IDictionary]) { continue }
       $value = ([string]$v).Trim()
-      if ($value.Length -lt $script:SafeMinLength) { continue }
+      if ($value.Length -lt $script:SafeMinLength -or (Test-SafeGenericValue -Value $value)) { continue }
       $key = $value
       if ($category -ceq 'Email') { $key = $value.ToLowerInvariant() } elseif ($category -ceq 'Sid') { $key = $value.ToUpperInvariant() }
       $token = Get-SafeToken -Masker $masker -Category $category -Key $key
       foreach ($form in $value, (ConvertTo-ToolDisplayText -Text $value -MaxLength 4096)) {
         if ($form.Length -lt $script:SafeMinLength -or $masker['LiteralTokens'].ContainsKey($form)) { continue }
         $masker['LiteralTokens'][$form] = $token
-        $entries.Add(@{ Value = $form; Word = (($script:SafeWordCategories -ccontains $category) -or $form.Length -lt $script:SafeWordBelow) })
+        $mode = 'Anywhere'
+        if ($form -match '\A[0-9]+\z') { $mode = 'Number' }
+        elseif (($script:SafeWordCategories -ccontains $category) -or $form.Length -lt $script:SafeWordBelow -or
+                ($category -cin 'Computer', 'Domain' -and $form -match '\A\p{L}+\z')) { $mode = 'Word' }
+        $entries.Add(@{ Value = $form; Mode = $mode })
       }
     }
   }
@@ -358,7 +435,15 @@ function New-SafeMasker {
     $sorted = @($entries.ToArray() | Sort-Object -Property @{ Expression = { $_.Value.Length }; Descending = $true }, @{ Expression = { $_.Value }; Descending = $false })
     $parts = foreach ($e in $sorted) {
       $escaped = [regex]::Escape($e.Value)
-      if ($e.Word) { '(?<![\p{L}\p{Nd}])' + $escaped + '(?![\p{L}\p{Nd}])' } else { $escaped }
+      switch -CaseSensitive ($e.Mode) {
+        'Number' { '(?<![0-9])' + $escaped + '(?![0-9])' }
+        'Word' {
+          # A Hebrew name may carry up to three prefix letters ("to Dana" is one Hebrew word; review I3).
+          $left = $(if ($e.Value -match $script:SafeHebrewLetter) { $script:SafeHebrewPrefixBoundary } else { '(?<![\p{L}\p{Nd}])' })
+          $left + $escaped + '(?![\p{L}\p{Nd}])'
+        }
+        default { $escaped }
+      }
     }
     $masker['Literals'] = New-SafeRegex -Pattern (@($parts) -join '|')
   }
@@ -371,11 +456,12 @@ function ConvertTo-SafeText {
     -Text with every personal value turned into its token (see the top of this file), through -Masker (New-SafeMasker),
     whose tokens it extends. Throws when a regex runs out of time: the caller writes no SAFE copy then.
   .DESCRIPTION
-    First the known values (longest first, case-insensitive), then the patterns: e-mail; SID (S-1-5-21-..., S-1-12-1-...;
-    well-known SIDs such as S-1-5-18 stay); MAC (aa:bb:..., aa-bb-..., and 12 hex digits); IPv4 and IPv6 (each confirmed
-    with [ipaddress]::TryParse, so times and versions stay; 0.0.0.0, 127.0.0.1, 255.255.255.255, masks, :: and ::1
-    stay); a profile folder [A-Za-z]:\Users\<name> (the name as a user token; built-in folders stay); an Israeli phone
-    number.
+    First the known values (longest first, case-insensitive), then the patterns (see the top of this file): e-mail
+    (also %40); SID (S-1-5-21-..., S-1-12-1-..., after a letter too; well-known SIDs such as S-1-5-18 stay); MAC
+    (aa:bb:..., aa-bb-..., aaaa.bbbb.cccc and 12 hex digits); IPv4 and IPv6 (each confirmed with [ipaddress]::TryParse,
+    so times and versions stay; 0.0.0.0, 127.0.0.1, 255.255.255.255, masks, :: and ::1 stay); a profile folder (C:\Users\,
+    c$\Users\, %SystemDrive%\Users\, with \, / or \\: the name as a user token; generic and built-in folders stay); an
+    Israeli phone number. A token that a letter or digit follows gets an underscore after it.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -385,41 +471,72 @@ function ConvertTo-SafeText {
   )
 
   if ([string]::IsNullOrEmpty($Text)) { return [string]$Text }
+  # Each pass reads $source (the text before it) and writes $value. A token that a letter or a digit follows gets an
+  # underscore after it (Get-SafeTokenText; review M4).
   $value = $Text
   if ($null -ne $Masker['Literals']) {
-    $value = $Masker['Literals'].Replace($value, [Text.RegularExpressions.MatchEvaluator] {
+    $source = $value
+    $value = $Masker['Literals'].Replace($source, [Text.RegularExpressions.MatchEvaluator] {
         param($m)
         $token = $null
-        if ($Masker['LiteralTokens'].TryGetValue($m.Value, [ref]$token)) { $token } else { '[masked]' } })
+        if (-not $Masker['LiteralTokens'].TryGetValue($m.Value, [ref]$token)) { $token = '[masked]' }
+        Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
   }
-  $value = (New-SafeRegex -Pattern $script:SafeEmailPattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
-      param($m) Get-SafeToken -Masker $Masker -Category 'Email' -Key $m.Value.ToLowerInvariant() })
-  $value = (New-SafeRegex -Pattern $script:SafeSidPattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
-      param($m) Get-SafeToken -Masker $Masker -Category 'Sid' -Key $m.Value.ToUpperInvariant() })
-  $value = (New-SafeRegex -Pattern $script:SafeMacPattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
-      param($m) Get-SafeToken -Masker $Masker -Category 'Mac' -Key (($m.Value -replace '[:-]', '').ToUpperInvariant()) })
-  $value = (New-SafeRegex -Pattern $script:SafeMacCompactPattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
+  $source = $value
+  $value = (New-SafeRegex -Pattern $script:SafeEmailPattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
       param($m)
-      $key = $m.Value.ToUpperInvariant()
-      if ($Masker['Tokens']['Mac'].ContainsKey($key) -or $key -match '[A-F]') { Get-SafeToken -Masker $Masker -Category 'Mac' -Key $key } else { $m.Value } })
+      $token = Get-SafeToken -Masker $Masker -Category 'Email' -Key ($m.Value.ToLowerInvariant() -replace '%40', '@')
+      Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
+  $source = $value
+  $value = (New-SafeRegex -Pattern $script:SafeSidPattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
+      param($m)
+      $token = Get-SafeToken -Masker $Masker -Category 'Sid' -Key $m.Value.ToUpperInvariant()
+      Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
+  $source = $value
+  $value = (New-SafeRegex -Pattern $script:SafeMacPattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
+      param($m)
+      $token = Get-SafeToken -Masker $Masker -Category 'Mac' -Key (($m.Value -replace '[:-]', '').ToUpperInvariant())
+      Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
+  foreach ($pattern in $script:SafeMacDottedPattern, $script:SafeMacCompactPattern) {
+    $source = $value
+    $value = (New-SafeRegex -Pattern $pattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $key = ($m.Value -replace '\.', '').ToUpperInvariant()
+        if ($Masker['Tokens']['Mac'].ContainsKey($key) -or $key -match '[A-F]') {
+          Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category 'Mac' -Key $key) -Source $source -End ($m.Index + $m.Length)
+        } else { $m.Value } })
+  }
   foreach ($pattern in $script:SafeIpv4Pattern, $script:SafeIpv6Pattern) {
-    $value = (New-SafeRegex -Pattern $pattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
+    $source = $value
+    $value = (New-SafeRegex -Pattern $pattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
         param($m)
         $address = ConvertTo-SafeAddress -Text $m.Value
         $where = $null
         if ($null -ne $address) { $where = Get-SafeAddressKey -Address $address }
-        if ($null -eq $where) { $m.Value } else { Get-SafeToken -Masker $Masker -Category $where.Category -Key $where.Key } })
+        if ($null -eq $where) { $m.Value }
+        else { Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category $where.Category -Key $where.Key) -Source $source -End ($m.Index + $m.Length) } })
   }
-  $value = (New-SafeRegex -Pattern $script:SafeProfilePattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
+  $source = $value
+  $value = (New-SafeRegex -Pattern $script:SafeProfilePattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
       param($m)
       $name = $m.Groups['name'].Value
-      if ($name -match $script:SafeTokenPattern -or (Test-SafeGenericName -Name $name)) { $m.Value }
-      else { $m.Groups['drive'].Value + (Get-SafeToken -Masker $Masker -Category 'User' -Key $name.Trim()) } })
-  $value = (New-SafeRegex -Pattern $script:SafePhonePattern).Replace($value, [Text.RegularExpressions.MatchEvaluator] {
+      $core = $name.TrimEnd('.', ' ', "`t")
+      if ($core -eq '' -or $core -match $script:SafeTokenPattern -or (Test-SafeGenericValue -Value $core)) { $m.Value }
+      else {
+        $token = Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category 'User' -Key $core.Trim()) -Source $source -End ($m.Index + $m.Length)
+        $m.Groups['drive'].Value + $token + $name.Substring($core.Length)
+      } })
+  $source = $value
+  $value = (New-SafeRegex -Pattern $script:SafePhonePattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
       param($m)
+      # One number, one key: 00972 / 972 (and a "(0)" after it) as 0, so every spelling of it gets one token.
       $digits = $m.Value -replace '[^0-9]', ''
-      if ($digits.StartsWith('972', [StringComparison]::Ordinal)) { $digits = '0' + $digits.Substring(3) }
-      Get-SafeToken -Masker $Masker -Category 'Phone' -Key $digits })
+      if ($digits.StartsWith('00972', [StringComparison]::Ordinal)) { $digits = $digits.Substring(2) }
+      if ($digits.StartsWith('972', [StringComparison]::Ordinal)) {
+        $digits = $digits.Substring(3)
+        if (-not $digits.StartsWith('0', [StringComparison]::Ordinal)) { $digits = '0' + $digits }
+      }
+      Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category 'Phone' -Key $digits) -Source $source -End ($m.Index + $m.Length) })
   return $value
 }
 

@@ -810,6 +810,26 @@ Describe 'the page at work (repair Task 5: strip, stick, tiles, confirmations, c
     # Back to New PC setup and here again: no second strip read and no second full stick search (the presence is the same).
     Click $w 'NavSetup'; Click $w 'NavRepair'; @($script:started).Count | Should -Be 1; $script:sticks | Should -Be 1
     @($script:logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'Toolbox stick changed' }).Count | Should -Be 1 }
+  It 'a stick change after the page opened reads the strip again, so Compare and Restore network settings follow the stick (Task 9 review M8)' {
+    $set = $script:loadingStrip.Clone(); $set.Stick = $null
+    $w = New-WorkWindow -Page 'setup' -Set $set; $script:presence = ''
+    $w.Tag.FindStick = { param($l) $script:sticks++; if ($script:presence -eq '') { @{ Root = $null; Drive = $null } } else { @{ Root = 'E:\'; Drive = 'E:' } } }
+    Click $w 'NavRepair'; @($script:started).Count | Should -Be 1   # the page's own first read, with no stick
+    $tick = New-ToolboxPowerTimer -Window $w
+    # Plugged in while that read still runs: it is marked to be read again, and a fresh one starts when it ends.
+    $script:presence = 'E:\|BENTECH|32010928128'; Invoke-ToolboxAction -Sender $tick -Action 'Power'
+    $w.FindName('ChipStickText').Text | Should -Be 'Stick E:'; $w.Tag.Runs.Safety.Reread | Should -BeTrue; @($script:started).Count | Should -Be 1
+    $script:fake.HasExited = $true; Send-RunTick $w
+    @($script:started).Count | Should -Be 2; $script:started[-1].Args | Should -Match '-ToolAction safety'
+    $args2 = Read-ToolJsonFile -Path (Join-Path $w.Tag.Runs.Safety.Dir 'args.json'); $args2.StickRoot | Should -Be 'E:\'
+    $chips = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; HasEarlierReport = $true }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeTrue; $w.Tag.Runs.Safety | Should -BeNullOrEmpty
+    # Pulled while nothing runs: a new read starts at once, without the stick.
+    $script:presence = ''; Invoke-ToolboxAction -Sender $tick -Action 'Power'
+    @($script:started).Count | Should -Be 3; (Read-ToolJsonFile -Path (Join-Path $w.Tag.Runs.Safety.Dir 'args.json')).StickRoot | Should -BeExactly ''
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; HasEarlierReport = $false }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeFalse }
   It 'a safety child that never finishes is killed at its deadline; its missing chips are unknown and block nothing (Review Focus 1)' {
     $w = New-WorkWindow -Page 'setup' -Set $script:loadingStrip; Click $w 'NavRepair'; $run = $w.Tag.Runs.Safety
     $null = Write-ToolJsonFile -Path (Join-Path $run.Dir 'progress.json') -InputObject @{ Action = 'safety'; RunId = $run.RunId; State = 'running'; Current = 1; Steps = @(); Log = @()

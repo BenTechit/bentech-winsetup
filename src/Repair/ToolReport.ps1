@@ -55,6 +55,15 @@ $script:ReportDiskEventIds = @('disk/7', 'disk/51', 'disk/153', 'Ntfs/55', 'Micr
 $script:ReportWheaFatalIds = @(1, 18, 20, 46)
 $script:ReportWheaCorrectedIds = @(17, 19, 47)
 
+# The finding codes only a Full report can give (its Full-only sources: the volume state, RD-R12). Compare never calls
+# them new or resolved between a Quick and a Full visit (ruling RD-R25, Task 9 review I1); a test runs the fake PC
+# Quick and Full and pins this list.
+$script:ReportFullOnlyCodes = @('volumeStateSpotFix', 'volumeStateFullRepair', 'volumeStateScan', 'volumeStateUnknown')
+
+# reportWrite looks for an earlier report on the stick only with at least this much of the action's time left (review
+# M7): after a Stop near the deadline, or past it, it only writes.
+$script:ReportEarlierMinSeconds = 60
+
 # The English lines Read-ToolLogErrors keeps from CBS.log and dism.log (always English).
 $script:ReportLogErrorPatterns = @(', Error', 'HRESULT = 0x8', '[SR] Cannot repair')
 
@@ -885,12 +894,27 @@ function Get-ToolReportRawDir {
 
 function Save-ToolReportText {
   # Private. Writes -Lines (CRLF) as UTF-8 with a BOM (Notepad shows Hebrew right). Throws when the file is a link
-  # (V2-R13) or cannot be written.
+  # (V2-R13) or cannot be written. -Replace (a file already written: reportWrite adding the since-last-visit section)
+  # writes <Path>.tmp and swaps it in, so a failure leaves the first version whole.
   [CmdletBinding()]
-  param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+  param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines, [switch]$Replace)
 
   if (Test-StickReparsePoint -Path $Path) { throw ('{0} is a link' -f [IO.Path]::GetFileName($Path)) }
-  [IO.File]::WriteAllText($Path, (($Lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $true))
+  $text = ($Lines -join "`r`n") + "`r`n"
+  if ($Replace -and [IO.File]::Exists($Path)) {
+    $temporary = $Path + '.tmp'
+    if (Test-StickReparsePoint -Path $temporary) { throw ('{0} is a link' -f [IO.Path]::GetFileName($temporary)) }
+    [IO.File]::WriteAllText($temporary, $text, (New-Object Text.UTF8Encoding $true))
+    try {
+      [IO.File]::Replace($temporary, $Path, [NullString]::Value)
+    } catch {
+      # A file system without ReplaceFile (record it on a FAT32 or exFAT stick: docs/testing.md 1.20): written over.
+      [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding $true))
+      [IO.File]::Delete($temporary)
+    }
+    return
+  }
+  [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding $true))
 }
 
 function Copy-ToolRawFile {
@@ -978,9 +1002,12 @@ function Invoke-ToolStepReportWrite {
     name, RD-R4). The report's findings go into the run's findings (the window shows them). $Run.Files.Report, .Data,
     .Raw and .Safe.
   .DESCRIPTION
-    When the stick holds an earlier report of this PC (Find-ToolEarlierReport, outside this visit's folder), the core
-    has the SINCE LAST VISIT section right after section 00; an earlier report file of this PC that cannot be read is
-    named there and is WARN earlierUnreadable (RD-R23: never a silent comparison with nothing).
+    The core is written first (review M7), then the stick is read: when it holds an earlier report of this PC
+    (Find-ToolEarlierReport, outside this visit's folder), the core is written again with the SINCE LAST VISIT section
+    right after section 00 (through <file>.tmp: a failure leaves the first version and is WARN reportWriteFailed); an
+    earlier report file of this PC that cannot be read is named there and is WARN earlierUnreadable (RD-R23: never a
+    silent comparison with nothing). With less than $script:ReportEarlierMinSeconds of the action's time left (a Stop
+    near the deadline, or past it) the stick is not read and the section says so: the report only writes.
     The core that cannot be written (a link, a pulled stick) is CRIT reportWriteFailed and 'failed'; a data file or a
     SAFE copy that cannot be written is WARN reportWriteFailed ('the data file ...', 'the privacy-safe copy ...'), the
     core stays; a SAFE copy is never written unmasked. Nothing is written through a link (V2-R13).
@@ -995,8 +1022,7 @@ function Invoke-ToolStepReportWrite {
     $pc = Get-ToolReportPcName -Run $Run
     $stamp = Get-ToolReportStamp -Run $Run
     $folder = Get-ToolReportFolder -Run $Run
-    $found = Get-ToolRunSinceLastVisit -Run $Run -Current $data
-    $lines = [string[]]@(Format-ReportCore -Report $report -Kind $report['Kind'] -SinceLastVisit $found.Lines)
+    $lines = [string[]]@(Format-ReportCore -Report $report -Kind $report['Kind'])
     $rawDir = $null
     $rawFile = 'raw_{0}\report-full.txt' -f $stamp
     try {
@@ -1010,6 +1036,27 @@ function Invoke-ToolStepReportWrite {
     $corePath = [IO.Path]::Combine($folder, ('REPORT_{0}_{1}.txt' -f $pc, $stamp))
     Save-ToolReportText -Path $corePath -Lines $core
     $Run.Files['Report'] = $corePath
+
+    # The core is on the stick: now the earlier report (review M7), only with time left.
+    $found = @{ Earlier = $null; Diff = $null; Skipped = [string[]]@(); Lines = [string[]]@() }
+    $lookFor = ([string]$Run.Args['StickRoot'] -ne '' -and (Get-ToolIdentityFolderPart -IdentityKey ([string](Get-ReportEntry -From $Run.Args['Identity'] -Name 'Key'))) -ne '')
+    if ($lookFor -and (Get-ToolRemainingSeconds -Run $Run) -lt $script:ReportEarlierMinSeconds) {
+      Add-ToolLog -Run $Run -Text 'No time left to look for an earlier report'
+      $found['Lines'] = [string[]]@('SINCE LAST VISIT', '  (not looked for: the report ran out of time)')
+    } elseif ($lookFor) {
+      $found = Get-ToolRunSinceLastVisit -Run $Run -Current $data
+    }
+    if (@($found['Lines']).Count -gt 0) {
+      $lines = [string[]]@(Format-ReportCore -Report $report -Kind $report['Kind'] -SinceLastVisit $found['Lines'])
+      $withSince = [string[]]@(Limit-ReportCore -Lines $lines -Sections $report['Sections'] -MaxBytes ([int]($maxKB * 1024)) -RawFile $rawFile)
+      try {
+        Save-ToolReportText -Path $corePath -Lines $withSince -Replace
+        $core = $withSince
+      } catch {
+        Write-SetupLog -Level WARN -Message 'The since-last-visit section could not be added to the report' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+        Add-ToolFinding -Run $Run -Level WARN -Code 'reportWriteFailed' -Arguments @('the since-last-visit section could not be added')
+      }
+    }
     if ($null -ne $rawDir) {
       try {
         Save-ToolReportText -Path ([IO.Path]::Combine($rawDir, 'report-full.txt')) -Lines $lines

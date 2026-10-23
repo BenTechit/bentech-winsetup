@@ -1449,7 +1449,9 @@ function Update-ToolboxStick {
     root than the model's replaces Repair.Stick, and the change is logged once: INFO 'Toolbox stick changed' with
     @{ drive } ('none' when it is gone; ASCII); a search that changes nothing logs nothing. A presence check or a search
     that throws changes nothing and is logged once per window (WARN 'Could not check for the stick', 'Could not look
-    for the stick').
+    for the stick'). A changed stick, once the page's first strip read has started (Tag.SafetyStarted), reads the strip
+    again (Start-ToolboxSafetyRun, or Reread on a read still running; Task 9 review M8), so Compare with last visit and
+    Restore network settings follow the stick.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -1496,6 +1498,12 @@ function Update-ToolboxStick {
   $stick = if ($root -ne '') { @{ Root = $root; Drive = $drive } } else { @{ Root = $null; Drive = $null } }
   Set-ToolboxRepair -State $state -Values @{ Stick = $stick }
   Write-SetupLog -Level INFO -Message 'Toolbox stick changed' -Data @{ drive = $(if ($drive -ne '') { ConvertTo-ScreenText -Text $drive } else { 'none' }) }
+  # What the safety child read from the stick (the saved network backup, an earlier report of this PC) follows the
+  # stick (Task 9 review M8): once the page's first read has started, a change reads the strip again; a read still
+  # running is marked Reread, so a fresh one starts when it ends.
+  if ($state['SafetyStarted'] -eq $true -and $state['Runs'] -is [System.Collections.IDictionary]) {
+    if ($null -ne $state['Runs']['Safety']) { $state['Runs']['Safety']['Reread'] = $true } else { Start-ToolboxSafetyRun -Window $Window }
+  }
 }
 
 function ConvertTo-ToolboxFullPath {

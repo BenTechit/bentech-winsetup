@@ -121,9 +121,10 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
       ConvertTo-SafeText -Masker $m -Text '050-1234567 and +972-50-1234567 and 0501234567' | Should -BeExactly 'PHONE-1 and PHONE-1 and PHONE-1'
     }
     It 'a known value under 3 characters is never masked, a short one only as a whole word, a long one everywhere' {
+      # RD-R25: a numeric serial under 6 digits is no known value (I2); a token a letter or digit follows gets '_' (M4).
       $m = New-SafeMasker -Known @{ User = @('Al', 'Ben'); Serial = @('1234', 'CNCMK0034R00AB'); Computer = @('OFFICE-PC') }
       ConvertTo-SafeText -Masker $m -Text 'Al Ben Bench KB51234 serial 1234 board /X/CNCMK0034R00AB/ usb USB\VID_1\CNCMK0034R00AB99 at office-pc2' |
-        Should -BeExactly 'Al user1 Bench KB51234 serial SERIAL-1 board /X/SERIAL-2/ usb USB\VID_1\SERIAL-299 at PC-12'
+        Should -BeExactly 'Al user1 Bench KB51234 serial 1234 board /X/SERIAL-1/ usb USB\VID_1\SERIAL-1_99 at PC-1_2'
     }
     It 'Get-ReportIdentifiers names every personal value the collectors saw, and never a built-in account or a placeholder' {
       $id = Get-ReportIdentifiers -Report $script:sample
@@ -248,7 +249,9 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
         '  Updated: Google Chrome 129.0.6668.90 -> 130.0.6723.70'
         '  Removed: Old Toolbar 1.0'
         '  New finding: [WARN] 1 devices have a problem (codes 28) (section 06)'
-        '  Resolved: [WARN] C: 9.5 GB free (2%) (section 03)')
+        '  Resolved: [WARN] C: 9.5 GB free (2%) (section 03)'
+        # RD-R25: the earlier visit had a Quick report, this one a Full one.
+        '  Not compared: the checks only a Full report makes (one visit had a Quick report, the other a Full one)')
       # wuDisabled (05) is not claimed resolved: section 05 was not fully collected this time; a source missing is no evidence.
       ($lines -join "`n") | Should -Not -Match 'Windows Update service'
       (Compare-ToolReportData -Earlier $earlier -Current $now).Count | Should -Be 12
@@ -437,6 +440,149 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
           $script:ToolboxStrings.he.Keys | Should -Contain ('finding.' + $v.Value) -Because $file
         }
       }
+    }
+  }
+
+  Describe 'the Task 9 review fixes (ruling RD-R25)' {
+    BeforeAll {
+      $script:fullOnlyNote = '  Not compared: the checks only a Full report makes (one visit had a Quick report, the other a Full one)'
+      function Get-Mask { param($Masker, [string]$Text) ConvertTo-SafeText -Masker $Masker -Text $Text }
+    }
+    It 'I1: a check only a Full report makes is never "new" or "resolved" between a Quick and a Full visit; a note says so' {
+      $full = Copy-ReportValue -Value $earlier; $full['Kind'] = 'full'
+      $full['Findings'] = @(@{ Code = 'volumeStateSpotFix'; Level = 'CRIT'; Args = @(); Section = '03' }, @{ Code = 'volumeDirty'; Level = 'WARN'; Args = @(); Section = '03' },
+                            @{ Code = 'lowSpace'; Level = 'WARN'; Args = @('C:', '9.5', '2'); Section = '03' })
+      $quick = Copy-ReportValue -Value $earlier; $quick['Kind'] = 'quick'; $quick['CreatedAt'] = '2026-10-20T09:00:00'; $quick['Findings'] = @()
+      # A Full report on visit 1, Compare (Quick sections) on visit 2: no false "Resolved" for the spot fix.
+      $d = Compare-ToolReportData -Earlier $full -Current $quick
+      @(foreach ($f in $d.FindingsResolved) { $f.Code }) | Should -Be @('volumeDirty', 'lowSpace')
+      $l = @(Format-ToolSinceLastVisit -Diff $d)
+      $l | Should -Contain $script:fullOnlyNote; ($l -join "`n") | Should -Not -Match 'spot fix'
+      # A Quick visit 1 and a Full visit 2: no false "New finding" either.
+      @(foreach ($f in (Compare-ToolReportData -Earlier $quick -Current $full).FindingsNew) { $f.Code }) | Should -Be @('volumeDirty', 'lowSpace')
+      # Two Full reports compare every code, and say nothing about it.
+      $full2 = Copy-ReportValue -Value $full; $full2['CreatedAt'] = '2026-10-20T09:00:00'; $full2['Findings'] = @()
+      $same = Compare-ToolReportData -Earlier $full -Current $full2
+      @(foreach ($f in $same.FindingsResolved) { $f.Code }) | Should -Contain 'volumeStateSpotFix'
+      @(Format-ToolSinceLastVisit -Diff $same) | Should -Not -Contain $script:fullOnlyNote
+    }
+    It 'I1: the Full-only codes are pinned: a Quick and a Full run of an unhealthy fake PC differ only by $script:ReportFullOnlyCodes' {
+      $script:gc['volumeState'] = @{ HealthStatus = 1; OperationalStatus = @(53262); Dirty = $true }
+      foreach ($v in @($script:cim['Win32_Volume'])) { if ($v.DriveLetter -eq 'C:') { $v.DirtyBitSet = $true } }
+      $codes = @{}
+      foreach ($action in 'quickReport', 'fullReport') {
+        $run = New-ReportActionRun -Action $action
+        $ids = @(foreach ($s in $script:ToolActionCatalog[$action].Steps) { if ([string]$s -match '^report([0-9]{2})\z') { $Matches[1] } })
+        foreach ($id in $ids) { $null = Invoke-ToolReportSection -Run $run -Id $id }
+        $codes[$action] = @(foreach ($f in (New-ToolReport -Run $run)['Findings']) { if ([string]$f.Code -cne 'notCollected') { [string]$f.Code } }) | Sort-Object -Unique
+      }
+      $fullOnly = @($codes['fullReport'] | Where-Object { @($codes['quickReport']) -cnotcontains $_ })
+      $fullOnly | Should -Contain 'volumeStateSpotFix'   # the unhealthy volume made the Full-only check speak
+      @($codes['quickReport']) | Should -Contain 'volumeDirty'   # the dirty bit is read by both
+      foreach ($c in $fullOnly) { @($script:ReportFullOnlyCodes) | Should -Contain $c -Because 'every code only a Full report gives is on the list' }
+      foreach ($c in @($script:ReportFullOnlyCodes)) { @($codes['quickReport']) | Should -Not -Contain $c -Because "$c is Full-only" }
+      @($codes['quickReport'] | Where-Object { @($codes['fullReport']) -cnotcontains $_ }) | Should -BeNullOrEmpty   # nothing is Quick-only
+    }
+    It 'I2: generic names are never masked (a stop-list, Windows'' own network names, letter-only names as whole words, short numeric serials not at all)' {
+      $hebNet2 = (-join ([char[]](0x05E8, 0x05E9, 0x05EA))) + ' 2'
+      $m = New-SafeMasker -Known @{ User = @('User', 'Admin', 'Owner', 'TEMP', 'Guest'); Ssid = @('Network', 'Network 2', 'Home', $hebNet2, 'Unidentified network')
+                                    Computer = @('OFFICE', 'COHENPC'); Domain = @('HOME', 'contoso', 'WORKGROUP'); Serial = @('1234', '98765', '123456') }
+      foreach ($line in '== 09 NETWORK ==', 'Network reset', 'Windows 11 Home', 'Microsoft Office Professional Plus', 'OfficeClickToRun.exe', 'no signed-in user',
+                        'User Profile Service', 'Run as Admin', 'Domain Admins', 'Free 1234 MB', 'Free 98765 MB', 'KB1234', 'Known network Network 2 (wired, Private)',
+                        'TEMP=%TEMP%', 'C:\Users\User\AppData', 'Connection Network on Ethernet: Private', "net $hebNet2", 'Guest (disabled)', 'Domain = WORKGROUP (workgroup)') {
+        Get-Mask $m $line | Should -BeExactly $line -Because $line
+      }
+      # A letter-only computer or domain name only as a whole word; one with a digit or a separator everywhere; a numeric
+      # serial of 6 digits or more only as a whole number.
+      Get-Mask $m 'host COHENPC.local, cohenpcx, contoso\dana, contosoltd, serial 123456, 91234567' |
+        Should -BeExactly 'host PC-1.local, cohenpcx, DOMAIN-1\dana, contosoltd, serial SERIAL-1, 91234567'
+      # Get-ReportIdentifiers leaves them out too: Windows' generic wired names, stop words, a WORKGROUP-like workgroup.
+      $rep = @{ Identity = @{ ComputerName = 'DESKTOP-4F7K2LQ'; Serial = '7HX2K93'; Brand = 'DELL' }
+                Items = @{ NetworkProfiles = @(@{ Name = 'Network'; Type = 'wired' }, @{ Name = 'Network 2'; Type = 'wired' }, @{ Name = $hebNet2; Type = 'wired' },
+                                               @{ Name = 'lan'; Type = 'wired' }, @{ Name = 'Cohen_Home'; Type = 'wireless' }, @{ Name = 'Unidentified network'; Type = 'other' })
+                           Ssids = @('Cohen_Home'); Users = @('Owner', 'Dana', 'User'); Workgroup = 'HOME'; BatterySerials = @('1234'); RamSerials = @('80AD0123') } }
+      $ids = Get-ReportIdentifiers -Report $rep
+      @($ids.Ssid) | Should -Be @('Cohen_Home'); @($ids.User) | Should -Be @('Dana'); @($ids.Domain).Count | Should -Be 0
+      @($ids.Serial) | Should -Not -Contain '1234'; @($ids.Serial) | Should -Contain '80AD0123'
+    }
+    It 'I3: Hebrew names after up to three prefix letters (b h v k l m sh) are masked, user names and network names alike' {
+      $m = New-SafeMasker -Known @{ User = @('דנה כהן', 'Dana'); Ssid = @('הבית כהן') }
+      Get-Mask $m 'לחזור לדנה כהן מחר' | Should -BeExactly 'לחזור לuser1 מחר'
+      Get-Mask $m 'ודנה כהן ביקשה' | Should -BeExactly 'וuser1 ביקשה'
+      Get-Mask $m 'וכשדנה כהן התקשרה' | Should -BeExactly 'וכשuser1 התקשרה'
+      Get-Mask $m 'של דנה כהן' | Should -BeExactly 'של user1'
+      Get-Mask $m 'ברשת בהבית כהן' | Should -BeExactly 'ברשת בSSID-1'
+      Get-Mask $m 'אדנה כהן' | Should -BeExactly 'אדנה כהן'   # א is no prefix letter
+    }
+    It 'I3: SIDs are found by pattern wherever they are, after a letter or a dash, known or not; well-known SIDs stay' {
+      $m = New-SafeMasker -Known @{}
+      Get-Mask $m 'OneDrive Standalone Update Task-S-1-5-21-444-555-666-1002' | Should -BeExactly 'OneDrive Standalone Update Task-SID-1'
+      Get-Mask $m 'GoogleUpdateTaskUserS-1-5-21-444-555-666-1003Core' | Should -BeExactly 'GoogleUpdateTaskUserSID-2_Core'
+      Get-Mask $m 'Task-S-1-12-1-11-22-33-44 and HKU\S-1-5-21-444-555-666-1002_Classes' | Should -BeExactly 'Task-SID-3 and HKU\SID-1_Classes'
+      Get-Mask $m 'system S-1-5-18 admins S-1-5-32-544' | Should -BeExactly 'system S-1-5-18 admins S-1-5-32-544'
+    }
+    It 'M1: phone numbers in every common Israeli spelling, the spec''s pinned ones included; dates, versions and codes stay' {
+      $m = New-SafeMasker -Known @{}
+      foreach ($p in '050-1234567', '0501234567', '050 123 4567', '+972-50-123-4567', '+972501234567', '972-50-1234567', '00972501234567', '050.123.4567',
+                     '972501234567', '050-123-45-67', '(050)1234567', '+972 (0)50-1234567', '+972-50-1234567') {
+        Get-Mask $m "call $p." | Should -BeExactly 'call PHONE-1.' -Because $p
+      }
+      Get-Mask $m 'call 054 - 7654321' | Should -BeExactly 'call PHONE-2'
+      Get-Mask $m '03-6123456 or +972 3 612 3456 or +972 3 6123456' | Should -BeExactly 'PHONE-3 or PHONE-3 or PHONE-3'
+      foreach ($keep in 'on 02.10.2026 1:15', 'build 10.0.26100.1', 'KB5044284', 'code 0x0000009F', 'size 512110190592', 'id 1972501234567', 'at 04/10/2026 09:00') {
+        Get-Mask $m $keep | Should -BeExactly $keep -Because $keep
+      }
+    }
+    It 'M2: an unknown profile name in a UNC, forward-slash, JSON-escaped or %SystemDrive% path, or at the end of a line, is a user token' {
+      $m = New-SafeMasker -Known @{}
+      Get-Mask $m '\\PC7\c$\Users\Yossi\Desktop' | Should -BeExactly '\\PC7\c$\Users\user1\Desktop'
+      Get-Mask $m 'C:/Users/Yossi/Desktop and C:\\Users\\Yossi\\Desktop' | Should -BeExactly 'C:/Users/user1/Desktop and C:\\Users\\user1\\Desktop'
+      Get-Mask $m '%SystemDrive%\Users\Rina2\x' | Should -BeExactly '%SystemDrive%\Users\user2\x'
+      Get-Mask $m "path C:\Users\Moshe Levi`nnext line" | Should -BeExactly "path C:\Users\user3`nnext line"
+      Get-Mask $m 'C:/Users/Public/x and C:\Users\Default' | Should -BeExactly 'C:/Users/Public/x and C:\Users\Default'
+    }
+    It 'M3: an IPv6 address right after a colon, a Cisco-style MAC and a URL-encoded e-mail address are masked; times stay' {
+      $m = New-SafeMasker -Known @{ Mac = @('A4-BB-6D-12-34-57') }
+      Get-Mask $m 'Address:2a00:1450:4001::8a IPv6:2a00:1450:4001::8d' | Should -BeExactly 'Address:IP6-1 IPv6:IP6-2'
+      Get-Mask $m 'at 10:15:45 and 12:34:56:78' | Should -BeExactly 'at 10:15:45 and 12:34:56:78'
+      Get-Mask $m 'mac a4bb.6d12.3457, user yossi%40gmail.com' | Should -BeExactly 'mac MAC-1, user EMAIL-1'
+    }
+    It 'M4: a token a letter or digit follows gets an underscore, so it never reads as another token' {
+      $m = New-SafeMasker -Known @{ Serial = @('S4EWNX0R123456'); Computer = @('DESKTOP-4F7K2LQ') }
+      Get-Mask $m 'S4EWNX0R1234567 OLD-DESKTOP-4F7K2LQX DESKTOP-4F7K2LQ.local S4EWNX0R123456' | Should -BeExactly 'SERIAL-1_7 OLD-PC-1_X PC-1.local SERIAL-1'
+    }
+    It 'M5: Compare names a BenTech-Reports that is a link or cannot be listed, and a visit folder it cannot list' {
+      $s = New-CompareStick -Name 'CmpStickList'
+      $skipped = New-Object System.Collections.Generic.List[string]
+      Mock Test-StickReparsePoint { $Path -like '*BenTech-Reports' }
+      Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current -Skipped $skipped | Should -BeNullOrEmpty
+      @($skipped) | Should -Be @('BenTech-Reports (a link)')
+      Mock Test-StickReparsePoint { if ($Path -like '*BenTech-Reports') { throw (New-Object UnauthorizedAccessException 'denied') }; $false }
+      $skipped.Clear(); $null = Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current -Skipped $skipped
+      @($skipped) | Should -Be @('BenTech-Reports (could not be listed)')
+      Mock Test-StickReparsePoint { if ($Path -like '*_2026-10-01_0900') { throw (New-Object UnauthorizedAccessException 'denied') }; $false }
+      $skipped.Clear()
+      (Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current -Skipped $skipped).CreatedAt | Should -Be '2026-09-01T09:00:00'
+      @($skipped) | Should -Be @('DELL-7HX2K93_7HX2K93_2026-10-01_0900 (could not be listed)')
+    }
+    It 'M6: the crash counts say they cover only the last crashDays when the last visit was longer ago' {
+      $note = '  Crashes are counted for the last 60 days only (the last visit was longer ago)'
+      $old = Copy-ReportValue -Value $earlier; $old['CreatedAt'] = '2026-07-01T09:00:00'
+      @(Format-ToolSinceLastVisit -Diff (Compare-ToolReportData -Earlier $old -Current $now -CrashDays 60)) | Should -Contain $note
+      @(Format-ToolSinceLastVisit -Diff (Compare-ToolReportData -Earlier $earlier -Current $now -CrashDays 60)) | Should -Not -Contain $note
+    }
+    It 'M7: reportWrite writes the core before it reads the stick; with no time left it only writes, and says so' {
+      $script:coresAtSearch = -1
+      Mock Find-ToolEarlierReport { $script:coresAtSearch = @(Get-ChildItem $script:sessionDir -Filter 'REPORT_DELL-7HX2K93_*.txt').Count; $null }
+      $r = New-ReportSampleRun -Sample $script:sample
+      Invoke-ToolStepReportWrite -Run $r | Should -Be 'done'
+      $script:coresAtSearch | Should -Be 1
+      $r2 = New-ReportSampleRun -Sample $script:sample
+      Mock Get-ToolRemainingSeconds { 0 }
+      Invoke-ToolStepReportWrite -Run $r2 | Should -Be 'done'
+      Should -Invoke Find-ToolEarlierReport -Times 1 -Exactly
+      [IO.File]::ReadAllText($r2.Files.Report) | Should -Match 'SINCE LAST VISIT\r\n  \(not looked for: the report ran out of time\)'
+      Test-Path $r2.Files.Safe | Should -BeTrue; Test-Path $r2.Files.Data | Should -BeTrue
     }
   }
 }

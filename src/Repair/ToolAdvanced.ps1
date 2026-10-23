@@ -31,7 +31,8 @@
 # device's name and class, an adapter's alias) keep their real text (ConvertTo-ToolDisplayText) and are written as
 # \uXXXX escapes (ConvertTo-ToolAsciiJson; ruling RD-R21), every other value and every log line is ASCII
 # (ConvertTo-ScreenText). result.json stays under 1 MB (the ghost list has a count cap and a byte budget, and says
-# so). Nothing on the stick is written or read through a link (Test-StickReparsePoint).
+# so). The network backup on the stick is a file Ben reads: plain UTF-8 (Write-ToolJsonFile -Utf8; ruling RD-R23).
+# Nothing on the stick is written or read through a link (Test-StickReparsePoint).
 #
 # Needs ToolEngine (Invoke-ToolNative, Invoke-ToolJsonChild, Add-ToolFinding, Add-ToolLog, Write-ToolJsonFile,
 # Read-ToolJsonFile, Get-ToolStepTimeout, Get-ToolRemainingSeconds, Get-ToolStepName, Format-ToolExitCode,
@@ -864,7 +865,9 @@ function Invoke-ToolStepNetBackup {
       $problem = ConvertTo-ScreenText -Text $_.Exception.Message
     }
   }
-  if ($problem -eq '' -and -not (Write-ToolJsonFile -Path $path -InputObject $backup -Depth 8)) { $problem = 'the file could not be written' }
+  # A file Ben reads on the stick: plain UTF-8 (ruling RD-R23, switched in the Task 9 review fixes); the read-back below
+  # and Read-ToolNetBackupFile hash and parse the same bytes as before.
+  if ($problem -eq '' -and -not (Write-ToolJsonFile -Path $path -InputObject $backup -Depth 8 -Utf8)) { $problem = 'the file could not be written' }
   if ($problem -eq '') {
     $back = Read-ToolJsonFile -Path $path
     $wrote = ConvertTo-Json -InputObject (ConvertTo-ToolSortedObject -InputObject $backup) -Depth 12 -Compress

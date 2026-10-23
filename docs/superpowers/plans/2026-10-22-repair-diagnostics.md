@@ -35,7 +35,7 @@
 - **Nothing on the stick is followed through a link** (V2-R13): `BenTech-Reports`, a session folder or a file named there that is a reparse point is never written through; the child falls back to the local folder with the `sessionLink` finding. Nothing is deleted with `Remove-Item -Recurse`. The repairs delete nothing: the Windows Update reset **renames**.
 
 **Text, language and colour**
-- `setup.log`, the child's log and the console: **English and ASCII** (`ConvertTo-ScreenText` on every free value). `args.json`, `progress.json` and `result.json`: **ASCII bytes; display names as `\u` escapes (RD-R21); stick files plain UTF-8 (RD-R23)**. Finding texts are English; the window shows `finding.<Code>` from the string table in its language.
+- `setup.log`, the child's log and the console: **English and ASCII** (`ConvertTo-ScreenText` on every free value). `args.json`, `progress.json` and `result.json`: **ASCII bytes; display names as `\u` escapes (RD-R21); stick files plain UTF-8 (RD-R23: the reports' `_data.json` and the network backup)**. Finding texts are English; the window shows `finding.<Code>` from the string table in its language.
 - **`src\Toolbox\Strings.ps1` stays the only non-ASCII `src` file.** The Hebrew YES (`טקד`) is written as code points `0x05D8, 0x05E7, 0x05D3` in `RepairPlanner.ps1` (**Plan call**).
 - **Diagnostic reports on the stick are UTF-8** and may hold Hebrew data (event messages, program names, the customer complaint); their headings, facts names and flags are English (spec 6.8, 10). Report dates `dd/MM/yyyy HH:mm` through `Format-ReportDate` (invariant culture, Gregorian).
 - Colours are hex values inside the one `<Window.Resources>` dictionary; `DarkYellow` / `DarkMagenta` never appear in `src`.

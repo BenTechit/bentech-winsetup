@@ -29,8 +29,10 @@
 # data file in it (REPORT_ or COMPARE_<PC>_<stamp>[_<n>]_data.json).
 $script:ToolVisitFolderPattern = '\A[A-Za-z0-9-]+_(?<part>[A-Za-z0-9-]+)_(?<stamp>[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4})\z'
 $script:ToolReportDataPattern = '\A(?:REPORT|COMPARE)_[A-Za-z0-9-]+_(?<stamp>[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4})(?:_(?<n>[0-9]{1,2}))?_data\.json\z'
-# At most this many data files are opened in one search, newest first.
+# At most this many data files, and this many bytes of them, are read in one search, newest first (review M7: a report
+# past its deadline must not spend minutes parsing old files).
 $script:ToolEarlierMaxReads = 32
+$script:ToolEarlierMaxBytes = 64MB
 # At most this many lines of one kind (installed, updated, removed programs) in the section; the rest are counted.
 $script:CompareListMax = 40
 
@@ -63,12 +65,15 @@ function Find-ToolEarlierReport {
     outside -CurrentSessionDir; else $null. Never throws.
   .DESCRIPTION
     Only the visit folders of this PC are looked at (their folder part is the key's: Get-ToolIdentityFolderPart), newest
-    first by the stamp in the file name, at most $script:ToolEarlierMaxReads files read. A file is read with
-    Read-ToolJsonFile -MaxBytes $script:ToolReportDataMaxBytes (16 MB, ruling RD-R23). An empty or unknown key, no stick
-    root, no BenTech-Reports or a BenTech-Reports that is a link: $null.
-    -Skipped (optional) gets, newest first, each file of this PC that could not be read before the one returned:
-    '<file> (a link)', '<file> (too big)', '<file> (not a report data file)'; a visit folder that is a link is never
-    listed ('<folder> (a link)'). A file of another PC that shares the folder part (two white boxes) is passed over.
+    first by the stamp in the file name, at most $script:ToolEarlierMaxReads files and $script:ToolEarlierMaxBytes bytes
+    read. A file is read with Read-ToolJsonFile -MaxBytes $script:ToolReportDataMaxBytes (16 MB, ruling RD-R23). An empty
+    or unknown key, no stick root or no BenTech-Reports: $null.
+    -Skipped (optional) gets, newest first, everything of this PC that could not be read before the one returned
+    (RD-R23: never a silent "nothing"; ruling RD-R25, review M5): '<file> (a link)', '<file> (too big)',
+    '<file> (not a report data file)'; a visit folder that is a link is never listed ('<folder> (a link)'), one that
+    cannot be listed is '<folder> (could not be listed)'; and 'BenTech-Reports (a link)' or 'BenTech-Reports (could not
+    be listed)' when nothing on the stick could be looked at. A file of another PC that shares the folder part (two
+    white boxes) is passed over.
   #>
   [CmdletBinding()]
   param(
@@ -80,64 +85,90 @@ function Find-ToolEarlierReport {
 
   $part = Get-ToolIdentityFolderPart -IdentityKey $IdentityKey
   if ([string]::IsNullOrEmpty($StickRoot) -or $part -eq '') { return $null }
+  $say = {
+    param($name, $why)
+    $line = ConvertTo-ScreenText -Text ('{0} ({1})' -f $name, $why)
+    if ($null -ne $Skipped) { $Skipped.Add($line) }
+    Write-SetupLog -Level WARN -Message 'An earlier report of this PC could not be read' -Data @{ file = $line }
+  }
+  $reports = [IO.Path]::Combine($StickRoot, 'BenTech-Reports')
+  $folders = @()
   try {
-    $reports = [IO.Path]::Combine($StickRoot, 'BenTech-Reports')
     if (-not [IO.Directory]::Exists($reports)) { return $null }
-    if (Test-StickReparsePoint -Path $reports) {
-      Write-SetupLog -Level WARN -Message 'Earlier reports were not read: BenTech-Reports on the stick is a link'
-      return $null
-    }
+    if (Test-StickReparsePoint -Path $reports) { & $say 'BenTech-Reports' 'a link'; return $null }
+    $folders = @([IO.Directory]::GetDirectories($reports))
+  } catch {
+    Write-SetupLog -Level WARN -Message 'Earlier reports could not be looked for' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    & $say 'BenTech-Reports' 'could not be listed'
+    return $null
+  }
+  try {
     $current = ([string]$CurrentSessionDir).TrimEnd('\')
     $candidates = New-Object System.Collections.Generic.List[object]
-    foreach ($folder in [IO.Directory]::GetDirectories($reports)) {
+    foreach ($folder in $folders) {
       $name = [IO.Path]::GetFileName($folder)
       $visit = [regex]::Match($name, $script:ToolVisitFolderPattern)
       if (-not $visit.Success -or -not [string]::Equals($visit.Groups['part'].Value, $part, [StringComparison]::OrdinalIgnoreCase)) { continue }
       if ($current -ne '' -and [string]::Equals($folder.TrimEnd('\'), $current, [StringComparison]::OrdinalIgnoreCase)) { continue }
-      if (Test-StickReparsePoint -Path $folder) {
-        $candidates.Add(@{ Sort = $visit.Groups['stamp'].Value + '_00'; Path = $folder; Name = $name; Link = $true })
+      $folderSort = $visit.Groups['stamp'].Value + '_00'
+      try {
+        if (Test-StickReparsePoint -Path $folder) {
+          $candidates.Add(@{ Sort = $folderSort; Path = $folder; Name = $name; Why = 'a link' })
+          continue
+        }
+        $files = @([IO.Directory]::GetFiles($folder, '*_data.json'))
+      } catch {
+        Write-SetupLog -Level WARN -Message 'A visit folder could not be listed' -Data @{ folder = (ConvertTo-ScreenText -Text $name); error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+        $candidates.Add(@{ Sort = $folderSort; Path = $folder; Name = $name; Why = 'could not be listed' })
         continue
       }
-      foreach ($file in [IO.Directory]::GetFiles($folder, '*_data.json')) {
+      foreach ($file in $files) {
         $fileName = [IO.Path]::GetFileName($file)
         $data = [regex]::Match($fileName, $script:ToolReportDataPattern)
         if (-not $data.Success) { continue }
         $n = 1
         if ($data.Groups['n'].Success) { $n = [int]$data.Groups['n'].Value }
-        $candidates.Add(@{ Sort = ('{0}_{1:D2}' -f $data.Groups['stamp'].Value, $n); Path = $file; Name = $fileName; Link = $false })
+        $candidates.Add(@{ Sort = ('{0}_{1:D2}' -f $data.Groups['stamp'].Value, $n); Path = $file; Name = $fileName; Why = '' })
       }
     }
     $newest = @($candidates.ToArray() | Sort-Object -Property @{ Expression = { [string]$_['Sort'] }; Descending = $true }, @{ Expression = { [string]$_['Path'] }; Descending = $true })
     $reads = 0
+    [long]$bytes = 0
     foreach ($c in $newest) {
-      if ($reads -ge $script:ToolEarlierMaxReads) {
-        Write-SetupLog -Level WARN -Message 'Earlier reports: stopped after the newest files' -Data @{ read = $reads }
+      if ($reads -ge $script:ToolEarlierMaxReads -or $bytes -ge $script:ToolEarlierMaxBytes) {
+        Write-SetupLog -Level WARN -Message 'Earlier reports: stopped after the newest files' -Data @{ read = $reads; bytes = $bytes }
         break
       }
-      $why = ''
-      if ($c['Link'] -or (Test-StickReparsePoint -Path ([string]$c['Path']))) {
-        $why = 'a link'
-      } elseif ((New-Object IO.FileInfo ([string]$c['Path'])).Length -gt $script:ToolReportDataMaxBytes) {
-        $why = 'too big'
-      } else {
-        $reads++
-        $value = Read-ToolJsonFile -Path ([string]$c['Path']) -MaxBytes $script:ToolReportDataMaxBytes
-        $key = Get-ReportEntry -From (Get-ReportEntry -From $value -Name 'Identity') -Name 'Key'
-        if ($value -isnot [System.Collections.IDictionary] -or $key -isnot [string] -or $null -eq (ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $value -Name 'CreatedAt'))) {
-          $why = 'not a report data file'
-        } elseif ([string]::Equals($key, $IdentityKey, [StringComparison]::Ordinal)) {
-          $value['File'] = [string]$c['Path']
-          return $value
-        } else {
-          continue   # another PC whose folder part is this one's (two white boxes): never merged, nothing to say
+      $why = [string]$c['Why']
+      if ($why -eq '') {
+        $path = [string]$c['Path']
+        $length = [long]0
+        try {
+          if (Test-StickReparsePoint -Path $path) { $why = 'a link' } else { $length = (New-Object IO.FileInfo $path).Length }
+        } catch {
+          $why = 'could not be read'
+        }
+        if ($why -eq '' -and $length -gt $script:ToolReportDataMaxBytes) { $why = 'too big' }
+        if ($why -eq '') {
+          $reads++
+          $bytes += $length
+          $value = Read-ToolJsonFile -Path $path -MaxBytes $script:ToolReportDataMaxBytes
+          $key = Get-ReportEntry -From (Get-ReportEntry -From $value -Name 'Identity') -Name 'Key'
+          if ($value -isnot [System.Collections.IDictionary] -or $key -isnot [string] -or $null -eq (ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $value -Name 'CreatedAt'))) {
+            $why = 'not a report data file'
+          } elseif ([string]::Equals($key, $IdentityKey, [StringComparison]::Ordinal)) {
+            $value['File'] = $path
+            return $value
+          } else {
+            continue   # another PC whose folder part is this one's (two white boxes): never merged, nothing to say
+          }
         }
       }
-      $line = ConvertTo-ScreenText -Text ('{0} ({1})' -f $c['Name'], $why)
-      if ($null -ne $Skipped) { $Skipped.Add($line) }
-      Write-SetupLog -Level WARN -Message 'An earlier report of this PC could not be read' -Data @{ file = $line }
+      & $say $c['Name'] $why
     }
   } catch {
     Write-SetupLog -Level WARN -Message 'Earlier reports could not be looked for' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    & $say 'BenTech-Reports' 'could not be listed'
   }
   return $null
 }
@@ -184,7 +215,8 @@ function Get-ToolRunSinceLastVisit {
   $diff = $null
   if ($null -ne $earlier) {
     try {
-      $diff = Compare-ToolReportData -Earlier $earlier -Current $Current
+      $crashDays = [int](Get-ToolRepairNumber -Config $Run.Config -Path 'thresholds', 'crashDays' -Default 60)
+      $diff = Compare-ToolReportData -Earlier $earlier -Current $Current -CrashDays $crashDays
     } catch {
       $name = ConvertTo-ScreenText -Text ('{0} (not a report data file)' -f [IO.Path]::GetFileName([string]$earlier['File']))
       Write-SetupLog -Level WARN -Message 'An earlier report of this PC could not be compared' -Data @{ file = $name; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
@@ -270,18 +302,29 @@ function Compare-ToolReportData {
        ProgramsAdded, ProgramsRemoved = @( @{ Name; Version } ), ProgramsUpdated = @( @{ Name; From; To } ) ('name|version';
        one name removed and added is an update); ProgramsCompared;
        FindingsNew, FindingsResolved = @( @{ Code; Level; Args; Section } ) (by code; only when the report that lacks it
-       collected that section in full); Count (every change) }.
+       collected that section in full); KindsDiffer; CrashWindowShort; CrashDays; Count (every change) }.
     A list one report lacks entirely (no programs, no disks) is not compared (DisksCompared / ProgramsCompared $false).
+    Ruling RD-R25 (review I1): when the two reports are not of the same Kind (a Quick and a Full one; Compare collects the
+    Quick sections), the codes only a Full report gives ($script:ReportFullOnlyCodes, ToolReport.ps1) are neither new
+    nor resolved: one of the two never checked them (KindsDiffer, and a note says so). Review M6: the crash events cover
+    the current report's last -CrashDays (repair.thresholds.crashDays, 60); when the last visit is older than that,
+    CrashWindowShort is $true (a note says so).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)]$Earlier,
-    [Parameter(Mandatory)]$Current
+    [Parameter(Mandatory)]$Current,
+    [ValidateRange(1, 3650)][int]$CrashDays = 60
   )
 
   $since = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Earlier -Name 'CreatedAt')
   $count = 0
+  $kindBefore = ([string](Get-ReportEntry -From $Earlier -Name 'Kind')).Trim()
+  $kindNow = ([string](Get-ReportEntry -From $Current -Name 'Kind')).Trim()
+  $kindsDiffer = ($kindBefore -eq '' -or -not [string]::Equals($kindBefore, $kindNow, [StringComparison]::OrdinalIgnoreCase))
+  $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Current -Name 'CreatedAt')
+  $crashWindowShort = ($null -ne $since -and $null -ne $created -and ($created - $since).TotalDays -gt $CrashDays)
 
   # New crashes: the current events after the earlier report.
   $crashes = [ordered]@{}
@@ -390,15 +433,19 @@ function Compare-ToolReportData {
   $incompleteAfter = @(Get-CompareIncomplete -Data $Current)
   $codesBefore = @(foreach ($f in $findingsBefore) { $f.Code })
   $codesAfter = @(foreach ($f in $findingsAfter) { $f.Code })
-  $new = @(foreach ($f in $findingsAfter) { if ($codesBefore -cnotcontains $f.Code -and $incompleteBefore -cnotcontains $f.Section) { $f } })
-  $resolved = @(foreach ($f in $findingsBefore) { if ($codesAfter -cnotcontains $f.Code -and $incompleteAfter -cnotcontains $f.Section) { $f } })
+  # A Quick and a Full report: the Full-only codes were checked by one of them only (RD-R25, review I1).
+  $notCompared = @()
+  if ($kindsDiffer) { $notCompared = @($script:ReportFullOnlyCodes) }
+  $new = @(foreach ($f in $findingsAfter) { if ($codesBefore -cnotcontains $f.Code -and $incompleteBefore -cnotcontains $f.Section -and $notCompared -cnotcontains $f.Code) { $f } })
+  $resolved = @(foreach ($f in $findingsBefore) { if ($codesAfter -cnotcontains $f.Code -and $incompleteAfter -cnotcontains $f.Section -and $notCompared -cnotcontains $f.Code) { $f } })
   $count += $new.Count + $resolved.Count
 
   return @{
     Since = $since; Crashes = $crashes; Disks = $disks.ToArray(); DisksCompared = $disksCompared; Free = $free
     DevicesAdded = $added; DevicesGone = $gone
     ProgramsAdded = $installed.ToArray(); ProgramsRemoved = $removed.ToArray(); ProgramsUpdated = $updated.ToArray(); ProgramsCompared = $programsCompared
-    FindingsNew = $new; FindingsResolved = $resolved; Count = $count
+    FindingsNew = $new; FindingsResolved = $resolved; KindsDiffer = $kindsDiffer; CrashWindowShort = $crashWindowShort; CrashDays = $CrashDays
+    Count = $count
   }
 }
 
@@ -464,6 +511,10 @@ function Format-ToolSinceLastVisit {
     }
   }
   if ($changes.Count -eq 0) { $lines.Add('  (no changes)') } else { foreach ($c in $changes) { $lines.Add($c) } }
+  if ($Diff['KindsDiffer'] -eq $true) { $lines.Add('  Not compared: the checks only a Full report makes (one visit had a Quick report, the other a Full one)') }
+  if ($Diff['CrashWindowShort'] -eq $true) {
+    $lines.Add(('  Crashes are counted for the last {0} days only (the last visit was longer ago)' -f [int]$Diff['CrashDays']))
+  }
   if ($Diff['DisksCompared'] -ne $true) { $lines.Add('  Disks: not compared (one of the two reports has no disk list)') }
   if ($Diff['ProgramsCompared'] -ne $true) { $lines.Add('  Programs: not compared (one of the two reports has no program list)') }
   return $lines.ToArray()

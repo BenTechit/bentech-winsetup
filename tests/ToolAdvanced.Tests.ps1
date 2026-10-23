@@ -263,7 +263,8 @@ Describe 'ToolAdvanced (repair Task 7)' {
     }
     Mock Write-ToolJsonFile {
       if ($script:break -eq 'the write fails') { return $false }
-      if ($PSBoundParameters.ContainsKey('Depth')) { & $script:realWriteJson -Path $Path -InputObject $InputObject -Depth $Depth } else { & $script:realWriteJson -Path $Path -InputObject $InputObject }
+      $plain = [bool]$Utf8   # RD-R23: the network backup is written plain UTF-8 (the mock's bound -Utf8; $false when not given)
+      if ($PSBoundParameters.ContainsKey('Depth')) { & $script:realWriteJson -Path $Path -InputObject $InputObject -Depth $Depth -Utf8:$plain } else { & $script:realWriteJson -Path $Path -InputObject $InputObject -Utf8:$plain }
     }
     Mock Read-ToolJsonFile {
       if ($script:break -eq 'the read-back differs') { return @{ Version = 1; CreatedAt = 'x'; Identity = @{ Key = 'SN-7HX2K93'; ComputerName = 'PC1' }; Adapters = @() } }
@@ -570,10 +571,11 @@ Describe 'ToolAdvanced (repair Task 7)' {
       # An IPv6 address with its zone is saved without it; a MAC that is no MAC is saved empty.
       $saved.Adapters[2].Addresses[0].Ip | Should -Be 'fe80::1'; $saved.Adapters[2].Mac | Should -BeExactly ''
       Test-ToolNetBackup -Value $saved -IdentityKey 'SN-7HX2K93' | Should -Not -BeNullOrEmpty
-      # RD-R21: the Hebrew alias is kept, written as \u escapes (ASCII bytes), passes the read-back compare, the strict
-      # decode and Test-ToolNetBackup, and the file's hash is stable.
+      # RD-R21, RD-R23 (Task 9 review): the Hebrew alias is kept, written as plain UTF-8 (a file Ben reads on the stick: no
+      # \u escapes), passes the read-back compare, the strict decode and Test-ToolNetBackup, and the file's hash is stable.
       $saved.Adapters[2].Alias | Should -BeExactly 'vEthernet (מתג)'
-      @([IO.File]::ReadAllBytes($file[0].FullName) | Where-Object { $_ -gt 0x7E }).Count | Should -Be 0
+      $text = (New-Object Text.UTF8Encoding $false, $true).GetString([IO.File]::ReadAllBytes($file[0].FullName))
+      $text | Should -Match 'vEthernet \(מתג\)'; $text | Should -Not -Match '\\u05'
       $once = Read-ToolNetBackupFile -Path $file[0].FullName; $twice = Read-ToolNetBackupFile -Path $file[0].FullName
       $once.Sha256 | Should -BeExactly (Get-FileHash $file[0].FullName).Hash; $twice.Sha256 | Should -BeExactly $once.Sha256
       (Test-ToolNetBackup -Value $once.Value -IdentityKey 'SN-7HX2K93').Adapters[2].Alias | Should -BeExactly 'vEthernet (מתג)'
