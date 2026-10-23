@@ -929,7 +929,7 @@ function Save-ToolReportText {
     try {
       [IO.File]::Replace($temporary, $Path, [NullString]::Value)
     } catch {
-      # A file system without ReplaceFile (record it on a FAT32 or exFAT stick: docs/testing.md 1.20): written over.
+      # A file system without ReplaceFile (record it on a FAT32 or exFAT stick: docs/testing.md 1.21): written over.
       [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding $true))
       [IO.File]::Delete($temporary)
     }

@@ -8,12 +8,14 @@
 # (data only: nothing of it runs) and the Toolbox files. No step, runner or entry file is loaded, nothing is
 # installed, nothing is written but the PNGs.
 #
-# Four views of the setup page for one sample machine (a Dell Latitude 5440 laptop on Windows 11, not fresh, on
+# Six views of the setup page for one sample machine (a Dell Latitude 5440 laptop on Windows 11, not fresh, on
 # battery, with a YELLOW previous run), so every banner and row is seen:
 #   toolbox-en.png, toolbox-he.png        the default profile, in English and in Hebrew
 #   toolbox-en-business-desktop.png       the Business profile as a desktop (ScreenConnect reminder, NumLock and
 #                                         classic Outlook rows)
 #   toolbox-en-blocked.png                Administrator protection on (red banner, Start disabled)
+#   toolbox-en-drivers.png,               the default profile with UPDATES on Drivers only, in English and in Hebrew
+#   toolbox-he-drivers.png                (the tile, and the plan's "Windows Update (drivers only)"; wu spec 3.1)
 # Seven views of the Repair & diagnostics page for the same Dell (every tile of this version, the setup files there,
 # the stick E:), with sample states (the actions are not built yet; nothing runs):
 #   repair-en.png, repair-he.png          idle: restart ok, C: 41% free, BitLocker on, internet ok, the disk worn
@@ -85,10 +87,12 @@ function Save-PreviewPng($Window, [string]$File, $Overlay = $null) {
 # --- The setup page -------------------------------------------------------------------------------------------------
 
 $views = @(
-  @{ File = 'toolbox-en.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = '' }
-  @{ File = 'toolbox-he.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = '' }
-  @{ File = 'toolbox-en-business-desktop.png'; Language = 'en'; Protection = 'Off'; Profile = 'business'; Mode = 'DESKTOP' }
-  @{ File = 'toolbox-en-blocked.png'; Language = 'en'; Protection = 'On'; Profile = ''; Mode = '' }
+  @{ File = 'toolbox-en.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = '' }
+  @{ File = 'toolbox-he.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = '' }
+  @{ File = 'toolbox-en-business-desktop.png'; Language = 'en'; Protection = 'Off'; Profile = 'business'; Mode = 'DESKTOP'; Updates = '' }
+  @{ File = 'toolbox-en-blocked.png'; Language = 'en'; Protection = 'On'; Profile = ''; Mode = ''; Updates = '' }
+  @{ File = 'toolbox-en-drivers.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS' }
+  @{ File = 'toolbox-he-drivers.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS' }
 )
 
 foreach ($view in $views) {
@@ -99,6 +103,7 @@ foreach ($view in $views) {
     foreach ($key in $fill.Keys) { $model.Choices[$key] = $fill[$key] }
   }
   if ($view.Mode -ne '') { $model.Choices.Mode = $view.Mode }
+  if ($view.Updates -ne '') { $model.Choices.WindowsUpdate = $view.Updates }
 
   $window = New-ToolboxWindow -Model $model -Machine $machine -Config $config -Version '2026.10.21.1' -ReadOnAC { $false }
   Save-PreviewPng $window $view.File

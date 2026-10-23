@@ -135,6 +135,7 @@ function Invoke-SetupWuRoundProcess {
   # passed as -OnAC, so firmware is flashed only on mains power. A failed read counts as battery (WARN):
   # firmware is never flashed on a guess. Spec 4.5: -InstallMode comes from config windowsUpdate.installMode
   # (Get-WuInstallMode: one update at a time unless the config says Batch).
+  # Wu spec 3.2: -Scope is Get-WindowsUpdateChoice of the state's Choices (no new switch); no state is FULL.
   [CmdletBinding()]
   [OutputType([int])]
   param(
@@ -152,6 +153,9 @@ function Invoke-SetupWuRoundProcess {
     if ($null -ne $runState -and $runState['Machine'] -is [System.Collections.IDictionary]) {
       $isWindows10 = ($runState['Machine']['IsWindows10'] -eq $true)
     }
+    # Indexing a $null state would throw, hence the guard.
+    $scope = 'FULL'
+    if ($runState -is [hashtable]) { $scope = Get-WindowsUpdateChoice -Choices $runState['Choices'] }
     $onAC = $false
     try {
       $onAC = [bool](Test-OnACPower)
@@ -162,7 +166,7 @@ function Invoke-SetupWuRoundProcess {
     # A missing state is not checked here: Invoke-WuRound reports it in the result JSON.
     $null = Invoke-WuRound -StatePath (Join-Path $Root 'state.json') -ResultPath $ResultPath `
       -FailuresBeforeHide ([int]$config.caps.wuFailuresBeforeHide) -IsWindows10 $isWindows10 -SearchOnly:$SearchOnly -OnAC $onAC `
-      -InstallMode (Get-WuInstallMode -Config $config)
+      -InstallMode (Get-WuInstallMode -Config $config) -Scope $scope
     return 0
   } catch {
     Write-SetupLog -Level ERROR -Message 'Windows Update round process failed' -Data @{ error = $_.Exception.Message; resultPath = $ResultPath }

@@ -34,14 +34,33 @@ Describe 'profiles (toolbox spec 5.2)' {
   It 'tweaksAdd adds catalog ids only' {
     $x = $cfg.PSObject.Copy(); $x.profiles = @([pscustomobject]@{ id = 'c'; name = [pscustomobject]@{ en = 'C' }; tweaks = @(); tweaksAdd = @('fileExtensions', 'widgets') })
     @((Get-ProfileChoices -Config $x -ProfileId 'c').Tweaks) | Should -Be @('fileExtensions') }
+  It 'a profile may set windowsUpdate (an invalid value is FULL); without it the key is not among its choices (wu spec 3.1)' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $x.profiles[1] | Add-Member NoteProperty windowsUpdate 'drivers'; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'never'
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Contains('WindowsUpdate') | Should -BeFalse
+    (Get-ProfileChoices -Config $x -ProfileId 'business').WindowsUpdate | Should -BeExactly 'DRIVERS'
+    (Get-ProfileChoices -Config $x -ProfileId 'clean').WindowsUpdate | Should -BeExactly 'FULL' }
+  # Pre-PR code review: an empty or blank windowsUpdate is "not set", like a missing or $null one, never FULL.
+  It 'a profile whose windowsUpdate is <Why> does not set it (code review)' -ForEach @(
+    @{ Why = 'empty'; V = '' }, @{ Why = 'whitespace'; V = " `t " }, @{ Why = '$null'; V = $null }) {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate $V
+    @(Get-SetupProfiles -Config $x)[0].WindowsUpdate | Should -BeExactly ''
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Contains('WindowsUpdate') | Should -BeFalse
+    $c = New-DefaultChoices -Machine $m -Config $x; $c.WindowsUpdate = 'DRIVERS'
+    Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
 }
 Describe 'ConvertTo-ValidChoices (toolbox spec 5.2)' {
   It 'repairs every key from the defaults and reports unknown tweak ids' {
     $r = ConvertTo-ValidChoices -Choices @{ Mode = 'tablet'; Office = 'business'; Remote = 'TEAMVIEWER'; SevenZip = 'yes'; Profile = 'nope'; RestorePoint = 1
-                                            Tweaks = @('noAds', 'widgets', '', 'classicOutlook') } -Config $cfg -Machine $m
+                                            Tweaks = @('noAds', 'widgets', '', 'classicOutlook'); WindowsUpdate = 'everything' } -Config $cfg -Machine $m
     $r.Choices.Mode | Should -Be 'LAPTOP'; $r.Choices.Office | Should -Be 'BUSINESS'; $r.Choices.Remote | Should -Be 'ANYDESK'
     $r.Choices.SevenZip | Should -BeTrue; $r.Choices.Profile | Should -BeExactly ''; $r.Choices.RestorePoint | Should -BeTrue
+    $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'
     @($r.Choices.Tweaks) | Should -Be @('noAds', 'classicOutlook'); @($r.Dropped) | Should -Be @('widgets') }
+  It 'keeps DRIVERS in any case and returns exactly eight keys' {
+    $c = New-DefaultChoices -Machine $m -Config $cfg; $c.WindowsUpdate = 'drivers'
+    $r = ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m; $r.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'
+    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate') }
   It 'keeps only ASCII ids in the Choices (nothing Hebrew reaches state.json or setup.log)' {
     $r = ConvertTo-ValidChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Config $cfg -Machine $m
     ($r.Choices | ConvertTo-Json -Compress) | Should -Not -Match '[^\x00-\x7F]' }
@@ -54,6 +73,11 @@ Describe 'Test-ProfileChanged (spec 10b.6)' {
       @{ Why = 'no restore point'; K = 'RestorePoint'; V = $false }, @{ Why = 'another Remote'; K = 'Remote'; V = 'BOTH' }) {
     $c[$K] = $V; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeTrue }
   It 'an unknown or empty profile is never "changed"' { $c.Profile = 'gone'; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'DRIVERS is no change for a profile that does not set windowsUpdate (Review Focus 2)' { $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'a profile that sets windowsUpdate: another value is a change, its own is not' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'FULL'
+    $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.WindowsUpdate = 'FULL'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
 }
 Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
   It 'opens on the default profile in the configured language' {
@@ -67,6 +91,26 @@ Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
     $l = @(Get-ToolboxPlanLines -Model (New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off') -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg `
       -Titles @{ prepare = 'Step one'; bitlocker = '' })
     $l[0] | Should -BeExactly ' 1  Step one'; $l[1] | Should -BeExactly ' 2  Turn off BitLocker' }
+  It 'DRIVERS titles the Windows Update line "(drivers only)", or with the window''s title for it (wu spec 3.1)' {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'; $dell = @{ Brand = 'DELL'; OsBuild = 26200 }
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1; @($l | Where-Object { $_ -match '  Windows Update$' }).Count | Should -Be 0
+    @(@(Get-ToolboxPlanLines -Model $mo -Machine $dell -Config $cfg -Titles @{ 'windows-update' = 'WU'; 'windows-update.drivers' = 'WU drivers' }) -match '  WU drivers$').Count | Should -Be 1 }
+  # Final wave 7 (Task 2 M4): a window language that has the Windows Update title but not the drivers one still
+  # shows "drivers only" (the English drivers title), never the plain FULL title.
+  It 'DRIVERS falls back to "Windows Update (drivers only)" when -Titles has no drivers title, or an empty one' -ForEach @(
+    @{ T = @{ 'windows-update' = 'WU' } }, @{ T = @{ 'windows-update' = 'WU'; 'windows-update.drivers' = '' } }) {
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg -Titles $T)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1; @($l | Where-Object { $_ -match '  WU$' }).Count | Should -Be 0 }
+  # Final wave 3 (Task 2 M2): the plan line decides through Get-WindowsUpdateChoice on the validated Choices, like
+  # every other reader. The mock flips the answer for each table it is asked about, so the line is DRIVERS only if
+  # the second question (about the validated table, where validation made it FULL) is asked.
+  It 'the DRIVERS title is decided by Get-WindowsUpdateChoice on the validated Choices (every reader goes through it)' {
+    Mock Get-WindowsUpdateChoice { if ($Choices['WindowsUpdate'] -ceq 'DRIVERS') { 'FULL' } else { 'DRIVERS' } }
+    $mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off'; $mo.Choices.WindowsUpdate = 'DRIVERS'
+    $l = @(Get-ToolboxPlanLines -Model $mo -Machine @{ Brand = 'DELL'; OsBuild = 26200 } -Config $cfg)
+    @($l | Where-Object { $_ -match '^[ \d]\d  Windows Update \(drivers only\)$' }).Count | Should -Be 1 }
 }
 Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
   BeforeEach { $script:mo = New-ToolboxModel -Machine $m -Config $cfg -IsFresh $true -OnAC $true -AdminProtection 'Off' }
@@ -80,7 +124,8 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'fileExtensions' -Config $cfg
     @($r.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds', 'classicOutlook', 'fileExtensions')
     @((Update-ToolboxModel -Model $r -Action 'Tweak' -Value 'accessKeys' -Config $cfg).Choices.Tweaks)[0] | Should -Be 'numLock'
-    foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''))) {
+    foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''),
+                     @('WindowsUpdate', 'drivers'), @('WindowsUpdate', 'NONE'))) {
       ConvertTo-SortedJson (Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg) | Should -Be (ConvertTo-SortedJson $mo) -Because ($a -join ' ') } }
   It 'opens on the setup page with the repair page''s model; Page switches to repair and back, nothing else (repair plan Task 3)' {
     $mo.Page | Should -Be 'setup'; $mo.Repair.Strip.State | Should -Be 'loading'; $mo.Repair.IsLaptop | Should -BeTrue
@@ -100,4 +145,10 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     ($mo | ConvertTo-Json -Depth 5) | Should -Be $before   # the input itself: same table, same order
     [object]::ReferenceEquals($r.Choices, $mo.Choices) | Should -BeFalse; [object]::ReferenceEquals($r.Choices.Tweaks, $mo.Choices.Tweaks) | Should -BeFalse
     @($r.Choices.Tweaks) | Should -Not -Contain 'accessKeys'; @($mo.Choices.Tweaks) | Should -Contain 'accessKeys' }
+  It 'sets the Windows Update choice from the tile; a profile without windowsUpdate keeps it, one with it fills it (wu spec 3.1, Review Focus 2)' {
+    $d = Update-ToolboxModel -Model $mo -Action 'WindowsUpdate' -Value 'DRIVERS' -Config $cfg
+    $d.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'; $d.Choices.Profile | Should -Be 'home'; $mo.Choices.WindowsUpdate | Should -BeExactly 'FULL'
+    foreach ($p in 'home', 'business', 'clean') { (Update-ToolboxModel -Model $d -Action 'Profile' -Value $p -Config $cfg).Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' -Because $p }
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'FULL'
+    (Update-ToolboxModel -Model $d -Action 'Profile' -Value 'clean' -Config $x).Choices.WindowsUpdate | Should -BeExactly 'FULL' }
 }

@@ -7,8 +7,8 @@
 # Config it reports ScreenConnect by apps.screenconnect.serviceName, and Format-SetupReport shows the
 # remote tools (AnyDesk ID, ScreenConnect) by Choices.Remote. With the Config, Format-SetupReport also names
 # the run's profile (toolbox spec 5.5); the tweaks and restore point lines come from the State.
-# Needs Catalog.ps1 (Get-RemoteChoice) + Verdict.ps1 (Get-StepTitle), StartScreen.ps1 (ConvertTo-ScreenText,
-# ConvertFrom-StateTime, Format-HoursMinutes), Toolbox\SetupPlanner.ps1 (Get-SetupProfiles,
+# Needs Catalog.ps1 (Get-RemoteChoice, Get-WindowsUpdateChoice) + Verdict.ps1 (Get-StepTitle), StartScreen.ps1
+# (ConvertTo-ScreenText, ConvertFrom-StateTime, Format-HoursMinutes), Toolbox\SetupPlanner.ps1 (Get-SetupProfiles,
 # Test-ProfileChanged), DefaultBrowser.ps1 (Read-RegistryStringValue), Office.ps1 ($script:OfficeReleaseKey)
 # and Logging.ps1; the bundle holds every file.
 #
@@ -199,11 +199,13 @@ function Format-SetupReport {
       PC name (old -> new) / Mode (chosen, and detected LAPTOP|DESKTOP|VM) / Windows / Activation /
       BitLocker / Smart App Control (Off|On|Evaluation|Unknown; -SmartAppControl, 'Unknown' when not
       given) / AnyDesk ID ('not available' when there is none; 'not chosen' when Choices.Remote is
-      SCREENCONNECT) / ScreenConnect / Profile / Tweaks / Restore point
+      SCREENCONNECT) / ScreenConnect / Profile / Tweaks / Restore point / Updates
     Choices.Remote is read with Get-RemoteChoice (a missing or invalid one is ANYDESK; ScreenConnect spec
     4.1). The ScreenConnect line reads 'not chosen' (ANYDESK), 'installed (service running)' (the
     screenconnect step is Done and its Data.Service is Running), 'installed (service not running)' (Done
     with any other service state) or 'not installed' (the step failed or has no entry).
+    Updates (wu spec 3.3) is 'drivers only (other updates left to Windows)' when Get-WindowsUpdateChoice
+    says DRIVERS, else 'full' (a missing or invalid Choices.WindowsUpdate, as in an older state, is FULL).
     Toolbox spec 5.5:
       Profile: '<name.en> (<id>)' for a profile of -Config, plus ' (changed)' when Test-ProfileChanged says
         so (spec 10b.6); an id the config does not know (or no -Config) shows the id alone; an empty or
@@ -325,6 +327,8 @@ function Format-SetupReport {
   $lines.Add('Profile      : ' + $profileText)
   $lines.Add('Tweaks       : ' + $tweaksText)
   $lines.Add('Restore point: ' + $restorePointText)
+  # Wu spec 3.3: named "Updates" so it is not mistaken for the "Windows Update: N rounds" line below.
+  $lines.Add('Updates      : ' + $(if ((Get-WindowsUpdateChoice -Choices $choices) -eq 'DRIVERS') { 'drivers only (other updates left to Windows)' } else { 'full' }))
 
   $lines.Add('')
   $lines.Add('Apps:')

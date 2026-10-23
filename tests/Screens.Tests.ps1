@@ -80,10 +80,11 @@ BeforeAll {
   # Runs Show-FinalScreen against the fake clock with a scripted key sequence: one key per poll, then
   # empty polls; 2000 empty polls (200 s of fake time) mean no Enter ever came. -KeyAt (elapsed seconds
   # -> key name or nothing) replaces -Keys when given. -Stick is the stick reader (default: the stick in
-  # $script:stick). Records colours, drawn screens, launches and the order of flush/read events.
+  # $script:stick). -Choices, when given, becomes the state's Choices. Records colours, drawn screens,
+  # launches and the order of flush/read events.
   function Invoke-FinalScreen {
     param([string[]]$Keys = @('Enter'), [scriptblock]$KeyAt = $null, [string]$Color = 'YELLOW', [string[]]$Failures = @(), [string[]]$Notes = @('x'),
-          [scriptblock]$Launch = $null, [scriptblock]$Stick = { $script:stick })
+          [scriptblock]$Launch = $null, [scriptblock]$Stick = { $script:stick }, [hashtable]$Choices = $null)
     Reset-FakeClock
     $script:keyQueue = New-Object System.Collections.Queue
     foreach ($k in $Keys) { $script:keyQueue.Enqueue($k) }
@@ -96,6 +97,7 @@ BeforeAll {
     $script:events = New-Object System.Collections.ArrayList
     $script:launchBody = $Launch
     $st = @{ Machine = $script:m; AnyDeskId = '123456789'; RebootCount = 2; StartedAt = '2026-10-18T09:00:00'; EndedAt = '2026-10-18T10:12:00' }
+    if ($null -ne $Choices) { $st.Choices = $Choices }
     $verdict = @{ Color = $Color; Banner = 'COMPLETE - CHECK NOTES'; Failures = $Failures; Notes = $Notes }
     Show-FinalScreen -State $st -Verdict $verdict -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' `
       -ReadKey {
@@ -210,6 +212,17 @@ Describe 'New-DefaultChoices' {
     & $eff ((Update-StartChoices -Choices $d -Key 'L').Choices) | Should -BeExactly 'accessKeys,startClean,noAds'
     & $eff ((Update-StartChoices -Choices $c -Key 'O').Choices) | Should -BeExactly 'accessKeys,startClean,noAds,classicOutlook'   # CRAFT -> BUSINESS
     @((Update-StartChoices -Choices $c -Key 'Z').Choices.Tweaks) | Should -Be @($c.Tweaks) }
+  It 'opens on FULL; defaults.windowsUpdate counts when the default profile does not set it; an invalid one is FULL (wu spec 3.1)' {
+    (New-DefaultChoices -Machine $m -Config $cfg).WindowsUpdate | Should -BeExactly 'FULL'
+    foreach ($case in @(@{ V = 'drivers'; E = 'DRIVERS' }, @{ V = 'SOMETIMES'; E = 'FULL' }, @{ V = $null; E = 'FULL' })) {
+      $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT'; windowsUpdate = $case.V } }
+      (New-DefaultChoices -Machine $m -Config $x).WindowsUpdate | Should -BeExactly $case.E } }
+  It 'a default profile that sets windowsUpdate wins over defaults.windowsUpdate' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'DRIVERS'
+    (New-DefaultChoices -Machine $m -Config $x).WindowsUpdate | Should -BeExactly 'DRIVERS' }
+  It 'the console fallback runs FULL: U is no key there (wu spec 3.1)' {
+    $r = Update-StartChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Key 'U'
+    $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'; $r.Action | Should -Be 'None' }
 }
 
 Describe 'Format-StartScreen (v2)' {
@@ -1007,6 +1020,31 @@ Describe 'Format-FinalScreen' {
     $st = New-FinalState; $st.Choices = $Choices; $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
     $l | Should -Contain '  New name : DELL-7HX2K93'; $l | Should -Contain '  AnyDesk ID:'; ($l -join "`n") | Should -Not -Match 'ScreenConnect'
   }
+
+  # Wu spec 3.3: in DRIVERS mode (Get-WindowsUpdateChoice of the state's Choices) the key line offers U, and
+  # the U outcome sits on the blank spacer line, so no line is added.
+  It 'DRIVERS: the key line offers U without the report path; FULL, no choice and an invalid one keep today''s line (wu spec 3.3, Review Focus 1)' {
+    $st = New-FinalState; $st.Choices = @{ WindowsUpdate = 'DRIVERS' }
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+    $l[$l.Count - 1] | Should -BeExactly '  [R] report   [U] Windows Update   [ENTER] finish'; ($l -join "`n") | Should -Not -Match 'Report:'
+    foreach ($c in @{ WindowsUpdate = 'FULL' }, @{ WindowsUpdate = 'SOON' }, @{ Mode = 'LAPTOP' }) {
+      $s = New-FinalState; $s.Choices = $c; $f = @(Format-FinalScreen -State $s -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true)
+      $f[$f.Count - 1] | Should -BeExactly '  Report: C:\r.txt   [R] open report   [ENTER] finish' } }
+  It 'the U outcome takes the blank spacer line: same length, same place; FULL never shows it' {
+    $st = New-FinalState; $st.Choices = @{ WindowsUpdate = 'DRIVERS' }
+    $f = { param($s) @(Format-FinalScreen -State $st -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $false -StickLine '  USB stick found (E:) - logs will be saved there' -WindowsUpdateStatus $s) }
+    $none = & $f ''; $ok = & $f 'Started'; $bad = & $f 'Failed'; $at = $none.Count - 4   # the spacer, above the Chrome hint, the stick line and the key line
+    $ok.Count | Should -Be $none.Count; $bad.Count | Should -Be $none.Count; $none[$at] | Should -BeExactly ''
+    $ok[$at] | Should -BeExactly '  Windows Update started: Windows will finish on its own'
+    $bad[$at] | Should -BeExactly '  Could not open Windows Update: open Settings > Windows Update'
+    (@(Format-FinalScreen -State (New-FinalState) -Verdict (New-Verdict) -ReportPath 'C:\r.txt' -DefaultBrowserIsChrome $true -WindowsUpdateStatus 'Started') -join "`n") | Should -Not -Match 'Windows Update started' }
+  It 'DRIVERS worst case: still 29 lines, the key and status lines within 79 columns (Review Focus 5)' {
+    $st = New-FinalState; $st.AnyDeskId = '1234567890'; $st.Choices = @{ Remote = 'BOTH'; WindowsUpdate = 'DRIVERS' }; $st.Steps = @{ screenconnect = @{ Status = 'Done' } }
+    $l = @(Format-FinalScreen -State $st -Verdict (New-Verdict -Color 'RED' -Banner 'COMPLETED WITH ERRORS' -Failures @(1..20 | % { "Failure $_" }) -Notes @(1..20 | % { "Note $_" })) `
+      -ReportPath 'C:\BenTech\Setup\Logs\Setup-Report.txt' -DefaultBrowserIsChrome $false -StickLine '  No BenTech USB stick - plug it in now to keep the logs' -WindowsUpdateStatus 'Failed')
+    $l.Count | Should -BeLessOrEqual 29
+    foreach ($t in @($l | Where-Object { $_ -like '*Windows Update*' })) { $t.Length | Should -BeLessOrEqual 79 }
+    @($l | Where-Object { $_ -like '*Windows Update*' }).Count | Should -Be 2 }
 }
 
 Describe 'Show-FinalScreen' {
@@ -1201,4 +1239,59 @@ Describe 'Show-FinalScreen' {
     $drawn.Count | Should -Be 1
     $drawn[0] | Should -Match 'SETUP COMPLETE'
   }
+
+  # Wu spec 3.3: U, in DRIVERS mode only, hands Windows Update to Windows through the -Launch seam.
+  It 'U in DRIVERS mode opens Settings on Windows Update, logs it and redraws at once; the screen keeps waiting (wu spec 3.3)' {
+    Invoke-FinalScreen -Keys 'U', 'Enter' -Choices @{ WindowsUpdate = 'DRIVERS' }
+    $launched.Count | Should -Be 1; $launched[0].Target | Should -BeExactly 'ms-settings:windowsupdate-action'; [string]$launched[0].Arguments | Should -BeExactly ''
+    $drawn.Count | Should -Be 2; $drawn[0] | Should -Not -Match 'Windows Update started'; $drawn[1] | Should -Match 'Windows Update started: Windows will finish on its own'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'Windows Update handed to Windows' } }
+  It 'a U that cannot open Settings shows the could-not line and logs a WARN; Enter still finishes (Review Focus 5)' {
+    Invoke-FinalScreen -Keys 'U', 'Enter' -Choices @{ WindowsUpdate = 'DRIVERS' } -Launch { param($t, $a) throw 'no settings app' }
+    $drawn[$drawn.Count - 1] | Should -Match 'Could not open Windows Update: open Settings > Windows Update'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open Windows Update from the final screen' -and $Data.error -eq 'no settings app' } }
+  It 'U does nothing in FULL mode or without the choice' -ForEach @(@{ C = @{ WindowsUpdate = 'FULL' } }, @{ C = $null }) {
+    Invoke-FinalScreen -Keys 'U', 'Enter' -Choices $C; $launched.Count | Should -Be 0; $drawn.Count | Should -Be 1 }
+  It 'the production launcher stops on a failed start, so a refused U reaches the could-not line' {
+    $p = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Launch' }
+    ([regex]::Matches($p.DefaultValue.Extent.Text, '-ErrorAction Stop')).Count | Should -Be 2 }
+  # Final wave 8 (Task 3 M2): the same, by behaviour, through the production -Launch default. Start-Process is
+  # mocked to fail the way a refused start does (a non-terminating error, CLAUDE.md), so nothing is ever opened.
+  It 'a refused start through the production launcher reaches the could-not line for U and the WARN for R (mocked Start-Process; Task 3 M2)' {
+    Mock Start-Process { Write-Error 'refused by the test' }
+    $script:drawn = New-Object System.Collections.ArrayList; $script:keyQueue = New-Object System.Collections.Queue; foreach ($k in 'R', 'U', 'Enter') { $script:keyQueue.Enqueue($k) }
+    Show-FinalScreen -State ($finalState + @{ Choices = @{ WindowsUpdate = 'DRIVERS' } }) -Verdict @{ Color = 'GREEN'; Banner = 'SETUP COMPLETE'; Failures = @(); Notes = @() } -ReportPath 'C:\r.txt' `
+      -ReadKey { if ($script:keyQueue.Count -gt 0) { $script:keyQueue.Dequeue() } } -Stick { $script:stick } -Now { [datetime]'2026-10-18T09:00:00' } -Sleep { param($ms) } `
+      -SetColor { param($b, $f) } -ResetColor { } -FlushInput { } -Write { param($lines) $null = $script:drawn.Add(($lines -join "`n")) }
+    Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'ms-settings:windowsupdate-action' }
+    Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'notepad.exe' }
+    $drawn[$drawn.Count - 1] | Should -Match 'Could not open Windows Update: open Settings > Windows Update'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open Windows Update from the final screen' -and $Data.error -match 'refused by the test' }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open the report from the final screen' -and $Data.error -match 'refused by the test' }
+    Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Message -eq 'Windows Update handed to Windows' } }
+  # Final wave 8 (Task 3 M3): every U opens Settings again and the line shows the last outcome; Enter ends the
+  # screen at once (Main.ps1 then runs the cleanup once, Entry.Tests), so a key after Enter is never read.
+  It 'U twice opens Settings twice and the line shows the last outcome; the first Enter ends the screen (<Last>; Task 3 M3)' -ForEach @(
+    @{ FailOn = 2; Last = 'Could not open Windows Update: open Settings > Windows Update' }
+    @{ FailOn = 1; Last = 'Windows Update started: Windows will finish on its own' }) {
+    $script:failOn = $FailOn
+    Invoke-FinalScreen -Keys 'U', 'U', 'Enter', 'U' -Choices @{ WindowsUpdate = 'DRIVERS' } -Launch { param($t, $a) if ($script:launched.Count -eq $script:failOn) { throw 'refused once' } }
+    $launched.Count | Should -Be 2; $script:keyQueue.Count | Should -Be 1     # the U after Enter was never read
+    $drawn.Count | Should -Be 3; $drawn[2] | Should -Match ([regex]::Escape($Last))
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'Windows Update handed to Windows' }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open Windows Update from the final screen' } }
+  # Final wave 1 (final review M1, Task 3 M1): the B/R WARN goes through ConvertTo-ScreenText like U's.
+  It 'a B or R that cannot start logs the error text as ASCII' {
+    Invoke-FinalScreen -Keys 'R', 'Enter' -Launch { param($t, $a) throw ('no notepad ' + $script:Hebrew) }
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -eq 'Could not open the report from the final screen' -and $Data.error -ceq 'no notepad ?????' } }
+  # Pre-PR code review: the launch and its WARN exist once ($open); U reads $open's answer instead of its own try/catch.
+  It 'B, R and U all launch through one place, with one could-not WARN (code review)' {
+    $statements = (Get-Command Show-FinalScreen).ScriptBlock.Ast.Body.EndBlock.Statements
+    $code = ($statements | ForEach-Object { $_.Extent.Text }) -join "`n"
+    ([regex]::Matches($code, '&\s*\$Launch\b')).Count | Should -Be 1
+    ([regex]::Matches($code, 'Could not open')).Count | Should -Be 1 }
+  It 'B, R and U return nothing to the caller, whether the launch works or not (code review)' -ForEach @(
+    @{ Why = 'works'; L = $null }, @{ Why = 'fails'; L = { param($t, $a) throw 'refused' } }) {
+    @(Invoke-FinalScreen -Keys 'B', 'R', 'U', 'Enter' -Choices @{ WindowsUpdate = 'DRIVERS' } -Launch $L).Count | Should -Be 0
+    $launched.Count | Should -Be 3 }
 }

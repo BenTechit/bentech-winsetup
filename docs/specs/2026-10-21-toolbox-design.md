@@ -2,7 +2,7 @@
 
 **Status:** Approved by Ben on 21/10/2026 (Q28), with his answers to Q26 and Q27 (section 10).
 **Amends:** the v1 spec, [2026-10-20-progress-visibility-design.md](2026-10-20-progress-visibility-design.md), [2026-10-20-craft-apps-design.md](2026-10-20-craft-apps-design.md) and [2026-10-20-screenconnect-design.md](2026-10-20-screenconnect-design.md). They stay binding wherever this document does not change them.
-**Amended by:** [2026-10-22-repair-diagnostics-design.md](2026-10-22-repair-diagnostics-design.md) (the second page, the action child, Restart PC).
+**Amended by:** [2026-10-22-windows-update-option-design.md](2026-10-22-windows-update-option-design.md) (Windows Update "drivers only" and the final screen's U key) and [2026-10-22-repair-diagnostics-design.md](2026-10-22-repair-diagnostics-design.md) (the second page, the action child, Restart PC).
 
 ## 1. Why
 

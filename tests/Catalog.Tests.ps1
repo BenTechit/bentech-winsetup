@@ -76,6 +76,18 @@ Describe 'Get-RemoteChoice (screenconnect spec 4.1)' {
     Get-RemoteChoice -Choices $old.Choices | Should -BeExactly 'ANYDESK'
   }
 }
+Describe 'Get-WindowsUpdateChoice (wu spec 3.1)' {
+  It 'Get-WindowsUpdateChoice: <Why>' -ForEach @(
+    @{ Why = 'DRIVERS'; C = @{ WindowsUpdate = 'DRIVERS' }; E = 'DRIVERS' }, @{ Why = 'any case'; C = @{ WindowsUpdate = 'drivers' }; E = 'DRIVERS' }
+    @{ Why = 'full'; C = @{ WindowsUpdate = 'full' }; E = 'FULL' }, @{ Why = 'unknown'; C = @{ WindowsUpdate = 'NONE' }; E = 'FULL' }
+    @{ Why = 'empty'; C = @{ WindowsUpdate = '' }; E = 'FULL' }, @{ Why = 'missing (an older state)'; C = @{ Mode = 'LAPTOP' }; E = 'FULL' }
+    @{ Why = 'no choices'; C = $null; E = 'FULL' }) { Get-WindowsUpdateChoice -Choices $C | Should -BeExactly $E }
+  It 'DRIVERS plans exactly the steps FULL plans (spec 3.2: the same step)' {
+    $c = @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'BUSINESS' }
+    $full = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ WindowsUpdate = 'FULL' }) -Config $cfg)
+    @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ WindowsUpdate = 'DRIVERS' }) -Config $cfg) -join ',' | Should -BeExactly ($full -join ',')
+    $full | Should -Contain 'windows-update' }
+}
 Describe 'Get-StepPlan' {
   It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,default-browser,vendor-pass1,office,windows-update,office-finish,vendor-pass2,consumer-app,vendor-cleanup,finalize' }
   It 'Dell desktop: vendor passes, no consumer app, no cleanup' { $p = P DELL DESKTOP; $p | Should -Contain 'vendor-pass1'; $p | Should -Not -Contain 'consumer-app'; $p | Should -Not -Contain 'vendor-cleanup' }

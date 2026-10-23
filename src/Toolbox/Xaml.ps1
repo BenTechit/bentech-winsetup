@@ -749,6 +749,7 @@ $script:ToolboxXaml = @'
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
 
               <TextBlock Grid.Row="0" Style="{StaticResource RowLabelStyle}" Tag="t:row.profile"/>
@@ -805,8 +806,18 @@ $script:ToolboxXaml = @'
                 </Border>
               </StackPanel>
 
-              <TextBlock Grid.Row="4" Style="{StaticResource RowLabelStyle}" Tag="t:row.apps"/>
+              <TextBlock Grid.Row="4" Style="{StaticResource RowLabelStyle}" Tag="t:row.updates"/>
               <WrapPanel Grid.Row="4" Grid.Column="1">
+                <RadioButton x:Name="UpdatesFull" Style="{StaticResource TileStyle}" Tag="a:WindowsUpdate:FULL">
+                  <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource TileGlyphStyle}" Text="&#xE895;"/><TextBlock Tag="t:updates.full" VerticalAlignment="Center"/></StackPanel>
+                </RadioButton>
+                <RadioButton x:Name="UpdatesDrivers" Style="{StaticResource TileStyle}" Tag="a:WindowsUpdate:DRIVERS">
+                  <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource TileGlyphStyle}" Text="&#xE950;"/><TextBlock Tag="t:updates.drivers" VerticalAlignment="Center"/></StackPanel>
+                </RadioButton>
+              </WrapPanel>
+
+              <TextBlock Grid.Row="5" Style="{StaticResource RowLabelStyle}" Tag="t:row.apps"/>
+              <WrapPanel Grid.Row="5" Grid.Column="1">
                 <Border Style="{StaticResource ChipStyle}" Margin="0,0,18,6">
                   <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock Style="{StaticResource TileGlyphStyle}" Foreground="{StaticResource AccentBrush}" Text="&#xE73E;"/>
@@ -818,11 +829,11 @@ $script:ToolboxXaml = @'
                 </CheckBox>
               </WrapPanel>
 
-              <TextBlock Grid.Row="5" Style="{StaticResource RowLabelStyle}" Tag="t:row.tweaks" Margin="0,11,10,0"/>
-              <StackPanel x:Name="TweakPanel" Grid.Row="5" Grid.Column="1" Margin="0,0,0,4"/>
+              <TextBlock Grid.Row="6" Style="{StaticResource RowLabelStyle}" Tag="t:row.tweaks" Margin="0,11,10,0"/>
+              <StackPanel x:Name="TweakPanel" Grid.Row="6" Grid.Column="1" Margin="0"/>
 
-              <TextBlock Grid.Row="6" Style="{StaticResource RowLabelStyle}" Tag="t:row.restore" Margin="0,11,10,0"/>
-              <Border Grid.Row="6" Grid.Column="1" Style="{StaticResource TweakRowStyle}" Margin="0">
+              <TextBlock Grid.Row="7" Style="{StaticResource RowLabelStyle}" Tag="t:row.restore" Margin="0,11,10,0"/>
+              <Border Grid.Row="7" Grid.Column="1" Style="{StaticResource TweakRowStyle}" Margin="0">
                 <CheckBox x:Name="RestoreSwitch" Style="{StaticResource SwitchStyle}" Tag="a:RestorePoint:">
                   <StackPanel Orientation="Horizontal">
                     <TextBlock Style="{StaticResource TweakGlyphStyle}" Text="&#xE777;"/>

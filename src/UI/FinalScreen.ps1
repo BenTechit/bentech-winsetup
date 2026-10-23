@@ -11,9 +11,12 @@
 # defaults, so the tests drive it with a scripted key sequence and a fake clock. Uses ConvertTo-ScreenText,
 # Limit-ScreenLine, ConvertFrom-StateTime and Format-HoursMinutes from StartScreen.ps1, the console frame
 # writer from ConsoleFrame.ps1, Find-SetupStick and Format-StickLine from Entry\Cleanup.ps1, the
-# default-browser helpers from DefaultBrowser.ps1 and Apps.ps1, and Get-RemoteChoice from Catalog.ps1.
+# default-browser helpers from DefaultBrowser.ps1 and Apps.ps1, and Get-RemoteChoice and
+# Get-WindowsUpdateChoice from Catalog.ps1.
 
 $script:FinalScreenWidth = 80
+# Wu spec 3.3: U (DRIVERS mode only) opens Settings > Windows Update and starts its check at once.
+$script:WindowsUpdateSettingsUri = 'ms-settings:windowsupdate-action'
 # Triage 240, v2 spec 10: with both lists over their caps, the Chrome hint, the USB stick line and a
 # 10-digit AnyDesk ID, the screen is 29 lines. The frame writer keeps the last row of the window free, so
 # that fits a default 30-row console window without scrolling the banner away.
@@ -123,6 +126,16 @@ function Format-FinalScreen {
     step is Done) or '     ScreenConnect: NOT installed' (it failed, or State.Steps has no entry for it).
     With SCREENCONNECT alone the AnyDesk ID lines (and the blank line after them) are left out. The
     status sits on an existing line, so the 29-line worst case does not change.
+
+    The Windows Update choice comes from State.Choices through Get-WindowsUpdateChoice (a missing or
+    invalid one is FULL; wu spec 3.3). In DRIVERS mode the key line is
+    '  [R] report   [U] Windows Update   [ENTER] finish', without the report path (R still opens the
+    report, and after Enter it is in the logs folder on the stick, when the stick is found). The blank
+    spacer line above the Chrome hint and the stick line shows the outcome of the last U:
+    '  Windows Update started: Windows will finish on its own' for -WindowsUpdateStatus Started,
+    '  Could not open Windows Update: open Settings > Windows Update' for Failed, and stays blank for ''.
+    The outcome replaces a line, so the line count is unchanged and the 29-line worst case holds. In FULL
+    mode the key line is today's and -WindowsUpdateStatus is ignored.
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
@@ -132,7 +145,8 @@ function Format-FinalScreen {
     [Parameter(Mandatory)][string]$ReportPath,
     [Parameter(Mandatory)][bool]$DefaultBrowserIsChrome,
     [datetime]$Now = (Get-Date),
-    [AllowNull()][AllowEmptyString()][string]$StickLine = ''
+    [AllowNull()][AllowEmptyString()][string]$StickLine = '',
+    [ValidateSet('', 'Started', 'Failed')][string]$WindowsUpdateStatus = ''
   )
 
   $machine = if ($State['Machine'] -is [hashtable]) { $State['Machine'] } else { @{} }
@@ -187,12 +201,18 @@ function Format-FinalScreen {
     $lines.AddRange($problems)
   }
 
-  $lines.Add('')
+  # Wu spec 3.3: in DRIVERS mode the U outcome takes this blank spacer line, so no line is added.
+  $drivers = (Get-WindowsUpdateChoice -Choices $State['Choices']) -eq 'DRIVERS'
+  $spacer = ''
+  if ($drivers -and $WindowsUpdateStatus -eq 'Started') { $spacer = '  Windows Update started: Windows will finish on its own' }
+  elseif ($drivers -and $WindowsUpdateStatus -eq 'Failed') { $spacer = '  Could not open Windows Update: open Settings > Windows Update' }
+  $lines.Add($spacer)
   if (-not $DefaultBrowserIsChrome) {
     $lines.Add("  Chrome is not the default browser: press B to open Default Apps, then click 'Set default'")
   }
   if (-not [string]::IsNullOrEmpty($StickLine)) { $lines.Add($StickLine) }
-  $lines.Add(('  Report: {0}   [R] open report   [ENTER] finish' -f $ReportPath))
+  if ($drivers) { $lines.Add('  [R] report   [U] Windows Update   [ENTER] finish') }
+  else { $lines.Add(('  Report: {0}   [R] open report   [ENTER] finish' -f $ReportPath)) }
 
   return $lines.ToArray()
 }
@@ -220,8 +240,14 @@ function Show-FinalScreen {
   .DESCRIPTION
     Enter finishes (v2 spec 10.1: the caller then saves the logs and deletes C:\BenTech, so a stray key
     must not end the screen). B opens Settings > Default apps for Chrome, R opens the report in Notepad;
-    both keep the screen up. Every other key is ignored. The Chrome hint is left out when Chrome is the
-    default browser or is not installed.
+    both keep the screen up. U, in DRIVERS mode only (Get-WindowsUpdateChoice of State.Choices; wu spec
+    3.3), opens ms-settings:windowsupdate-action, which opens Settings > Windows Update and starts its
+    check, so Windows downloads and installs on its own and decides when to restart (docs/testing.md 1.20
+    checks that); it logs the outcome, redraws at once
+    with the outcome on the blank spacer line ('Windows Update started' or 'Could not open Windows
+    Update', a WARN in setup.log), and keeps the screen up. Every press opens Settings again, and the line
+    shows the last outcome. In FULL mode U is ignored, like every other key. The Chrome hint is left out
+    when Chrome is the default browser or is not installed.
 
     The screen has a live USB stick line: the stick is looked for again every second and the screen
     redrawn, so a stick plugged in while the screen waits shows within a second. A stick check that throws
@@ -242,7 +268,9 @@ function Show-FinalScreen {
       -Write      draws the lines in the given colours: param($lines, $foreground, $background). The
                   production writer draws over the window through the console frame writer: no flicker,
                   and nothing in the transcript
-      -Launch     starts a program or opens a URI: param($target, $arguments)
+      -Launch     starts a program or opens a URI: param($target, $arguments). The production launcher
+                  passes -ErrorAction Stop, so a refused start always throws and reaches the WARN (and,
+                  for U, the could-not line)
       -FlushInput throws away waiting key presses
       -Stick      the USB stick: @{ Root; Drive } (Find-SetupStick with the launcher recorded in the state)
       -Now        the clock
@@ -259,8 +287,8 @@ function Show-FinalScreen {
     [scriptblock]$Write = { param($lines, $foreground, $background) Write-ConsoleFrame -Lines $lines -Writer (New-ConsoleWriter) -Foreground $foreground -Background $background },
     [scriptblock]$Launch = {
       param($target, $arguments)
-      if ([string]::IsNullOrEmpty($arguments)) { Start-Process -FilePath $target }
-      else { Start-Process -FilePath $target -ArgumentList $arguments }
+      if ([string]::IsNullOrEmpty($arguments)) { Start-Process -FilePath $target -ErrorAction Stop }
+      else { Start-Process -FilePath $target -ArgumentList $arguments -ErrorAction Stop }
     },
     [scriptblock]$FlushInput = { while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) } },
     [scriptblock]$Stick = { Find-SetupStick -Launcher $State['Launcher'] },
@@ -278,6 +306,9 @@ function Show-FinalScreen {
   $stickInfo = @{ Root = $null; Drive = $null }
   $stickWarned = $false
   $drawWarned = $false
+  # Wu spec 3.3: U works in DRIVERS mode only; $wuStatus is the outcome of the last U ('' before any).
+  $isDrivers = (Get-WindowsUpdateChoice -Choices $State['Choices']) -eq 'DRIVERS'
+  $wuStatus = ''
 
   # Colours, input flushing, launching, the stick check and drawing are conveniences: a failure there must
   # not stop the screen from showing the AnyDesk ID. $readStick and $draw are dot-sourced, so their
@@ -286,10 +317,16 @@ function Show-FinalScreen {
     try { $null = & $SetColor $colors.Background $colors.Foreground }
     catch { Write-SetupLog -Message 'Could not set the console colour for the final screen' -Level WARN -Data @{ error = $_.Exception.Message } }
   }
+  # The one launch for B, R and U: $true when it started, $false (and the WARN, with $what in its message) when not.
   $open = {
     param($what, $target, $arguments)
-    try { $null = & $Launch $target $arguments }
-    catch { Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = $_.Exception.Message } }
+    try {
+      $null = & $Launch $target $arguments
+      return $true
+    } catch {
+      Write-SetupLog -Message "Could not open $what from the final screen" -Level WARN -Data @{ error = (ConvertTo-ScreenText $_.Exception.Message) }
+      return $false
+    }
   }
   $readStick = {
     try {
@@ -305,7 +342,7 @@ function Show-FinalScreen {
   }
   $draw = {
     $lines = @(Format-FinalScreen -State $State -Verdict $Verdict -ReportPath $ReportPath -DefaultBrowserIsChrome $isChrome `
-      -Now ([datetime](& $clockBlock)) -StickLine (Format-StickLine -Stick $stickInfo))
+      -Now ([datetime](& $clockBlock)) -StickLine (Format-StickLine -Stick $stickInfo) -WindowsUpdateStatus $wuStatus)
     try { $null = & $Write $lines $colors.Foreground $colors.Background }
     catch {
       # The next frame (a second later) clears the window and draws everything again.
@@ -333,11 +370,23 @@ function Show-FinalScreen {
       $key = [string](& $ReadKey)
       if ($key -eq 'Enter') { return }
       if ($key -eq 'B') {
-        & $open 'Default Apps' ('ms-settings:defaultapps?registeredAppMachine=' + [Uri]::EscapeDataString((Get-ChromeRegisteredAppName))) $null
+        $null = & $open 'Default Apps' ('ms-settings:defaultapps?registeredAppMachine=' + [Uri]::EscapeDataString((Get-ChromeRegisteredAppName))) $null
         continue
       }
       if ($key -eq 'R') {
-        & $open 'the report' 'notepad.exe' ('"{0}"' -f $ReportPath)
+        $null = & $open 'the report' 'notepad.exe' ('"{0}"' -f $ReportPath)
+        continue
+      }
+      if ($key -eq 'U' -and $isDrivers) {
+        # Hand the remaining updates to Windows; the redraw shows the outcome at once. A failed launch gets $open's
+        # WARN, with 'Windows Update' in its message.
+        if (& $open 'Windows Update' $script:WindowsUpdateSettingsUri $null) {
+          $wuStatus = 'Started'
+          Write-SetupLog -Message 'Windows Update handed to Windows' -Data @{ uri = $script:WindowsUpdateSettingsUri }
+        } else {
+          $wuStatus = 'Failed'
+        }
+        . $draw
         continue
       }
       # No key, or any other key (ignored): wait a moment, and once a second look for the stick and redraw.
