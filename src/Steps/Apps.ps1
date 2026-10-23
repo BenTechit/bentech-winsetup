@@ -1,15 +1,16 @@
 ﻿# src/Steps/Apps.ps1
 # Steps 7-9 (spec 8.3): Google Chrome, AnyDesk and 7-Zip, and the optional Zoom (zoom spec 3.2, winget like 7-Zip).
-# Needs StepResult.ps1, Logging.ps1, Process.ps1,
-# Download.ps1, Config.ps1 (Get-Signers) and Winget.ps1 (Invoke-WingetInstall); the bundle holds every file.
+# Needs StepResult.ps1, Logging.ps1, Process.ps1, Download.ps1, Config.ps1 (Get-Signers) and Winget.ps1
+# (Invoke-WingetInstall); the bundle holds every file.
 # Office.ps1 and DefaultBrowser.ps1 also use Test-ChromeInstalled and Write-TextFileUtf8NoBom from here.
 #
 # Chrome and AnyDesk come from vendor permalinks that always serve the newest build; both are
-# Authenticode-checked against the signer in config before they run (spec 9.1). 7-Zip goes through winget.
+# Authenticode-checked against the signer in config before they run (spec 9.1). 7-Zip and Zoom go through winget.
 #
-# Each of the three also writes one fact to the activity feed (Add-SetupActivity, Activity.ps1): the version
-# that was installed, read with Get-InstalledAppVersions (Report.ps1; the bundle holds every file). That
-# line is display only, so a version that cannot be read never changes a step's result.
+# Each of the four also writes one fact to the activity feed (Add-SetupActivity, Activity.ps1): the version
+# that was installed, read with Get-InstalledAppVersions (Report.ps1; the bundle holds every file), or for a
+# Zoom that winget found already installed, 'Zoom already installed'. That line is display only, so a version
+# that cannot be read never changes a step's result.
 
 function Write-TextFileUtf8NoBom {
   <#
@@ -39,7 +40,7 @@ function Get-AppVersionText {
   <#
   .SYNOPSIS
     Private. The installed version of one of the apps this tool installs, for the activity feed: the
-    value Get-InstalledAppVersions reports under Name ('Google Chrome', 'AnyDesk', '7-Zip'), or '' when
+    value Get-InstalledAppVersions reports under Name ('Google Chrome', 'AnyDesk', '7-Zip', 'Zoom'), or '' when
     the app is not listed or the lookup fails (a WARN). Never throws.
   #>
   [CmdletBinding()]

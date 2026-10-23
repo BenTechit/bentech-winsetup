@@ -169,7 +169,7 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
   It 'never changes the input: the Choices and the Tweaks array are copies' {
     $before = $mo | ConvertTo-Json -Depth 5
     $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'accessKeys' -Config $cfg
-    foreach ($a in @(@('Profile', 'clean'), @('Mode', 'DESKTOP'), @('SevenZip', ''), @('Language', 'he'), @('Power', 'false'))) { $null = Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg }
+    foreach ($a in @(@('Profile', 'clean'), @('Mode', 'DESKTOP'), @('SevenZip', ''), @('Zoom', ''), @('Language', 'he'), @('Power', 'false'))) { $null = Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg }
     ($mo | ConvertTo-Json -Depth 5) | Should -Be $before   # the input itself: same table, same order
     [object]::ReferenceEquals($r.Choices, $mo.Choices) | Should -BeFalse; [object]::ReferenceEquals($r.Choices.Tweaks, $mo.Choices.Tweaks) | Should -BeFalse
     @($r.Choices.Tweaks) | Should -Not -Contain 'accessKeys'; @($mo.Choices.Tweaks) | Should -Contain 'accessKeys' }
@@ -179,4 +179,21 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     foreach ($p in 'home', 'business', 'clean') { (Update-ToolboxModel -Model $d -Action 'Profile' -Value $p -Config $cfg).Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' -Because $p }
     $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'FULL'
     (Update-ToolboxModel -Model $d -Action 'Profile' -Value 'clean' -Config $x).Choices.WindowsUpdate | Should -BeExactly 'FULL' }
+  It 'Zoom toggles on, then off; the value is ignored and the input is untouched (zoom spec 3.1)' {
+    $on = Update-ToolboxModel -Model $mo -Action 'Zoom' -Value 'false' -Config $cfg
+    $on.Choices.Zoom | Should -BeOfType [bool]; $on.Choices.Zoom | Should -BeTrue; $on.Choices.Profile | Should -Be 'home'
+    $mo.Choices.Zoom | Should -BeFalse
+    $off = Update-ToolboxModel -Model $on -Action 'Zoom' -Value 'true' -Config $cfg
+    $off.Choices.Zoom | Should -BeOfType [bool]; $off.Choices.Zoom | Should -BeFalse }
+  It 'Zoom toggles from Test-ZoomChosen: <Why> counts as off, so a click turns it on' -ForEach @(
+    @{ Why = 'the string true'; V = 'true' }, @{ Why = 'the number 1'; V = 1 }, @{ Why = '$null'; V = $null }, @{ Why = 'a missing key'; V = 'none' }) {
+    if ($V -is [string] -and $V -eq 'none') { $mo.Choices.Remove('Zoom') } else { $mo.Choices.Zoom = $V }
+    $r = Update-ToolboxModel -Model $mo -Action 'Zoom' -Config $cfg
+    $r.Choices.Zoom | Should -BeOfType [bool]; $r.Choices.Zoom | Should -BeTrue }
+  It 'a profile click after Zoom keeps it on, and the profile is not "changed" by it (Review Focus 5)' {
+    $z = Update-ToolboxModel -Model $mo -Action 'Zoom' -Config $cfg
+    foreach ($p in 'home', 'business', 'clean') {
+      $r = Update-ToolboxModel -Model $z -Action 'Profile' -Value $p -Config $cfg
+      $r.Choices.Profile | Should -Be $p; $r.Choices.Zoom | Should -BeTrue -Because $p
+      Test-ProfileChanged -Choices $r.Choices -Config $cfg -Machine $m | Should -BeFalse -Because $p } }
 }

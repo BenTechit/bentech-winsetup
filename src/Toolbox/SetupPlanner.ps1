@@ -295,6 +295,8 @@ function Update-ToolboxModel {
       - Mode LAPTOP | DESKTOP, Office (one of $script:OfficeChoices), Remote (one of $script:RemoteChoices),
         WindowsUpdate (one of $script:WindowsUpdateChoices: FULL | DRIVERS): set.
       - SevenZip, RestorePoint: toggled (the value is ignored).
+      - Zoom: toggled from Test-ZoomChosen (the value is ignored; zoom spec 3.1), so anything that is not the bool
+        $true counts as off and the result is always a bool.
       - Tweak <id>: that catalog id is toggled in the selection, which is then in catalog order, each id once.
         The selection is not filtered by the Type or Office rules (Get-EffectiveTweaks does that), so NumLock
         comes back with Desktop. An id that is not in the catalog changes nothing.
@@ -328,6 +330,7 @@ function Update-ToolboxModel {
     'Remote' { if ($script:RemoteChoices -ccontains $Value) { $choices['Remote'] = $Value } }
     'WindowsUpdate' { if ($script:WindowsUpdateChoices -ccontains $Value) { $choices['WindowsUpdate'] = $Value } }
     'SevenZip' { $choices['SevenZip'] = -not [bool]$choices['SevenZip'] }
+    'Zoom' { $choices['Zoom'] = -not (Test-ZoomChosen -Choices $choices) }
     'RestorePoint' { $choices['RestorePoint'] = -not [bool]$choices['RestorePoint'] }
     'Tweak' {
       $catalog = @(Get-TweakCatalog -Config $Config)

@@ -620,6 +620,9 @@ $script:ToolboxXaml = @'
                 <CheckBox x:Name="SevenZipSwitch" Style="{StaticResource SwitchStyle}" Tag="a:SevenZip:" Height="30" Margin="0,0,0,6">
                   <TextBlock Tag="t:apps.sevenZip" FlowDirection="LeftToRight"/>
                 </CheckBox>
+                <CheckBox x:Name="ZoomSwitch" Style="{StaticResource SwitchStyle}" Tag="a:Zoom:" Height="30" Margin="18,0,0,6">
+                  <TextBlock Tag="t:apps.zoom" FlowDirection="LeftToRight"/>
+                </CheckBox>
               </WrapPanel>
 
               <TextBlock Grid.Row="6" Style="{StaticResource RowLabelStyle}" Tag="t:row.tweaks" Margin="0,11,10,0"/>

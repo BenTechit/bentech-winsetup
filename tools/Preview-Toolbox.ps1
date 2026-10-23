@@ -7,7 +7,7 @@
 # (New-DefaultChoices, ConvertTo-ScreenText, Format-PreviousRun) and the four Toolbox files. No step, runner or
 # entry file is loaded, nothing is installed, nothing is written but the PNGs.
 #
-# Six views of one sample machine (a Dell Latitude 5440 laptop on Windows 11, not fresh, on battery, with a
+# Eight views of one sample machine (a Dell Latitude 5440 laptop on Windows 11, not fresh, on battery, with a
 # YELLOW previous run), so every banner and row is seen:
 #   toolbox-en.png, toolbox-he.png        the default profile, in English and in Hebrew
 #   toolbox-en-business-desktop.png       the Business profile as a desktop (ScreenConnect reminder, NumLock and
@@ -15,6 +15,8 @@
 #   toolbox-en-blocked.png                Administrator protection on (red banner, Start disabled)
 #   toolbox-en-drivers.png,               the default profile with UPDATES on Drivers only, in English and in Hebrew
 #   toolbox-he-drivers.png                (the tile, and the plan's "Windows Update (drivers only)"; wu spec 3.1)
+#   toolbox-en-zoom.png,                  the default profile with the APPS row's Zoom switch on, in English and in
+#   toolbox-he-zoom.png                   Hebrew (the switch, and the plan's Zoom line after 7-Zip; zoom spec 3.1)
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\Preview-Toolbox.ps1 [-OutDir <folder>]
 # The default folder is dist\toolbox-preview (dist\ is git-ignored). Prints each PNG's path.
@@ -44,12 +46,14 @@ $width = 1000
 $height = 680
 
 $views = @(
-  @{ File = 'toolbox-en.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = '' }
-  @{ File = 'toolbox-he.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = '' }
-  @{ File = 'toolbox-en-business-desktop.png'; Language = 'en'; Protection = 'Off'; Profile = 'business'; Mode = 'DESKTOP'; Updates = '' }
-  @{ File = 'toolbox-en-blocked.png'; Language = 'en'; Protection = 'On'; Profile = ''; Mode = ''; Updates = '' }
-  @{ File = 'toolbox-en-drivers.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS' }
-  @{ File = 'toolbox-he-drivers.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS' }
+  @{ File = 'toolbox-en.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = ''; Zoom = $false }
+  @{ File = 'toolbox-he.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = ''; Zoom = $false }
+  @{ File = 'toolbox-en-business-desktop.png'; Language = 'en'; Protection = 'Off'; Profile = 'business'; Mode = 'DESKTOP'; Updates = ''; Zoom = $false }
+  @{ File = 'toolbox-en-blocked.png'; Language = 'en'; Protection = 'On'; Profile = ''; Mode = ''; Updates = ''; Zoom = $false }
+  @{ File = 'toolbox-en-drivers.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS'; Zoom = $false }
+  @{ File = 'toolbox-he-drivers.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = 'DRIVERS'; Zoom = $false }
+  @{ File = 'toolbox-en-zoom.png'; Language = 'en'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = ''; Zoom = $true }
+  @{ File = 'toolbox-he-zoom.png'; Language = 'he'; Protection = 'Off'; Profile = ''; Mode = ''; Updates = ''; Zoom = $true }
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -63,6 +67,7 @@ foreach ($view in $views) {
   }
   if ($view.Mode -ne '') { $model.Choices.Mode = $view.Mode }
   if ($view.Updates -ne '') { $model.Choices.WindowsUpdate = $view.Updates }
+  if ($view.Zoom) { $model.Choices.Zoom = $true }
 
   $window = New-ToolboxWindow -Model $model -Machine $machine -Config $config -Version '2026.10.21.1' -ReadOnAC { $false }
   $window.Width = $width
