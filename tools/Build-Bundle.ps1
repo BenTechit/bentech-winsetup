@@ -75,6 +75,8 @@ $BundleOrder = @(
   'Repair\ToolSafety.ps1'
   'Repair\ToolRepairs.ps1'
   'Repair\ToolAdvanced.ps1'
+  'Repair\ToolCollect.ps1'
+  'Repair\ToolReport.ps1'
   'UI\ConsoleFrame.ps1'
   'UI\StartScreen.ps1'
   'UI\ProgressScreen.ps1'

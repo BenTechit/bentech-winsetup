@@ -64,6 +64,11 @@
 # log locally), netReset (netBackup first: no verified backup on the stick, no reset), netRestore and ghostRemove
 # (ghostCsv first: no saved list, nothing removed). The safety child also names this PC's newest saved network
 # backup on the stick (safetyNetBackup), for the Restore network settings button.
+#
+# Task 8: quickReport and fullReport (spec 6.8): one step per report section (report01 ... report12, ToolCollect.ps1:
+# each stores its section in $Run.Data.Report), then reportWrite (ToolReport.ps1: the AI-ready core, the data JSON and
+# raw_<stamp>\ on the stick) and, Full only, reportZip. reportWrite always runs: a report stopped or out of time still
+# writes what it collected, and names the sections it did not reach.
 $script:ToolActionCatalog = [ordered]@{
   safety     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
                   Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup') }
@@ -90,6 +95,12 @@ $script:ToolActionCatalog = [ordered]@{
                    Steps = [string[]]@('ghostList') }
   ghostRemove = @{ Kind = 'destructive'; Confirm = 'yes'; NeedsStick = $true; LogLocal = $false
                    Steps = [string[]]@('ghostCsv', 'ghostRemove') }
+  quickReport = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('report01', 'report02', 'report03', 'report04', 'report05', 'report06', 'report07', 'report08', 'report09', 'report10',
+                                       'report11', 'reportWrite') }
+  fullReport  = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('report01', 'report02', 'report03', 'report04', 'report05', 'report06', 'report07', 'report08', 'report09', 'report10',
+                                       'report11', 'report12', 'reportWrite', 'reportZip') }
 }
 $script:ToolSteps = @{
   safetyRestart    = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
@@ -133,11 +144,34 @@ $script:ToolSteps = @{
   ghostList         = @{ Function = 'Invoke-ToolStepGhostList'; Servicing = $false }
   ghostCsv          = @{ Function = 'Invoke-ToolStepGhostCsv'; Servicing = $false }
   ghostRemove       = @{ Function = 'Invoke-ToolStepGhostRemove'; Servicing = $false }
+  report01          = @{ Function = 'Invoke-ToolStepReport01'; Servicing = $false }
+  report02          = @{ Function = 'Invoke-ToolStepReport02'; Servicing = $false }
+  report03          = @{ Function = 'Invoke-ToolStepReport03'; Servicing = $false }
+  report04          = @{ Function = 'Invoke-ToolStepReport04'; Servicing = $false }
+  report05          = @{ Function = 'Invoke-ToolStepReport05'; Servicing = $false }
+  report06          = @{ Function = 'Invoke-ToolStepReport06'; Servicing = $false }
+  report07          = @{ Function = 'Invoke-ToolStepReport07'; Servicing = $false }
+  report08          = @{ Function = 'Invoke-ToolStepReport08'; Servicing = $false }
+  report09          = @{ Function = 'Invoke-ToolStepReport09'; Servicing = $false }
+  report10          = @{ Function = 'Invoke-ToolStepReport10'; Servicing = $false }
+  report11          = @{ Function = 'Invoke-ToolStepReport11'; Servicing = $false }
+  report12          = @{ Function = 'Invoke-ToolStepReport12'; Servicing = $false }
+  reportWrite       = @{ Function = 'Invoke-ToolStepReportWrite'; Servicing = $false; AlwaysRun = $true }
+  reportZip         = @{ Function = 'Invoke-ToolStepReportZip'; Servicing = $false }
 }
 
 # A failed progress write, or a failed tick, is logged once per run (New-ToolRun resets both).
 $script:ToolProgressWarned = $false
 $script:ToolTickWarned = $false
+
+# The Data keys that stay in the child: the report sections (Task 8) are written to the report files on the stick, and
+# result.json holds only the summary and the paths (ruling RD-R21: the window reads a result.json over 1 MB as no
+# result); the signed-in user the report read (a name and a SID) is in the report files only.
+$script:ToolResultHiddenData = @('Report', 'ReportUser')
+
+# The read cap of a report's _data.json (ruling RD-R23): Compare (Task 9) reads it with this, not with the 1 MB of the
+# exchange files.
+$script:ToolReportDataMaxBytes = 16MB
 
 # --- Texts ------------------------------------------------------------------------------------------------------
 
@@ -203,6 +237,28 @@ function ConvertTo-ToolAsciiJson {
   return [regex]::Replace($Json, '[^\x00-\x7E]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 }
 
+function ConvertFrom-ToolJsonHtmlEscapes {
+  <#
+  .SYNOPSIS
+    -Json with the four escapes Windows PowerShell 5.1's ConvertTo-Json always writes (backslash-u and the hex code
+    of the ampersand 0026, the apostrophe 0027 and the angle brackets 003c and 003e) turned back into their characters,
+    so a file Ben reads shows them (ruling RD-R23). Pure.
+  .DESCRIPTION
+    Only an escape whose backslash is not itself escaped is turned back (an even run of backslashes before it), so a
+    value that holds such an escape as text (its backslash doubled in the JSON) stays as it is. The four characters
+    need no escape in a JSON string; the JSON means the same.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Json)
+
+  if ([string]::IsNullOrEmpty($Json)) { return [string]$Json }
+  return [regex]::Replace($Json, '(?<!\\)((?:\\\\)*)\\u00(26|27|3[cCeE])', {
+      param($m)
+      $m.Groups[1].Value + [string][char][Convert]::ToInt32($m.Groups[2].Value, 16)
+    })
+}
+
 function ConvertTo-ToolDisplayText {
   <#
   .SYNOPSIS
@@ -227,18 +283,22 @@ function ConvertTo-ToolDisplayText {
 }
 
 function Save-ToolJsonFile {
-  # Private. Writes -InputObject as JSON (UTF-8 without a BOM, ASCII bytes: ConvertTo-ToolAsciiJson) to <Path>.tmp,
-  # then swaps it in: [IO.File]::Replace over an existing file ([NullString]::Value, because PowerShell would pass ''
-  # for $null), else a move. Folders are not created. Throws on failure; Write-ToolJsonFile, Write-ToolProgress and
-  # Write-ToolResult catch.
+  # Private. Writes -InputObject as JSON (UTF-8 without a BOM) to <Path>.tmp, then swaps it in: [IO.File]::Replace over
+  # an existing file ([NullString]::Value, because PowerShell would pass '' for $null), else a move. Folders are not
+  # created. Throws on failure; Write-ToolJsonFile, Write-ToolProgress and Write-ToolResult catch.
+  # The window/child exchange files (args, progress, result) are ASCII bytes (ConvertTo-ToolAsciiJson, RD-R21). -Utf8
+  # (ruling RD-R23) is for the files Ben reads on the stick (a report's _data.json): their text stays as it is, so a
+  # Hebrew letter is two bytes and Notepad shows it, never a \uXXXX escape.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][AllowNull()]$InputObject,
-    [int]$Depth = 8
+    [int]$Depth = 8,
+    [switch]$Utf8
   )
 
-  $json = ConvertTo-ToolAsciiJson -Json (ConvertTo-Json -InputObject $InputObject -Depth $Depth)
+  $json = ConvertTo-Json -InputObject $InputObject -Depth $Depth
+  if ($Utf8) { $json = ConvertFrom-ToolJsonHtmlEscapes -Json $json } else { $json = ConvertTo-ToolAsciiJson -Json $json }
   $temporary = $Path + '.tmp'
   [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding $false))
   if ([IO.File]::Exists($Path)) {
@@ -254,17 +314,21 @@ function Write-ToolJsonFile {
     Writes -InputObject as JSON (depth 8 by default, UTF-8 without a BOM, in ASCII bytes: a character outside ASCII is
     a \uXXXX escape, RD-R21) through <Path>.tmp, so a reader never sees half a file. $true when written; a failure is
     a WARN in the log and $false. Never throws.
+  .DESCRIPTION
+    -Utf8 (ruling RD-R23): plain UTF-8 text, no escapes, for the files Ben reads on the stick (a report's _data.json).
+    The exchange files between the window and the child (args, progress, result) never take it.
   #>
   [CmdletBinding()]
   [OutputType([bool])]
   param(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][AllowNull()]$InputObject,
-    [ValidateRange(1, 100)][int]$Depth = 8
+    [ValidateRange(1, 100)][int]$Depth = 8,
+    [switch]$Utf8
   )
 
   try {
-    Save-ToolJsonFile -Path $Path -InputObject $InputObject -Depth $Depth
+    Save-ToolJsonFile -Path $Path -InputObject $InputObject -Depth $Depth -Utf8:$Utf8
     return $true
   } catch {
     Write-SetupLog -Level WARN -Message 'Could not write a tool JSON file' -Data @{
@@ -280,7 +344,9 @@ function Read-ToolJsonFile {
     -MaxBytes (1 MB), not JSON, or not a JSON object. Never throws.
   .DESCRIPTION
     Opened with FileShare ReadWrite + Delete, so the writer can swap a new version in while this reads (the window
-    polls progress.json every 500 ms). UTF-8, with or without a BOM.
+    polls progress.json every 500 ms). Decoded as UTF-8, with or without a BOM: the ASCII exchange files (RD-R21) and
+    the plain UTF-8 files on the stick (RD-R23) alike. 1 MB is the cap of the exchange files; a reader of a report's
+    _data.json (Compare, Task 9) passes -MaxBytes $script:ToolReportDataMaxBytes (16 MB).
   #>
   [CmdletBinding()]
   param(
@@ -689,7 +755,8 @@ function Write-ToolResult {
     RestartRequired; Offers; Files; Data; StartedAt; EndedAt }. $true when result.json was written; a failure is an
     ERROR in the log and $false. Never throws.
   .DESCRIPTION
-    Files.Folder defaults to the session folder (else the run folder) and Files.Log to <LogDir>\setup.log.
+    Files.Folder defaults to the session folder (else the run folder) and Files.Log to <LogDir>\setup.log. Data leaves
+    out the keys of $script:ToolResultHiddenData (the report sections: they are in the report files, RD-R21).
   #>
   [CmdletBinding()]
   [OutputType([bool])]
@@ -703,6 +770,8 @@ function Write-ToolResult {
     Write-ToolProgress -Run $Run -State 'done'
     if (-not $Run.Files.ContainsKey('Folder')) { $Run.Files['Folder'] = $(if ($Run.SessionDir) { $Run.SessionDir } else { $Run.Dir }) }
     if (-not $Run.Files.ContainsKey('Log')) { $Run.Files['Log'] = [IO.Path]::Combine($Run.LogDir, 'setup.log') }
+    $data = @{}
+    foreach ($key in @($Run.Data.Keys)) { if ($script:ToolResultHiddenData -notcontains [string]$key) { $data[$key] = $Run.Data[$key] } }
     $result = [ordered]@{
       Action          = [string]$Run.Args['Action']
       RunId           = [string]$Run.Args['RunId']
@@ -713,7 +782,7 @@ function Write-ToolResult {
       RestartRequired = [bool]$Run.RestartRequired
       Offers          = $Run.Offers
       Files           = $Run.Files
-      Data            = $Run.Data
+      Data            = $data
       StartedAt       = (Format-ToolTime -Value $Run.StartedAt)
       EndedAt         = (Format-ToolTime -Value (Get-Date))
     }
@@ -976,7 +1045,8 @@ function Invoke-ToolNative {
     'native' by default). Returns @{ ExitCode (<int>, $null on a timeout); TimedOut; OutputPath }.
   .DESCRIPTION
     Without -OutputName the tool runs itself and its output is discarded (never captured). With it, the output goes
-    to <LogDir>\<OutputName>-<HHmmss>.txt (-2, -3, ... when taken) through
+    to <LogDir>\<OutputName>-<HHmmss>.txt (-2, -3, ... when taken; -OutputFolder names another folder, such as a
+    report's raw_<stamp>\: Task 8) through
       cmd.exe /d /s /c ""<FilePath>" <ArgumentList> > "<file>" 2>&1"
     so the tick can read DISM's percent from the file while the tool runs: $Run.OutputPath holds the file during the
     call and is cleared in a finally. cmd passes the tool's exit code through. Plan call: every part is built from
@@ -990,7 +1060,8 @@ function Invoke-ToolNative {
     [Parameter(Mandatory)][string]$FilePath,
     [AllowEmptyString()][string]$ArgumentList = '',
     [string]$StepTimeout = 'native',
-    [string]$OutputName
+    [string]$OutputName,
+    [string]$OutputFolder
   )
 
   if ([string]::IsNullOrEmpty($OutputName)) {
@@ -999,11 +1070,13 @@ function Invoke-ToolNative {
   }
 
   if ($OutputName -notmatch '^[A-Za-z0-9_-]{1,40}\z') { throw ('Invoke-ToolNative: the output name is not a plain name ({0})' -f (ConvertTo-ScreenText -Text $OutputName)) }
+  $folder = [string]$Run.LogDir
+  if (-not [string]::IsNullOrEmpty($OutputFolder)) { $folder = $OutputFolder }
   $stamp = (Get-Date).ToString('HHmmss', [Globalization.CultureInfo]::InvariantCulture)
-  $outputPath = [IO.Path]::Combine([string]$Run.LogDir, ('{0}-{1}.txt' -f $OutputName, $stamp))
+  $outputPath = [IO.Path]::Combine($folder, ('{0}-{1}.txt' -f $OutputName, $stamp))
   $n = 2
   while ([IO.File]::Exists($outputPath)) {
-    $outputPath = [IO.Path]::Combine([string]$Run.LogDir, ('{0}-{1}-{2}.txt' -f $OutputName, $stamp, $n))
+    $outputPath = [IO.Path]::Combine($folder, ('{0}-{1}-{2}.txt' -f $OutputName, $stamp, $n))
     $n++
   }
   foreach ($part in $FilePath, $ArgumentList, $outputPath) {

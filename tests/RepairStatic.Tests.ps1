@@ -13,9 +13,29 @@ BeforeAll {
   $script:repairFiles = @(Get-ChildItem -LiteralPath (Join-Path $script:srcRoot 'Repair') -Recurse -File -Filter *.ps1)
   # Task 2 adds the CBS.log reader (SFC's verdict, always English) and the ReAgent.xml reader (WinRE's supporting
   # evidence, read by attribute); Task 7 the ghost CSV's own read-back (Invoke-ToolStepGhostCsv) and the network
-  # backup's reader, which hashes and parses the same bytes (Read-ToolNetBackupFile); Task 8 adds Read-ToolLogErrors.
+  # backup's reader, which hashes and parses the same bytes (Read-ToolNetBackupFile); Task 8 the English servicing logs
+  # condensed for the report (Read-ToolLogErrors: CBS.log, dism.log, setupapi.dev.log) and the hosts file (Get-ReportData09).
   $script:allowedReads = @('Update-ToolTick', 'Read-ToolJsonFile', 'Read-ToolArgs', 'Read-ToolCbsLog', 'Get-ToolReAgentState', 'Invoke-ToolStepGhostCsv',
-                           'Read-ToolNetBackupFile')
+                           'Read-ToolNetBackupFile', 'Read-ToolLogErrors', 'Get-ReportData09')
+  # Tools whose answer is localized text (Task 8, spec 6.8: every report source is language-independent). Matched in the
+  # code only (every token but comments, so a command inside a grandchild's here-string counts), a tool's name and its
+  # switch within one line.
+  $script:localizedTools = @(
+    '(?i)\bnetstat(\.exe)?\b', '(?i)\bipconfig(\.exe)?\b[^\n]{0,80}?/all\b', '(?i)\bpnputil(\.exe)?\b[^\n]{0,80}?/enum', '(?i)\bdriverquery(\.exe)?\b',
+    '(?i)\bnet1?(\.exe)?[''"]?\s+[''"]?(localgroup|user)\b', '(?i)\bnetsh(\.exe)?\b[^\n]{0,80}?\bwlan\b[^\n]{0,40}?\bshow\b', '(?i)manage-bde',
+    '(?i)\bslmgr(\.vbs)?\b', '(?i)\bbcdedit(\.exe)?\b', '(?i)\breagentc(\.exe)?\b[^\n]{0,80}?/info\b')
+  # The text of every token that is not a comment, in order, one space apart (new lines kept).
+  function Get-CodeText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $tokens = $null; $errors = $null
+    $null = [Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    (@(foreach ($t in $tokens) { if ($t.Kind -eq 'NewLine') { "`n" } elseif ($t.Kind -ne 'Comment') { $t.Text } }) -join ' ')
+  }
+  function Get-LocalizedToolViolation {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][string]$Name)
+    $code = Get-CodeText -Text $Text
+    foreach ($p in $script:localizedTools) { foreach ($m in [regex]::Matches($code, $p)) { '{0}: {1}' -f $Name, $m.Value } }
+  }
   # A key protector's password (review M3). No repair file names the WMI method that returns it, the BitLocker
   # module's cmdlet whose protector objects carry it, or manage-bde; and the word RecoveryPassword appears only as the
   # one string constant 'RecoveryPassword' inside $script:ToolKeyProtectorTypes (the protector TYPE's name, which the
@@ -158,6 +178,34 @@ $e = Invoke-CimMethod -InputObject $v -MethodName 'GetKeyProtectorNumericalPassw
     }
     $values['$script:GhostExcludedPrefixes'] | Should -Be @('BTHENUM\', 'BTHLE\', 'BTHLEDEVICE\', 'BTHHFENUM\', 'SWD\MMDEVAPI\', 'SWD\PRINTENUM\', 'WSDPRINT\')
     $values['$script:GhostExcludedClasses'] | Should -Be @('Bluetooth', 'Printer', 'PrintQueue', 'AudioEndpoint')
+  }
+  It 'the report collectors call no localized-output tool (repair Task 8, spec 6.8)' {
+    $bad = @(foreach ($f in $script:repairFiles) { Get-LocalizedToolViolation -Text ([IO.File]::ReadAllText($f.FullName)) -Name $f.Name })
+    $bad -join "`n" | Should -BeNullOrEmpty
+    @($script:repairFiles.Name) | Should -Contain 'ToolCollect.ps1'
+  }
+  It 'the localized-tool detector finds each tool in code and in a grandchild''s text, and skips comments and look-alike names' {
+    $snippet = @'
+# netstat -ano and bcdedit /enum in a comment are fine
+$a = Invoke-ToolNative -Run $Run -FilePath (Get-ToolSystemTool -Name 'pnputil.exe') -ArgumentList '/enum-drivers'
+$b = Invoke-ToolNative -Run $Run -FilePath 'ipconfig.exe' -ArgumentList '/all'
+$c = @"
+netsh wlan show profiles
+net localgroup administrators
+"@
+& netstat.exe -ano
+& driverquery /v
+& net user
+& bcdedit /enum
+& reagentc.exe /info
+cscript slmgr.vbs /dli
+manage-bde -status
+function Test-ToolNetStatic { $x = 'user' }
+$ok = Invoke-ToolNative -Run $Run -FilePath 'pnputil.exe' -ArgumentList '/scan-devices'
+'@
+    $found = @(Get-LocalizedToolViolation -Text $snippet -Name 'snippet')
+    $found.Count | Should -Be 11
+    ($found -join '|') | Should -Not -Match 'NetStatic|scan-devices'
   }
   It 'no src file calls the disk-check exclusion tool (ruling RD-R1)' {
     $tool = 'chk' + 'ntfs'
