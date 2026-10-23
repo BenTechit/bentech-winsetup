@@ -5,7 +5,7 @@
 # change file associations and policies. Nothing here may do any of that. Every test that reaches
 # the system runs after Initialize-AppMocks (each Describe calls it from BeforeEach), which replaces
 # EVERY command the steps can reach with a recorder: Invoke-External, Start-BackgroundExternal (the Office
-# setup.exe never starts), Get-RemoteFile, Get-RemoteText, Get-WingetPath,
+# setup.exe never starts), Get-RemoteFile, Get-RemoteText, Get-WingetPath, Get-WingetVersion,
 # Test-FileSignature, Invoke-WingetInstall (kept real with -RealWinget, so winget's exit-code mapping runs
 # against the Invoke-External recorder), Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
 # Get-Content, Start-Sleep, Write-SetupLog and Get-ShellDefaultBrowserProgId (the AssocQueryString
@@ -129,6 +129,9 @@ BeforeAll {
       return (-not ($script:sigBad -contains (Split-Path -Leaf $Path)))
     }
     Mock Get-WingetPath { 'C:\fake\winget.exe' }
+    $script:wingetVersion = [version]'1.9.25200'
+    $script:versionCalls = New-Object System.Collections.ArrayList
+    Mock Get-WingetVersion { [void]$script:versionCalls.Add($Path); return $script:wingetVersion }
     if (-not $RealWinget) {
       Mock Invoke-WingetInstall {
         [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source; Custom = $Custom; TimeoutMinutes = $TimeoutMinutes })
@@ -763,6 +766,44 @@ Describe 'Invoke-StepZoom' {
     # A dropped token is logged by position, never by its text.
     ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match 'calc'
     @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+  }
+  # Final review M2: --custom needs winget 1.5 or later; an older winget would refuse the whole command line.
+  It 'winget <V>: the tokens go to winget, after one version probe of winget''s own path' -ForEach @(@{ V = '1.5.1572' }, @{ V = '1.28.190' }) {
+    $script:wingetVersion = [version]$V
+    $r = Invoke-StepZoom -Context $script:ctx
+    @($r.Notes).Count | Should -Be 0
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly (@($script:ctx.Config.apps.zoom.custom) -join '|')
+    @($script:versionCalls) | Should -Be @('C:\fake\winget.exe')
+  }
+  It 'winget <Why>: Zoom installs without the tokens, with the yellow Note and a WARN' -ForEach @(
+    @{ Why = '1.4.11071'; V = '1.4.11071' }, @{ Why = '1.4'; V = '1.4' }, @{ Why = 'whose version cannot be read'; V = $null }
+  ) {
+    $script:wingetVersion = if ($null -eq $V) { $null } else { [version]$V }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: installed'
+    @($r.Notes) | Should -Be @('Zoom auto-update not set')
+    $script:wingetCalls.Count | Should -Be 1
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly ''
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 10
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'older than 1\.5' }).Count | Should -Be 1
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+  }
+  It 'an already-installed answer from an old winget still gives only the already-installed Note' {
+    $script:wingetVersion = [version]'1.4.11071'
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    @((Invoke-StepZoom -Context $script:ctx).Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+  }
+  It 'asks no version when there is no token to pass, or no winget (winget''s own result then says so)' {
+    $script:ctx.Config.apps.zoom.custom = @()
+    $null = Invoke-StepZoom -Context $script:ctx
+    $script:versionCalls.Count | Should -Be 0
+    Mock Get-WingetPath { $null }
+    $script:ctx.Config.apps.zoom.custom = @('ZConfig=AU2_EnableAutoUpdate=true')
+    $script:wingetResult = New-StepResult -Status Failed -Message 'winget unavailable'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $script:versionCalls.Count | Should -Be 0
+    $r.Message | Should -BeExactly 'winget unavailable'
   }
   It 'already installed with a broken config: only the already-installed Note' {
     $script:ctx.Config.apps.zoom.custom = @('A B=c')

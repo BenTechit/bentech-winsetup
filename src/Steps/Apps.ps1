@@ -1,7 +1,7 @@
 ﻿# src/Steps/Apps.ps1
 # Steps 7-9 (spec 8.3): Google Chrome, AnyDesk and 7-Zip, and the optional Zoom (zoom spec 3.2, winget like 7-Zip).
 # Needs StepResult.ps1, Logging.ps1, Process.ps1, Download.ps1, Config.ps1 (Get-Signers) and Winget.ps1
-# (Invoke-WingetInstall); the bundle holds every file.
+# (Invoke-WingetInstall, Get-WingetPath, Get-WingetVersion); the bundle holds every file.
 # Office.ps1 and DefaultBrowser.ps1 also use Test-ChromeInstalled and Write-TextFileUtf8NoBom from here.
 #
 # Chrome and AnyDesk come from vendor permalinks that always serve the newest build; both are
@@ -388,6 +388,9 @@ function Invoke-StepZoom {
     costs minutes, not timeoutsMinutes.default.
       - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When a
         token was missing or dropped Zoom still installs, with the yellow Note 'Zoom auto-update not set'.
+      - --custom needs winget 1.5 or later (final review M2): before passing tokens the step reads winget's
+        version (Get-WingetVersion, one minute at most). Below 1.5, or unreadable, Zoom installs without the
+        tokens (a WARN), with the same yellow Note.
       - Already installed (Data.AlreadyInstalled: winget 0x8A150061, or 0x8A15002B "no applicable update" for a
         Zoom that is up to date or installed per user, ruling Z-R3; nothing ran, so auto-update was not
         touched) is Done '<id>: already installed' with the Note 'Zoom was already installed: auto-update not
@@ -412,6 +415,18 @@ function Invoke-StepZoom {
   $dropped = New-Object System.Collections.Generic.List[int]
   for ($i = 0; $i -lt $given.Count; $i++) {
     if ($given[$i] -is [string] -and (Test-WingetCustomToken -Token $given[$i])) { $custom.Add($given[$i]) } else { $dropped.Add($i) }
+  }
+  # Final review M2: winget's --custom needs winget 1.5 or later; an older one refuses the whole command line.
+  # With no winget at all there is nothing to ask: Invoke-WingetInstall then says 'winget unavailable'.
+  if ($custom.Count -gt 0) {
+    $wingetPath = Get-WingetPath
+    if ($wingetPath) {
+      $wingetVersion = Get-WingetVersion -Path $wingetPath
+      if ($null -eq $wingetVersion -or $wingetVersion -lt [version]'1.5') {
+        Write-SetupLog -Message 'winget is older than 1.5, or its version could not be read: no --custom, so Zoom installs without its custom arguments' -Level WARN -Data @{ wingetVersion = [string]$wingetVersion }
+        $custom.Clear()
+      }
+    }
   }
   $autoUpdateSet = ($custom.Count -gt 0) -and ($dropped.Count -eq 0)
   if (-not $autoUpdateSet) {

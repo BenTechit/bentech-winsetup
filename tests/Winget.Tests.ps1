@@ -549,6 +549,52 @@ Describe 'Test-WingetUsable' {
     Test-WingetUsable -Path 'C:\stale\alias\winget.exe' | Should -BeFalse
   }
 }
+# Final review M2: winget's --custom needs winget 1.5 or later, so the zoom step asks for the version first.
+Describe 'Get-WingetVersion' {
+  BeforeEach {
+    Mock Write-SetupLog {}
+    Mock Invoke-External {
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $script:extQueue.Dequeue()
+    }
+  }
+
+  It 'reads "<Out>" as <V>, from "winget --version" with a one-minute limit' -ForEach @(
+    @{ Out = 'v1.9.25200'; V = '1.9.25200' }, @{ Out = "v1.4.11071`r`n"; V = '1.4.11071' }, @{ Out = 'v1.5.1572'; V = '1.5.1572' }
+    @{ Out = 'v1.10.40-preview'; V = '1.10.40' }, @{ Out = '  v1.28.190  '; V = '1.28.190' }, @{ Out = '1.6.2771'; V = '1.6.2771' }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult 0 $false $Out)
+    $r = Get-WingetVersion -Path 'C:\fake\winget.exe'
+    $r | Should -BeOfType [version]
+    $r | Should -Be ([version]$V)
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].FilePath | Should -Be 'C:\fake\winget.exe'
+    $extCalls[0].ArgumentList | Should -BeExactly '--version'
+    $extCalls[0].TimeoutMinutes | Should -Be 1
+    $extCalls[0].Capture | Should -BeTrue
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 0 -Exactly
+  }
+  It 'is $null, with one WARN, for <Why>' -ForEach @(
+    @{ Why = 'no output'; R = @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+    @{ Why = 'text that is not a version'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'Windows Package Manager' } }
+    @{ Why = 'a version inside a sentence'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'version v1.9.25200 here' } }
+    @{ Why = 'digits of another script'; R = @{ ExitCode = 0; TimedOut = $false; Output = ('v1.' + [char]0x0669) } }
+    @{ Why = 'a number too large for a version'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'v1.99999999999' } }
+    @{ Why = 'a timeout'; R = @{ ExitCode = $null; TimedOut = $true; Output = 'v1.9.25200' } }
+    @{ Why = 'a non-zero exit code'; R = @{ ExitCode = 1; TimedOut = $false; Output = 'v1.9.25200' } }
+    @{ Why = 'no exit code'; R = @{ ExitCode = $null; TimedOut = $false; Output = 'v1.9.25200' } }
+  ) {
+    Set-ExternalQueue @($R)
+    Get-WingetVersion -Path 'C:\fake\winget.exe' | Should -BeNullOrEmpty
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 1 -Exactly
+  }
+  It 'is $null, and does not throw, when winget cannot be started' {
+    Mock Invoke-External { throw 'Cannot start' }
+    { Get-WingetVersion -Path 'C:\stale\winget.exe' } | Should -Not -Throw
+    Get-WingetVersion -Path 'C:\stale\winget.exe' | Should -BeNullOrEmpty
+  }
+}
+
 Describe 'ConvertTo-PowerShellLiteral' {
   It 'wraps plain text in single quotes' {
     ConvertTo-PowerShellLiteral -Text 'C:\BenTech\Setup\x.msixbundle' | Should -Be "'C:\BenTech\Setup\x.msixbundle'"

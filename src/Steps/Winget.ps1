@@ -479,6 +479,38 @@ function Test-WingetUsable {
   }
 }
 
+function Get-WingetVersion {
+  <#
+  .SYNOPSIS
+    winget's own version, from `<Path> --version`, as a [version]; $null when it cannot be read. Never throws.
+  .DESCRIPTION
+    Final review M2: winget's --custom needs winget 1.5 or later, and an older winget refuses the whole command
+    line. `winget --version` prints one line such as 'v1.9.25200' (a preview adds '-preview'), the same in
+    every language. Only a line that is exactly that, ASCII digits, is read; anything else, a timeout (one
+    minute, as Test-WingetUsable), a non-zero exit code or a program that cannot be started is $null and one
+    WARN. The output is never logged.
+  #>
+  [CmdletBinding()]
+  [OutputType([version])]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    $run = Invoke-External -FilePath $Path -ArgumentList '--version' -TimeoutMinutes 1 -CaptureOutput
+  } catch {
+    Write-SetupLog -Message 'winget --version could not be run' -Level WARN -Data @{ path = $Path; error = (ConvertTo-ScreenText $_.Exception.Message) }
+    return $null
+  }
+  if (-not $run.TimedOut -and $null -ne $run.ExitCode -and $run.ExitCode -eq 0) {
+    foreach ($line in ([string]$run.Output -split "`r`n|`r|`n")) {
+      $m = [regex]::Match($line.Trim(), '^v?(?<v>[0-9]+\.[0-9]+(?:\.[0-9]+){0,2})(?:-[0-9A-Za-z.]+)?\z')
+      $version = $null
+      if ($m.Success -and [version]::TryParse($m.Groups['v'].Value, [ref]$version)) { return $version }
+    }
+  }
+  Write-SetupLog -Message 'winget version could not be read' -Level WARN -Data @{ path = $Path; timedOut = [bool]$run.TimedOut; exitCode = $run.ExitCode }
+  return $null
+}
+
 function Wait-WingetPath {
   <#
   .SYNOPSIS
