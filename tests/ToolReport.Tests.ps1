@@ -431,6 +431,35 @@ Describe 'ToolReport (repair Task 8)' {
       @{ Line = ''; Program = '' }) {
       Get-ToolCommandExecutable -Command $Line | Should -BeExactly $Program
     }
+    It 'final wave item 17 (Task 8 re-review <Case>): <Line> gives <Program>' -ForEach @(
+      # R1: an unterminated or empty quote: the rest is judged as unquoted (the program only), or nothing.
+      @{ Case = 'R1'; Line = '"C:\Program Files\Agent\agent.exe --token abc'; Program = 'C:\Program Files\Agent\agent.exe' }
+      @{ Case = 'R1'; Line = '"" C:\x.exe --token abc'; Program = 'C:\x.exe' }
+      @{ Case = 'R1'; Line = '""'; Program = '' }
+      @{ Case = 'R1'; Line = '"'; Program = '' }
+      @{ Case = 'R1'; Line = '"agent --token abc'; Program = 'agent' }
+      # R3: chains without white space: the first program only.
+      @{ Case = 'R3'; Line = 'C:\tools\run.bat&&setx TOKEN abc&&C:\b.exe'; Program = 'C:\tools\run.bat' }
+      @{ Case = 'R3'; Line = 'C:\a.bat;setx TOKEN abc;C:\b.exe'; Program = 'C:\a.bat' }
+      @{ Case = 'R3'; Line = 'C:\a.exe|C:\b.exe secret'; Program = 'C:\a.exe' }
+      @{ Case = 'R3'; Line = 'run.bat&&setx TOKEN abc'; Program = 'run.bat' }
+      @{ Case = 'R3'; Line = 'C:\prog\foo token=sk-1234 C:\a.exe'; Program = 'C:\prog\foo' }
+      # R4: an env-style or switch-first first word is no program.
+      @{ Case = 'R4'; Line = 'A=B C:\x\y.exe'; Program = '' }
+      @{ Case = 'R4'; Line = 'TOKEN=abc C:\x\y.exe'; Program = '' }
+      @{ Case = 'R4'; Line = '-token=abc'; Program = '' }
+      @{ Case = 'R4'; Line = '/c something'; Program = '' }
+      @{ Case = 'R4'; Line = '^setx TOKEN abc'; Program = '' }
+      # N1: a spaced path whose folder holds ' - ' (not a switch: a dash followed by a space).
+      @{ Case = 'N1'; Line = 'C:\Program Files\Foo - Bar\foo.exe'; Program = 'C:\Program Files\Foo - Bar\foo.exe' }
+      @{ Case = 'N1'; Line = 'C:\Program Files\Foo - Bar\foo.exe --token abc'; Program = 'C:\Program Files\Foo - Bar\foo.exe' }
+      @{ Case = 'N1'; Line = 'C:\Program Files\Foo - Bar\foo.exe /S C:\x.exe'; Program = 'C:\Program Files\Foo - Bar\foo.exe' }
+      # Still the program only (the earlier cases' shapes, and a real switch inside the matched part).
+      @{ Case = 'kept'; Line = 'C:\Tools\x -k C:\tools\run.bat'; Program = 'C:\Tools\x' }
+      @{ Case = 'kept'; Line = 'C:\Users\Dana\AppData\Local\Microsoft\OneDrive\OneDrive.exe /background'; Program = 'C:\Users\Dana\AppData\Local\Microsoft\OneDrive\OneDrive.exe' }
+      @{ Case = 'kept'; Line = 'C:\Program Files (x86)\Google\Update\GoogleUpdate.exe /ua'; Program = 'C:\Program Files (x86)\Google\Update\GoogleUpdate.exe' }) {
+      Get-ToolCommandExecutable -Command $Line | Should -BeExactly $Program
+    }
     It 'M1: section 07 lists its crash, WHEA, hang, dump and reliability lines before the event groups, so the size limit cuts event groups first (800 groups)' {
       $script:gc['eventGroups'] = @{ system = @{ Error = ''; Total = 4000; Rows = @(); Groups = (New-ManyGroups -Log 'System' -Count 400) }
                                      application = @{ Error = ''; Total = 4000; Rows = @(); Groups = (New-ManyGroups -Log 'Application' -Count 400) } }

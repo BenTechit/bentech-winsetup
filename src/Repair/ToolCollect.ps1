@@ -676,8 +676,18 @@ function Get-ToolCommandExecutable {
     The program of a command line, never its arguments (a task's, a service's or a startup item's arguments may hold
     tokens): the quoted part when it starts with a quote; else, when it starts like a path (a drive, \\ or an
     %variable%), up to the first .exe, .com, .bat, .cmd, .ps1, .vbs, .js, .dll, .msc or .scr (an unquoted path may
-    hold spaces), unless that part holds a switch (' -' or ' /': then the extension belongs to an argument; review
-    I1); else its first word. Pure.
+    hold spaces), unless that part holds a switch (' -x', ' /x', ' --x': then the extension belongs to an argument;
+    review I1); else its first word. Pure.
+  .DESCRIPTION
+    The Task 8 re-review's hardening (final wave item 17):
+      - R1: an empty or unterminated opening quote is dropped and the rest judged as unquoted ('' when nothing is left);
+      - R3: the extension match never crosses & | ; < > ^ = or a quote, and ends at white space, a comma, the end or a
+        chain character, so 'C:\a.bat&&setx TOKEN abc' gives C:\a.bat; the first word ends at a chain character too;
+      - R4: a first word that starts with '-' or '/', or holds '=', '^' or a quote (an environment-style assignment, a
+        switch, an escape) is no program: '';
+      - N1: a dash followed by a space (a folder named 'Foo - Bar') is no switch.
+    What stays (R2): an unquoted path whose program has no listed extension, followed by bare words and a later listed
+    extension, gives up to that extension ('C:\prog\foo word C:\a.exe'): it cannot be told from a spaced path.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -688,11 +698,14 @@ function Get-ToolCommandExecutable {
   if ($text.StartsWith('"')) {
     $end = $text.IndexOf('"', 1)
     if ($end -gt 1) { return $text.Substring(1, $end - 1) }
-    return $text.Trim('"')
+    $text = $text.TrimStart('"').Trim()
+    if ($text -eq '') { return '' }
   }
-  $match = [regex]::Match($text, '^((?:[A-Za-z]:\\|\\\\|%[^%\s]+%).*?\.(exe|com|bat|cmd|ps1|vbs|js|dll|msc|scr))(\s|,|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-  if ($match.Success -and $match.Groups[1].Value -notmatch '\s[-/]') { return $match.Groups[1].Value }
-  return ($text -split '\s+', 2)[0]
+  $match = [regex]::Match($text, '^((?:[A-Za-z]:\\|\\\\|%[^%\s]+%)[^&|;<>^="]*?\.(exe|com|bat|cmd|ps1|vbs|js|dll|msc|scr))(?=\s|,|$|[&|;<>])', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($match.Success -and $match.Groups[1].Value -notmatch '\s[-/]+[^\s\-/]') { return $match.Groups[1].Value }
+  $first = ($text -split '[\s&|;<>]', 2)[0]
+  if ($first -match '^[-/]|[=^"]') { return '' }
+  return $first
 }
 
 function Format-ReportGB {
