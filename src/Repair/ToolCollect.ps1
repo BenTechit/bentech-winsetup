@@ -630,7 +630,7 @@ function Get-ReportUser {
     if ($user['Name'] -eq '') {
       $user['Error'] = 'no signed-in user'
     } else {
-      $sid = [string](Get-ToolUserSid -UserName $user['Name'])
+      $sid = [string](Get-ToolUserSid -Run $Run -UserName $user['Name'])
       if ($sid -match '^S-1-[0-9]+(-[0-9]+)+\z') { $user['Sid'] = $sid } else { $user['Error'] = 'no SID for the user' }
     }
   } catch {

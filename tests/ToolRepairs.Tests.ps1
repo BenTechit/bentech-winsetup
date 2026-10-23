@@ -556,7 +556,7 @@ Describe 'ToolRepairs (repair Task 6)' {
         if ($Path -like 'Registry::HKEY_USERS\*') { [pscustomobject]@{ DisplayName = 'HP Smart' } }
         else { [pscustomobject]@{ DisplayName = 'Dell SupportAssist' }; [pscustomobject]@{ DisplayName = ' ' }; [pscustomobject]@{ NoName = 1 } }
       }
-      @(Get-ToolInstalledPrograms) | Should -Be @('Dell SupportAssist', 'HP Smart')
+      @(Get-ToolInstalledPrograms -Run (New-ActionRun postClone)) | Should -Be @('Dell SupportAssist', 'HP Smart')
       @($script:paths) | Should -Be @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
                                       'Registry::HKEY_USERS\S-1-5-21-1111111111-2222222222-3333333333-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')
       Should -Invoke Get-ToolUserSid -Times 1 -Exactly -ParameterFilter { $UserName -eq 'PC1\dana' }
@@ -565,11 +565,35 @@ Describe 'ToolRepairs (repair Task 6)' {
       $script:paths = New-Object System.Collections.ArrayList
       Mock Get-ItemProperty -ParameterFilter { $Path -like '*Uninstall\`*' } { [void]$script:paths.Add([string]$Path) }
       Mock Get-SignedInUserName { '' }
-      $null = Get-ToolInstalledPrograms
+      $null = Get-ToolInstalledPrograms -Run (New-ActionRun postClone)
       Mock Get-SignedInUserName { 'PC1\gone' }; Mock Get-ToolUserSid { '' }
-      $null = Get-ToolInstalledPrograms
+      $null = Get-ToolInstalledPrograms -Run (New-ActionRun postClone)
       @($script:paths | Where-Object { $_ -notlike 'HKLM:\*' }) | Should -BeNullOrEmpty
       @($script:paths).Count | Should -Be 4
+    }
+    It 'the account''s SID is looked up in a bounded grandchild, never in this process: a domain controller that does not answer cannot stall a report (final wave item 18)' {
+      $script:gc['userSid'] = @{ Sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001' }
+      $r = New-ActionRun quickReport
+      Get-ToolUserSid -Run $r -UserName "CORP\dana o'neil" | Should -BeExactly 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+      Should -Invoke Invoke-ToolJsonChild -Times 1 -Exactly -ParameterFilter { $Name -eq 'userSid' -and $StepTimeout -eq 'grandchild' }
+      $script:gcCommands['userSid'] | Should -Match ([regex]::Escape("NTAccount 'CORP\dana o''neil'"))
+      $script:gcCommands['userSid'] | Should -Match 'Translate\(\[Security\.Principal\.SecurityIdentifier\]\)'
+      $errors = $null; $null = [Management.Automation.Language.Parser]::ParseInput($script:gcCommands['userSid'], [ref]$null, [ref]$errors); @($errors).Count | Should -Be 0
+      # A lookup that times out or fails, or an answer that is no SID, is no SID (a WARN), never a throw or a wait.
+      $script:gcFail['userSid'] = 'timed out'; Get-ToolUserSid -Run $r -UserName 'CORP\dana' | Should -BeExactly ''
+      $script:gcFail.Clear(); $script:gc['userSid'] = @{ Sid = 'not a sid' }; Get-ToolUserSid -Run $r -UserName 'CORP\dana' | Should -BeExactly ''
+      Get-ToolUserSid -Run $r -UserName '' | Should -BeExactly ''
+      Should -Invoke Invoke-ToolJsonChild -Times 3 -Exactly -ParameterFilter { $Name -eq 'userSid' }
+      # No account name is translated in this process anywhere in src\Repair (only inside a grandchild's command).
+      foreach ($f in Get-ChildItem "$PSScriptRoot\..\src\Repair" -Filter *.ps1) {
+        $ast = [Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -eq 'Translate' }, $true)).Count | Should -Be 0 -Because $f.Name
+      }
+      # The callers pass the run: the report's user and the installed programs.
+      Mock Get-SignedInUserName { 'PC1\dana' }; Mock Get-ToolUserSid { 'S-1-5-21-1111111111-2222222222-3333333333-1001' }
+      Mock Get-ItemProperty -ParameterFilter { $Path -like '*Uninstall\`*' } { }
+      $null = Get-ToolInstalledPrograms -Run $r
+      Should -Invoke Get-ToolUserSid -Times 1 -Exactly -ParameterFilter { $null -ne $Run -and $UserName -eq 'PC1\dana' }
     }
   }
 

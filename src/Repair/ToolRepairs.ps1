@@ -726,17 +726,38 @@ function Invoke-ToolStepPnpScan {
   return 'warn'
 }
 
+# The SID of one account (<N>: DOMAIN\user, as a literal). In a grandchild: NTAccount.Translate can wait on a domain
+# controller that does not answer (a domain laptop away from its network; final wave item 18).
+$script:ToolUserSidCommand = @'
+@{ Sid = [string](New-Object Security.Principal.NTAccount <N>).Translate([Security.Principal.SecurityIdentifier]).Value }
+'@
+
 function Get-ToolUserSid {
-  # Private seam. The SID of the account -UserName (DOMAIN\user) as text, or '' when it does not translate.
+  <#
+  .SYNOPSIS
+    Private seam. The SID of the account -UserName (DOMAIN\user) as text, or '' when it does not translate. Never throws.
+  .DESCRIPTION
+    The lookup runs in the grandchild 'userSid' (Invoke-ToolJsonChild, toolStep.grandchild, capped by the action's
+    time), never in this process, so a domain controller that does not answer costs at most that bound (final wave item
+    18). A lookup that fails or times out is '' with WARN 'The account''s SID could not be read' (the reason in ASCII);
+    an answer that is no SID is ''.
+  #>
   [CmdletBinding()]
   [OutputType([string])]
-  param([AllowNull()][AllowEmptyString()][string]$UserName)
+  param(
+    [Parameter(Mandatory)][hashtable]$Run,
+    [AllowNull()][AllowEmptyString()][string]$UserName
+  )
 
-  try {
-    return [string](New-Object Security.Principal.NTAccount $UserName).Translate([Security.Principal.SecurityIdentifier]).Value
-  } catch {
+  if ([string]::IsNullOrWhiteSpace($UserName)) { return '' }
+  $child = Invoke-ToolJsonChild -Run $Run -Name 'userSid' -Command ($script:ToolUserSidCommand.Replace('<N>', (ConvertTo-PowerShellLiteral -Text $UserName))) -StepTimeout 'grandchild'
+  if (-not $child.Ok) {
+    Write-SetupLog -Level WARN -Message 'The account''s SID could not be read' -Data @{ reason = (ConvertTo-ScreenText -Text $(if ($child.TimedOut) { 'timed out' } else { [string]$child.Error })) }
     return ''
   }
+  $sid = [string]$child.Data['Sid']
+  if ($sid -match '^S-1-[0-9]+(-[0-9]+)+\z') { return $sid }
+  return ''
 }
 
 function Get-ToolInstalledPrograms {
@@ -747,11 +768,12 @@ function Get-ToolInstalledPrograms {
     the elevated process's HKCU, which may be another account's (review I-12; Plan call). Never throws.
   .DESCRIPTION
     Without a signed-in user (an RDP session, an early logon) or a name that does not translate, only the machine
-    views are read (logged). A view that cannot be read is skipped.
+    views are read (logged). A view that cannot be read is skipped. The SID lookup runs in -Run's bounded grandchild
+    (Get-ToolUserSid).
   #>
   [CmdletBinding()]
   [OutputType([string[]])]
-  param()
+  param([Parameter(Mandatory)][hashtable]$Run)
 
   $keys = New-Object System.Collections.Generic.List[string]
   foreach ($key in $script:ToolMachineUninstallKeys) { $keys.Add($key) }
@@ -760,7 +782,7 @@ function Get-ToolInstalledPrograms {
   if ($user -eq '') {
     Write-SetupLog -Level WARN -Message 'No signed-in user: the per-user programs were not read'
   } else {
-    $sid = Get-ToolUserSid -UserName $user
+    $sid = Get-ToolUserSid -Run $Run -UserName $user
     if ($sid -match '^S-1-[0-9]+(-[0-9]+)+\z') {
       $keys.Add('Registry::HKEY_USERS\' + $sid + '\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
     } else {
@@ -847,7 +869,7 @@ function Invoke-ToolStepOemLeftovers {
     Add-ToolFinding -Run $Run -Level INFO -Code 'oemSkipped'
     return 'done'
   }
-  $found = @(Get-ToolOemLeftovers -Programs @(Get-ToolInstalledPrograms) -Brand $brand -Config $Run.Config)
+  $found = @(Get-ToolOemLeftovers -Programs @(Get-ToolInstalledPrograms -Run $Run) -Brand $brand -Config $Run.Config)
   $names = [string[]]@(foreach ($n in $found) { ConvertTo-ScreenText -Text $n })
   $Run.Data['OemLeftovers'] = @{ Brand = $brand; Programs = $names }
   Add-ToolLog -Run $Run -Text ('Other makers'' software on this {0}: {1}' -f $brand, $names.Count)
