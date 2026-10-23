@@ -168,7 +168,7 @@ A pending servicing restart blocks the action before it starts (section 5), and 
 5. Trigger a scan.
 
 ### 6.5 Disk check at restart (YES)
-- **How it is scheduled** (builder check 5): `fsutil dirty set <system drive>`. It is judged by its exit code, then confirmed by `fsutil dirty query` (exit code). At the next start Windows runs autochk, the boot-time chkdsk.
+- **How it is scheduled** (builder check 5): `fsutil dirty set <system drive>`. It is judged by its exit code, then confirmed by the volume's `Win32_Volume.DirtyBitSet` (read through CIM; amended in the final wave: the toolbox never runs `fsutil dirty query`, and a dirty bit that cannot be read is "could not confirm", never "not scheduled"). At the next start Windows runs autochk, the boot-time chkdsk.
   - `Repair-Volume -OfflineScanAndFix` is not used: Microsoft does not document it scheduling a boot-time check on the volume in use.
   - The real-VM test (14) confirms the dirty-bit route.
 - **There is no Cancel (ruling RD-R1, 22/10/2026).** `chkntfs /x` would exclude the drive from **every later** start-up check until `chkntfs /d`, silently switching off a Windows safety check. The YES confirmation therefore says: "It runs at the next start and cannot be cancelled from the toolbox". The toolbox never calls `chkntfs`.
@@ -235,9 +235,9 @@ A pending servicing restart blocks the action before it starts (section 5), and 
   - **The child never draws anything and never prompts.** Every question was answered in the window before it started.
 - **The window polls** the progress file every 500 ms with a DispatcherTimer and renders it. No runspaces, and the UI thread never blocks.
 - **Progress percent** comes from the tools' own numbers where they give them: DISM's `[===   45.0%]` and the `Repair-WindowsImage` progress. Otherwise the step list alone is shown.
-- **Deadlines:** a child past its deadline is killed (process tree), and the action ends as "timed out" (red) with whatever it had finished. Per-step timeouts inside the child also go through `Invoke-External`.
+- **Deadlines:** a child still running at its budget + 3 minutes is killed (process tree), and the action ends as "timed out" (red) with whatever it had finished. Rulings RD-R8 and RD-R9 (amended in the final wave): every deadline runs on a monotonic clock, never the wall clock, which the time sync moves. The child gets its budget in seconds (`BudgetSeconds` in `args.json`) and stops itself at it on its own Stopwatch; the window measures each run on a Stopwatch it starts when it launches the child, and kills only 3 minutes past the budget (the child's own Stopwatch starts after PowerShell's start-up and the bundle's parsing). Per-step timeouts inside the child also go through `Invoke-External`.
 - **Engine change:** `src\Entry\Param.ps1` gains `-ToolAction` and `-ToolArgs`, like `-WuRound`. That amends the pinned parameter list. The launcher does not change.
-- **The window starts the child without waiting** (builder check 1), through the engine's existing non-blocking `Start-BackgroundExternal`. The window enforces the action's deadline on its timer, killing the process tree at the deadline. This becomes the second named exception to "every child goes through `Invoke-External`" (after Office).
+- **The window starts the child without waiting** (builder check 1), through the engine's existing non-blocking `Start-BackgroundExternal`. The window enforces the action's deadline on its timer, killing the process tree at the budget + 3 minutes on the run's own Stopwatch (rulings RD-R8, RD-R9). This becomes the second named exception to "every child goes through `Invoke-External`" (after Office).
 - **Logs and outputs** are written by the child **directly to the stick**, in `BenTech-Reports\<PC>_<serial>_<yyyy-MM-dd_HHmm>\` (section 8; ruling RD-R6). The window also keeps one ASCII line per action in setup.log.
 
 ## 8. Where things are kept
