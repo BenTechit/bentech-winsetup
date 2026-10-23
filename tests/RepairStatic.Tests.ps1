@@ -207,6 +207,30 @@ $ok = Invoke-ToolNative -Run $Run -FilePath 'pnputil.exe' -ArgumentList '/scan-d
     $found.Count | Should -Be 11
     ($found -join '|') | Should -Not -Match 'NetStatic|scan-devices'
   }
+  It 'every grandchild command of the report parses (review M7: a syntax slip would make its source "not collected" on every PC)' {
+    $commands = [ordered]@{}
+    foreach ($file in 'ToolCollect.ps1', 'ToolReport.ps1') {
+      $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $script:srcRoot "Repair\$file"), [ref]$null, [ref]$null)
+      foreach ($a in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -match '^\$script:Report[A-Za-z0-9]+Command\z' }, $false)) {
+        $commands[$a.Left.Extent.Text] = $a.Right.Find({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true).Value
+      }
+    }
+    # The 16 of Task 8, the Administrators (review M4) and the zip (review M5).
+    $commands.Count | Should -Be 18
+    @($commands.Keys) | Should -Contain '$script:ReportAdminsCommand'; @($commands.Keys) | Should -Contain '$script:ReportZipCommand'
+    foreach ($name in $commands.Keys) {
+      # The placeholders the callers replace (<L>, <SPECS>, <DAYS>, <P>, <FROM>, <TO>) as a value, inside the block
+      # Invoke-ToolJsonChild wraps every command in.
+      $text = [regex]::Replace([string]$commands[$name], '<[A-Z]+>', '1')
+      $errors = $null
+      $null = [Management.Automation.Language.Parser]::ParseInput(("`$value = & {`r`n" + $text + "`r`n}"), [ref]$null, [ref]$errors)
+      @($errors).Count | Should -Be 0 -Because $name
+    }
+    # The check catches a slip.
+    $errors = $null
+    $null = [Management.Automation.Language.Parser]::ParseInput('$value = & { @{ Items = @(Get-Printer | ForEach-Object { @{ Name = $_.Name } ) } }', [ref]$null, [ref]$errors)
+    @($errors).Count | Should -BeGreaterThan 0
+  }
   It 'no src file calls the disk-check exclusion tool (ruling RD-R1)' {
     $tool = 'chk' + 'ntfs'
     foreach ($f in Get-ChildItem -LiteralPath $script:srcRoot -Recurse -File -Filter *.ps1) {

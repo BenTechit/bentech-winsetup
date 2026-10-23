@@ -146,7 +146,9 @@ Describe 'config.json' {
     @($cfg.timeoutsMinutes.tool.PSObject.Properties.Name) | Should -Be @('safety', 'health', 'standard', 'postClone', 'dismSource', 'wuReset', 'diskCheck',
       'netInfo', 'netReset', 'netRestore', 'ghostList', 'ghostRemove', 'quickReport', 'fullReport', 'compare')
     @($cfg.timeoutsMinutes.toolStep.PSObject.Properties.Name) | Should -Be @('native', 'grandchild', 'disks', 'volumeScan', 'imageCheck', 'imageScan', 'dism', 'sfc',
-      'timeSync', 'pnpScan', 'componentCleanup', 'retrim', 'wuScan', 'service', 'pnputil', 'ghostList', 'drivers', 'printers', 'events', 'msinfo32', 'wuLog')
+      'timeSync', 'pnpScan', 'componentCleanup', 'retrim', 'wuScan', 'service', 'pnputil', 'ghostList', 'drivers', 'printers', 'events', 'msinfo32', 'wuLog', 'zip')
+    # The report's raw zip runs in a grandchild bounded by toolStep.zip (review M5, ruling RD-R24).
+    $cfg.timeoutsMinutes.toolStep.zip | Should -Be 15
     foreach ($section in $cfg.timeoutsMinutes.tool, $cfg.timeoutsMinutes.toolStep) {
       foreach ($p in $section.PSObject.Properties) {
         ($p.Value -is [int] -or $p.Value -is [long] -or $p.Value -is [double]) | Should -BeTrue -Because $p.Name; $p.Value | Should -BeGreaterThan 0 -Because $p.Name } }

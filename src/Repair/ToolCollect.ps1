@@ -12,10 +12,13 @@
 #   - every source is language-independent: CIM and registry values, enum names, event providers, IDs and their
 #     data fields, SIDs; never a tool's text. The tools that only feed raw\ (systeminfo, vssadmin, gpresult, dsregcmd,
 #     powercfg, wevtutil, msinfo32) are run, never read; Full only;
-#   - every source is bounded: CIM with -OperationTimeoutSec 30, every cmdlet that can hang and every event query in a
-#     grandchild (Invoke-ToolJsonChild) with its toolStep timeout, every native tool through Invoke-ToolNative;
+#   - every source is bounded: CIM with -OperationTimeoutSec 30, every cmdlet that can hang (the Administrators group's
+#     member lookups among them) and every event query (the disk events too) in a grandchild (Invoke-ToolJsonChild)
+#     with its toolStep timeout, every native tool through Invoke-ToolNative (review M4: a stall loses its source,
+#     never the report);
 #   - a source that fails or runs out of time is a Missing entry (notCollected), never a failed section: each source
-#     is caught on its own (Invoke-ReportSource), and a collector never throws;
+#     is caught on its own (Invoke-ReportSource), and a collector never throws. Its reason is a fixed English code
+#     (ConvertTo-ReportReason, review M11), never Windows' own (localized) message, which only the log keeps;
 #   - Quick skips every slow source (the table of the brief) and runs one connectivity test, the internet check of
 #     section 01, which section 09 reuses ($Run.Data.Internet);
 #   - the report reads; it changes nothing and scans no disk (the read-only volume state of the Health check, ruling
@@ -25,12 +28,12 @@
 #     privacy-safe copy (Task 9);
 #   - the signed-in user's own hive (HKEY_USERS\<SID>), never the elevated process's HKCU (review I-12).
 #
-# Needs ToolEngine (Invoke-ToolJsonChild, Invoke-ToolNative, Add-ToolLog, Format-ToolExitCode), ToolChecks
-# (Get-ToolWinReState, Get-ToolVolumeState, Get-ToolProblemDevices, Get-ToolActivation, Get-ToolCheckError,
-# Get-ToolSystemLetter, ConvertFrom-CbsSrText, Read-ToolCbsLog), ToolSafety (Test-ToolInternet, Get-ToolDiskEventCount,
-# Get-ToolBitLockerChip, Get-ToolRepairNumber), ToolRepairs (Get-ToolSystemTool, Get-ToolUserSid,
-# Get-ToolOemLeftovers, $script:ToolMachineUninstallKeys), ToolAdvanced (Get-ToolNetSettings), ToolReport
-# (ConvertTo-ReportText, ConvertTo-EventGroups, Get-ToolReportRawDir, Copy-ToolRawFile, Read-ToolLogErrors,
+# Needs ToolEngine (Invoke-ToolJsonChild, Invoke-ToolNative, Add-ToolLog, Format-ToolExitCode,
+# ConvertTo-ToolDisplayText), ToolChecks (Get-ToolWinReState, Get-ToolVolumeState, Get-ToolProblemDevices,
+# Get-ToolActivation, Get-ToolCheckError, Get-ToolSystemLetter, ConvertFrom-CbsSrText, Read-ToolCbsLog), ToolSafety
+# (Test-ToolInternet, Get-ToolDiskEventSplit, Get-ToolBitLockerChip, Get-ToolRepairNumber), ToolRepairs
+# (Get-ToolSystemTool, Get-ToolUserSid, Get-ToolOemLeftovers, $script:ToolMachineUninstallKeys), ToolAdvanced
+# (Get-ToolNetSettings), ToolReport (ConvertTo-EventGroups, Get-ToolReportRawDir, Copy-ToolRawFile, Read-ToolLogErrors,
 # ConvertTo-ReportNumber, Format-ReportNumber, ConvertTo-ReportDateTime), Reboot (Get-RebootRegistryValue,
 # Get-ServicingRebootSignals), Detection (Get-SignedInUserName, Resolve-Brand), Report (Format-ReportDate,
 # Get-SmartAppControlState), Activity (Read-FileTail, Wait-SetupDelay), Winget (ConvertTo-PowerShellLiteral), Logging
@@ -111,7 +114,8 @@ $script:ReportPartitionsCommand = @'
 # Provider (in the filter: a provider that is always registered); Providers (checked after the query: one missing on
 # this PC would fail the whole query); Mode 'groups' (provider + ID + level counted here, at most Keep groups, the
 # newest event's message cut to 300) or 'rows' (at most Keep events, with the named EventData fields Names and the
-# Properties at the indexes Props). The answer per spec: @{ Error; Total; Rows; Groups }. Messages are display only.
+# Properties at the indexes Props). The answer per spec: @{ Error; Total; Capped (the query read Max events, so Total
+# is a lower bound: review M6); Unreadable; Rows; Groups }. Messages are display only.
 $script:ReportEventsCommand = @'
 $specs = ConvertFrom-Json -InputObject <SPECS>
 $invariant = [Globalization.CultureInfo]::InvariantCulture
@@ -172,7 +176,8 @@ foreach ($s in @($specs)) {
       $unreadable++
     }
   }
-  $answer[[string]$s.Name] = @{ Error = $problem; Total = $total; Unreadable = $unreadable; Rows = $rows.ToArray(); Groups = @(foreach ($k in $order) { $groups[$k] }) }
+  $answer[[string]$s.Name] = @{ Error = $problem; Total = $total; Capped = ($events.Count -ge [int]$s.Max); Unreadable = $unreadable; Rows = $rows.ToArray()
+                                Groups = @(foreach ($k in $order) { $groups[$k] }) }
 }
 $answer
 '@
@@ -268,6 +273,30 @@ $s = Get-MpComputerStatus
    SignatureAge = [int]$s.AntivirusSignatureAge; Mode = [string]$s.AMRunningMode; Tamper = [bool]$s.IsTamperProtected; SignatureVersion = [string]$s.AntivirusSignatureVersion }
 '@
 
+# The local Administrators group by its SID (S-1-5-32-544), in a grandchild because the member lookups can stall (a
+# domain laptop away from its domain controller; review M4). Get-LocalGroupMember fails on a group that holds an
+# orphaned domain account: then ADSI (the WinNT provider) on the group's translated (localized) name. LocalError is
+# Get-LocalGroupMember's message, for the log only.
+$script:ReportAdminsCommand = @'
+$source = 'Get-LocalGroupMember'
+$localError = ''
+$items = @()
+try {
+  $items = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { @{ Name = [string]$_.Name; Sid = [string]$_.SID; Source = [string]$_.PrincipalSource } })
+} catch {
+  $source = 'ADSI'
+  $localError = [string]$_.Exception.Message
+  $account = ([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+  $group = [ADSI]('WinNT://./{0},group' -f ($account -split '\\')[-1])
+  $items = @(foreach ($member in @($group.psbase.Invoke('Members'))) {
+    $name = [string]$member.GetType().InvokeMember('Name', 'GetProperty', $null, $member, $null)
+    $sid = ''
+    try { $sid = (New-Object Security.Principal.SecurityIdentifier($member.GetType().InvokeMember('objectSid', 'GetProperty', $null, $member, $null), 0)).Value } catch { $sid = '' }
+    @{ Name = $name; Sid = $sid; Source = 'ADSI' } })
+}
+@{ Source = $source; LocalError = $localError; Items = $items }
+'@
+
 # Windows Update's ETW traces merged into a text log in raw\ (<P>: the file, as a literal).
 $script:ReportWuLogCommand = @'
 $null = Get-WindowsUpdateLog -LogPath <P>
@@ -306,21 +335,60 @@ function Complete-ReportSection {
   return $Section
 }
 
+# The reasons a source may be "not collected" for (review M11): fixed English codes, so a Hebrew PC's message never
+# reaches the report as '????' and the AI reads the same words on every PC.
+$script:ReportReasonPattern = '\A(timed out|failed|no result|no answer|output too large|access denied|not found|not supported|is a link|no system drive letter|no signed-in user|no SID for the user|not enough time left|not run: the report was stopped or ran out of time|exit 0x[0-9A-F]{8}|no file \(exit 0x[0-9A-F]{8}\))\z'
+
+function ConvertTo-ReportReason {
+  <#
+  .SYNOPSIS
+    Private, pure. Why a source was not collected, as one of the fixed English reasons ($script:ReportReasonPattern,
+    review M11): -Why, or -Exception's message, when it already is one ('timed out' from a grandchild, a chip or a
+    helper; '<file> is a link' is 'is a link'); else by -Exception's type (also its inner exceptions): access denied
+    (UnauthorizedAccessException, SecurityException), not found (an item, file or folder), not supported
+    (NotSupportedException and PlatformNotSupportedException), timed out (TimeoutException); else 'failed' ('no result'
+    when there is nothing at all). Windows' and the tools' own text, localized on a Hebrew PC, never becomes a reason:
+    Add-ReportMissing logs it.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Why, [AllowNull()][Exception]$Exception)
+
+  foreach ($text in $Why, $(if ($null -ne $Exception) { $Exception.Message } else { '' })) {
+    $candidate = ([string]$text).Trim()
+    if ($candidate -ne '' -and $candidate -cmatch $script:ReportReasonPattern) { return $candidate }
+    # This code's own refusals name the file: '<file> is a link' (V2-R13).
+    if ($candidate -cmatch ' is a link\z') { return 'is a link' }
+  }
+  $e = $Exception
+  while ($null -ne $e) {
+    if ($e -is [UnauthorizedAccessException] -or $e -is [Security.SecurityException]) { return 'access denied' }
+    if ($e -is [Management.Automation.ItemNotFoundException] -or $e -is [IO.FileNotFoundException] -or $e -is [IO.DirectoryNotFoundException]) { return 'not found' }
+    if ($e -is [NotSupportedException]) { return 'not supported' }
+    if ($e -is [TimeoutException]) { return 'timed out' }
+    $e = $e.InnerException
+  }
+  if ($null -eq $Exception -and [string]::IsNullOrWhiteSpace($Why)) { return 'no result' }
+  return 'failed'
+}
+
 function Add-ReportMissing {
-  # A source of -Section that was not collected: @{ What (English); Why (ASCII, at most 200 characters) }, and a WARN in
-  # the log. The report lists it and adds the INFO finding notCollected.
+  # A source of -Section that was not collected: @{ What (English); Why (ConvertTo-ReportReason of -Why and
+  # -Exception: a fixed English reason) }, and a WARN in the log with the original text (ASCII, at most 300
+  # characters). The report lists it and adds the INFO finding notCollected.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][hashtable]$Section,
     [Parameter(Mandatory)][string]$What,
-    [AllowNull()][AllowEmptyString()][string]$Why
+    [AllowNull()][AllowEmptyString()][string]$Why,
+    [AllowNull()][Exception]$Exception
   )
 
-  $reason = ConvertTo-ScreenText -Text $Why
-  if ($reason -eq '') { $reason = 'no result' }
-  if ($reason.Length -gt 200) { $reason = $reason.Substring(0, 200) }
+  $reason = ConvertTo-ReportReason -Why $Why -Exception $Exception
   $Section['Missing'].Add(@{ What = $What; Why = $reason })
-  Write-SetupLog -Level WARN -Message 'A report source was not collected' -Data @{ section = $Section['Id']; source = $What; reason = $reason }
+  $detail = ConvertTo-ScreenText -Text $(if ($null -ne $Exception) { $Exception.Message } else { $Why })
+  if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) }
+  Write-SetupLog -Level WARN -Message 'A report source was not collected' -Data @{ section = $Section['Id']; source = $What; reason = $reason; error = $detail }
 }
 
 function Invoke-ReportSource {
@@ -342,7 +410,7 @@ function Invoke-ReportSource {
   try {
     & $Script
   } catch {
-    Add-ReportMissing -Section $Section -What $What -Why $_.Exception.Message
+    Add-ReportMissing -Section $Section -What $What -Exception $_.Exception
   }
 }
 
@@ -450,6 +518,29 @@ function Get-ReportEventRows {
   return , @(foreach ($r in @($answer[$Part])) { if ($r -is [System.Collections.IDictionary]) { $r } })
 }
 
+function Get-ReportEventTotal {
+  <#
+  .SYNOPSIS
+    Private. How many events one query of Get-ReportEvents counted (-Spec, New-ReportEventSpec): @{ Count; Capped;
+    Text }. Count is its Total (at least -Least: the rows the caller kept). Capped: the query read its Max events (the
+    grandchild's Capped, or a Total at Max), so there may be more: Text is '<n>+' (review M6), else '<n>'.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param([AllowNull()]$Events, [Parameter(Mandatory)][System.Collections.IDictionary]$Spec, [int]$Least = 0)
+
+  $count = 0
+  $capped = $false
+  if ($Events -is [System.Collections.IDictionary] -and $Events[$Spec['Name']] -is [System.Collections.IDictionary]) {
+    $answer = $Events[$Spec['Name']]
+    $total = ConvertTo-ReportNumber -Value $answer['Total']
+    if ($null -ne $total) { $count = [int]$total }
+    $capped = ($answer['Capped'] -eq $true) -or ($count -ge [int]$Spec['Max'])
+  }
+  if ($Least -gt $count) { $count = $Least }
+  return @{ Count = $count; Capped = $capped; Text = $(if ($capped) { '{0}+' -f $count } else { [string]$count }) }
+}
+
 function Invoke-ReportNative {
   <#
   .SYNOPSIS
@@ -490,7 +581,7 @@ function Invoke-ReportNative {
       Add-ReportMissing -Section $Section -What $What -Why ('no file (exit {0})' -f (Format-ToolExitCode -ExitCode $result.ExitCode))
     }
   } catch {
-    Add-ReportMissing -Section $Section -What $What -Why $_.Exception.Message
+    Add-ReportMissing -Section $Section -What $What -Exception $_.Exception
   }
 }
 
@@ -513,7 +604,7 @@ function Get-ReportInternet {
                   ClockOffsetSeconds = (ConvertTo-ReportNumber -Value $check['ClockOffsetSeconds']); Clock = ($check['Clock'] -eq $true) }
     }
   } catch {
-    Add-ReportMissing -Section $Section -What 'Internet check' -Why $_.Exception.Message
+    Add-ReportMissing -Section $Section -What 'Internet check' -Exception $_.Exception
   }
   $Run.Data['Internet'] = $value
   return $value
@@ -524,7 +615,8 @@ function Get-ReportUser {
   .SYNOPSIS
     Private. The user signed in at the console (Get-SignedInUserName) and that account's SID (Get-ToolUserSid): its own
     hive, HKEY_USERS\<SID>, is read; never the elevated process's HKCU, which may be another account's (review I-12).
-    @{ Name; Sid; Error }, read once per run ($Run.Data.ReportUser; it stays out of result.json).
+    @{ Name; Sid; Error (a fixed reason, ConvertTo-ReportReason) }, read once per run ($Run.Data.ReportUser; it stays
+    out of result.json). The sections keep the SID as Items.SignedInSid (review M3: the privacy-safe copy masks it).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -536,13 +628,14 @@ function Get-ReportUser {
   try {
     $user['Name'] = ([string](Get-SignedInUserName)).Trim()
     if ($user['Name'] -eq '') {
-      $user['Error'] = 'no user is signed in at the console'
+      $user['Error'] = 'no signed-in user'
     } else {
       $sid = [string](Get-ToolUserSid -UserName $user['Name'])
-      if ($sid -match '^S-1-[0-9]+(-[0-9]+)+\z') { $user['Sid'] = $sid } else { $user['Error'] = 'the signed-in user has no SID here' }
+      if ($sid -match '^S-1-[0-9]+(-[0-9]+)+\z') { $user['Sid'] = $sid } else { $user['Error'] = 'no SID for the user' }
     }
   } catch {
-    $user['Error'] = ConvertTo-ScreenText -Text $_.Exception.Message
+    $user['Error'] = ConvertTo-ReportReason -Exception $_.Exception
+    Write-SetupLog -Level WARN -Message 'The signed-in user could not be read for the report' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
   $Run.Data['ReportUser'] = $user
   return $user
@@ -581,8 +674,10 @@ function Get-ToolCommandExecutable {
   <#
   .SYNOPSIS
     The program of a command line, never its arguments (a task's, a service's or a startup item's arguments may hold
-    tokens): the quoted part when it starts with a quote, else up to the first .exe, .com, .bat, .cmd, .ps1, .vbs,
-    .js, .dll, .msc or .scr, else its first word. Pure.
+    tokens): the quoted part when it starts with a quote; else, when it starts like a path (a drive, \\ or an
+    %variable%), up to the first .exe, .com, .bat, .cmd, .ps1, .vbs, .js, .dll, .msc or .scr (an unquoted path may
+    hold spaces), unless that part holds a switch (' -' or ' /': then the extension belongs to an argument; review
+    I1); else its first word. Pure.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -595,8 +690,8 @@ function Get-ToolCommandExecutable {
     if ($end -gt 1) { return $text.Substring(1, $end - 1) }
     return $text.Trim('"')
   }
-  $match = [regex]::Match($text, '^(.+?\.(exe|com|bat|cmd|ps1|vbs|js|dll|msc|scr))(\s|,|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-  if ($match.Success) { return $match.Groups[1].Value }
+  $match = [regex]::Match($text, '^((?:[A-Za-z]:\\|\\\\|%[^%\s]+%).*?\.(exe|com|bat|cmd|ps1|vbs|js|dll|msc|scr))(\s|,|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+  if ($match.Success -and $match.Groups[1].Value -notmatch '\s[-/]') { return $match.Groups[1].Value }
   return ($text -split '\s+', 2)[0]
 }
 
@@ -649,14 +744,14 @@ function Get-ReportData01 {
     $null = Invoke-ReportSource -Section $s -What 'Windows version (registry)' -Script {
       $build = ConvertTo-ReportNumber -Value (Get-RebootRegistryValue -Path $nt -Name 'CurrentBuild')
       if ($null -eq $build -or $build -le 0) { throw 'no build number in the registry' }
-      $product = ConvertTo-ReportText -Text (Get-RebootRegistryValue -Path $nt -Name 'ProductName')
+      $product = ConvertTo-ToolDisplayText -Text (Get-RebootRegistryValue -Path $nt -Name 'ProductName') -MaxLength 300
       if ($build -ge 22000) { $product = $product -replace 'Windows 10', 'Windows 11' }
       $buildText = Format-ReportNumber -Value $build -Format '0'
       $ubr = ConvertTo-ReportNumber -Value (Get-RebootRegistryValue -Path $nt -Name 'UBR')
       if ($null -ne $ubr) { $buildText += '.' + (Format-ReportNumber -Value $ubr -Format '0') }
-      $s.Facts['Windows'] = ('{0} {1}' -f $product, (ConvertTo-ReportText -Text (Get-RebootRegistryValue -Path $nt -Name 'DisplayVersion'))).Trim()
+      $s.Facts['Windows'] = ('{0} {1}' -f $product, (ConvertTo-ToolDisplayText -Text (Get-RebootRegistryValue -Path $nt -Name 'DisplayVersion') -MaxLength 300)).Trim()
       $s.Facts['Build'] = $buildText
-      $s.Facts['Edition'] = ConvertTo-ReportText -Text (Get-RebootRegistryValue -Path $nt -Name 'EditionID')
+      $s.Facts['Edition'] = ConvertTo-ToolDisplayText -Text (Get-RebootRegistryValue -Path $nt -Name 'EditionID') -MaxLength 300
       $installed = ConvertTo-ReportNumber -Value (Get-RebootRegistryValue -Path $nt -Name 'InstallDate')
       if ($null -ne $installed -and $installed -gt 0) { $s.Facts['Installed'] = Format-ReportDate -When ([DateTimeOffset]::FromUnixTimeSeconds([long]$installed).LocalDateTime) }
       $s.Items['OsBuild'] = [int]$build
@@ -666,7 +761,7 @@ function Get-ReportData01 {
       $os = @(Get-ReportCim -ClassName 'Win32_OperatingSystem') | Select-Object -First 1
       if ($null -eq $os) { throw 'no answer' }
       $s.Facts['Language'] = (@(foreach ($l in @($os.MUILanguages)) { [string]$l }) -join ', ')
-      $s.Facts['Architecture'] = ConvertTo-ReportText -Text $os.OSArchitecture
+      $s.Facts['Architecture'] = ConvertTo-ToolDisplayText -Text $os.OSArchitecture -MaxLength 300
       if ($os.LastBootUpTime -is [datetime]) {
         $days = ((Get-Date) - $os.LastBootUpTime).TotalDays
         $s.Facts['Last boot'] = Format-ReportDate -When $os.LastBootUpTime
@@ -677,16 +772,21 @@ function Get-ReportData01 {
     $null = Invoke-ReportSource -Section $s -What 'Computer (CIM)' -Script {
       $cs = @(Get-ReportCim -ClassName 'Win32_ComputerSystem') | Select-Object -First 1
       if ($null -eq $cs) { throw 'no answer' }
-      $s.Facts['Computer'] = ConvertTo-ReportText -Text $cs.Name
-      $s.Facts['Model'] = ('{0} {1}' -f (ConvertTo-ReportText -Text $cs.Manufacturer), (ConvertTo-ReportText -Text $cs.Model)).Trim()
-      if ($cs.PartOfDomain -eq $true) { $s.Facts['Domain'] = '{0} (domain)' -f (ConvertTo-ReportText -Text $cs.Domain) }
-      else { $s.Facts['Domain'] = '{0} (workgroup)' -f (ConvertTo-ReportText -Text $cs.Workgroup) }
+      $s.Facts['Computer'] = ConvertTo-ToolDisplayText -Text $cs.Name -MaxLength 300
+      $s.Facts['Model'] = ('{0} {1}' -f (ConvertTo-ToolDisplayText -Text $cs.Manufacturer -MaxLength 300), (ConvertTo-ToolDisplayText -Text $cs.Model -MaxLength 300)).Trim()
+      if ($cs.PartOfDomain -eq $true) {
+        $s.Facts['Domain'] = '{0} (domain)' -f (ConvertTo-ToolDisplayText -Text $cs.Domain -MaxLength 300)
+        # The domain's own name, for the privacy-safe copy (review M3); a workgroup has none.
+        $s.Items['Domain'] = ([string]$cs.Domain).Trim()
+      } else {
+        $s.Facts['Domain'] = '{0} (workgroup)' -f (ConvertTo-ToolDisplayText -Text $cs.Workgroup -MaxLength 300)
+      }
       $s.Items['ComputerName'] = [string]$cs.Name
     }
     $null = Invoke-ReportSource -Section $s -What 'BIOS (CIM)' -Script {
       $bios = @(Get-ReportCim -ClassName 'Win32_BIOS') | Select-Object -First 1
       if ($null -eq $bios) { throw 'no answer' }
-      $s.Facts['Serial'] = ConvertTo-ReportText -Text $bios.SerialNumber
+      $s.Facts['Serial'] = ConvertTo-ToolDisplayText -Text $bios.SerialNumber -MaxLength 300
       $s.Items['Serial'] = ([string]$bios.SerialNumber).Trim()
     }
     $identity = $Run.Args['Identity']
@@ -725,7 +825,7 @@ function Get-ReportData01 {
     }
     if (-not $Quick) { Invoke-ReportNative -Run $Run -Section $s -What 'systeminfo' -FilePath (Get-ToolSystemTool -Name 'systeminfo.exe') -OutputName 'systeminfo' }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -750,18 +850,18 @@ function Get-ReportData02 {
       if ($null -eq $bios) { throw 'no answer' }
       $date = ''
       if ($bios.ReleaseDate -is [datetime]) { $date = ' ({0})' -f $bios.ReleaseDate.ToString('dd/MM/yyyy', [Globalization.CultureInfo]::InvariantCulture) }
-      $s.Facts['BIOS'] = ('{0} {1}{2}' -f (ConvertTo-ReportText -Text $bios.Manufacturer), (ConvertTo-ReportText -Text $bios.SMBIOSBIOSVersion), $date).Trim()
+      $s.Facts['BIOS'] = ('{0} {1}{2}' -f (ConvertTo-ToolDisplayText -Text $bios.Manufacturer -MaxLength 300), (ConvertTo-ToolDisplayText -Text $bios.SMBIOSBIOSVersion -MaxLength 300), $date).Trim()
     }
     $null = Invoke-ReportSource -Section $s -What 'Board (CIM)' -Script {
       $board = @(Get-ReportCim -ClassName 'Win32_BaseBoard') | Select-Object -First 1
       if ($null -eq $board) { throw 'no answer' }
-      $s.Facts['Board'] = ('{0} {1}' -f (ConvertTo-ReportText -Text $board.Manufacturer), (ConvertTo-ReportText -Text $board.Product)).Trim()
+      $s.Facts['Board'] = ('{0} {1}' -f (ConvertTo-ToolDisplayText -Text $board.Manufacturer -MaxLength 300), (ConvertTo-ToolDisplayText -Text $board.Product -MaxLength 300)).Trim()
       $s.Items['BoardSerial'] = ([string]$board.SerialNumber).Trim()
     }
     $null = Invoke-ReportSource -Section $s -What 'CPU (CIM)' -Script {
       $cpus = @(Get-ReportCim -ClassName 'Win32_Processor')
       if ($cpus.Count -eq 0) { throw 'no answer' }
-      $text = '{0} ({1} cores, {2} threads)' -f (ConvertTo-ReportText -Text $cpus[0].Name), [int]$cpus[0].NumberOfCores, [int]$cpus[0].NumberOfLogicalProcessors
+      $text = '{0} ({1} cores, {2} threads)' -f (ConvertTo-ToolDisplayText -Text $cpus[0].Name -MaxLength 300), [int]$cpus[0].NumberOfCores, [int]$cpus[0].NumberOfLogicalProcessors
       if ($cpus.Count -gt 1) { $text += ' x{0}' -f $cpus.Count }
       $s.Facts['CPU'] = $text
     }
@@ -784,9 +884,9 @@ function Get-ReportData02 {
       foreach ($card in $cards) {
         $inf = [string]$card.InfFilename
         if ([string]::Equals($inf, 'display.inf', [StringComparison]::OrdinalIgnoreCase)) { $basic = $true }
-        if ($cards.Count -gt 1 -or $basic) { $s.Groups.Add(('GPU: {0}, driver {1} ({2})' -f (ConvertTo-ReportText -Text $card.Name), (ConvertTo-ReportText -Text $card.DriverVersion), (ConvertTo-ReportText -Text $inf))) }
+        if ($cards.Count -gt 1 -or $basic) { $s.Groups.Add(('GPU: {0}, driver {1} ({2})' -f (ConvertTo-ToolDisplayText -Text $card.Name -MaxLength 300), (ConvertTo-ToolDisplayText -Text $card.DriverVersion -MaxLength 300), (ConvertTo-ToolDisplayText -Text $inf -MaxLength 300))) }
       }
-      if ($cards.Count -gt 0) { $s.Facts['GPU'] = '{0} (driver {1})' -f (ConvertTo-ReportText -Text $cards[0].Name), (ConvertTo-ReportText -Text $cards[0].DriverVersion) }
+      if ($cards.Count -gt 0) { $s.Facts['GPU'] = '{0} (driver {1})' -f (ConvertTo-ToolDisplayText -Text $cards[0].Name -MaxLength 300), (ConvertTo-ToolDisplayText -Text $cards[0].DriverVersion -MaxLength 300) }
       $s.Items['BasicDisplay'] = $basic
     }
     if (-not $Quick) {
@@ -834,7 +934,7 @@ function Get-ReportData02 {
     } catch {
       $exception = $_.Exception
       if ($exception -is [PlatformNotSupportedException] -or $exception.InnerException -is [PlatformNotSupportedException]) { $secure = 'Unsupported' }
-      else { Add-ReportMissing -Section $s -What 'Secure Boot' -Why $exception.Message }
+      else { Add-ReportMissing -Section $s -What 'Secure Boot' -Exception $exception }
     }
     if ($secure -cne 'Unknown') {
       $s.Facts['Secure Boot'] = $(if ($secure -ceq 'Unsupported') { 'not supported (legacy BIOS)' } else { $secure })
@@ -848,7 +948,7 @@ function Get-ReportData02 {
         return
       }
       $ready = ($tpm.IsEnabled_InitialValue -eq $true) -and ($tpm.IsActivated_InitialValue -eq $true)
-      $version = ConvertTo-ReportText -Text ((([string]$tpm.SpecVersion) -split ',')[0])
+      $version = ConvertTo-ToolDisplayText -Text ((([string]$tpm.SpecVersion) -split ',')[0]) -MaxLength 300
       $s.Facts['TPM'] = '{0} ({1})' -f $(if ($ready) { 'ready' } else { 'not ready' }), $version
       $s.Items['TpmReady'] = $ready
     }
@@ -862,7 +962,7 @@ function Get-ReportData02 {
       $s.Facts['VBS'] = $(if ($running.Count -gt 0) { '{0} ({1})' -f $status, ($running -join ', ') } else { $status })
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -874,7 +974,8 @@ function Get-ReportData03 {
   .SYNOPSIS
     Section 03, Storage: the physical disks with their serials and counters (grandchildren diskInfo and diskCounters,
     toolStep.disks; the system disk is judged, ruling RD-R10, every disk listed), the disk events of the system disk
-    (Get-ToolDiskEventCount), the volumes (Win32_Volume: free space, dirty bit), TRIM, BitLocker's protection and
+    (grandchild diskEvents, toolStep.events, split by Get-ToolDiskEventSplit; review M4), the volumes (Win32_Volume:
+    free space, dirty bit), TRIM, BitLocker's protection and
     protector types, the page file and the restore points. Full: the read-only volume state (Get-Volume, the Health
     check's; ruling RD-R12: the report never scans) and vssadmin's lists to raw.
   #>
@@ -910,7 +1011,7 @@ function Get-ReportData03 {
         $c = $counters[[string]$d['DeviceId']]
         if ($c -isnot [System.Collections.IDictionary]) { $c = @{} }
         $row = [ordered]@{
-          Number = $(if ($null -ne $number) { [int]$number } else { $null }); System = $isSystem; Model = (ConvertTo-ReportText -Text $d['Model'] -MaxLength 100)
+          Number = $(if ($null -ne $number) { [int]$number } else { $null }); System = $isSystem; Model = (ConvertTo-ToolDisplayText -Text $d['Model'] -MaxLength 100)
           Serial = ([string]$d['Serial']).Trim(); Media = [string]$d['Media']; Bus = [string]$d['Bus']
           SizeGB = [math]::Round([double](ConvertTo-ReportNumber -Value $d['Size']) / 1GB, 1); Health = [string]$d['Health']
           Wear = (ConvertTo-ReportNumber -Value $c['Wear']); Temperature = (ConvertTo-ReportNumber -Value $c['Temperature'])
@@ -945,20 +1046,26 @@ function Get-ReportData03 {
       $s.Items['Disks'] = $rows.ToArray()
       if ($systemHealth -ne '') { $s.Items['DiskHealth'] = $systemHealth }
     }
-    $null = Invoke-ReportSource -Section $s -What 'Disk events' -Script {
-      $days = Get-ReportDays -Run $Run -Name 'diskEventDays' -Default 30
-      $events = Get-ToolDiskEventCount -Days $days -SystemDisks $systemDisks -SystemDrive $drive
-      if ($events['Ok'] -ne $true) { throw ([string]$events['Error']) }
-      $s.Items['DiskEvents'] = [string[]]@($events['Ids'])
-      $s.Facts['Disk events'] = '{0} on the system disk, {1} elsewhere ({2} days: disk 7, 51, 153, NTFS 55)' -f [int]$events['Count'], [int]$events['Other'], $days
+    # The disk events (spec 5, ruling RD-R10) in a grandchild (review M4: Get-WinEvent can stall), split here.
+    $diskDays = Get-ReportDays -Run $Run -Name 'diskEventDays' -Default 30
+    $diskSpec = New-ReportEventSpec -Name 'disk' -Label 'Disk events' -Log 'System' -Ids @(7, 51, 153, 55) -Providers @('disk', 'Ntfs', 'Microsoft-Windows-Ntfs') -Days $diskDays `
+      -Max 5000 -Mode rows -Keep 5000 -Props @(0)
+    $diskEvents = Get-ReportEvents -Run $Run -Section $s -What 'Disk events' -Name 'diskEvents' -Specs @($diskSpec)
+    if ($null -ne $diskEvents -and $null -ne $diskEvents['disk']) {
+      $rows = @(foreach ($r in (Get-ReportEventRows -Events $diskEvents -Name 'disk')) { @{ Provider = [string]$r['Provider']; Id = $r['Id']; First = [string]@($r['Props'])[0] } })
+      $split = Get-ToolDiskEventSplit -Events $rows -SystemDisks $systemDisks -SystemDrive $drive
+      $read = Get-ReportEventTotal -Events $diskEvents -Spec $diskSpec
+      $s.Items['DiskEvents'] = [string[]]@($split['Ids'])
+      $s.Facts['Disk events'] = '{0} on the system disk, {1} elsewhere ({2} days: disk 7, 51, 153, NTFS 55{3})' -f [int]$split['Count'], [int]$split['Other'], $diskDays,
+        $(if ($read['Capped']) { '; the newest {0} read' -f $diskSpec['Max'] } else { '' })
     }
     $null = Invoke-ReportSource -Section $s -What 'Volumes (CIM)' -Script {
       foreach ($v in @(Get-ReportCim -ClassName 'Win32_Volume')) {
         $name = [string]$v.DriveLetter
         if ($name -eq '') { continue }
-        $label = ConvertTo-ReportText -Text $v.Label -MaxLength 64
+        $label = ConvertTo-ToolDisplayText -Text $v.Label -MaxLength 64
         $dirty = $(if ($v.DirtyBitSet -eq $true) { 'yes' } elseif ($v.DirtyBitSet -eq $false) { 'no' } else { 'unknown' })
-        $s.Groups.Add(('Volume {0}{1} {2} {3}, {4} free, dirty {5}' -f $name, $(if ($label -ne '') { ' (' + $label + ')' } else { '' }), (ConvertTo-ReportText -Text $v.FileSystem),
+        $s.Groups.Add(('Volume {0}{1} {2} {3}, {4} free, dirty {5}' -f $name, $(if ($label -ne '') { ' (' + $label + ')' } else { '' }), (ConvertTo-ToolDisplayText -Text $v.FileSystem -MaxLength 300),
             (Format-ReportGB -Bytes $v.Capacity), (Format-ReportGB -Bytes $v.FreeSpace), $dirty))
         if ([string]::Equals($name, $drive, [StringComparison]::OrdinalIgnoreCase)) {
           $total = ConvertTo-ReportNumber -Value $v.Capacity
@@ -976,7 +1083,7 @@ function Get-ReportData03 {
     if (-not $Quick) {
       $state = Get-ToolVolumeState -Run $Run
       $s.Items['VolumeState'] = [string]$state['Verdict']
-      if ([string]$state['Verdict'] -ceq 'Unknown') { $s.Items['VolumeStateError'] = Get-ToolCheckError -Run $Run -Name 'volumeState' }
+      if ([string]$state['Verdict'] -ceq 'Unknown') { $s.Items['VolumeStateError'] = ConvertTo-ReportReason -Why (Get-ToolCheckError -Run $Run -Name 'volumeState') }
       if ($state['Dirty'] -is [bool]) { $s.Items['Dirty'] = [bool]$state['Dirty'] }
       $s.Facts['Volume state'] = '{0} (health {1})' -f $state['Verdict'], $(if ([string]$state['Health'] -ne '') { $state['Health'] } else { 'unknown' })
     }
@@ -1003,10 +1110,11 @@ function Get-ReportData03 {
         if (-not $missing.Contains($pageDrive) -and -not (Test-Path -LiteralPath ($pageDrive + '\'))) { $missing.Add($pageDrive) }
       }
       $s.Items['PageFile'] = @{ Files = $files.ToArray(); MissingDrives = $missing.ToArray(); Error = '' }
-      $usage = @(foreach ($u in @(Get-ReportCim -ClassName 'Win32_PageFileUsage')) { '{0} {1} MB (peak {2} MB)' -f (ConvertTo-ReportText -Text $u.Name), [int]$u.AllocatedBaseSize, [int]$u.PeakUsage })
+      $usage = @(foreach ($u in @(Get-ReportCim -ClassName 'Win32_PageFileUsage')) { '{0} {1} MB (peak {2} MB)' -f (ConvertTo-ToolDisplayText -Text $u.Name -MaxLength 300), [int]$u.AllocatedBaseSize, [int]$u.PeakUsage })
       $s.Facts['Page file'] = '{0}{1}' -f $(if ($files.Count -eq 0) { 'system managed' } else { $files.ToArray() -join ', ' }), $(if ($usage.Count -gt 0) { ': ' + ($usage -join ', ') } else { '' })
     } catch {
-      $s.Items['PageFile'] = @{ Files = @(); MissingDrives = @(); Error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+      $s.Items['PageFile'] = @{ Files = @(); MissingDrives = @(); Error = (ConvertTo-ReportReason -Exception $_.Exception) }
+      Write-SetupLog -Level WARN -Message 'The page file settings could not be read for the report' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     }
     $null = Invoke-ReportSource -Section $s -What 'Restore points (CIM)' -Script {
       $points = @(Get-ReportCim -Namespace 'root\default' -ClassName 'SystemRestore')
@@ -1023,7 +1131,7 @@ function Get-ReportData03 {
       Invoke-ReportNative -Run $Run -Section $s -What 'Shadow copy storage' -FilePath $vssadmin -ArgumentList 'list shadowstorage' -OutputName 'vssadmin-storage'
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1046,7 +1154,7 @@ function Get-ReportData04 {
   try {
     $winRe = Get-ToolWinReState -Run $Run
     $reason = ''
-    if ([string]$winRe['Bcd'] -ceq 'Unknown') { $reason = Get-ToolCheckError -Run $Run -Name 'bcd' }
+    if ([string]$winRe['Bcd'] -ceq 'Unknown') { $reason = ConvertTo-ReportReason -Why (Get-ToolCheckError -Run $Run -Name 'bcd') }
     $s.Items['WinRe'] = @{ Bcd = [string]$winRe['Bcd']; ReAgent = [string]$winRe['ReAgent']; Verdict = [string]$winRe['Verdict']; Error = $reason }
     $s.Items['SafeBoot'] = $winRe['SafeBoot']
     $s.Facts['WinRE'] = '{0} (boot configuration {1}, ReAgent.xml {2})' -f $winRe['Verdict'], $winRe['Bcd'], $winRe['ReAgent']
@@ -1093,7 +1201,7 @@ function Get-ReportData04 {
       foreach ($line in @(ConvertTo-EventGroups -Events $power)) { $s.Groups.Add($line) }
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1120,7 +1228,7 @@ function Get-ReportData05 {
       $rows = @(foreach ($q in @(Get-ReportCim -ClassName 'Win32_QuickFixEngineering')) {
           $when = [datetime]::MinValue
           $parsed = [datetime]::TryParseExact(([string]$q.InstalledOn).Trim(), [string[]]@('M/d/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd'), $invariant, [Globalization.DateTimeStyles]::None, [ref]$when)
-          [pscustomobject]@{ Id = (ConvertTo-ScreenText -Text $q.HotFixID); When = $(if ($parsed) { $when } else { $null }); Kind = (ConvertTo-ReportText -Text $q.Description -MaxLength 60) }
+          [pscustomobject]@{ Id = (ConvertTo-ScreenText -Text $q.HotFixID); When = $(if ($parsed) { $when } else { $null }); Kind = (ConvertTo-ToolDisplayText -Text $q.Description -MaxLength 60) }
         })
       $sorted = @($rows | Sort-Object -Property @{ Expression = { if ($null -eq $_.When) { [datetime]::MinValue } else { $_.When } }; Descending = $true })
       $s.Facts['Updates installed'] = [string]$rows.Count
@@ -1154,7 +1262,7 @@ function Get-ReportData05 {
         $services[$name] = @{ Status = [string]$service.Status; StartType = [string]$service.StartType }
         $s.Groups.Add(('Service {0}: {1}, {2}' -f $name, $service.StartType, $service.Status))
       } catch {
-        Add-ReportMissing -Section $s -What ('Service ' + $name) -Why $_.Exception.Message
+        Add-ReportMissing -Section $s -What ('Service ' + $name) -Exception $_.Exception
       }
     }
     $s.Items['WuServices'] = $services
@@ -1166,26 +1274,34 @@ function Get-ReportData05 {
       $s.Facts['SFC in CBS.log (30 days)'] = $(if (-not $cbs['Ran']) { 'no [SR] lines' } else {
           'verify complete {0}, {1} integrity problems, {2} repaired, {3} not repairable' -f $(if ($cbs['VerifyComplete']) { 'yes' } else { 'no' }), $cbs['Corrupt'], $cbs['Repaired'], $cbs['CannotRepair'] })
     }
+    if (-not $Quick) {
+      # The servicing logs' error lines come before the update events, so the size limit cuts the oldest events first
+      # (review M1).
+      foreach ($log in @(@('CBS.log', 'CbsLog'), @('dism.log', 'DismLog'))) {
+        foreach ($line in @(Read-ToolLogErrors -Path ([string]$script:ToolReportPaths[$log[1]]) -MaxLines 40)) { $s.Groups.Add(('{0}: {1}' -f $log[0], $line)) }
+      }
+    }
     $days = Get-ReportDays -Run $Run -Name 'eventDays' -Default 14
+    $wuSpec = New-ReportEventSpec -Name 'wu' -Label 'Windows Update events' -Log 'System' -Ids @(19, 20, 25, 31, 43, 44) -Providers @('Microsoft-Windows-WindowsUpdateClient') -Days $days -Max 2000 -Mode groups -Keep 100
     $specs = @(
-      (New-ReportEventSpec -Name 'wu' -Label 'Windows Update events' -Log 'System' -Ids @(19, 20, 25, 31, 43, 44) -Providers @('Microsoft-Windows-WindowsUpdateClient') -Days $days -Max 2000 -Mode groups -Keep 100)
+      $wuSpec
       (New-ReportEventSpec -Name 'wuFailed' -Label 'Failed updates' -Log 'System' -Ids @(20) -Providers @('Microsoft-Windows-WindowsUpdateClient') -Days $days -Max 200 -Mode rows -Keep 20 -Props @(0, 1)))
     $events = Get-ReportEvents -Run $Run -Section $s -What 'Windows Update events' -Name 'wuEvents' -Specs $specs
     if ($null -ne $events) {
+      foreach ($row in (Get-ReportEventRows -Events $events -Name 'wuFailed')) {
+        $s.Groups.Add(('Update failed {0}: {1} {2}' -f (Format-ReportDate -When (ConvertTo-ReportDateTime -Value $row['Time'])), (ConvertTo-ScreenText -Text @($row['Props'])[0]),
+            (ConvertTo-ToolDisplayText -Text @($row['Props'])[1] -MaxLength 150)))
+      }
       $groups = Get-ReportEventRows -Events $events -Name 'wu' -Part 'Groups'
       $installed = 0; $failed = 0
       foreach ($g in $groups) { if ([int]$g['Id'] -eq 19) { $installed += [int]$g['Count'] } elseif ([int]$g['Id'] -eq 20) { $failed += [int]$g['Count'] } }
-      $s.Facts['Update events'] = 'installed {0}, failed {1} ({2} days)' -f $installed, $failed, $days
+      $s.Facts['Update events'] = 'installed {0}, failed {1} ({2} days{3})' -f $installed, $failed, $days,
+        $(if ((Get-ReportEventTotal -Events $events -Spec $wuSpec)['Capped']) { '; the newest {0} read' -f $wuSpec['Max'] } else { '' })
       foreach ($line in @(ConvertTo-EventGroups -Events $groups)) { $s.Groups.Add($line) }
-      foreach ($row in (Get-ReportEventRows -Events $events -Name 'wuFailed')) {
-        $s.Groups.Add(('Update failed {0}: {1} {2}' -f (Format-ReportDate -When (ConvertTo-ReportDateTime -Value $row['Time'])), (ConvertTo-ScreenText -Text @($row['Props'])[0]),
-            (ConvertTo-ReportText -Text @($row['Props'])[1] -MaxLength 150)))
-      }
     }
     if (-not $Quick) {
       foreach ($log in @(@('CBS.log', 'CbsLog', 32MB), @('dism.log', 'DismLog', 16MB))) {
         $path = [string]$script:ToolReportPaths[$log[1]]
-        foreach ($line in @(Read-ToolLogErrors -Path $path -MaxLines 40)) { $s.Groups.Add(('{0}: {1}' -f $log[0], $line)) }
         $null = Invoke-ReportSource -Section $s -What ('{0} copy' -f $log[0]) -Script {
           if (Copy-ToolRawFile -Source $path -Destination ([IO.Path]::Combine((Get-ToolReportRawDir -Run $Run), $log[0])) -MaxBytes $log[2]) { $s.Raw.Add($log[0]) }
         }
@@ -1197,7 +1313,7 @@ function Get-ReportData05 {
       }
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1229,12 +1345,12 @@ function Get-ReportData06 {
       foreach ($d in $devices) {
         $code = ConvertTo-ReportNumber -Value $d['ConfigManagerErrorCode']
         if ($null -eq $code) { $code = 0 }
-        $name = ConvertTo-ReportText -Text $d['Name'] -MaxLength 200
-        if ($code -eq 22) { $disabled++; $s.Groups.Add(('Disabled device: {0} ({1})' -f $name, (ConvertTo-ReportText -Text $d['Class']))); continue }
+        $name = ConvertTo-ToolDisplayText -Text $d['Name'] -MaxLength 200
+        if ($code -eq 22) { $disabled++; $s.Groups.Add(('Disabled device: {0} ({1})' -f $name, (ConvertTo-ToolDisplayText -Text $d['Class'] -MaxLength 300))); continue }
         if ($code -le 0) { continue }
         $codes.Add([int]$code)
         if ($problem.Count -lt 50) { $problem.Add([ordered]@{ Id = [string]$d['InstanceId']; Name = $name; Class = [string]$d['Class']; Code = [int]$code }) }
-        $s.Groups.Add(('Problem device: {0} ({1}, code {2})' -f $name, (ConvertTo-ReportText -Text $d['Class']), [int]$code))
+        $s.Groups.Add(('Problem device: {0} ({1}, code {2})' -f $name, (ConvertTo-ToolDisplayText -Text $d['Class'] -MaxLength 300), [int]$code))
       }
       $unique = @($codes.ToArray() | Sort-Object -Unique)
       $s.Items['ProblemDevices'] = $problem.ToArray()
@@ -1252,7 +1368,7 @@ function Get-ReportData06 {
       $s.Items['GhostCount'] = $total
       $s.Facts['Disconnected devices'] = [string]$total
       if ($rows.Count -gt 0) {
-        $s.Groups.Add(('Disconnected by class: {0}' -f (@($rows | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, Class | ForEach-Object { '{0} {1}' -f (ConvertTo-ReportText -Text $_.Class), $_.Count }) -join ', ')))
+        $s.Groups.Add(('Disconnected by class: {0}' -f (@($rows | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, Class | ForEach-Object { '{0} {1}' -f (ConvertTo-ToolDisplayText -Text $_.Class -MaxLength 300), $_.Count }) -join ', ')))
       }
     }
     $days = Get-ReportDays -Run $Run -Name 'eventDays' -Default 14
@@ -1268,8 +1384,8 @@ function Get-ReportData06 {
         $s.Facts['Third-party drivers'] = [string]$rows.Count
         foreach ($d in @($rows | Sort-Object -Property @{ Expression = { [string]$_['Class'] } }, @{ Expression = { [string]$_['Provider'] } })) {
           $date = ConvertTo-ReportDateTime -Value $d['Date']
-          $line = 'Driver {0} ({1}): {2}, {3} {4} ({5})' -f (ConvertTo-ScreenText -Text $d['Driver']), (ConvertTo-ScreenText -Text $d['Original']), (ConvertTo-ReportText -Text $d['Class']),
-            (ConvertTo-ReportText -Text $d['Provider'] -MaxLength 80), (ConvertTo-ScreenText -Text $d['Version']), (Format-ReportDate -When $date)
+          $line = 'Driver {0} ({1}): {2}, {3} {4} ({5})' -f (ConvertTo-ScreenText -Text $d['Driver']), (ConvertTo-ScreenText -Text $d['Original']), (ConvertTo-ToolDisplayText -Text $d['Class'] -MaxLength 300),
+            (ConvertTo-ToolDisplayText -Text $d['Provider'] -MaxLength 80), (ConvertTo-ScreenText -Text $d['Version']), (Format-ReportDate -When $date)
           if ($null -ne $date -and $date -lt $limit -and $script:ReportCoreDriverClasses -contains [string]$d['Class']) { $old++; $line = 'Old core ' + $line.Substring(0, 1).ToLowerInvariant() + $line.Substring(1) }
           $s.Groups.Add($line)
         }
@@ -1283,7 +1399,7 @@ function Get-ReportData06 {
       }
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1299,63 +1415,82 @@ function Get-ReportData07 {
     hang), BugCheck 1001 by code, WHEA by ID and level, 6008, Application Error 1000 by app and module, Application
     Hang 1002; the crash dumps listed. Full: the newest 10 dumps copied, Reliability Monitor's records (grandchild
     reliability) and the System and Application logs of eventDays exported (wevtutil epl) to raw.
+  .DESCRIPTION
+    The details list the blue screens, WHEA, crashes, hangs, dumps and reliability records first and the System and
+    Application event groups last, so the core's size limit, which cuts a section's details from their end, drops the
+    oldest event groups before any crash line (review M1). A count whose query read its Max events (or kept fewer rows
+    than it counted) is a lower bound: '<n>+' in the facts, and its Item is named in Items.CappedCounts, which the
+    findings read (review M6).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param([Parameter(Mandatory)][hashtable]$Run, [Parameter(Mandatory)][bool]$Quick)
 
   $s = New-ReportSection -Id '07'
+  $eventLines = New-Object System.Collections.Generic.List[string]
+  $capped = New-Object System.Collections.Generic.List[string]
   try {
     $eventDays = Get-ReportDays -Run $Run -Name 'eventDays' -Default 14
     $days = $(if ($Quick) { Get-ReportDays -Run $Run -Name 'quickEventDays' -Default 7 } else { $eventDays })
     $crashDays = Get-ReportDays -Run $Run -Name 'crashDays' -Default 60
-    $groups = Get-ReportEvents -Run $Run -Section $s -What 'Error and warning events' -Name 'eventGroups' -Specs @(
+    $logSpecs = @(
       (New-ReportEventSpec -Name 'system' -Label 'System log' -Log 'System' -Levels @(1, 2, 3) -Days $days -Max 5000 -Mode groups -Keep 400)
       (New-ReportEventSpec -Name 'application' -Label 'Application log' -Log 'Application' -Levels @(1, 2, 3) -Days $days -Max 5000 -Mode groups -Keep 400))
-    foreach ($log in @(@('system', 'System'), @('application', 'Application'))) {
-      if ($null -eq $groups -or $null -eq $groups[$log[0]]) { continue }
-      $rows = Get-ReportEventRows -Events $groups -Name $log[0] -Part 'Groups'
-      $s.Facts[('{0} errors and warnings' -f $log[1])] = '{0} in {1} days' -f [int]$groups[$log[0]]['Total'], $days
-      foreach ($line in @(ConvertTo-EventGroups -Events $rows)) { $s.Groups.Add($line) }
+    $groups = Get-ReportEvents -Run $Run -Section $s -What 'Error and warning events' -Name 'eventGroups' -Specs $logSpecs
+    foreach ($pair in @(@($logSpecs[0], 'System'), @($logSpecs[1], 'Application'))) {
+      $spec = $pair[0]
+      if ($null -eq $groups -or $null -eq $groups[$spec['Name']]) { continue }
+      $total = Get-ReportEventTotal -Events $groups -Spec $spec
+      $s.Facts[('{0} errors and warnings' -f $pair[1])] = '{0} in {1} days{2}' -f $total['Text'], $days, $(if ($total['Capped']) { ' (the newest {0} read)' -f $spec['Max'] } else { '' })
+      foreach ($line in @(ConvertTo-EventGroups -Events (Get-ReportEventRows -Events $groups -Name $spec['Name'] -Part 'Groups'))) { $eventLines.Add($line) }
     }
 
-    $crash = Get-ReportEvents -Run $Run -Section $s -What 'Crash events' -Name 'crashEvents' -Specs @(
-      (New-ReportEventSpec -Name 'kp41' -Label 'Kernel-Power 41' -Log 'System' -Ids @(41) -Provider 'Microsoft-Windows-Kernel-Power' -Days $crashDays -Max 500 -Mode rows -Keep 200 -Names @('BugcheckCode'))
-      (New-ReportEventSpec -Name 'bugcheck' -Label 'Blue screens (1001)' -Log 'System' -Ids @(1001) -Providers @('Microsoft-Windows-WER-SystemErrorReporting', 'BugCheck') -Days $crashDays -Max 500 -Mode rows -Keep 200 -Props @(0))
-      (New-ReportEventSpec -Name 'whea' -Label 'WHEA' -Log 'System' -Provider 'Microsoft-Windows-WHEA-Logger' -Days $crashDays -Max 1000 -Mode rows -Keep 500)
-      (New-ReportEventSpec -Name 'shutdown' -Label 'Unexpected shutdowns (6008)' -Log 'System' -Ids @(6008) -Providers @('EventLog') -Days $crashDays -Max 200 -Mode rows -Keep 100)
-      (New-ReportEventSpec -Name 'appError' -Label 'Application crashes (1000)' -Log 'Application' -Ids @(1000) -Providers @('Application Error') -Days $crashDays -Max 1000 -Mode rows -Keep 500 -Props @(0, 3, 6))
-      (New-ReportEventSpec -Name 'appHang' -Label 'Application hangs (1002)' -Log 'Application' -Ids @(1002) -Providers @('Application Hang') -Days $crashDays -Max 500 -Mode rows -Keep 200 -Props @(0)))
+    $crashSpecs = [ordered]@{
+      kp41     = (New-ReportEventSpec -Name 'kp41' -Label 'Kernel-Power 41' -Log 'System' -Ids @(41) -Provider 'Microsoft-Windows-Kernel-Power' -Days $crashDays -Max 500 -Mode rows -Keep 200 -Names @('BugcheckCode'))
+      bugcheck = (New-ReportEventSpec -Name 'bugcheck' -Label 'Blue screens (1001)' -Log 'System' -Ids @(1001) -Providers @('Microsoft-Windows-WER-SystemErrorReporting', 'BugCheck') -Days $crashDays -Max 500 -Mode rows -Keep 200 -Props @(0))
+      whea     = (New-ReportEventSpec -Name 'whea' -Label 'WHEA' -Log 'System' -Provider 'Microsoft-Windows-WHEA-Logger' -Days $crashDays -Max 1000 -Mode rows -Keep 500)
+      shutdown = (New-ReportEventSpec -Name 'shutdown' -Label 'Unexpected shutdowns (6008)' -Log 'System' -Ids @(6008) -Providers @('EventLog') -Days $crashDays -Max 200 -Mode rows -Keep 100)
+      appError = (New-ReportEventSpec -Name 'appError' -Label 'Application crashes (1000)' -Log 'Application' -Ids @(1000) -Providers @('Application Error') -Days $crashDays -Max 1000 -Mode rows -Keep 500 -Props @(0, 3, 6))
+      appHang  = (New-ReportEventSpec -Name 'appHang' -Label 'Application hangs (1002)' -Log 'Application' -Ids @(1002) -Providers @('Application Hang') -Days $crashDays -Max 500 -Mode rows -Keep 200 -Props @(0))
+    }
+    $crash = Get-ReportEvents -Run $Run -Section $s -What 'Crash events' -Name 'crashEvents' -Specs @($crashSpecs.Values)
     if ($null -ne $crash) {
       if ($null -ne $crash['kp41']) {
         $rows = Get-ReportEventRows -Events $crash -Name 'kp41'
         $events41 = @(foreach ($r in $rows) {
             $code = ConvertTo-ReportNumber -Value $r['Data']['BugcheckCode']
             [ordered]@{ Time = [string]$r['Time']; BugcheckCode = $(if ($null -ne $code) { [long]$code } else { $null }) } })
-        $total = [math]::Max([int]$crash['kp41']['Total'], $events41.Count)
-        $losses = @($events41 | Where-Object { $null -eq $_.BugcheckCode -or $_.BugcheckCode -eq 0 }).Count + ($total - $events41.Count)
-        $s.Items['KernelPower41'] = $total
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['kp41'] -Least $events41.Count
+        $losses = @($events41 | Where-Object { $null -eq $_.BugcheckCode -or $_.BugcheckCode -eq 0 }).Count + ($total['Count'] - $events41.Count)
+        $s.Items['KernelPower41'] = $total['Count']
         $s.Items['KernelPower41Events'] = $events41
-        $s.Facts['Kernel-Power 41'] = '{0} in {1} days (power loss or hang: {2})' -f $total, $crashDays, $losses
+        if ($total['Capped']) { $capped.Add('KernelPower41') }
+        $s.Facts['Kernel-Power 41'] = '{0} in {1} days (power loss or hang: {2}{3})' -f $total['Text'], $crashDays, $losses, $(if ($total['Capped']) { '+' } else { '' })
       }
       if ($null -ne $crash['bugcheck']) {
         $blue = @(foreach ($r in (Get-ReportEventRows -Events $crash -Name 'bugcheck')) {
             $hex = [regex]::Match([string]@($r['Props'])[0], '0[xX][0-9A-Fa-f]{1,16}')
             [ordered]@{ Time = [string]$r['Time']; Code = $(if ($hex.Success) { ConvertTo-ReportBugcheck -Value $hex.Value } else { '' }) } })
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['bugcheck'] -Least $blue.Count
         $s.Items['BugChecks'] = $blue
-        $s.Facts['Blue screens'] = '{0} in {1} days' -f $blue.Count, $crashDays
+        if ($total['Capped'] -or $total['Count'] -gt $blue.Count) { $capped.Add('BugChecks') }
+        $s.Facts['Blue screens'] = '{0} in {1} days' -f $total['Text'], $crashDays
         foreach ($b in $blue) { $s.Groups.Add(('Blue screen {0}: {1}' -f (Format-ReportDate -When (ConvertTo-ReportDateTime -Value $b.Time)), $(if ($b.Code -ne '') { $b.Code } else { 'code unknown' }))) }
       }
       if ($null -ne $crash['whea']) {
         $whea = @(foreach ($r in (Get-ReportEventRows -Events $crash -Name 'whea')) { [ordered]@{ Time = [string]$r['Time']; Id = [int]$r['Id']; Level = [int]$r['Level'] } })
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['whea'] -Least $whea.Count
         $s.Items['Whea'] = $whea
-        $s.Facts['WHEA'] = '{0} events in {1} days' -f $whea.Count, $crashDays
+        if ($total['Capped'] -or $total['Count'] -gt $whea.Count) { $capped.Add('Whea') }
+        $s.Facts['WHEA'] = '{0} events in {1} days' -f $total['Text'], $crashDays
         foreach ($line in @(ConvertTo-EventGroups -Events @(foreach ($w in $whea) { @{ Provider = 'Microsoft-Windows-WHEA-Logger'; Id = $w.Id; Level = $w.Level; Time = $w.Time } }))) { $s.Groups.Add($line) }
       }
       if ($null -ne $crash['shutdown']) {
         $times = @(foreach ($r in (Get-ReportEventRows -Events $crash -Name 'shutdown')) { [string]$r['Time'] })
-        $s.Items['UnexpectedShutdowns'] = $times.Count
-        $s.Facts['Unexpected shutdowns (6008)'] = '{0} in {1} days' -f $times.Count, $crashDays
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['shutdown'] -Least $times.Count
+        $s.Items['UnexpectedShutdowns'] = $total['Count']
+        if ($total['Capped']) { $capped.Add('UnexpectedShutdowns') }
+        $s.Facts['Unexpected shutdowns (6008)'] = '{0} in {1} days' -f $total['Text'], $crashDays
       }
       if ($null -ne $crash['appError']) {
         $rows = Get-ReportEventRows -Events $crash -Name 'appError'
@@ -1363,16 +1498,18 @@ function Get-ReportData07 {
         $byPair = @{}
         foreach ($r in $rows) {
           $props = @($r['Props'])
-          $app = ConvertTo-ReportText -Text $props[0] -MaxLength 80
-          $module = ConvertTo-ReportText -Text $props[1] -MaxLength 80
+          $app = ConvertTo-ToolDisplayText -Text $props[0] -MaxLength 80
+          $module = ConvertTo-ToolDisplayText -Text $props[1] -MaxLength 80
           $byApp[$app] = 1 + [int]$byApp[$app]
           $pair = '{0} / {1}' -f $app, $module
           $byPair[$pair] = 1 + [int]$byPair[$pair]
         }
         $top = @($byApp.GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value }; Descending = $true }, @{ Expression = { $_.Key } } | Select-Object -First 1)
-        $s.Items['AppCrashes'] = [math]::Max([int]$crash['appError']['Total'], $rows.Count)
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['appError'] -Least $rows.Count
+        $s.Items['AppCrashes'] = $total['Count']
+        if ($total['Capped']) { $capped.Add('AppCrashes') }
         $s.Items['AppCrashTop'] = $(if ($top.Count -gt 0) { [string]$top[0].Key } else { '' })
-        $s.Facts['Application crashes'] = '{0} in {1} days' -f $s.Items['AppCrashes'], $crashDays
+        $s.Facts['Application crashes'] = '{0} in {1} days' -f $total['Text'], $crashDays
         foreach ($p in @($byPair.GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value }; Descending = $true }, @{ Expression = { $_.Key } } | Select-Object -First 30)) {
           $s.Groups.Add(('Application crash: {0} x{1}' -f $p.Key, $p.Value))
         }
@@ -1380,16 +1517,17 @@ function Get-ReportData07 {
       if ($null -ne $crash['appHang']) {
         $rows = Get-ReportEventRows -Events $crash -Name 'appHang'
         $byApp = @{}
-        foreach ($r in $rows) { $app = ConvertTo-ReportText -Text @($r['Props'])[0] -MaxLength 80; $byApp[$app] = 1 + [int]$byApp[$app] }
-        $s.Items['AppHangs'] = $rows.Count
-        $s.Facts['Application hangs'] = '{0} in {1} days' -f $rows.Count, $crashDays
+        foreach ($r in $rows) { $app = ConvertTo-ToolDisplayText -Text @($r['Props'])[0] -MaxLength 80; $byApp[$app] = 1 + [int]$byApp[$app] }
+        $total = Get-ReportEventTotal -Events $crash -Spec $crashSpecs['appHang'] -Least $rows.Count
+        $s.Items['AppHangs'] = $total['Count']
+        if ($total['Capped']) { $capped.Add('AppHangs') }
+        $s.Facts['Application hangs'] = '{0} in {1} days' -f $total['Text'], $crashDays
         foreach ($p in @($byApp.GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value }; Descending = $true }, @{ Expression = { $_.Key } } | Select-Object -First 20)) {
           $s.Groups.Add(('Application hang: {0} x{1}' -f $p.Key, $p.Value))
         }
       }
     }
 
-    $dumps = @()
     $null = Invoke-ReportSource -Section $s -What 'Crash dumps' -Script {
       $folder = [string]$script:ToolReportPaths['Minidump']
       $since = (Get-Date).AddDays(-$crashDays)
@@ -1424,7 +1562,7 @@ function Get-ReportData07 {
       $reliability = Get-ReportChild -Run $Run -Section $s -What 'Reliability records' -Name 'reliability' -Command ($script:ReportReliabilityCommand.Replace('<DAYS>', [string]$crashDays)) -StepTimeout 'events'
       if ($null -ne $reliability) {
         $records = @(foreach ($r in @($reliability['Items'])) { if ($r -is [System.Collections.IDictionary]) { $r } })
-        $s.Facts['Reliability records'] = '{0} in {1} days' -f $records.Count, $crashDays
+        $s.Facts['Reliability records'] = '{0}{1} in {2} days' -f $records.Count, $(if ($records.Count -ge 1000) { '+' } else { '' }), $crashDays
         foreach ($line in @(ConvertTo-EventGroups -Events @(foreach ($r in $records) { @{ Provider = ('Reliability ' + [string]$r['Source']); Id = $r['EventId']; Level = 0; Time = $r['Time']
                                                                                                 Message = ('{0}: {1}' -f [string]$r['Product'], [string]$r['Message']) } }) | Select-Object -First 60)) {
           $s.Groups.Add($line)
@@ -1437,8 +1575,11 @@ function Get-ReportData07 {
       }
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
+  # The event groups last (review M1), whatever else failed.
+  foreach ($line in $eventLines) { $s.Groups.Add($line) }
+  if ($capped.Count -gt 0) { $s.Items['CappedCounts'] = [string[]]$capped.ToArray() }
   return (Complete-ReportSection -Section $s)
 }
 
@@ -1482,8 +1623,8 @@ function Get-ReportData08 {
       $processes = @($sample['Processes'] | Where-Object { [string]$_.Name -notin '_Total', 'Idle' })
       $cpu = @($processes | Sort-Object -Property @{ Expression = { [double]$_.PercentProcessorTime }; Descending = $true } | Select-Object -First 15)
       $memory = @($processes | Sort-Object -Property @{ Expression = { [double]$_.WorkingSetPrivate }; Descending = $true } | Select-Object -First 15)
-      if ($cpu.Count -gt 0) { $s.Groups.Add(('Top CPU (% of one core): {0}' -f (@(foreach ($p in $cpu) { '{0} {1}' -f (ConvertTo-ReportText -Text $p.Name -MaxLength 60), [int]$p.PercentProcessorTime }) -join ', '))) }
-      if ($memory.Count -gt 0) { $s.Groups.Add(('Top memory (private MB): {0}' -f (@(foreach ($p in $memory) { '{0} {1}' -f (ConvertTo-ReportText -Text $p.Name -MaxLength 60), [math]::Round([double]$p.WorkingSetPrivate / 1MB) }) -join ', '))) }
+      if ($cpu.Count -gt 0) { $s.Groups.Add(('Top CPU (% of one core): {0}' -f (@(foreach ($p in $cpu) { '{0} {1}' -f (ConvertTo-ToolDisplayText -Text $p.Name -MaxLength 60), [int]$p.PercentProcessorTime }) -join ', '))) }
+      if ($memory.Count -gt 0) { $s.Groups.Add(('Top memory (private MB): {0}' -f (@(foreach ($p in $memory) { '{0} {1}' -f (ConvertTo-ToolDisplayText -Text $p.Name -MaxLength 60), [math]::Round([double]$p.WorkingSetPrivate / 1MB) }) -join ', '))) }
     }
     $scheme = ([string](Get-RebootRegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes' -Name 'ActivePowerScheme')).Trim().ToLowerInvariant()
     if ($scheme -ne '') {
@@ -1496,7 +1637,7 @@ function Get-ReportData08 {
       Invoke-ReportNative -Run $Run -Section $s -What 'Energy report' -FilePath $powercfg -ArgumentList '/energy /duration 30 /output "<RAW>\energy-report.html"' -File 'energy-report.html'
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1543,7 +1684,7 @@ function Get-ReportData09 {
       foreach ($a in $adapters) {
         $addresses = [string[]]@(foreach ($x in @($a['Addresses'])) { '{0}/{1}' -f $x['Ip'], $x['Prefix'] })
         $rows.Add([ordered]@{ Alias = [string]$a['Alias']; Mac = [string]$a['Mac']; Addresses = $addresses; Gateways = [string[]]@($a['Gateways']); Dns = [string[]]@($a['Dns']) })
-        $s.Groups.Add(('Adapter {0} ({1}): DHCP v4 {2}, v6 {3}; static {4}; gateways {5}; DNS {6}' -f (ConvertTo-ReportText -Text $a['Alias'] -MaxLength 64), $a['Mac'],
+        $s.Groups.Add(('Adapter {0} ({1}): DHCP v4 {2}, v6 {3}; static {4}; gateways {5}; DNS {6}' -f (ConvertTo-ToolDisplayText -Text $a['Alias'] -MaxLength 64), $a['Mac'],
             $(if ($a['Ipv4Dhcp']) { 'on' } else { 'off' }), $(if ($a['Ipv6Dhcp']) { 'on' } else { 'off' }), $(if ($addresses.Count) { $addresses -join ', ' } else { 'none' }),
             $(if (@($a['Gateways']).Count) { @($a['Gateways']) -join ', ' } else { 'none' }), $(if (@($a['Dns']).Count) { @($a['Dns']) -join ', ' } else { 'automatic' })))
       }
@@ -1551,7 +1692,13 @@ function Get-ReportData09 {
     }
     $state = Get-ReportChild -Run $Run -Section $s -What 'Network state' -Name 'netState' -Command $script:ReportNetStateCommand
     if ($null -ne $state) {
-      foreach ($e in @($state['Errors'])) { if ([string]$e -ne '') { Add-ReportMissing -Section $s -What 'Network state' -Why ([string]$e) } }
+      # Each failed part is '<part>: <Windows' message>': the part names the source, the message goes to the log only.
+      foreach ($e in @($state['Errors'])) {
+        if ([string]$e -eq '') { continue }
+        $part = ([string]$e -split ': ', 2)[0]
+        if ($part -notmatch '^[A-Za-z ]{1,40}\z') { $part = 'a part' }
+        Add-ReportMissing -Section $s -What ('Network state ({0})' -f $part) -Why ([string]$e)
+      }
       $off = New-Object System.Collections.Generic.List[string]
       $firewall = @(foreach ($f in @($state['Firewall'])) {
           if ($f -isnot [System.Collections.IDictionary]) { continue }
@@ -1561,11 +1708,11 @@ function Get-ReportData09 {
       if ($firewall.Count -gt 0) { $s.Facts['Firewall'] = $firewall -join ', ' }
       $s.Items['FirewallOff'] = [string[]]$off.ToArray()
       foreach ($p in @($state['Profiles'])) {
-        if ($p -is [System.Collections.IDictionary]) { $s.Groups.Add(('Connection {0} on {1}: {2}, IPv4 {3}, IPv6 {4}' -f (ConvertTo-ReportText -Text $p['Name'] -MaxLength 64), (ConvertTo-ReportText -Text $p['Alias'] -MaxLength 64), $p['Category'], $p['Ipv4'], $p['Ipv6'])) }
+        if ($p -is [System.Collections.IDictionary]) { $s.Groups.Add(('Connection {0} on {1}: {2}, IPv4 {3}, IPv6 {4}' -f (ConvertTo-ToolDisplayText -Text $p['Name'] -MaxLength 64), (ConvertTo-ToolDisplayText -Text $p['Alias'] -MaxLength 64), $p['Category'], $p['Ipv4'], $p['Ipv6'])) }
       }
-      $current = [string[]]@(foreach ($x in @($state['Addresses'])) { if ($x -is [System.Collections.IDictionary]) { $s.Groups.Add(('Address {0}: {1}/{2} ({3})' -f (ConvertTo-ReportText -Text $x['Alias'] -MaxLength 64), $x['Ip'], $x['Prefix'], $x['Origin'])); [string]$x['Ip'] } })
-      $gateways = [string[]]@(foreach ($g in @($state['Gateways'])) { if ($g -is [System.Collections.IDictionary]) { $s.Groups.Add(('Default route {0}: {1} (metric {2})' -f (ConvertTo-ReportText -Text $g['Alias'] -MaxLength 64), $g['NextHop'], $g['Metric'])); [string]$g['NextHop'] } })
-      $servers = [string[]]@(foreach ($d in @($state['Dns'])) { if ($d -is [System.Collections.IDictionary]) { $s.Groups.Add(('DNS {0}: {1}' -f (ConvertTo-ReportText -Text $d['Alias'] -MaxLength 64), (@($d['Servers']) -join ', '))); foreach ($x in @($d['Servers'])) { [string]$x } } })
+      $current = [string[]]@(foreach ($x in @($state['Addresses'])) { if ($x -is [System.Collections.IDictionary]) { $s.Groups.Add(('Address {0}: {1}/{2} ({3})' -f (ConvertTo-ToolDisplayText -Text $x['Alias'] -MaxLength 64), $x['Ip'], $x['Prefix'], $x['Origin'])); [string]$x['Ip'] } })
+      $gateways = [string[]]@(foreach ($g in @($state['Gateways'])) { if ($g -is [System.Collections.IDictionary]) { $s.Groups.Add(('Default route {0}: {1} (metric {2})' -f (ConvertTo-ToolDisplayText -Text $g['Alias'] -MaxLength 64), $g['NextHop'], $g['Metric'])); [string]$g['NextHop'] } })
+      $servers = [string[]]@(foreach ($d in @($state['Dns'])) { if ($d -is [System.Collections.IDictionary]) { $s.Groups.Add(('DNS {0}: {1}' -f (ConvertTo-ToolDisplayText -Text $d['Alias'] -MaxLength 64), (@($d['Servers']) -join ', '))); foreach ($x in @($d['Servers'])) { [string]$x } } })
       $s.Items['CurrentAddresses'] = $current
       $s.Items['Gateways'] = $gateways
       $s.Items['DnsServers'] = $servers
@@ -1581,7 +1728,7 @@ function Get-ReportData09 {
         $category = switch ([int](ConvertTo-ReportNumber -Value $p['Values']['Category'])) { 0 { 'Public' } 1 { 'Private' } 2 { 'Domain' } default { 'unknown' } }
         $known.Add([ordered]@{ Name = $name; Type = $type; Category = $category })
         if ($type -eq 'wireless') { $ssids.Add($name) }
-        $s.Groups.Add(('Known network {0} ({1}, {2})' -f (ConvertTo-ReportText -Text $name -MaxLength 64), $type, $category))
+        $s.Groups.Add(('Known network {0} ({1}, {2})' -f (ConvertTo-ToolDisplayText -Text $name -MaxLength 64), $type, $category))
       }
       $s.Items['NetworkProfiles'] = $known.ToArray()
       $s.Items['Ssids'] = [string[]]$ssids.ToArray()
@@ -1606,14 +1753,14 @@ function Get-ReportData09 {
           if ($clean -ne '') { $clean } })
       $s.Items['HostsEntries'] = $active.Count
       $s.Facts['Hosts file'] = '{0} active entries' -f $active.Count
-      foreach ($line in @($active | Select-Object -First 20)) { $s.Groups.Add('hosts: ' + (ConvertTo-ReportText -Text $line -MaxLength 200)) }
+      foreach ($line in @($active | Select-Object -First 20)) { $s.Groups.Add('hosts: ' + (ConvertTo-ToolDisplayText -Text $line -MaxLength 200)) }
     }
     $tcp = Get-ReportChild -Run $Run -Section $s -What 'TCP connections' -Name 'tcp' -Command $script:ReportTcpCommand
     if ($null -ne $tcp) {
       $byProcess = @{}
       foreach ($r in @($tcp['Items'])) {
         if ($r -isnot [System.Collections.IDictionary]) { continue }
-        $name = ConvertTo-ReportText -Text $r['Process'] -MaxLength 60
+        $name = ConvertTo-ToolDisplayText -Text $r['Process'] -MaxLength 60
         if (-not $byProcess.ContainsKey($name)) { $byProcess[$name] = @{ Total = 0; States = [ordered]@{} } }
         $byProcess[$name].Total += [int]$r['Count']
         $byProcess[$name].States[[string]$r['State']] = [int]$r['Count']
@@ -1626,7 +1773,7 @@ function Get-ReportData09 {
     $s.Items['Smb1'] = ($null -ne $smb -and [string]$smb -ne '4')
     $s.Facts['SMBv1'] = $(if ($null -eq $smb) { 'not installed' } elseif ([string]$smb -eq '4') { 'off' } else { 'on (start {0})' -f (ConvertTo-ScreenText -Text $smb) })
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1653,6 +1800,8 @@ function Get-ReportData10 {
     $user = Get-ReportUser -Run $Run
     $userHive = $(if ([string]$user['Sid'] -ne '') { 'Registry::HKEY_USERS\' + $user['Sid'] } else { '' })
     if ([string]$user['Name'] -ne '') { $s.Items['SignedInUser'] = [string]$user['Name'] }
+    # The SID is in task names and paths (OneDrive's and Google Update's tasks): the privacy-safe copy masks it (M3).
+    if ([string]$user['Sid'] -ne '') { $s.Items['SignedInSid'] = [string]$user['Sid'] }
 
     $keys = New-Object System.Collections.Generic.List[string]
     foreach ($k in $script:ToolMachineUninstallKeys) { $keys.Add($k) }
@@ -1665,9 +1814,9 @@ function Get-ReportData10 {
         $entries = Read-ToolRegistrySubkeys -Path $key
         foreach ($e in @($entries)) {
           $v = $e['Values']
-          $name = ConvertTo-ReportText -Text $v['DisplayName'] -MaxLength 150
+          $name = ConvertTo-ToolDisplayText -Text $v['DisplayName'] -MaxLength 150
           if ($name -eq '' -or (ConvertTo-ReportNumber -Value $v['SystemComponent']) -eq 1 -or [string]$v['ParentKeyName'] -ne '') { continue }
-          $version = ConvertTo-ReportText -Text $v['DisplayVersion'] -MaxLength 50
+          $version = ConvertTo-ToolDisplayText -Text $v['DisplayVersion'] -MaxLength 50
           $id = $name + '|' + $version
           if ($seen.ContainsKey($id)) { continue }
           $seen[$id] = $true
@@ -1676,10 +1825,10 @@ function Get-ReportData10 {
           if ([datetime]::TryParseExact([string]$v['InstallDate'], 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$when)) {
             $installed = $when.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
           }
-          $programs.Add([ordered]@{ Name = $name; Version = $version; Publisher = (ConvertTo-ReportText -Text $v['Publisher'] -MaxLength 100); InstallDate = $installed })
+          $programs.Add([ordered]@{ Name = $name; Version = $version; Publisher = (ConvertTo-ToolDisplayText -Text $v['Publisher'] -MaxLength 100); InstallDate = $installed })
         }
       } catch {
-        Add-ReportMissing -Section $s -What 'Installed programs' -Why $_.Exception.Message
+        Add-ReportMissing -Section $s -What 'Installed programs' -Exception $_.Exception
       }
     }
     $sorted = @($programs.ToArray() | Sort-Object -Property @{ Expression = { $_.Name } })
@@ -1732,10 +1881,10 @@ function Get-ReportData10 {
         foreach ($name in @($values.Keys | Sort-Object)) {
           if ([string]$name -eq '') { continue }
           $program = Get-ToolCommandExecutable -Command ([string]$values[$name])
-          $startup.Add([ordered]@{ Name = (ConvertTo-ReportText -Text $name -MaxLength 100); Program = (ConvertTo-ReportText -Text $program -MaxLength 260); Where = $pair[0] })
+          $startup.Add([ordered]@{ Name = (ConvertTo-ToolDisplayText -Text $name -MaxLength 100); Program = (ConvertTo-ToolDisplayText -Text $program -MaxLength 260); Where = $pair[0] })
         }
       } catch {
-        Add-ReportMissing -Section $s -What ('Startup ' + $pair[0]) -Why $_.Exception.Message
+        Add-ReportMissing -Section $s -What ('Startup ' + $pair[0]) -Exception $_.Exception
       }
     }
     $folders = @(, @('Startup folder (all users)', [string]$script:ToolReportPaths['CommonStartup']))
@@ -1749,7 +1898,7 @@ function Get-ReportData10 {
           foreach ($path in [IO.Directory]::GetFiles($pair[1])) {
             $leaf = [IO.Path]::GetFileName($path)
             if ($leaf -ieq 'desktop.ini') { continue }
-            $startup.Add([ordered]@{ Name = (ConvertTo-ReportText -Text $leaf -MaxLength 100); Program = ''; Where = $pair[0] })
+            $startup.Add([ordered]@{ Name = (ConvertTo-ToolDisplayText -Text $leaf -MaxLength 100); Program = ''; Where = $pair[0] })
           }
         }
       }
@@ -1762,8 +1911,8 @@ function Get-ReportData10 {
     if ($null -ne $tasks) {
       $rows = @(foreach ($t in @($tasks['Items'])) {
           if ($t -isnot [System.Collections.IDictionary]) { continue }
-          $programsOfTask = @(foreach ($x in @($t['Execute'])) { $p = Get-ToolCommandExecutable -Command ([string]$x); if ($p -ne '') { ConvertTo-ReportText -Text $p -MaxLength 260 } })
-          [ordered]@{ Name = (ConvertTo-ReportText -Text $t['Name'] -MaxLength 150); Path = (ConvertTo-ReportText -Text $t['Path'] -MaxLength 150); State = [string]$t['State']; Execute = ($programsOfTask -join ', ') } })
+          $programsOfTask = @(foreach ($x in @($t['Execute'])) { $p = Get-ToolCommandExecutable -Command ([string]$x); if ($p -ne '') { ConvertTo-ToolDisplayText -Text $p -MaxLength 260 } })
+          [ordered]@{ Name = (ConvertTo-ToolDisplayText -Text $t['Name'] -MaxLength 150); Path = (ConvertTo-ToolDisplayText -Text $t['Path'] -MaxLength 150); State = [string]$t['State']; Execute = ($programsOfTask -join ', ') } })
       $s.Items['Tasks'] = $rows
       $s.Facts['Scheduled tasks (not Microsoft)'] = [string]$rows.Count
       foreach ($t in $rows) { $s.Groups.Add(('Task {0}{1}: {2} ({3})' -f $t.Path, $t.Name, $t.Execute, $t.State)) }
@@ -1779,7 +1928,7 @@ function Get-ReportData10 {
         $expanded = [Environment]::ExpandEnvironmentVariables($program)
         if ([string]$service.StartMode -eq 'Auto' -and [string]$service.State -ne 'Running' -and $name -notmatch $script:ReportServiceIgnore) { $stopped.Add((ConvertTo-ScreenText -Text $name)) }
         if ($expanded -ne '' -and -not $expanded.StartsWith($windows, [StringComparison]::OrdinalIgnoreCase)) {
-          $own.Add([ordered]@{ Name = (ConvertTo-ReportText -Text $name -MaxLength 100); StartMode = [string]$service.StartMode; State = [string]$service.State; Program = (ConvertTo-ReportText -Text $program -MaxLength 260) })
+          $own.Add([ordered]@{ Name = (ConvertTo-ToolDisplayText -Text $name -MaxLength 100); StartMode = [string]$service.StartMode; State = [string]$service.State; Program = (ConvertTo-ToolDisplayText -Text $program -MaxLength 260) })
         }
       }
       $s.Items['Services'] = $own.ToArray()
@@ -1794,7 +1943,7 @@ function Get-ReportData10 {
       if ($null -ne $appx) {
         $apps = @(foreach ($a in @($appx['Items'])) { if ($a -is [System.Collections.IDictionary]) { $a } })
         $s.Facts['Store apps'] = [string]$apps.Count
-        foreach ($a in @($apps | Sort-Object -Property @{ Expression = { [string]$_['Name'] } })) { $s.Groups.Add(('App {0} {1}' -f (ConvertTo-ReportText -Text $a['Name'] -MaxLength 120), (ConvertTo-ScreenText -Text $a['Version']))) }
+        foreach ($a in @($apps | Sort-Object -Property @{ Expression = { [string]$_['Name'] } })) { $s.Groups.Add(('App {0} {1}' -f (ConvertTo-ToolDisplayText -Text $a['Name'] -MaxLength 120), (ConvertTo-ScreenText -Text $a['Version']))) }
       }
       $features = Get-ReportChild -Run $Run -Section $s -What 'Optional features' -Name 'features' -Command $script:ReportFeaturesCommand
       if ($null -ne $features) {
@@ -1806,37 +1955,17 @@ function Get-ReportData10 {
       if ($null -ne $printers) {
         $list = @(foreach ($p in @($printers['Items'])) { if ($p -is [System.Collections.IDictionary]) { $p } })
         $s.Facts['Printers'] = [string]$list.Count
-        foreach ($p in $list) { $s.Groups.Add(('Printer {0} ({1}, {2}{3})' -f (ConvertTo-ReportText -Text $p['Name'] -MaxLength 120), (ConvertTo-ReportText -Text $p['Driver'] -MaxLength 120), (ConvertTo-ReportText -Text $p['Port'] -MaxLength 80), $(if ($p['Shared'] -eq $true) { ', shared' } else { '' }))) }
+        foreach ($p in $list) { $s.Groups.Add(('Printer {0} ({1}, {2}{3})' -f (ConvertTo-ToolDisplayText -Text $p['Name'] -MaxLength 120), (ConvertTo-ToolDisplayText -Text $p['Driver'] -MaxLength 120), (ConvertTo-ToolDisplayText -Text $p['Port'] -MaxLength 80), $(if ($p['Shared'] -eq $true) { ', shared' } else { '' }))) }
       }
     }
     foreach ($p in $sorted) { $s.Groups.Add(('Program {0} {1}{2}' -f $p.Name, $p.Version, $(if ($p.Publisher -ne '') { ' (' + $p.Publisher + ')' } else { '' }))) }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
 
 # --- 11 Security ---------------------------------------------------------------------------------------------------
-
-function Get-ToolAdminMembersAdsi {
-  <#
-  .SYNOPSIS
-    Seam. The members of the local Administrators group through ADSI (the WinNT provider), when Get-LocalGroupMember
-    fails (it does on a group that holds an orphaned domain account): the group is found by its SID S-1-5-32-544,
-    translated to this PC's (localized) name. @( @{ Name; Sid } ). Throws when it cannot be read.
-  #>
-  [CmdletBinding()]
-  param()
-
-  $account = ([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
-  $group = [ADSI]('WinNT://./{0},group' -f ($account -split '\\')[-1])
-  foreach ($member in @($group.psbase.Invoke('Members'))) {
-    $name = [string]$member.GetType().InvokeMember('Name', 'GetProperty', $null, $member, $null)
-    $sid = ''
-    try { $sid = (New-Object Security.Principal.SecurityIdentifier($member.GetType().InvokeMember('objectSid', 'GetProperty', $null, $member, $null), 0)).Value } catch { $sid = '' }
-    @{ Name = $name; Sid = $sid }
-  }
-}
 
 function Get-ReportData11 {
   <#
@@ -1844,7 +1973,8 @@ function Get-ReportData11 {
     Section 11, Security: Defender (Get-MpComputerStatus, grandchild defender), the antivirus products Windows Security
     knows (root\SecurityCenter2; Defender by its windowsdefender:// path), UAC, Smart App Control, the local users
     (Win32_UserAccount; the Guest account by its SID, -501), the Administrators group by its SID S-1-5-32-544
-    (Get-LocalGroupMember -SID, else ADSI on the translated name), the profiles, automatic sign-in (AutoAdminLogon only:
+    (grandchild admins: Get-LocalGroupMember -SID, else ADSI on the translated name; review M4), the signed-in user and
+    their SID, the profiles, automatic sign-in (AutoAdminLogon only:
     its password is never read), Remote Desktop and NLA, and the join state (domain, Entra ID). Full: gpresult /h and
     dsregcmd /status to raw.
   #>
@@ -1865,7 +1995,7 @@ function Get-ReportData11 {
     $null = Invoke-ReportSource -Section $s -What 'Antivirus products (CIM)' -Script {
       $products = @(foreach ($p in @(Get-ReportCim -Namespace 'root\SecurityCenter2' -ClassName 'AntiVirusProduct')) {
           $state = [long](ConvertTo-ReportNumber -Value $p.productState)
-          [ordered]@{ Name = (ConvertTo-ReportText -Text $p.displayName -MaxLength 100); Defender = ([string]$p.pathToSignedProductExe).StartsWith('windowsdefender:', [StringComparison]::OrdinalIgnoreCase)
+          [ordered]@{ Name = (ConvertTo-ToolDisplayText -Text $p.displayName -MaxLength 100); Defender = ([string]$p.pathToSignedProductExe).StartsWith('windowsdefender:', [StringComparison]::OrdinalIgnoreCase)
                       Enabled = ((($state -shr 12) -band 0xF) -eq 1); UpToDate = ((($state -shr 4) -band 0xF) -eq 0) } })
       $s.Items['AvProducts'] = $products
       $s.Facts['Antivirus'] = $(if ($products.Count -eq 0) { 'none registered' } else {
@@ -1884,7 +2014,7 @@ function Get-ReportData11 {
       $texts = New-Object System.Collections.Generic.List[string]
       $guest = $false
       foreach ($u in @(Get-ReportCim -ClassName 'Win32_UserAccount' -Filter 'LocalAccount=True')) {
-        $name = ConvertTo-ReportText -Text $u.Name -MaxLength 100
+        $name = ConvertTo-ToolDisplayText -Text $u.Name -MaxLength 100
         $sid = [string]$u.SID
         $names.Add($name)
         if ($sid -match '-501\z' -and $u.Disabled -ne $true) { $guest = $true }
@@ -1894,27 +2024,24 @@ function Get-ReportData11 {
       $s.Items['GuestEnabled'] = $guest
       $s.Facts['Local users'] = $texts.ToArray() -join ', '
     }
-    $admins = $null
-    try {
-      $admins = @(foreach ($m in @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)) { @{ Name = [string]$m.Name; Sid = [string]$m.SID; Source = [string]$m.PrincipalSource } })
-    } catch {
-      Write-SetupLog -Level WARN -Message 'Get-LocalGroupMember failed; reading the Administrators through ADSI' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
-      try {
-        $admins = @(foreach ($m in @(Get-ToolAdminMembersAdsi)) { @{ Name = [string]$m['Name']; Sid = [string]$m['Sid']; Source = 'ADSI' } })
-      } catch {
-        Add-ReportMissing -Section $s -What 'Administrators' -Why $_.Exception.Message
+    $group = Get-ReportChild -Run $Run -Section $s -What 'Administrators' -Name 'admins' -Command $script:ReportAdminsCommand
+    if ($null -ne $group) {
+      $viaAdsi = ([string]$group['Source'] -ceq 'ADSI')
+      if ($viaAdsi) {
+        Write-SetupLog -Level WARN -Message 'Get-LocalGroupMember failed; the Administrators were read through ADSI' -Data @{ error = (ConvertTo-ScreenText -Text $group['LocalError']) }
       }
-    }
-    if ($null -ne $admins) {
+      $admins = @(foreach ($m in @($group['Items'])) {
+          if ($m -is [System.Collections.IDictionary]) { @{ Name = [string]$m['Name']; Sid = [string]$m['Sid']; Source = [string]$m['Source'] } } })
       $s.Items['Admins'] = $admins
-      $s.Facts['Administrators'] = (@(foreach ($a in $admins) { ConvertTo-ReportText -Text $a['Name'] -MaxLength 100 }) -join ', ')
+      $s.Facts['Administrators'] = '{0}{1}' -f (@(foreach ($a in $admins) { ConvertTo-ToolDisplayText -Text $a['Name'] -MaxLength 100 }) -join ', '), $(if ($viaAdsi) { ' (read through ADSI)' } else { '' })
     }
     $null = Invoke-ReportSource -Section $s -What 'Profiles (registry)' -Script {
       $profiles = Read-ToolRegistrySubkeys -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
       $s.Items['Profiles'] = [string[]]@(foreach ($p in @($profiles)) { if ([string]$p['Name'] -match '^S-1-5-21-') { [string]$p['Values']['ProfileImagePath'] } })
     }
     $user = Get-ReportUser -Run $Run
-    if ([string]$user['Name'] -ne '') { $s.Items['SignedInUser'] = [string]$user['Name']; $s.Facts['Signed in'] = ConvertTo-ReportText -Text $user['Name'] -MaxLength 100 }
+    if ([string]$user['Name'] -ne '') { $s.Items['SignedInUser'] = [string]$user['Name']; $s.Facts['Signed in'] = ConvertTo-ToolDisplayText -Text $user['Name'] -MaxLength 100 }
+    if ([string]$user['Sid'] -ne '') { $s.Items['SignedInSid'] = [string]$user['Sid'] }
 
     # Presence only: Winlogon's other values (the password among them) are never read.
     $s.Items['AutoLogon'] = ([string](Get-RebootRegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'AutoAdminLogon')).Trim() -eq '1'
@@ -1927,7 +2054,7 @@ function Get-ReportData11 {
     $null = Invoke-ReportSource -Section $s -What 'Join state' -Script {
       $cs = @(Get-ReportCim -ClassName 'Win32_ComputerSystem') | Select-Object -First 1
       $joined = Read-ToolRegistrySubkeys -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo'
-      $domain = $(if ($null -ne $cs -and $cs.PartOfDomain -eq $true) { 'domain ' + (ConvertTo-ReportText -Text $cs.Domain) } else { 'workgroup' })
+      $domain = $(if ($null -ne $cs -and $cs.PartOfDomain -eq $true) { 'domain ' + (ConvertTo-ToolDisplayText -Text $cs.Domain -MaxLength 300) } else { 'workgroup' })
       $s.Facts['Join'] = '{0}, {1}' -f $domain, $(if (@($joined).Count -gt 0) { 'Entra ID joined' } else { 'not Entra ID joined' })
     }
     if (-not $Quick) {
@@ -1935,7 +2062,7 @@ function Get-ReportData11 {
       Invoke-ReportNative -Run $Run -Section $s -What 'Device registration' -FilePath (Get-ToolSystemTool -Name 'dsregcmd.exe') -ArgumentList '/status' -OutputName 'dsregcmd'
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }
@@ -1961,7 +2088,7 @@ function Get-ReportData12 {
       if ($s.Raw.Count -gt 0) { $s.Facts['msinfo32'] = $s.Raw.ToArray() -join ', ' }
     }
   } catch {
-    Add-ReportMissing -Section $s -What 'This section' -Why $_.Exception.Message
+    Add-ReportMissing -Section $s -What 'This section' -Exception $_.Exception
   }
   return (Complete-ReportSection -Section $s)
 }

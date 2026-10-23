@@ -11,7 +11,7 @@
                        "toolStep": { "native": 3, "grandchild": 3, "disks": 1, "volumeScan": 60, "imageCheck": 15, "imageScan": 60, "dism": 150,
                                      "sfc": 90, "timeSync": 3, "pnpScan": 5, "componentCleanup": 90, "retrim": 30, "wuScan": 15,
                                      "service": 2, "pnputil": 2, "ghostList": 8, "drivers": 10, "printers": 1, "events": 5,
-                                     "msinfo32": 4, "wuLog": 5 } },
+                                     "msinfo32": 4, "wuLog": 5, "zip": 15 } },
   "power": { "finalAcMonitorMinutes": 15 },
   "windowsUpdate": { "installMode": "OneAtATime" },
   "freshInstall": { "maxInstallAgeDays": 14, "maxUserDataGB": 1 },

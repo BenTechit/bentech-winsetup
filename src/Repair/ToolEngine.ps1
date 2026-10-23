@@ -35,7 +35,8 @@
 #
 # Needs Logging (Write-SetupLog, Initialize-SetupLog), Activity (Read-FileTail, Register-SetupTick), Process
 # (Invoke-External), Winget (Invoke-PowerShellChild, ConvertTo-PowerShellLiteral), Config (Read-SetupConfig), State
-# (ConvertTo-HashtableDeep), Reboot (Get-ServicingRebootSignals), StartScreen (ConvertTo-ScreenText), Strings
+# (ConvertTo-HashtableDeep), Reboot (Get-ServicingRebootSignals), StartScreen (ConvertTo-ScreenText,
+# $script:DirectionMarksPattern), Strings
 # ($script:ToolboxStrings) and Cleanup (Test-StickReparsePoint). The bundle holds every file.
 
 # The actions and their steps (repair plan, "Actions and steps"). Each task adds its own rows:
@@ -262,9 +263,10 @@ function ConvertFrom-ToolJsonHtmlEscapes {
 function ConvertTo-ToolDisplayText {
   <#
   .SYNOPSIS
-    A display-only name (a device's, an adapter's) with its real text kept for the window (RD-R21): every control
-    character becomes a space, the ends are trimmed, and it is cut to -MaxLength UTF-16 code units, never between
-    the two halves of a surrogate pair. $null is ''. No decision may read it; a log line still takes
+    A display-only name (a device's, an adapter's, a report value's) with its real text kept for the window and the
+    report (RD-R21): the direction marks Hebrew Windows adds are dropped ($script:DirectionMarksPattern, StartScreen),
+    every control character becomes a space, the ends are trimmed, and it is cut to -MaxLength UTF-16 code units,
+    never between the two halves of a surrogate pair. $null is ''. No decision may read it; a log line still takes
     ConvertTo-ScreenText of it.
   #>
   [CmdletBinding()]
@@ -275,7 +277,8 @@ function ConvertTo-ToolDisplayText {
   )
 
   if ($null -eq $Text) { return '' }
-  $value = ([regex]::Replace([string]$Text, '[\x00-\x1F\x7F]', ' ')).Trim()
+  $value = [regex]::Replace([string]$Text, $script:DirectionMarksPattern, '')
+  $value = ([regex]::Replace($value, '[\x00-\x1F\x7F]', ' ')).Trim()
   if ($value.Length -le $MaxLength) { return $value }
   $cut = $MaxLength
   if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }

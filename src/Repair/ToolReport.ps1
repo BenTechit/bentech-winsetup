@@ -10,10 +10,19 @@
 #      Sections = [ordered] '<NN>' -> @{ Id; Title; Facts = [ordered] name -> value; Groups = [string[]]; Items; Raw = [string[]];
 #                                        Missing = @( @{ What; Why } ) };
 #      Items (every section's Items in one table: the names are unique); Findings (Get-ReportFlags) }
-# Items that hold personal values, for the privacy-safe copy (Task 9 masks the parsed values, never the JSON text):
-#   ComputerName, Serial, BiosUuid, BoardSerial, RamSerials, MonitorSerials, BatterySerials, Disks[].Serial (01-03);
-#   Adapters[] (Mac, Addresses, Gateways, Dns) and CurrentAddresses, Gateways, DnsServers, Ssids, NetworkProfiles[].Name,
-#   UserProxy (09); SignedInUser, OneDriveEmails, Programs (10); Users, Admins[].Name, Profiles (11).
+# Items that hold personal values, for the privacy-safe copy (Task 9 masks the parsed values, never the JSON text;
+# review M3):
+#   01 ComputerName, Serial, BiosUuid, Domain (a domain PC only); 02 BoardSerial, RamSerials, MonitorSerials,
+#      BatterySerials; 03 Disks[].Serial;
+#   06 ProblemDevices[] (Id: a USB instance ID holds the device's serial; Name: a Bluetooth name may hold its owner's);
+#   09 Adapters[] (Mac, Addresses, Gateways, Dns), CurrentAddresses, Gateways, DnsServers, Ssids, NetworkProfiles[].Name,
+#      UserProxy;
+#   10 SignedInUser, SignedInSid, OneDriveEmails, Programs, Tasks[] (Name and Execute: OneDrive's and Google Update's
+#      task names hold the user's SID, a program a profile path), Startup[].Program, Services[].Program;
+#   11 Users, Admins[].Name, Admins[].Sid, Profiles, SignedInUser, SignedInSid.
+# Free text that can hold them too, in Groups and Facts: event and reliability messages (DOMAIN\user, SIDs, profile
+# paths, MACs, SSIDs, host names), volume labels (03), device names (06), hosts lines (09), printer names and ports
+# (10), and the complaint.
 #
 # The rules (repair plan, Global Constraints; spec 6.8, 10):
 #   - the core and every file Ben reads on the stick are UTF-8 and may hold Hebrew (event messages, program names, the
@@ -25,10 +34,11 @@
 #   - nothing on the stick is written through a link (V2-R13); result.json holds the findings and the paths only
 #     (the sections stay in the child: $script:ToolResultHiddenData, ruling RD-R21).
 #
-# Needs ToolEngine (Add-ToolFinding, Add-ToolLog, Get-ToolText, Write-ToolJsonFile, Format-ToolTime), ToolCollect
-# (New-ReportSection, $script:ReportSectionTitles), ToolSafety (Get-ToolRepairNumber), Report (Format-ReportDate),
-# Activity (Read-FileTail), Cleanup (Test-StickReparsePoint), Logging and StartScreen (ConvertTo-ScreenText,
-# $script:DirectionMarksPattern). The bundle holds every file.
+# Needs ToolEngine (Add-ToolFinding, Add-ToolLog, Get-ToolText, Write-ToolJsonFile, Format-ToolTime,
+# ConvertTo-ToolDisplayText, Invoke-ToolJsonChild, Get-ToolRemainingSeconds), ToolCollect (New-ReportSection,
+# ConvertTo-ReportReason, $script:ReportSectionTitles), ToolSafety (Get-ToolRepairNumber), Report (Format-ReportDate),
+# Activity (Read-FileTail), Winget (ConvertTo-PowerShellLiteral), Cleanup (Test-StickReparsePoint), Logging and
+# StartScreen (ConvertTo-ScreenText). The bundle holds every file.
 
 # The facts of section 00, in order: '<section>|<fact name>' (a fact a section did not collect is left out).
 $script:ReportSummaryFacts = @(
@@ -57,32 +67,9 @@ $script:ReportHowToUse = @(
 
 # --- Text ----------------------------------------------------------------------------------------------------------
 
-function ConvertTo-ReportText {
-  <#
-  .SYNOPSIS
-    A value as one line of report text, its real (Hebrew) characters kept: the direction marks Hebrew Windows adds are
-    dropped, control characters become spaces, white space is collapsed (-KeepSpacing: kept, for a line already laid
-    out such as an event group's), the ends trimmed, and it is cut to -MaxLength UTF-16 code units, never between the
-    two halves of a surrogate pair. $null is ''. Pure.
-  #>
-  [CmdletBinding()]
-  [OutputType([string])]
-  param(
-    [AllowNull()]$Text,
-    [ValidateRange(1, 100000)][int]$MaxLength = 300,
-    [switch]$KeepSpacing
-  )
-
-  if ($null -eq $Text) { return '' }
-  $value = [regex]::Replace([string]$Text, $script:DirectionMarksPattern, '')
-  $value = [regex]::Replace($value, '[\x00-\x1F\x7F]', ' ')
-  if (-not $KeepSpacing) { $value = [regex]::Replace($value, '\s+', ' ') }
-  $value = $value.Trim()
-  if ($value.Length -le $MaxLength) { return $value }
-  $cut = $MaxLength
-  if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }
-  return $value.Substring(0, $cut)
-}
+# A report value keeps its real (Hebrew) text through ConvertTo-ToolDisplayText (ToolEngine: direction marks dropped,
+# control characters as spaces, a surrogate-safe cut; review M11). A message whose white space should collapse (an
+# event's, a log line's) is collapsed first ([regex]::Replace(..., '\s+', ' ')).
 
 function Get-ReportEntry {
   # Private. -Name of -From: a dictionary's key or an object's property; $null when there is none.
@@ -197,8 +184,8 @@ function ConvertTo-EventGroups {
   $sorted = @($groups.Values | Sort-Object -Property @{ Expression = { if ($null -eq $_.Last) { [datetime]::MinValue } else { $_.Last } }; Descending = $true },
                                                    @{ Expression = { $_.Count }; Descending = $true }, @{ Expression = { $_.Key }; Descending = $false })
   foreach ($g in $sorted) {
-    ('{0}x {1}/{2} [{3}] {4} - {5}  {6}' -f $g.Count, (ConvertTo-ReportText -Text $g.Provider -MaxLength 100), $g.Id, $g.Level,
-      (Format-ReportDate -When $g.First), (Format-ReportDate -When $g.Last), (ConvertTo-ReportText -Text $g.Message -MaxLength 200)).TrimEnd()
+    ('{0}x {1}/{2} [{3}] {4} - {5}  {6}' -f $g.Count, (ConvertTo-ToolDisplayText -Text $g.Provider -MaxLength 100), $g.Id, $g.Level,
+      (Format-ReportDate -When $g.First), (Format-ReportDate -When $g.Last), (ConvertTo-ToolDisplayText -Text ([regex]::Replace([string]$g.Message, '\s+', ' ')) -MaxLength 200)).TrimEnd()
   }
 }
 
@@ -257,15 +244,17 @@ function Get-ReportFlags {
   .SYNOPSIS
     The report's findings from its Items and the thresholds of -Config (repair.thresholds, repair.freeSpace): every Task 8
     finding of the plan's table, the Health check's codes the sections reproduce (volumeState*, volumeDirty, winre*,
-    notActivated, devicesProblem, oemLeftover, trimOff, pageFile*), clockOff and captivePortal (RD-R13, RD-R20), and
+    notActivated, devicesProblem, oemLeftover, trimOff, pageFile*), clockWrong and captivePortal (RD-R13, RD-R20), and
     one notCollected per Missing source. Each names its section. CRIT before WARN before INFO, then by section. Pure.
   .DESCRIPTION
     The thresholds: kernelPower at kernelPowerWarn or more (power losses: the Kernel-Power 41 events whose
     BugcheckCode is 0 or absent; a 41 that carries a code was a blue screen), appCrashes at appCrashesWarn, lowRam under
     ramMinGB, ghostDevicesMany above ghostDevicesInfo, uptimeLong above uptimeDays, batteryWear at batteryWearPercent,
-    defenderSignatureOld above defenderSignatureDays, clockOff above clockOffsetMinutes, diskWear at diskWearPercent,
-    diskTemp at diskTemperatureC, lowSpace under freeSpace.minPercent % or minGB GB. A clock that breaks HTTPS (the
-    Internet item's Clock, ruling RD-R20) is clockOff, never noInternet.
+    defenderSignatureOld above defenderSignatureDays, clockWrong above clockOffsetMinutes, diskWear at
+    diskWearPercent, diskTemp at diskTemperatureC, lowSpace under freeSpace.minPercent % or minGB GB. A clock that
+    breaks HTTPS (the Internet item's Clock, ruling RD-R20) is clockWrong, never noInternet. clockWrong is the report's
+    own code (review M2): a report syncs nothing, and Task 6's clockOff means "still off after the time sync".
+    A count whose Item is in Items.CappedCounts (its query read its Max events) is a lower bound: '<n>+' (review M6).
   #>
   [CmdletBinding()]
   param(
@@ -280,6 +269,9 @@ function Get-ReportFlags {
   $crashDays = [int](& $limit 'crashDays' 60)
   $item = { param($name) Get-ReportEntry -From $items -Name $name }
   $number = { param($name) ConvertTo-ReportNumber -Value (Get-ReportEntry -From $items -Name $name) }
+  $cappedItems = @(foreach ($c in (ConvertTo-ReportList -Value (Get-ReportEntry -From $items -Name 'CappedCounts'))) { [string]$c })
+  # A count as text, '<n>+' when the Item's query stopped at its Max (review M6).
+  $countText = { param($value, $name) $text = Format-ReportNumber -Value $value -Format '0'; if ($cappedItems -contains $name) { $text + '+' } else { $text } }
 
   # 01 System
   $build = & $number 'OsBuild'
@@ -292,7 +284,7 @@ function Get-ReportFlags {
   if ($null -ne $uptime -and $uptime -gt (& $limit 'uptimeDays' 7)) { Add-ReportFlag -List $flags -Code 'uptimeLong' -Level INFO -Section '01' -Arguments @([math]::Floor($uptime)) }
   $clock = & $number 'ClockOffsetMinutes'
   if ($null -ne $clock -and [math]::Abs($clock) -gt (& $limit 'clockOffsetMinutes' 2)) {
-    Add-ReportFlag -List $flags -Code 'clockOff' -Level WARN -Section '01' -Arguments @(Format-ReportNumber -Value ([math]::Abs($clock)) -Format '0.0')
+    Add-ReportFlag -List $flags -Code 'clockWrong' -Level WARN -Section '01' -Arguments @(Format-ReportNumber -Value ([math]::Abs($clock)) -Format '0.0')
   }
   if ([string](& $item 'Activation') -ceq 'Not activated') { Add-ReportFlag -List $flags -Code 'notActivated' -Level WARN -Section '01' }
 
@@ -385,13 +377,13 @@ function Get-ReportFlags {
   if ($null -eq $total41 -or $total41 -lt $rows41.Count) { $total41 = $rows41.Count }
   $blue41 = @(foreach ($r in $rows41) { $code = ConvertTo-ReportBugcheck -Value (Get-ReportEntry -From $r -Name 'BugcheckCode'); if ($code -ne '') { $code } })
   $powerLosses = $total41 - $blue41.Count
-  if ($powerLosses -ge (& $limit 'kernelPowerWarn' 3)) { Add-ReportFlag -List $flags -Code 'kernelPower' -Level WARN -Section '07' -Arguments @((Format-ReportNumber -Value $powerLosses -Format '0'), $crashDays) }
+  if ($powerLosses -ge (& $limit 'kernelPowerWarn' 3)) { Add-ReportFlag -List $flags -Code 'kernelPower' -Level WARN -Section '07' -Arguments @((& $countText $powerLosses 'KernelPower41'), $crashDays) }
   $blue = @(foreach ($r in (ConvertTo-ReportList -Value (& $item 'BugChecks'))) { $code = ConvertTo-ReportBugcheck -Value (Get-ReportEntry -From $r -Name 'Code'); if ($code -eq '') { 'unknown' } else { $code } })
   if ($blue.Count -eq 0) { $blue = $blue41 }
   if ($blue.Count -gt 0) {
     $byCode = @($blue | Group-Object | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } |
         ForEach-Object { if ($_.Count -gt 1) { '{0} x{1}' -f $_.Name, $_.Count } else { $_.Name } })
-    Add-ReportFlag -List $flags -Code 'bugchecks' -Level CRIT -Section '07' -Arguments @($blue.Count, $crashDays, ($byCode -join ', '))
+    Add-ReportFlag -List $flags -Code 'bugchecks' -Level CRIT -Section '07' -Arguments @((& $countText $blue.Count 'BugChecks'), $crashDays, ($byCode -join ', '))
   }
   $fatal = 0
   $corrected = 0
@@ -401,13 +393,13 @@ function Get-ReportFlags {
     if (($null -ne $id -and $script:ReportWheaFatalIds -contains [int]$id) -or ($null -ne $level -and $level -ge 1 -and $level -le 2)) { $fatal++ }
     elseif ($null -ne $id -and $script:ReportWheaCorrectedIds -contains [int]$id) { $corrected++ }
   }
-  if ($fatal -gt 0) { Add-ReportFlag -List $flags -Code 'wheaFatal' -Level CRIT -Section '07' -Arguments @($fatal, $crashDays) }
-  if ($corrected -gt 0) { Add-ReportFlag -List $flags -Code 'wheaCorrected' -Level WARN -Section '07' -Arguments @($corrected, $crashDays) }
+  if ($fatal -gt 0) { Add-ReportFlag -List $flags -Code 'wheaFatal' -Level CRIT -Section '07' -Arguments @((& $countText $fatal 'Whea'), $crashDays) }
+  if ($corrected -gt 0) { Add-ReportFlag -List $flags -Code 'wheaCorrected' -Level WARN -Section '07' -Arguments @((& $countText $corrected 'Whea'), $crashDays) }
   $dumps = & $number 'Minidumps'
   if ($null -ne $dumps -and $dumps -gt 0) { Add-ReportFlag -List $flags -Code 'minidumps' -Level WARN -Section '07' -Arguments @((Format-ReportNumber -Value $dumps -Format '0'), $crashDays) }
   $crashes = & $number 'AppCrashes'
   if ($null -ne $crashes -and $crashes -ge (& $limit 'appCrashesWarn' 10)) {
-    Add-ReportFlag -List $flags -Code 'appCrashes' -Level WARN -Section '07' -Arguments @((Format-ReportNumber -Value $crashes -Format '0'), $crashDays, [string](& $item 'AppCrashTop'))
+    Add-ReportFlag -List $flags -Code 'appCrashes' -Level WARN -Section '07' -Arguments @((& $countText $crashes 'AppCrashes'), $crashDays, [string](& $item 'AppCrashTop'))
   }
 
   # 09 Network
@@ -533,12 +525,12 @@ function Format-ReportFactValue {
 
   if ($null -eq $Value) { return '' }
   if ($Value -is [bool]) { if ($Value) { return 'yes' } else { return 'no' } }
-  if ($Value -is [string]) { return (ConvertTo-ReportText -Text $Value -MaxLength 400) }
+  if ($Value -is [string]) { return (ConvertTo-ToolDisplayText -Text $Value -MaxLength 400) }
   if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
-    return (ConvertTo-ReportText -Text (@(foreach ($v in $Value) { [string]$v }) -join ', ') -MaxLength 400)
+    return (ConvertTo-ToolDisplayText -Text (@(foreach ($v in $Value) { [string]$v }) -join ', ') -MaxLength 400)
   }
   if ($null -ne (ConvertTo-ReportNumber -Value $Value)) { return (Format-ReportNumber -Value $Value -Format '0.##') }
-  return (ConvertTo-ReportText -Text $Value -MaxLength 400)
+  return (ConvertTo-ToolDisplayText -Text $Value -MaxLength 400)
 }
 
 function Format-ReportCore {
@@ -564,16 +556,16 @@ function Format-ReportCore {
   $identity = Get-ReportEntry -From $Report -Name 'Identity'
   $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Report -Name 'CreatedAt')
   $lines.Add(('BENTECH TOOLBOX {0} REPORT | {1} | version {2} | PC {3} | {4} {5} | serial {6}' -f $Kind.ToUpperInvariant(), (Format-ReportDate -When $created),
-      (ConvertTo-ReportText -Text (Get-ReportEntry -From $Report -Name 'ToolVersion') -MaxLength 40),
-      (ConvertTo-ReportText -Text (Get-ReportEntry -From $identity -Name 'ComputerName') -MaxLength 64),
-      (ConvertTo-ReportText -Text (Get-ReportEntry -From $identity -Name 'Manufacturer') -MaxLength 64),
-      (ConvertTo-ReportText -Text (Get-ReportEntry -From $identity -Name 'Model') -MaxLength 64),
-      (ConvertTo-ReportText -Text (Get-ReportEntry -From $identity -Name 'Serial') -MaxLength 64)))
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $Report -Name 'ToolVersion') -MaxLength 40),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'ComputerName') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Manufacturer') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Model') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Serial') -MaxLength 64)))
   $lines.Add('')
 
   $lines.Add('CUSTOMER COMPLAINT')
   $complaint = [string](Get-ReportEntry -From $Report -Name 'Complaint')
-  $complaintLines = @(foreach ($line in [regex]::Split($complaint, '\r?\n')) { $text = ConvertTo-ReportText -Text $line -MaxLength 2000; if ($text -ne '') { $text } })
+  $complaintLines = @(foreach ($line in [regex]::Split($complaint, '\r?\n')) { $text = ConvertTo-ToolDisplayText -Text $line -MaxLength 2000; if ($text -ne '') { $text } })
   if ($complaintLines.Count -eq 0) { $lines.Add('  (none)') } else { foreach ($line in $complaintLines) { $lines.Add('  ' + $line) } }
   $lines.Add('')
 
@@ -628,7 +620,7 @@ function Format-ReportCore {
     $groups = @(ConvertTo-ReportList -Value (Get-ReportEntry -From $section -Name 'Groups'))
     if ($groups.Count -gt 0) {
       $lines.Add('  Details:')
-      foreach ($g in $groups) { $lines.Add('    ' + (ConvertTo-ReportText -Text $g -MaxLength 500 -KeepSpacing)) }
+      foreach ($g in $groups) { $lines.Add('    ' + (ConvertTo-ToolDisplayText -Text $g -MaxLength 500)) }
     }
     foreach ($m in (ConvertTo-ReportList -Value (Get-ReportEntry -From $section -Name 'Missing'))) {
       $lines.Add(('  Not collected: {0} ({1})' -f (ConvertTo-ScreenText -Text (Get-ReportEntry -From $m -Name 'What')), (ConvertTo-ScreenText -Text (Get-ReportEntry -From $m -Name 'Why'))))
@@ -929,7 +921,7 @@ function Read-ToolLogErrors {
       foreach ($p in $Patterns) { if ($p -ne '' -and $line.IndexOf($p, [StringComparison]::Ordinal) -ge 0) { $hit = $true; break } }
       if (-not $hit) { continue }
       $body = [regex]::Replace($line, '^\s*[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?,?\s*', '')
-      $body = ConvertTo-ReportText -Text $body -MaxLength 300
+      $body = ConvertTo-ToolDisplayText -Text ([regex]::Replace($body, '\s+', ' ')) -MaxLength 300
       if ($body -eq '') { continue }
       $g = $groups[$body]
       if ($null -eq $g) { $g = @{ Text = $body; Count = 0; Last = 0 }; $groups[$body] = $g }
@@ -1008,19 +1000,49 @@ function Invoke-ToolStepReportWrite {
     Add-ToolLog -Run $Run -Text ('Report written: {0} lines, {1} findings ({2})' -f $core.Count, @($report['Findings']).Count, [IO.Path]::GetFileName($corePath))
     return 'done'
   } catch {
-    $reason = ConvertTo-ScreenText -Text $_.Exception.Message
-    Write-SetupLog -Level ERROR -Message 'The report could not be written' -Data @{ error = $reason }
+    $reason = ConvertTo-ReportReason -Exception $_.Exception
+    Write-SetupLog -Level ERROR -Message 'The report could not be written' -Data @{ reason = $reason; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     Add-ToolFinding -Run $Run -Level CRIT -Code 'reportWriteFailed' -Arguments @($reason)
     return 'failed'
+  }
+}
+
+# The zip of raw_<stamp>\ (<FROM>, <TO>: literals), run in a grandchild bounded by toolStep.zip (review M5). It writes
+# the temporary <zip>.partial, which the step renames once the grandchild ended well.
+$script:ReportZipCommand = @'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::CreateFromDirectory(<FROM>, <TO>, [IO.Compression.CompressionLevel]::Optimal, $false)
+@{ Done = $true }
+'@
+
+# The least time left (seconds) the zip is started with; with less the raw folder stays as it is (review M5).
+$script:ReportZipMinSeconds = 180
+
+function Remove-ToolReportPartial {
+  # Private. Deletes the zip's temporary file when it exists and is no link (V2-R13). Never throws: a file that stays
+  # is logged (its name says it is not complete).
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  try {
+    if ([IO.File]::Exists($Path) -and -not (Test-StickReparsePoint -Path $Path)) { [IO.File]::Delete($Path) }
+  } catch {
+    Write-SetupLog -Level WARN -Message 'The unfinished zip could not be deleted' -Data @{ file = (ConvertTo-ScreenText -Text ([IO.Path]::GetFileName($Path))); error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
   }
 }
 
 function Invoke-ToolStepReportZip {
   <#
   .SYNOPSIS
-    Step reportZip (Full): raw_<stamp>\ into REPORT_<PC>_<stamp>_raw.zip beside it
-    (System.IO.Compression.ZipFile.CreateFromDirectory); the folder stays. $Run.Files.Zip. No raw folder: 'skipped'. A
-    zip that cannot be made (a link, an existing file, a full stick) is WARN reportZipFailed and 'warn'.
+    Step reportZip (Full): raw_<stamp>\ into REPORT_<PC>_<stamp>_raw.zip beside it; the folder stays. $Run.Files.Zip.
+  .DESCRIPTION
+    No raw folder: 'skipped'. Less than $script:ReportZipMinSeconds of the action's time left: WARN reportZipFailed
+    ('not enough time left') and 'skipped'. Else the grandchild zip (System.IO.Compression.ZipFile.CreateFromDirectory,
+    toolStep.zip, capped by the time left) writes <zip>.partial (a leftover one is deleted first), and only after the
+    grandchild ended well is it renamed to the zip's name (review M5): a stall, a kill or a full stick never leaves a
+    file that looks complete, and the partial file is deleted. A zip that cannot be made (a link, an existing zip, a
+    full stick) is WARN reportZipFailed with a fixed reason (ConvertTo-ReportReason) and 'warn'; a timeout is the
+    same finding and 'timedout'.
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -1032,16 +1054,34 @@ function Invoke-ToolStepReportZip {
     return 'skipped'
   }
   $zip = [IO.Path]::Combine((Get-ToolReportFolder -Run $Run), ('REPORT_{0}_{1}_raw.zip' -f (Get-ToolReportPcName -Run $Run), (Get-ToolReportStamp -Run $Run)))
+  $partial = $zip + '.partial'
+  if ((Get-ToolRemainingSeconds -Run $Run) -lt $script:ReportZipMinSeconds) {
+    Add-ToolLog -Run $Run -Text 'Too little time left to zip the raw files'
+    Add-ToolFinding -Run $Run -Level WARN -Code 'reportZipFailed' -Arguments @('not enough time left', $rawDir)
+    return 'skipped'
+  }
   try {
-    if (Test-StickReparsePoint -Path $zip) { throw 'the zip is a link' }
+    foreach ($path in $zip, $partial) { if (Test-StickReparsePoint -Path $path) { throw ('{0} is a link' -f [IO.Path]::GetFileName($path)) } }
     if ([IO.File]::Exists($zip)) { throw 'the zip already exists' }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Compression.ZipFile]::CreateFromDirectory($rawDir, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    if ([IO.File]::Exists($partial)) { [IO.File]::Delete($partial) }
+    $command = $script:ReportZipCommand.Replace('<FROM>', (ConvertTo-PowerShellLiteral -Text $rawDir)).Replace('<TO>', (ConvertTo-PowerShellLiteral -Text $partial))
+    $child = Invoke-ToolJsonChild -Run $Run -Name 'zip' -Command $command -StepTimeout 'zip'
+    if (-not $child.Ok -or -not [IO.File]::Exists($partial)) {
+      Remove-ToolReportPartial -Path $partial
+      $reason = ConvertTo-ReportReason -Why $(if ($child.Ok) { 'no result' } else { [string]$child.Error })
+      Add-ToolFinding -Run $Run -Level WARN -Code 'reportZipFailed' -Arguments @($reason, $rawDir)
+      if ($child.TimedOut) { return 'timedout' }
+      return 'warn'
+    }
+    [IO.File]::Move($partial, $zip)
     $Run.Files['Zip'] = $zip
     Add-ToolLog -Run $Run -Text ('Raw files zipped: {0}' -f [IO.Path]::GetFileName($zip))
     return 'done'
   } catch {
-    Add-ToolFinding -Run $Run -Level WARN -Code 'reportZipFailed' -Arguments @($_.Exception.Message, $rawDir)
+    Remove-ToolReportPartial -Path $partial
+    $reason = ConvertTo-ReportReason -Exception $_.Exception
+    Write-SetupLog -Level WARN -Message 'The raw files could not be zipped' -Data @{ reason = $reason; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    Add-ToolFinding -Run $Run -Level WARN -Code 'reportZipFailed' -Arguments @($reason, $rawDir)
     return 'warn'
   }
 }

@@ -224,6 +224,7 @@ $script:ToolboxStrings = @{
     'finding.notCollected'           = '{0}: not collected ({1})'
     'finding.reportWriteFailed'      = 'The report could not be written ({0})'
     'finding.reportZipFailed'        = 'The raw files could not be zipped ({0}): they are in {1}'
+    'finding.clockWrong'             = 'The clock is {0} min off Microsoft''s time: HTTPS, Windows Update and activation may fail until it is fixed (Standard repair syncs it)'
 
     'repair.row.safety'     = 'SAFETY'
     'repair.row.check'      = 'CHECK'
@@ -599,7 +600,7 @@ $script:ToolboxStrings = @{
     'finding.userProxy'              = 'מוגדר פרוקסי למשתמש: {0}'
     'finding.hostsEntries'           = 'בקובץ hosts יש {0} רשומות פעילות'
     'finding.lowRam'                 = 'רק {0} GB זיכרון'
-    'finding.windows10'              = 'גרסת Windows 10 בגרסת בנייה {0}: ללא תמיכה מאז 14/10/2025'
+    'finding.windows10'              = 'מערכת Windows 10 בגרסת בנייה {0}: ללא תמיכה מאז 14/10/2025'
     'finding.uptimeLong'             = 'המחשב פועל {0} ימים ברציפות: יש להפעיל מחדש לפני שמעריכים יציבות'
     'finding.batteryWear'            = 'הסוללה שחוקה ב-{0}%'
     'finding.basicDisplay'           = 'אין דרייבר תצוגה (מתאם התצוגה הבסיסי של Microsoft)'
@@ -614,6 +615,7 @@ $script:ToolboxStrings = @{
     'finding.notCollected'           = '{0}: לא נאסף ({1})'
     'finding.reportWriteFailed'      = 'לא ניתן היה לכתוב את הדוח ({0})'
     'finding.reportZipFailed'        = 'לא ניתן היה לדחוס את הקבצים הגולמיים ({0}): הם נמצאים ב-{1}'
+    'finding.clockWrong'             = 'השעון סוטה ב-{0} דקות מהשעה של Microsoft: חיבורי HTTPS, עדכוני Windows והפעלת Windows עלולים להיכשל עד שהשעון יתוקן (התיקון הרגיל מסנכרן אותו)'
 
     'repair.row.safety'     = 'בטיחות'
     'repair.row.check'      = 'בדיקה'

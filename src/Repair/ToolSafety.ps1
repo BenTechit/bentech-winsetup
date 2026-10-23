@@ -536,14 +536,43 @@ function Get-ToolDiskEventCount {
     Write-SetupLog -Level WARN -Message 'The disk events could not be read' -Data @{ error = $reason }
     return @{ Ok = $false; Count = $null; Other = $null; Ids = [string[]]@(); Error = $reason }
   }
+  $rows = @(foreach ($e in $events) {
+      $first = ''
+      $properties = $e.Properties
+      if ($null -ne $properties -and $properties.Count -gt 0 -and $null -ne $properties[0]) { $first = [string]$properties[0].Value }
+      @{ Provider = [string]$e.ProviderName; Id = [int]$e.Id; First = $first } })
+  $split = Get-ToolDiskEventSplit -Events $rows -SystemDisks $SystemDisks -SystemDrive $drive
+  return @{ Ok = $true; Count = $split['Count']; Other = $split['Other']; Ids = $split['Ids'] }
+}
+
+function Get-ToolDiskEventSplit {
+  <#
+  .SYNOPSIS
+    Ruling RD-R10's split of disk events, pure (Get-ToolDiskEventCount here; the report reads the same events in a
+    grandchild, review M4): -Events are rows @{ Provider; Id; First (the event's first property: a device path or a
+    drive name, never localized) }. A disk 7, 51 or 153 counts when First is \Device\Harddisk<N>\... with N one of
+    -SystemDisks; an NTFS 55 ('Ntfs' or 'Microsoft-Windows-Ntfs') when First is -SystemDrive ('C:'); any other row is
+    ignored. @{ Count (on the system disk or volume); Other (elsewhere); Ids = [string[]] ('<provider>/<id>' of the
+    counted ones, sorted, unique) }.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param(
+    [AllowNull()][AllowEmptyCollection()][object[]]$Events,
+    [AllowNull()][int[]]$SystemDisks,
+    [AllowNull()][AllowEmptyString()][string]$SystemDrive
+  )
+
+  if ($null -eq $SystemDisks) { $SystemDisks = [int[]]@() }
+  $drive = ([string]$SystemDrive).Trim().TrimEnd('\')
   $counted = New-Object System.Collections.Generic.List[string]
   $other = 0
-  foreach ($e in $events) {
-    $provider = [string]$e.ProviderName
-    $id = [int]$e.Id
-    $first = ''
-    $properties = $e.Properties
-    if ($null -ne $properties -and $properties.Count -gt 0 -and $null -ne $properties[0]) { $first = ([string]$properties[0].Value).Trim() }
+  foreach ($e in @($Events)) {
+    if ($e -isnot [System.Collections.IDictionary]) { continue }
+    $provider = [string]$e['Provider']
+    $id = 0
+    if (-not [int]::TryParse([string]$e['Id'], [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$id)) { continue }
+    $first = ([string]$e['First']).Trim()
     $onSystem = $false
     if ($provider -eq 'disk' -and $id -in 7, 51, 153) {
       $device = [regex]::Match($first, '^\\Device\\Harddisk([0-9]{1,4})\\', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -555,7 +584,7 @@ function Get-ToolDiskEventCount {
     }
     if ($onSystem) { $counted.Add(('{0}/{1}' -f $provider, $id)) } else { $other++ }
   }
-  return @{ Ok = $true; Count = $counted.Count; Other = $other; Ids = [string[]]@($counted.ToArray() | Sort-Object -Unique) }
+  return @{ Count = $counted.Count; Other = $other; Ids = [string[]]@($counted.ToArray() | Sort-Object -Unique) }
 }
 
 function Get-ToolDiskChip {
