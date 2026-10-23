@@ -3,6 +3,7 @@
 # mocks Invoke-External, Add-AppxPackage, Get-RemoteFile and Get-WingetPath.
 BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Process', 'Common\Download', 'Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: winget's output tail is logged as ASCII (final review M1)
 
   function New-WingetContext {
     param([double]$ReadyMinutes = 5)
@@ -74,6 +75,10 @@ Describe 'Convert-WingetExitCode' {
     Convert-WingetExitCode -ExitCode 1 | Should -Be 'Failed'
     Convert-WingetExitCode -ExitCode -1 | Should -Be 'Failed'
   }
+  It 'keeps 0x8A15002B (no applicable update) Failed for every verb: only the install path reads it (ruling Z-R3)' {
+    Convert-WingetExitCode -ExitCode -1978335189 | Should -Be 'Failed'
+    Convert-WingetExitCode -ExitCode 2316632107 | Should -Be 'Failed'
+  }
 }
 
 Describe 'Get-WingetInstallArgs' {
@@ -92,6 +97,45 @@ Describe 'Get-WingetInstallArgs' {
   }
   It 'rejects an unknown source' {
     { Get-WingetInstallArgs -Id '7zip.7zip' -Source 'evil' } | Should -Throw
+  }
+
+  # Zoom spec 3.2: the signed config's custom tokens travel as one quoted --custom value.
+  It 'appends one quoted --custom value for a custom token' {
+    Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true' |
+      Should -BeExactly 'install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true"'
+  }
+  It 'joins two custom tokens with one space' {
+    Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true', 'ZSSOHOST=x' |
+      Should -BeExactly 'install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true ZSSOHOST=x"'
+  }
+  It 'throws for a custom token that could change the command line, and never echoes it: <t>' -ForEach @(
+    @{ t = 'ZConfig="x" & calc' }, @{ t = 'A B=c' }, @{ t = '=x' }, @{ t = '' }
+  ) {
+    $err = $null
+    try { Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'A=b', $t } catch { $err = $_.Exception.Message }
+    $err | Should -Not -BeNullOrEmpty
+    if ($t -ne '') { $err | Should -Not -Match ([regex]::Escape($t)) }
+  }
+  It 'without -Custom, or with an empty list, the args are byte-identical to today''s' {
+    $today = 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+    Get-WingetInstallArgs -Id '7zip.7zip' | Should -BeExactly $today
+    Get-WingetInstallArgs -Id '7zip.7zip' -Custom @() | Should -BeExactly $today
+    Get-WingetInstallArgs -Id '9WZDNCRFJ4MV' -Source msstore | Should -BeExactly ($today -replace '7zip\.7zip', '9WZDNCRFJ4MV' -replace '--source winget', '--source msstore')
+  }
+}
+
+Describe 'Test-WingetCustomToken' {
+  It 'accepts <t>' -ForEach @(@{ t = 'ZConfig=AU2_EnableAutoUpdate=true' }, @{ t = 'A=b;c=d' }, @{ t = 'NAME_1=x_2' }) {
+    Test-WingetCustomToken -Token $t | Should -BeTrue
+  }
+  It 'refuses <Why>' -ForEach @(
+    @{ Why = 'a quote and an ampersand'; t = 'ZConfig="x" & calc' }, @{ Why = 'a space'; t = 'A B=c' }, @{ Why = 'no name'; t = '=x' }
+    @{ Why = 'no value'; t = 'A=' }, @{ Why = 'no equals sign'; t = 'ABC' }, @{ Why = 'a leading dash'; t = '-A=b' }
+    @{ Why = 'a slash'; t = 'A=/b' }, @{ Why = 'a trailing newline'; t = "A=b`n" }, @{ Why = 'empty'; t = '' }, @{ Why = '$null'; t = $null }
+    @{ Why = 'a Kelvin sign (a letter only a case-insensitive match takes for k)'; t = ('A=' + [char]0x212A) }
+    @{ Why = 'a Hebrew letter'; t = ('A=' + [char]0x05D0) }
+  ) {
+    Test-WingetCustomToken -Token $t | Should -BeFalse
   }
 }
 
@@ -235,6 +279,29 @@ Describe 'Invoke-WingetInstall' {
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be '7zip.7zip: winget timed out'
   }
+  # Final review M1: a timeout logs what winget had printed, so setup.log tells a slow download from a
+  # msiexec help box. ASCII, like the failure tail: a Hebrew Windows prints Hebrew.
+  It 'logs the last five lines of the output, as ASCII, at WARN, when winget times out' {
+    $out = ((1..6 | ForEach-Object { "line-$_" }) + ('Starting package install... ' + [char]0x05D0 + [char]0x05D1)) -join "`r`n"
+    Set-ExternalQueue @(New-ExternalResult $null $true $out)
+    Invoke-WingetInstall -Id 'Zoom.Zoom' -TimeoutMinutes 10 -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter {
+      $Message -eq 'winget install timed out' -and $Level -eq 'WARN' -and $Data.id -eq 'Zoom.Zoom' -and $Data.timeoutMinutes -eq 10 -and
+      $Data.tail -ceq 'line-3 | line-4 | line-5 | line-6 | Starting package install... ??'
+    } -Times 1 -Exactly
+  }
+  It 'logs the timeout with an empty tail when winget printed nothing' {
+    Set-ExternalQueue @(New-ExternalResult $null $true '')
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install timed out' -and $Data.timeoutMinutes -eq 7 -and $Data.tail -ceq '' } -Times 1 -Exactly
+  }
+  It 'logs a failure''s tail and a failed source reset''s tail as ASCII too' {
+    $hebrew = [string][char]0x05D0
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 5 $false "reset $hebrew"), (New-ExternalResult 0x8A15001E $false "line-1`r`nfailed $hebrew"))
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget source reset did not succeed; retrying anyway' -and $Data.tail -ceq 'reset ?' } -Times 1 -Exactly
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install failed' -and $Data.tail -ceq 'line-1 | failed ?' } -Times 1 -Exactly
+  }
   It 'is Failed, with the number as text, for an exit code that is not a 32-bit value' {
     Set-ExternalQueue @(New-ExternalResult 99999999999)
     $r = Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx
@@ -298,6 +365,71 @@ Describe 'Invoke-WingetInstall' {
     $r.Message | Should -Match 'invalid winget package id'
     $extCalls.Count | Should -Be 0
   }
+
+  # Zoom spec 3.2: custom args and a per-call limit; the already-installed and timed-out answers carry Data.
+  It 'passes the custom tokens on the command line and -TimeoutMinutes to Invoke-External' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true' -TimeoutMinutes 10 -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Zoom.Zoom: installed'
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].ArgumentList | Should -BeExactly (Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true')
+    $extCalls[0].TimeoutMinutes | Should -Be 10
+  }
+  It 'without -TimeoutMinutes it waits timeoutsMinutes.default, and without -Custom it runs today''s command line' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    $extCalls[0].TimeoutMinutes | Should -Be 7
+    $extCalls[0].ArgumentList | Should -BeExactly 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+  }
+  It 'the source reset and the retry keep the given limit and the custom tokens' {
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult 0))
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'A=b' -TimeoutMinutes 10 -Context $ctx).Status | Should -Be 'Done'
+    @($extCalls.TimeoutMinutes) | Should -Be @(10, 10, 10)
+    $extCalls[2].ArgumentList | Should -BeExactly (Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'A=b')
+  }
+  It 'a Done from 0x8A150061 (already installed) carries Data.AlreadyInstalled; a plain 0 does not' {
+    Set-ExternalQueue @(New-ExternalResult -1978335135)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Data.AlreadyInstalled | Should -BeTrue
+    Set-ExternalQueue @(New-ExternalResult 0)
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.Contains('AlreadyInstalled') | Should -BeFalse
+  }
+  # Ruling Z-R3: `winget install` of a package it finds installed tries an upgrade, and with nothing applicable it
+  # answers 0x8A15002B (UPDATE_NOT_APPLICABLE); 0x8A150061 (PACKAGE_ALREADY_INSTALLED) needs --no-upgrade. For
+  # the install verb both mean "already installed": Done, winget's own "installed" message, Data.AlreadyInstalled.
+  It '<Id>: <Hex> as <Code> is Done "<Id>: installed" with Data.AlreadyInstalled, and no failure is logged (ruling Z-R3)' -ForEach @(
+    @{ Id = 'Zoom.Zoom'; Hex = '0x8A15002B'; Code = -1978335189 }, @{ Id = 'Zoom.Zoom'; Hex = '0x8A15002B'; Code = 2316632107 }
+    @{ Id = 'Zoom.Zoom'; Hex = '0x8A150061'; Code = -1978335135 }, @{ Id = 'Zoom.Zoom'; Hex = '0x8A150061'; Code = 2316632161 }
+    @{ Id = '7zip.7zip'; Hex = '0x8A15002B'; Code = -1978335189 }, @{ Id = '7zip.7zip'; Hex = '0x8A15002B'; Code = 2316632107 }
+    @{ Id = '7zip.7zip'; Hex = '0x8A150061'; Code = -1978335135 }, @{ Id = '7zip.7zip'; Hex = '0x8A150061'; Code = 2316632161 }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult $Code)
+    $r = Invoke-WingetInstall -Id $Id -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly "${Id}: installed"
+    $r.Reboot | Should -Be 'None'
+    $r.Data.AlreadyInstalled | Should -BeTrue
+    $extCalls.Count | Should -Be 1
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install failed' } -Times 0 -Exactly
+  }
+  It 'a timed-out run carries Data.TimedOut, on the first run and on the retry' {
+    Set-ExternalQueue @(New-ExternalResult $null $true)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -TimeoutMinutes 10 -Context $ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Zoom.Zoom: winget timed out'; $r.Data.TimedOut | Should -BeTrue
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult $null $true))
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.TimedOut | Should -BeTrue
+    Set-ExternalQueue @(New-ExternalResult 0x8A15001E)
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.Contains('TimedOut') | Should -BeFalse
+  }
+  It 'returns Failed (it does not throw) for a custom token that fails the pattern, runs nothing and never echoes it' {
+    Set-ExternalQueue @()
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'A=b', 'ZConfig="x" & calc' -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: invalid winget custom argument'
+    $extCalls.Count | Should -Be 0
+  }
 }
 
 Describe 'Invoke-WingetUninstall' {
@@ -341,6 +473,15 @@ Describe 'Invoke-WingetUninstall' {
   It 'is Failed "timed out" when winget times out' {
     Set-ExternalQueue @(New-ExternalResult $null $true)
     (Invoke-WingetUninstall -Id 'Lenovo.SystemUpdate' -Context $ctx).Message | Should -Be 'Lenovo.SystemUpdate: winget timed out'
+  }
+  It 'keeps 0x8A15002B Failed for uninstall, as <Code> (ruling Z-R3: only install reads it as already installed)' -ForEach @(
+    @{ Code = -1978335189 }, @{ Code = 2316632107 }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult $Code)
+    $r = Invoke-WingetUninstall -Id 'Lenovo.SystemUpdate' -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Lenovo.SystemUpdate: winget 0x8A15002B'
+    $r.Data.Contains('AlreadyInstalled') | Should -BeFalse
   }
   It 'resets the sources once and retries once on 0x8A15000F' {
     Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult 0))
@@ -408,6 +549,52 @@ Describe 'Test-WingetUsable' {
     Test-WingetUsable -Path 'C:\stale\alias\winget.exe' | Should -BeFalse
   }
 }
+# Final review M2: winget's --custom needs winget 1.5 or later, so the zoom step asks for the version first.
+Describe 'Get-WingetVersion' {
+  BeforeEach {
+    Mock Write-SetupLog {}
+    Mock Invoke-External {
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $script:extQueue.Dequeue()
+    }
+  }
+
+  It 'reads "<Out>" as <V>, from "winget --version" with a one-minute limit' -ForEach @(
+    @{ Out = 'v1.9.25200'; V = '1.9.25200' }, @{ Out = "v1.4.11071`r`n"; V = '1.4.11071' }, @{ Out = 'v1.5.1572'; V = '1.5.1572' }
+    @{ Out = 'v1.10.40-preview'; V = '1.10.40' }, @{ Out = '  v1.28.190  '; V = '1.28.190' }, @{ Out = '1.6.2771'; V = '1.6.2771' }
+  ) {
+    Set-ExternalQueue @(New-ExternalResult 0 $false $Out)
+    $r = Get-WingetVersion -Path 'C:\fake\winget.exe'
+    $r | Should -BeOfType [version]
+    $r | Should -Be ([version]$V)
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].FilePath | Should -Be 'C:\fake\winget.exe'
+    $extCalls[0].ArgumentList | Should -BeExactly '--version'
+    $extCalls[0].TimeoutMinutes | Should -Be 1
+    $extCalls[0].Capture | Should -BeTrue
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 0 -Exactly
+  }
+  It 'is $null, with one WARN, for <Why>' -ForEach @(
+    @{ Why = 'no output'; R = @{ ExitCode = 0; TimedOut = $false; Output = '' } }
+    @{ Why = 'text that is not a version'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'Windows Package Manager' } }
+    @{ Why = 'a version inside a sentence'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'version v1.9.25200 here' } }
+    @{ Why = 'digits of another script'; R = @{ ExitCode = 0; TimedOut = $false; Output = ('v1.' + [char]0x0669) } }
+    @{ Why = 'a number too large for a version'; R = @{ ExitCode = 0; TimedOut = $false; Output = 'v1.99999999999' } }
+    @{ Why = 'a timeout'; R = @{ ExitCode = $null; TimedOut = $true; Output = 'v1.9.25200' } }
+    @{ Why = 'a non-zero exit code'; R = @{ ExitCode = 1; TimedOut = $false; Output = 'v1.9.25200' } }
+    @{ Why = 'no exit code'; R = @{ ExitCode = $null; TimedOut = $false; Output = 'v1.9.25200' } }
+  ) {
+    Set-ExternalQueue @($R)
+    Get-WingetVersion -Path 'C:\fake\winget.exe' | Should -BeNullOrEmpty
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 1 -Exactly
+  }
+  It 'is $null, and does not throw, when winget cannot be started' {
+    Mock Invoke-External { throw 'Cannot start' }
+    { Get-WingetVersion -Path 'C:\stale\winget.exe' } | Should -Not -Throw
+    Get-WingetVersion -Path 'C:\stale\winget.exe' | Should -BeNullOrEmpty
+  }
+}
+
 Describe 'ConvertTo-PowerShellLiteral' {
   It 'wraps plain text in single quotes' {
     ConvertTo-PowerShellLiteral -Text 'C:\BenTech\Setup\x.msixbundle' | Should -Be "'C:\BenTech\Setup\x.msixbundle'"

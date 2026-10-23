@@ -72,7 +72,7 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $w = New-TestWindow
     foreach ($n in 'RootBorder','TitleBar','LangEn','LangHe','CloseButton','NavSetup','ContentScroll','MachineModel','MachineSerial','MachineNewName','MachinePower',
       'WarnPanel','WarnText','AdminBanner','ProfilePanel','TypeLaptop','TypeDesktop','OfficeCraft','OfficeBusiness','OfficeHome','OfficeOff','RemoteAnyDesk',
-      'RemoteScreenConnect','RemoteBoth','ScreenConnectWarn','UpdatesFull','UpdatesDrivers','SevenZipSwitch','TweakPanel','RestoreSwitch','PlanList','StartButton','CancelButton') { $w.FindName($n) | Should -Not -BeNullOrEmpty -Because $n }
+      'RemoteScreenConnect','RemoteBoth','ScreenConnectWarn','UpdatesFull','UpdatesDrivers','SevenZipSwitch','ZoomSwitch','TweakPanel','RestoreSwitch','PlanList','StartButton','CancelButton') { $w.FindName($n) | Should -Not -BeNullOrEmpty -Because $n }
     $w.Width | Should -Be 1000; $w.Height | Should -Be 680; $w.Topmost | Should -BeTrue; $w.WindowStyle | Should -Be 'None'; $w.FontFamily.Source | Should -Be 'Segoe UI'
     $s = $w.FindName('StartButton'); $s.IsDefault | Should -BeFalse; $s.Focusable | Should -BeFalse
     foreach ($b in 'StartButton','CancelButton','CloseButton') { $w.FindName($b).IsCancel | Should -BeFalse }
@@ -181,6 +181,26 @@ Describe 'the toolbox look (toolbox spec 4.1-4.3)' {
     $remote | Should -BeLessThan $updates; $updates | Should -BeLessThan $apps
     (& $rowOf 'RemoteBoth') | Should -Be $remote; (& $rowOf 'UpdatesDrivers') | Should -Be $updates
     $w.FindName('UpdatesFull').IsChecked | Should -BeTrue; $w.FindName('UpdatesDrivers').IsChecked | Should -BeFalse }
+  # Zoom spec 3.1: the APPS row gains a Zoom switch after 7-Zip, in the same switch style; 7-Zip's margin is unchanged.
+  It 'the Zoom switch sits in the APPS row right after 7-Zip, in the 7-Zip switch''s style, off by default (zoom spec 3.1)' {
+    $w = New-TestWindow; $z = $w.FindName('ZoomSwitch'); $s = $w.FindName('SevenZipSwitch')
+    $z | Should -BeOfType [Windows.Controls.CheckBox]
+    [object]::ReferenceEquals($z.Parent, $s.Parent) | Should -BeTrue; $z.Parent | Should -BeOfType [Windows.Controls.WrapPanel]
+    $z.Parent.Children.IndexOf($z) | Should -Be ($s.Parent.Children.IndexOf($s) + 1); $z.Parent.Children.Count | Should -Be ($z.Parent.Children.IndexOf($z) + 1)
+    [object]::ReferenceEquals($z.Style, $s.Style) | Should -BeTrue; [object]::ReferenceEquals($z.Style, $w.FindResource('SwitchStyle')) | Should -BeTrue
+    $z.Tag | Should -BeExactly 'a:Zoom:'; $z.Height | Should -Be 30; $z.Height | Should -Be $s.Height
+    $z.Margin | Should -Be (New-Object Windows.Thickness 18, 0, 0, 6); $s.Margin | Should -Be (New-Object Windows.Thickness 0, 0, 0, 6)
+    $z.Content | Should -BeOfType [Windows.Controls.TextBlock]; $z.Content.Tag | Should -BeExactly 't:apps.zoom'; $z.Content.FlowDirection | Should -Be 'LeftToRight'
+    $z.Content.Text | Should -BeExactly 'Zoom'; $z.IsChecked | Should -BeFalse
+    $h = New-TestWindow @{ Language = 'he' }; $h.FindName('ZoomSwitch').Content.Text | Should -BeExactly 'Zoom'; $h.FindName('ZoomSwitch').IsChecked | Should -BeFalse
+    $on = New-TestWindow @{ Zoom = $true }; $on.FindName('ZoomSwitch').IsChecked | Should -BeTrue
+    $odd = New-TestWindow @{ Zoom = 'true' }; $odd.FindName('ZoomSwitch').IsChecked | Should -BeFalse }   # the view reads Test-ZoomChosen, as the plan does
+  It 'the Zoom switch stays on the 7-Zip line at 1000 x 680 (<Lang>): the APPS row does not wrap' -ForEach @(@{ Lang = 'en' }, @{ Lang = 'he' }) {
+    $w = New-TestWindow @{ Language = $Lang }; Set-TestLayout $w 1000 680
+    $z = $w.FindName('ZoomSwitch'); $s = $w.FindName('SevenZipSwitch'); $origin = New-Object Windows.Point 0, 0
+    $z.ActualWidth | Should -BeGreaterThan 0
+    $z.TranslatePoint($origin, $z.Parent).Y | Should -Be $s.TranslatePoint($origin, $s.Parent).Y
+    $w.Close() }
   # Final wave 4 (WU-R4): the new 36 px UPDATES row made a one-warning view overflow the 680 px window by 1 px, so
   # it drew a scroll bar for nothing. A view with at most one warning (not fresh, on battery, an earlier run) fits.
   It 'a view with at most one warning fits the 1000 x 680 window: no scroll bar (<N>, <Lang>; WU-R4)' -ForEach @(
@@ -223,8 +243,9 @@ Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
   It 'Start returns the validated Choices and closes; Cancel and Close return Cancel' {
     $w = New-LiveWindow; Click $w 'TypeDesktop'; Click $w 'StartButton'
     $w.Tag.Outcome | Should -Be 'Start'; $w.Tag.Closing | Should -BeTrue
-    @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate')
+    @($w.Tag.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate', 'Zoom')
     $w.Tag.Choices.WindowsUpdate | Should -BeExactly 'FULL'
+    $w.Tag.Choices.Zoom | Should -BeOfType [bool]; $w.Tag.Choices.Zoom | Should -BeFalse
     @($w.Tag.Choices.Tweaks) | Should -Be @('accessKeys', 'numLock', 'startClean', 'noAds')
     foreach ($b in 'CancelButton', 'CloseButton') { $c = New-LiveWindow; Click $c $b; $c.Tag.Outcome | Should -Be 'Cancel'; $c.Tag.Choices | Should -BeNullOrEmpty }
     $x = New-LiveWindow; $x.Close(); $x.Tag.Outcome | Should -Be 'Cancel' }   # Alt+F4 and the window's X end in Closing
@@ -235,6 +256,20 @@ Describe 'the toolbox logic (toolbox spec 4.1, 5.1)' {
     Click $w 'LangHe'; (@($w.FindName('PlanList').Children).Text -join "`n") | Should -Match ('(?m)  ' + [regex]::Escape($script:ToolboxStrings.he['step.windows-update.drivers']) + '$')
     ClickTag $w 'a:Profile:business'; $w.Tag.Model.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'; $w.FindName('UpdatesDrivers').IsChecked | Should -BeTrue
     Click $w 'StartButton'; $w.Tag.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' }
+  It 'Zoom: a click checks the switch through the model and puts Zoom right after 7-Zip in the plan, in both languages; a profile click keeps it (zoom spec 3.1, Review Focus 5)' {
+    $w = New-LiveWindow
+    $names = { @($w.FindName('PlanList').Children | ForEach-Object { $_.Text -replace '^[ \d]\d  ', '' }) }
+    (& $names) | Should -Not -Contain 'Zoom'
+    ClickTag $w 'a:Zoom:'
+    $w.Tag.Model.Choices.Zoom | Should -BeTrue; $w.FindName('ZoomSwitch').IsChecked | Should -BeTrue
+    $rows = & $names; $i = [array]::IndexOf($rows, '7-Zip'); $i | Should -BeGreaterOrEqual 0; $rows[$i + 1] | Should -BeExactly 'Zoom'
+    Click $w 'LangHe'
+    $rows = & $names; $i = [array]::IndexOf($rows, $script:ToolboxStrings.he['step.7zip']); $i | Should -BeGreaterOrEqual 0
+    $rows[$i + 1] | Should -BeExactly $script:ToolboxStrings.he['step.zoom']; $w.FindName('ZoomSwitch').IsChecked | Should -BeTrue
+    ClickTag $w 'a:Profile:business'; $w.Tag.Model.Choices.Zoom | Should -BeTrue; $w.FindName('ZoomSwitch').IsChecked | Should -BeTrue
+    Click $w 'ZoomSwitch'; $w.Tag.Model.Choices.Zoom | Should -BeFalse; $w.FindName('ZoomSwitch').IsChecked | Should -BeFalse
+    (& $names) | Should -Not -Contain 'Zoom'
+    Click $w 'ZoomSwitch'; Click $w 'StartButton'; $w.Tag.Choices.Zoom | Should -BeTrue; $w.Tag.Choices.Profile | Should -Be 'business' }
   It 'Administrator protection On: red banner, Start disabled, a raised click refused (Review Focus 4)' {
     $w = New-TestWindow -Protection 'On'; Register-ToolboxHandlers -Window $w
     $s = $w.FindName('StartButton'); $s.IsEnabled | Should -BeFalse; $w.FindName('AdminBanner').Visibility | Should -Be 'Visible'
@@ -562,10 +597,14 @@ Describe 'every test passes the WPF seams (final review M5)' {
     $script:callsSeen | Should -BeGreaterOrEqual 5 }   # not vacuous: it sees the real calls in Toolbox.Tests and Entry.Tests
 }
 Describe 'tools\Preview-Toolbox.ps1' {
-  It 'renders the thirteen PNGs (the six setup views, the seven repair views) at 1000x680 without showing a window' {
-    $out = Join-Path $TestDrive 'preview'; $paths = @(& "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out); $paths.Count | Should -Be 13
-    foreach ($f in 'toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png', 'toolbox-en-drivers.png', 'toolbox-he-drivers.png',
-                   'repair-en.png', 'repair-he.png', 'repair-en-blocked.png', 'repair-en-confirm.png', 'repair-en-running.png', 'repair-he-running.png', 'repair-en-result.png') {
+  It 'renders the fifteen PNGs (the eight setup views, the seven repair views) at 1000x680 without showing a window, and prints their paths' {
+    $out = Join-Path $TestDrive 'preview'; $printed = @(& "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out)
+    $files = @('toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png', 'toolbox-en-drivers.png', 'toolbox-he-drivers.png',
+               'toolbox-en-zoom.png', 'toolbox-he-zoom.png',
+               'repair-en.png', 'repair-he.png', 'repair-en-blocked.png', 'repair-en-confirm.png', 'repair-en-running.png', 'repair-he-running.png', 'repair-en-result.png')
+    @($printed | ForEach-Object { Split-Path -Leaf $_ }) | Should -Be $files
+    @(Get-ChildItem $out -Filter *.png).Count | Should -Be 15
+    foreach ($f in $files) {
       $s = [IO.File]::OpenRead((Join-Path $out $f))
       try { $frame = [Windows.Media.Imaging.BitmapDecoder]::Create($s, 'None', 'OnLoad').Frames[0]; $frame.PixelWidth | Should -Be 1000; $frame.PixelHeight | Should -Be 680 }
       finally { $s.Dispose() } } }

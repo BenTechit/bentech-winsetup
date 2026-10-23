@@ -11,7 +11,7 @@ BeforeAll {
     Get-StepPlan -Machine @{Brand=$brand} -Choices $c -Config $cfg }
 }
 Describe 'StepCatalog' {
-  It 'lists the 22 steps in spec order with their titles and functions' {
+  It 'lists the 23 steps in spec order with their titles and functions' {
     $rows = @($script:StepCatalog | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Title, $_.Function })
     $rows | Should -Be @(
       'prepare|Prepare machine|Invoke-StepPrepare'
@@ -26,6 +26,7 @@ Describe 'StepCatalog' {
       'anydesk|AnyDesk|Invoke-StepAnyDesk'
       'screenconnect|ScreenConnect|Invoke-StepScreenConnect'
       '7zip|7-Zip|Invoke-StepSevenZip'
+      'zoom|Zoom|Invoke-StepZoom'
       'craft-apps|Craft apps|Invoke-StepCraftApps'
       'default-browser|Chrome as default browser|Invoke-StepDefaultBrowser'
       'vendor-pass1|Vendor drivers + BIOS (pass 1)|Invoke-StepVendorPass1'
@@ -43,7 +44,7 @@ Describe 'StepCatalog' {
   It 'has the progress screen''s Short titles (v2 spec 4.2)' {
     @($script:StepCatalog | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Short }) | Should -Be @(
       'prepare|Prepare', 'bitlocker|BitLocker off', 'region|Time zone + keyboard', 'desktop-icons|Desktop icons', 'tweaks|Tweaks'
-      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', 'screenconnect|ScreenConnect', '7zip|7-Zip', 'craft-apps|Craft apps'
+      'bloatware|Remove bloatware', 'rename|Rename PC', 'winget|winget', 'chrome|Chrome', 'anydesk|AnyDesk', 'screenconnect|ScreenConnect', '7zip|7-Zip', 'zoom|Zoom', 'craft-apps|Craft apps'
       'default-browser|Default browser', 'vendor-pass1|Drivers (pass 1)', 'office|Microsoft 365', 'windows-update|Windows Update'
       'office-finish|Microsoft 365', 'vendor-pass2|Drivers (pass 2)', 'consumer-app|Laptop app', 'vendor-cleanup|Remove updater', 'finalize|Finish'
     )
@@ -87,6 +88,48 @@ Describe 'Get-WindowsUpdateChoice (wu spec 3.1)' {
     $full = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ WindowsUpdate = 'FULL' }) -Config $cfg)
     @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ WindowsUpdate = 'DRIVERS' }) -Config $cfg) -join ',' | Should -BeExactly ($full -join ',')
     $full | Should -Contain 'windows-update' }
+}
+Describe 'Test-ZoomChosen (zoom spec 3.1)' {
+  It '<Why> is <E>' -ForEach @(
+    @{ Why = 'the bool $true';                  C = @{ Zoom = $true };      E = $true }
+    @{ Why = 'an ordered table with $true';     C = [ordered]@{ Zoom = $true }; E = $true }
+    @{ Why = 'the bool $false';                 C = @{ Zoom = $false };     E = $false }
+    @{ Why = 'the string true';                 C = @{ Zoom = 'true' };     E = $false }
+    @{ Why = 'the number 1';                    C = @{ Zoom = 1 };          E = $false }
+    @{ Why = 'a $null value';                   C = @{ Zoom = $null };      E = $false }
+    @{ Why = 'a missing key (an older state)';  C = @{ Mode = 'LAPTOP' };   E = $false }
+    @{ Why = 'no choices';                      C = $null;                  E = $false }
+    @{ Why = 'something that is not a table';   C = 'Zoom';                 E = $false }
+  ) {
+    $r = Test-ZoomChosen -Choices $C
+    $r | Should -BeOfType [bool]
+    $r | Should -Be $E
+  }
+  It 'zoom is planned right after 7zip with Zoom = $true, and not without; nothing else moves' {
+    $c = @{ Mode = 'LAPTOP'; SevenZip = $true; Office = 'BUSINESS' }
+    $without = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $c -Config $cfg)
+    $with = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ Zoom = $true }) -Config $cfg)
+    $without | Should -Not -Contain 'zoom'
+    $with.IndexOf('zoom') | Should -Be ($with.IndexOf('7zip') + 1)
+    @($with | Where-Object { $_ -ne 'zoom' }) -join ',' | Should -BeExactly ($without -join ',')
+    foreach ($v in $false, 'true', 1) { @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices ($c + @{ Zoom = $v }) -Config $cfg) | Should -Not -Contain 'zoom' }
+  }
+  It 'zoom comes before craft-apps and before office, so its MSI never overlaps the Office install' {
+    $craft = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices @{ Mode = 'LAPTOP'; SevenZip = $false; Office = 'CRAFT'; Zoom = $true } -Config $cfg)
+    $craft.IndexOf('zoom') | Should -BeLessThan $craft.IndexOf('craft-apps')
+    $m365 = @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices @{ Mode = 'LAPTOP'; SevenZip = $false; Office = 'HOME'; Zoom = $true } -Config $cfg)
+    $m365.IndexOf('zoom') | Should -BeLessThan $m365.IndexOf('office')
+    $m365.IndexOf('zoom') | Should -BeGreaterThan $m365.IndexOf('anydesk')
+  }
+  It 'a state.json from an older version (no Zoom) plans no zoom; one with Zoom true does (Review Focus 4)' {
+    $old = ConvertTo-HashtableDeep -InputObject ('{"Choices":{"Mode":"LAPTOP","SevenZip":true,"Office":"CRAFT"}}' | ConvertFrom-Json)
+    @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $old.Choices -Config $cfg) | Should -Not -Contain 'zoom'
+    $new = ConvertTo-HashtableDeep -InputObject ('{"Choices":{"Mode":"LAPTOP","SevenZip":true,"Office":"CRAFT","Zoom":true}}' | ConvertFrom-Json)
+    @(Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $new.Choices -Config $cfg) | Should -Contain 'zoom'
+  }
+  It 'the default choices plan no zoom (Q49: off everywhere)' {
+    $d = New-DefaultChoices -Machine @{ IsLaptop = $true } -Config $cfg
+    Get-StepPlan -Machine @{ Brand = 'DELL' } -Choices $d -Config $cfg | Should -Not -Contain 'zoom' }
 }
 Describe 'Get-StepPlan' {
   It 'Dell laptop gets everything in order' { (P DELL LAPTOP) -join ',' | Should -Be 'prepare,bitlocker,region,desktop-icons,bloatware,rename,winget,chrome,anydesk,7zip,default-browser,vendor-pass1,office,windows-update,office-finish,vendor-pass2,consumer-app,vendor-cleanup,finalize' }

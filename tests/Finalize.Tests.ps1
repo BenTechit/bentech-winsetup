@@ -571,6 +571,77 @@ Describe 'Get-InstalledAppVersions' {
     (Get-InstalledAppVersions -Config $scCfg)['ScreenConnect'] | Should -Be '26.6.6.9747'
     (Get-InstalledAppVersions).ContainsKey('ScreenConnect') | Should -BeFalse
   }
+  # Zoom spec 3.3: Zoom's per-machine names, in order, never a bare Zoom*.
+  It 'reports Zoom from a Zoom Workplace entry, and leaves the other apps as they were' {
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'Google Chrome'; DisplayVersion = '155.0.8059.85' }
+      [pscustomobject]@{ DisplayName = 'Zoom Workplace (64-bit)'; DisplayVersion = '6.6.0.1234' }
+      [pscustomobject]@{ DisplayName = '7-Zip 24.08 (x64)'; DisplayVersion = '24.08' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    $v = Get-InstalledAppVersions
+    $v['Zoom'] | Should -Be '6.6.0.1234'
+    $v['Google Chrome'] | Should -Be '155.0.8059.85'; $v['AnyDesk'] | Should -Be '9.5.3'; $v['7-Zip'] | Should -Be '24.08'
+    $v.Count | Should -Be 5
+  }
+  It 'finds <Name> when no Zoom Workplace entry exists' -ForEach @(@{ Name = 'Zoom(64bit)' }, @{ Name = 'Zoom (64-bit)' }) {
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = $script:zoomName; DisplayVersion = '5.17.11' } } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    $script:zoomName = $Name
+    (Get-InstalledAppVersions)['Zoom'] | Should -Be '5.17.11'
+  }
+  It 'prefers Zoom Workplace over Zoom(64bit) in the same view, whichever comes first' {
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'Zoom(64bit)'; DisplayVersion = '5.17.11' }
+      [pscustomobject]@{ DisplayName = 'Zoom Workplace (64-bit)'; DisplayVersion = '6.6.0.1234' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    (Get-InstalledAppVersions)['Zoom'] | Should -Be '6.6.0.1234'
+  }
+  It 'reads the 64-bit machine view before the per-user one, so a per-machine Zoom wins' {
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'Zoom(64bit)'; DisplayVersion = '5.17.11' } } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    Mock Get-ItemProperty { [pscustomobject]@{ DisplayName = 'Zoom Workplace'; DisplayVersion = '6.6.0.1234' } } -ParameterFilter { @($Path) -contains 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' }
+    (Get-InstalledAppVersions)['Zoom'] | Should -Be '5.17.11'
+  }
+  # Task 1 review M3: one entry that throws costs only that entry, not the fixed apps of its whole view.
+  It 'an entry that throws while it is read is skipped; the rest of its view is still reported, with one WARN' {
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'Google Chrome'; DisplayVersion = '155.0.8059.85' }
+      # A DisplayName that cannot be turned into text: [string] on it throws (a throwing ScriptProperty would not,
+      # PowerShell swallows a getter's exception).
+      $name = [pscustomobject]@{ Value = 1 }
+      $name | Add-Member -MemberType ScriptMethod -Name ToString -Value { throw 'the value cannot be read' } -Force
+      [pscustomobject]@{ DisplayName = $name; DisplayVersion = '1.0' }
+      [pscustomobject]@{ DisplayName = '7-Zip 24.08 (x64)'; DisplayVersion = '24.08' }
+      [pscustomobject]@{ DisplayName = 'Zoom Workplace (64-bit)'; DisplayVersion = '6.6.0.1234' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    $v = Get-InstalledAppVersions
+    $v['Google Chrome'] | Should -Be '155.0.8059.85'; $v['7-Zip'] | Should -Be '24.08'; $v['Zoom'] | Should -Be '6.6.0.1234'
+    $v['AnyDesk'] | Should -Be '9.5.3'; $v['Microsoft 365'] | Should -Be '16.0.19127.20000'
+    $v.Count | Should -Be 5
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Data.key -eq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' -and $Data.skipped -eq 1 } -Times 1 -Exactly
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 1 -Exactly
+  }
+  It 'a Craft displayName that is not a valid regex keeps the fixed apps, ScreenConnect and the Craft apps before it' {
+    $cfg = '{"apps":{"craft":{"items":[{"name":"WordCraft","displayName":"^WordCraft"},{"name":"Bad","displayName":"[unclosed"}]},"screenconnect":{"serviceName":"ScreenConnect Client (b58e7c32699a96bf)"}}}' | ConvertFrom-Json
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'Google Chrome'; DisplayVersion = '155.0.8059.85' }
+      [pscustomobject]@{ DisplayName = 'WordCraft'; DisplayVersion = '0.8.0' }
+      [pscustomobject]@{ DisplayName = 'ScreenConnect Client (b58e7c32699a96bf)'; DisplayVersion = '26.6.6.9747' }
+      [pscustomobject]@{ DisplayName = '7-Zip 24.08 (x64)'; DisplayVersion = '24.08' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    $v = Get-InstalledAppVersions -Config $cfg
+    $v['Google Chrome'] | Should -Be '155.0.8059.85'; $v['7-Zip'] | Should -Be '24.08'; $v['AnyDesk'] | Should -Be '9.5.3'
+    $v['WordCraft'] | Should -Be '0.8.0'; $v['ScreenConnect'] | Should -Be '26.6.6.9747'; $v.ContainsKey('Bad') | Should -BeFalse
+    # One WARN per view whose entries threw (the 64-bit view and AnyDesk's 32-bit view), never one per entry.
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' } -Times 2 -Exactly
+    Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Data.key -eq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' -and $Data.skipped -eq 4 } -Times 1 -Exactly
+  }
+  It 'a Zoom Outlook Plugin alone, or another Zoom-named product, is no Zoom' {
+    Mock Get-ItemProperty {
+      [pscustomobject]@{ DisplayName = 'Zoom Outlook Plugin'; DisplayVersion = '5.17.0' }
+      [pscustomobject]@{ DisplayName = 'Zoom Rooms'; DisplayVersion = '6.0.0' }
+      [pscustomobject]@{ DisplayName = 'Zoom'; DisplayVersion = '6.0.0' }
+    } -ParameterFilter { @($Path) -contains $script:Uninstall64 }
+    (Get-InstalledAppVersions).ContainsKey('Zoom') | Should -BeFalse
+  }
 }
 
 Describe 'ConvertTo-BitLockerFinding' {

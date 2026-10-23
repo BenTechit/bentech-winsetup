@@ -5,8 +5,9 @@
 # change file associations and policies. Nothing here may do any of that. Every test that reaches
 # the system runs after Initialize-AppMocks (each Describe calls it from BeforeEach), which replaces
 # EVERY command the steps can reach with a recorder: Invoke-External, Start-BackgroundExternal (the Office
-# setup.exe never starts), Get-RemoteFile, Get-RemoteText,
-# Test-FileSignature, Invoke-WingetInstall, Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
+# setup.exe never starts), Get-RemoteFile, Get-RemoteText, Get-WingetPath, Get-WingetVersion,
+# Test-FileSignature, Invoke-WingetInstall (kept real with -RealWinget, so winget's exit-code mapping runs
+# against the Invoke-External recorder), Test-Path, Get-ItemProperty, New-Item, New-ItemProperty,
 # Get-Content, Start-Sleep, Write-SetupLog and Get-ShellDefaultBrowserProgId (the AssocQueryString
 # P/Invoke wrapper). The Office wait Describes also mock Get-Process, Stop-ProcessTree, Save-RunState and
 # Wait-SetupDelay, so no real process is looked up or killed. The only real file I/O is inside
@@ -17,6 +18,7 @@ BeforeAll {
   # State.ps1 holds Save-RunState, which the Office background wait and office-finish call (mocked below).
   . "$PSScriptRoot\..\src\State\State.ps1"
   . "$PSScriptRoot\..\src\Steps\Winget.ps1"
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: the real winget path (-RealWinget) logs its output tail as ASCII
   foreach ($f in 'Apps', 'Office', 'DefaultBrowser') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
   # Report.ps1 holds Get-InstalledAppVersions, which the steps read for the activity feed (mocked below).
   . "$PSScriptRoot\..\src\Report\Report.ps1"
@@ -66,6 +68,7 @@ BeforeAll {
   #   $script:activity    one hashtable (Text, LogText) per Add-SetupActivity call
   #   $script:bg          one hashtable (FilePath, ArgumentList) per Start-BackgroundExternal call
   function Initialize-AppMocks {
+    param([switch]$RealWinget)
     $script:activity = New-Object System.Collections.ArrayList
     $script:bg = New-Object System.Collections.ArrayList
     $script:OfficeBackgroundProcess = $null
@@ -125,9 +128,15 @@ BeforeAll {
       [void]$script:sigCalls.Add(@{ Path = $Path; Signers = @($AllowedSigners) })
       return (-not ($script:sigBad -contains (Split-Path -Leaf $Path)))
     }
-    Mock Invoke-WingetInstall {
-      [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source })
-      return $script:wingetResult
+    Mock Get-WingetPath { 'C:\fake\winget.exe' }
+    $script:wingetVersion = [version]'1.9.25200'
+    $script:versionCalls = New-Object System.Collections.ArrayList
+    Mock Get-WingetVersion { [void]$script:versionCalls.Add($Path); return $script:wingetVersion }
+    if (-not $RealWinget) {
+      Mock Invoke-WingetInstall {
+        [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source; Custom = $Custom; TimeoutMinutes = $TimeoutMinutes })
+        return $script:wingetResult
+      }
     }
     Mock Get-ItemProperty {
       if ($script:regReadThrows) { throw 'Requested registry access is not allowed' }
@@ -687,6 +696,195 @@ Describe 'Invoke-StepSevenZip' {
     $script:wingetResult = New-StepResult -Status Skipped -Message '7zip.7zip: no package or installer for this system'
     $null = Invoke-StepSevenZip -Context $script:ctx
     $script:activity.Count | Should -Be 0
+  }
+  It 'calls winget exactly as before: no custom tokens, the default limit' {
+    $null = Invoke-StepSevenZip -Context $script:ctx
+    $script:wingetCalls[0].Custom | Should -BeNullOrEmpty
+    $script:wingetCalls[0].TimeoutMinutes | Should -BeNullOrEmpty
+  }
+}
+
+# --- Invoke-StepZoom (zoom spec 3.2) ------------------------------------------------------------
+Describe 'Invoke-StepZoom' {
+  BeforeEach {
+    Initialize-AppMocks
+    $script:ctx = New-AppContext -Dir (New-TestDir)
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed'
+  }
+  It 'a fresh install: Done, no Note, the activity line; winget gets Zoom.Zoom, the config''s tokens and the 10-minute limit' {
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: installed'
+    @($r.Notes).Count | Should -Be 0
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+    $script:wingetCalls.Count | Should -Be 1
+    $script:wingetCalls[0].Id | Should -BeExactly 'Zoom.Zoom'
+    $script:wingetCalls[0].Source | Should -BeExactly 'winget'
+    @($script:wingetCalls[0].Custom) | Should -Be @('ZConfig=AU2_EnableAutoUpdate=true;AU2_SetUpdateChannel=0')
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 10
+  }
+  It 'writes its version when it is known, as 7-Zip does' {
+    Mock Get-InstalledAppVersions { @{ 'Zoom' = '6.6.0.1234' } }
+    $null = Invoke-StepZoom -Context $script:ctx
+    @($script:activity.Text) | Should -Be @('Zoom 6.6.0.1234 installed')
+  }
+  It 'already installed (0x8A150061): Done, the yellow Note, the already-installed line, no claim of a fresh install (Review Focus 1)' {
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: already installed'
+    @($r.Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+    @($script:activity.Text) | Should -Be @('Zoom already installed')
+  }
+  It 'a timed-out install is Failed "Zoom install timed out", with no activity line (Review Focus 2)' {
+    $script:wingetResult = New-StepResult -Status Failed -Message 'Zoom.Zoom: winget timed out' -Data @{ TimedOut = $true }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom install timed out'
+    $script:activity.Count | Should -Be 0
+  }
+  It 'the limit comes from timeoutsMinutes.zoom: <Value>' -ForEach @(@{ Value = 4; Minutes = 4 }, @{ Value = 2.5; Minutes = 2.5 }, @{ Value = '6'; Minutes = 6 }) {
+    $script:ctx.Config.timeoutsMinutes.zoom = $Value
+    $null = Invoke-StepZoom -Context $script:ctx
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be $Minutes
+    @($script:logs | Where-Object { $_.Message -match 'timeoutsMinutes' }).Count | Should -Be 0
+  }
+  # Task 1 review M2: a broken config's limit falls back to timeoutsMinutes.default, with a WARN, so Zoom still
+  # installs instead of failing 'winget could not be started' (or throwing).
+  It 'a timeoutsMinutes.zoom that is <Why> falls back to timeoutsMinutes.default, with a WARN' -ForEach @(
+    @{ Why = 'missing'; Value = 'none' }, @{ Why = '$null'; Value = $null }, @{ Why = '0'; Value = 0 }, @{ Why = 'negative'; Value = -5 }
+    @{ Why = 'not a number'; Value = 'ten' }, @{ Why = 'longer than Invoke-External allows'; Value = 20000 }, @{ Why = 'NaN'; Value = 'NaN' }
+  ) {
+    if ($Value -is [string] -and $Value -eq 'none') { $script:ctx.Config.timeoutsMinutes.PSObject.Properties.Remove('zoom') } else { $script:ctx.Config.timeoutsMinutes.zoom = $Value }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $script:wingetCalls.Count | Should -Be 1
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 30
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'timeoutsMinutes\.zoom' }).Count | Should -Be 1
+  }
+  # Review Focus 3 and final review M3: a refused token is dropped and logged (by position); the Note says only
+  # what is true, so it comes only when no token that reaches winget carries AU2_EnableAutoUpdate.
+  It 'a config with <Why>: Zoom installs with the good tokens only; the Note: <Note>' -ForEach @(
+    @{ Why = 'no custom';                                Custom = 'none';                                                             Kept = @();                                                   Refused = $false; Note = $true }
+    @{ Why = 'an empty custom list';                     Custom = @();                                                                Kept = @();                                                   Refused = $false; Note = $true }
+    @{ Why = 'a refused second token';                   Custom = @('ZConfig=AU2_EnableAutoUpdate=true', 'ZConfig="x" & calc', 'B=c'); Kept = @('ZConfig=AU2_EnableAutoUpdate=true', 'B=c'); Refused = $true; Note = $false }
+    @{ Why = 'the auto-update token refused';            Custom = @('ZConfig="AU2_EnableAutoUpdate=true" & calc', 'B=c');              Kept = @('B=c');                                              Refused = $true;  Note = $true }
+    @{ Why = 'no token with the auto-update key';        Custom = @('ZConfig=nogoogle=1');                                            Kept = @('ZConfig=nogoogle=1');                               Refused = $false; Note = $true }
+    @{ Why = 'the key inside a combined ZConfig token';  Custom = @('ZConfig=nogoogle=1;AU2_EnableAutoUpdate=true');                  Kept = @('ZConfig=nogoogle=1;AU2_EnableAutoUpdate=true');     Refused = $false; Note = $false }
+    @{ Why = 'a token that is not a string';             Custom = @(5, 'A=b');                                                        Kept = @('A=b');                                              Refused = $true;  Note = $true }
+    @{ Why = 'a null token';                             Custom = @($null, 'A=b');                                                    Kept = @('A=b');                                              Refused = $true;  Note = $true }
+  ) {
+    if ($Custom -is [string] -and $Custom -eq 'none') { $script:ctx.Config.apps.zoom.PSObject.Properties.Remove('custom') } else { $script:ctx.Config.apps.zoom.custom = $Custom }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    (@($r.Notes) -join '|') | Should -BeExactly $(if ($Note) { 'Zoom auto-update not set' } else { '' })
+    $script:wingetCalls.Count | Should -Be 1
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly (@($Kept) -join '|')
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+    # A dropped token is logged by position, never by its text; a missing auto-update token is logged too.
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match 'calc'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'refused' -and $null -ne $_.Data.droppedPositions }).Count | Should -Be ([int]$Refused)
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'AU2_EnableAutoUpdate' }).Count | Should -Be ([int]$Note)
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be ([int]$Refused + [int]$Note)
+  }
+  # Final review M2: --custom needs winget 1.5 or later; an older winget would refuse the whole command line.
+  It 'winget <V>: the tokens go to winget, after one version probe of winget''s own path' -ForEach @(@{ V = '1.5.1572' }, @{ V = '1.28.190' }) {
+    $script:wingetVersion = [version]$V
+    $r = Invoke-StepZoom -Context $script:ctx
+    @($r.Notes).Count | Should -Be 0
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly (@($script:ctx.Config.apps.zoom.custom) -join '|')
+    @($script:versionCalls) | Should -Be @('C:\fake\winget.exe')
+  }
+  It 'winget <Why>: Zoom installs without the tokens, with the yellow Note and a WARN' -ForEach @(
+    @{ Why = '1.4.11071'; V = '1.4.11071' }, @{ Why = '1.4'; V = '1.4' }, @{ Why = 'whose version cannot be read'; V = $null }
+  ) {
+    $script:wingetVersion = if ($null -eq $V) { $null } else { [version]$V }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: installed'
+    @($r.Notes) | Should -Be @('Zoom auto-update not set')
+    $script:wingetCalls.Count | Should -Be 1
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly ''
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 10
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'older than 1\.5' }).Count | Should -Be 1
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+  }
+  It 'an already-installed answer from an old winget still gives only the already-installed Note' {
+    $script:wingetVersion = [version]'1.4.11071'
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    @((Invoke-StepZoom -Context $script:ctx).Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+  }
+  It 'asks no version when there is no token to pass, or no winget (winget''s own result then says so)' {
+    $script:ctx.Config.apps.zoom.custom = @()
+    $null = Invoke-StepZoom -Context $script:ctx
+    $script:versionCalls.Count | Should -Be 0
+    Mock Get-WingetPath { $null }
+    $script:ctx.Config.apps.zoom.custom = @('ZConfig=AU2_EnableAutoUpdate=true')
+    $script:wingetResult = New-StepResult -Status Failed -Message 'winget unavailable'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $script:versionCalls.Count | Should -Be 0
+    $r.Message | Should -BeExactly 'winget unavailable'
+  }
+  It 'already installed with a broken config: only the already-installed Note' {
+    $script:ctx.Config.apps.zoom.custom = @('A B=c')
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    @((Invoke-StepZoom -Context $script:ctx).Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+  }
+  It 'another winget failure is passed through unchanged: winget''s own message, red' {
+    $script:wingetResult = New-StepResult -Status Failed -Message 'Zoom.Zoom: winget 0x8A15001E'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r | Should -Be $script:wingetResult
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: winget 0x8A15001E'
+    $script:activity.Count | Should -Be 0
+  }
+  It 'a skipped winget install is passed through, with no activity line' {
+    $script:wingetResult = New-StepResult -Status Skipped -Message 'Zoom.Zoom: no package or installer for this system'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r | Should -Be $script:wingetResult
+    $script:activity.Count | Should -Be 0
+  }
+}
+
+# --- winget's "no applicable update" on a PC that already has the app (ruling Z-R3) -------------------
+# The real Invoke-WingetInstall against the Invoke-External recorder: a second run on the same PC, where
+# `winget install` tries an upgrade and finds none (0x8A15002B), must be as green as 0x8A150061.
+Describe 'winget 0x8A15002B on a PC that already has the app (ruling Z-R3)' {
+  BeforeEach {
+    Initialize-AppMocks -RealWinget
+    $script:ctx = New-AppContext -Dir (New-TestDir)
+    $script:wingetCode = 0
+    $script:extHandler = { param($c) @{ ExitCode = $script:wingetCode; TimedOut = $false; Output = '' } }
+  }
+  It '7-Zip: <Hex> as <Code> is green "7zip.7zip: installed", with its activity line and today''s command line' -ForEach @(
+    @{ Hex = '0x8A15002B'; Code = -1978335189 }, @{ Hex = '0x8A150061'; Code = -1978335135 }
+  ) {
+    $script:wingetCode = $Code
+    $r = Invoke-StepSevenZip -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly '7zip.7zip: installed'
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('7-Zip installed')
+    @($script:ext | Where-Object { $_.ArgumentList -like 'install *' }).Count | Should -Be 1
+    $script:ext[-1].ArgumentList | Should -BeExactly 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+  }
+  It 'Zoom: <Hex> as <Code> is green with the yellow already-installed Note' -ForEach @(
+    @{ Hex = '0x8A15002B'; Code = -1978335189 }, @{ Hex = '0x8A150061'; Code = -1978335135 }
+  ) {
+    $script:wingetCode = $Code
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: already installed'
+    @($r.Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('Zoom already installed')
+  }
+  It 'another code is still red: winget''s own message' {
+    $script:wingetCode = -1978335202   # 0x8A15001E
+    $r = Invoke-StepSevenZip -Context $script:ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly '7zip.7zip: winget 0x8A15001E'
   }
 }
 

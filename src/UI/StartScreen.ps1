@@ -117,7 +117,7 @@ function New-DefaultChoices {
   <#
   .SYNOPSIS
     The choices the start screen (and the toolbox window) opens with: Mode, SevenZip, Office, Remote, Profile,
-    Tweaks, RestorePoint and WindowsUpdate.
+    Tweaks, RestorePoint, WindowsUpdate and Zoom.
   .DESCRIPTION
     First config.defaults, as before the toolbox: mode from the detected machine (LAPTOP only for a laptop
     that is not a virtual machine), 7-Zip, Office and the remote tool. An Office default that is not CRAFT,
@@ -125,16 +125,18 @@ function New-DefaultChoices {
     config.json is CRAFT (the free Craft apps); BUSINESS and HOME are Microsoft 365. A remote default
     (defaults.remote) that is not ANYDESK, SCREENCONNECT or BOTH, or is missing, becomes ANYDESK
     (Get-RemoteChoice), the tool every run installed before this choice existed. With them: Profile = '' (no
-    profile), Tweaks = the catalog entries marked default (Get-TweakCatalog), RestorePoint = $true and
-    WindowsUpdate = defaults.windowsUpdate through Get-WindowsUpdateChoice (missing or invalid is FULL).
+    profile), Tweaks = the catalog entries marked default (Get-TweakCatalog), RestorePoint = $true,
+    WindowsUpdate = defaults.windowsUpdate through Get-WindowsUpdateChoice (missing or invalid is FULL) and
+    Zoom = defaults.zoom through Test-ZoomChosen (only the bool true is $true: zoom spec 3.1).
     Then, when defaults.profile names a valid profile (Get-DefaultProfileId, SetupPlanner.ps1), every key that
     profile fills in (Get-ProfileChoices: Office, Remote, SevenZip, RestorePoint, Tweaks and Profile, and
-    WindowsUpdate only when the profile sets it) replaces those values (toolbox spec 10b.5: the default
-    profile wins). Mode always stays detected: the Type is never part of a profile.
+    WindowsUpdate and Zoom only when the profile sets them) replaces those values (toolbox spec 10b.5: the
+    default profile wins). Mode always stays detected: the Type is never part of a profile.
     Tweaks is the selection, not yet filtered by the Type, Office and build rules (Get-EffectiveTweaks does
     that), so the console's L, D and O keys bring NumLock and classic Outlook back or drop them. The console
     start screen shows none of the new keys: the run takes the default profile's tweaks and restore point.
-    Nor does it show a line or have a key for WindowsUpdate: the run takes this value (wu spec 3.1).
+    Nor does it show a line or have a key for WindowsUpdate or Zoom: the run takes these values (wu spec 3.1,
+    zoom spec 3.1).
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -152,9 +154,10 @@ function New-DefaultChoices {
 
   $choices = @{ Mode = $mode; SevenZip = [bool]$Config.defaults.sevenZip; Office = $office; Remote = $remote
                 Profile = ''; Tweaks = $tweaks; RestorePoint = $true
-                WindowsUpdate = (Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$Config.defaults.windowsUpdate }) }
+                WindowsUpdate = (Get-WindowsUpdateChoice -Choices @{ WindowsUpdate = [string]$Config.defaults.windowsUpdate })
+                Zoom = (Test-ZoomChosen -Choices @{ Zoom = $Config.defaults.zoom }) }
 
-  # Every key the profile fills in: WindowsUpdate only when the profile sets it (wu spec 3.1).
+  # Every key the profile fills in: WindowsUpdate and Zoom only when the profile sets them (wu spec 3.1, zoom spec 3.1).
   $profileChoices = Get-ProfileChoices -Config $Config -ProfileId (Get-DefaultProfileId -Config $Config)
   if ($null -ne $profileChoices) {
     foreach ($key in @($profileChoices.Keys)) { $choices[$key] = $profileChoices[$key] }

@@ -57,10 +57,16 @@ Describe 'ConvertTo-ValidChoices (toolbox spec 5.2)' {
     $r.Choices.SevenZip | Should -BeTrue; $r.Choices.Profile | Should -BeExactly ''; $r.Choices.RestorePoint | Should -BeTrue
     $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'
     @($r.Choices.Tweaks) | Should -Be @('noAds', 'classicOutlook'); @($r.Dropped) | Should -Be @('widgets') }
-  It 'keeps DRIVERS in any case and returns exactly eight keys' {
+  It 'keeps DRIVERS in any case and returns exactly nine keys' {
     $c = New-DefaultChoices -Machine $m -Config $cfg; $c.WindowsUpdate = 'drivers'
     $r = ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m; $r.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'
-    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate') }
+    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate', 'Zoom') }
+  It 'Zoom is Test-ZoomChosen: only the bool $true stays on; <Why> is $false (zoom spec 3.1)' -ForEach @(
+    @{ Why = 'a missing key'; V = 'none' }, @{ Why = 'the string true'; V = 'true' }, @{ Why = 'the number 1'; V = 1 }, @{ Why = '$null'; V = $null }, @{ Why = '$false'; V = $false }) {
+    $c = New-DefaultChoices -Machine $m -Config $cfg; if ($V -is [string] -and $V -eq 'none') { $c.Remove('Zoom') } else { $c.Zoom = $V }
+    $z = (ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m).Choices.Zoom
+    $z | Should -BeOfType [bool]; $z | Should -BeFalse
+    $c.Zoom = $true; (ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m).Choices.Zoom | Should -BeTrue }
   It 'keeps only ASCII ids in the Choices (nothing Hebrew reaches state.json or setup.log)' {
     $r = ConvertTo-ValidChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Config $cfg -Machine $m
     ($r.Choices | ConvertTo-Json -Compress) | Should -Not -Match '[^\x00-\x7F]' }
@@ -78,6 +84,35 @@ Describe 'Test-ProfileChanged (spec 10b.6)' {
     $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'FULL'
     $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
     $c.WindowsUpdate = 'FULL'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
+  It 'Zoom on is no change for a profile that does not set zoom (Review Focus 5)' { $c.Zoom = $true; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'a profile that sets zoom: another value is a change, its own is not; a missing Zoom reads $false' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty zoom $true
+    $c.Zoom = $false; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.Remove('Zoom'); Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.Zoom = $true; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
+}
+Describe 'Zoom in the profiles and the default choices (zoom spec 3.1)' {
+  It 'the shipped profiles do not set zoom: no Zoom key among their choices, and $null in Get-SetupProfiles' {
+    foreach ($p in @(Get-SetupProfiles -Config $cfg)) { $p.Contains('Zoom') | Should -BeTrue; $p.Zoom | Should -BeNullOrEmpty }
+    foreach ($id in 'home', 'business', 'clean') { (Get-ProfileChoices -Config $cfg -ProfileId $id).Contains('Zoom') | Should -BeFalse -Because $id } }
+  It 'a profile with "zoom": true or false sets it; a value that is not a bool does not' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $x.profiles[0] | Add-Member NoteProperty zoom $true; $x.profiles[1] | Add-Member NoteProperty zoom $false; $x.profiles[2] | Add-Member NoteProperty zoom 'true'
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Zoom | Should -BeTrue
+    $b = Get-ProfileChoices -Config $x -ProfileId 'business'; $b.Contains('Zoom') | Should -BeTrue; $b.Zoom | Should -BeFalse
+    (Get-ProfileChoices -Config $x -ProfileId 'clean').Contains('Zoom') | Should -BeFalse
+    @(Get-SetupProfiles -Config $x)[2].Zoom | Should -BeNullOrEmpty }
+  It 'New-DefaultChoices opens with Zoom off (Q49)' {
+    $d = New-DefaultChoices -Machine $m -Config $cfg; $d.Zoom | Should -BeOfType [bool]; $d.Zoom | Should -BeFalse }
+  It 'New-DefaultChoices takes defaults.zoom only when it is the bool true' -ForEach @(
+    @{ V = $true; E = $true }, @{ V = $false; E = $false }, @{ V = 'true'; E = $false }, @{ V = 1; E = $false }, @{ V = $null; E = $false }) {
+    $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT'; zoom = $V } }
+    $z = (New-DefaultChoices -Machine $m -Config $x).Zoom; $z | Should -BeOfType [bool]; $z | Should -Be $E }
+  It 'a default profile that sets zoom wins over defaults.zoom; one that does not leaves it' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.defaults.zoom = $true
+    (New-DefaultChoices -Machine $m -Config $x).Zoom | Should -BeTrue
+    $x.profiles[0] | Add-Member NoteProperty zoom $false
+    (New-DefaultChoices -Machine $m -Config $x).Zoom | Should -BeFalse }
 }
 Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
   It 'opens on the default profile in the configured language' {
@@ -141,7 +176,7 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
   It 'never changes the input: the Choices and the Tweaks array are copies' {
     $before = $mo | ConvertTo-Json -Depth 5
     $r = Update-ToolboxModel -Model $mo -Action 'Tweak' -Value 'accessKeys' -Config $cfg
-    foreach ($a in @(@('Profile', 'clean'), @('Mode', 'DESKTOP'), @('SevenZip', ''), @('Language', 'he'), @('Power', 'false'))) { $null = Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg }
+    foreach ($a in @(@('Profile', 'clean'), @('Mode', 'DESKTOP'), @('SevenZip', ''), @('Zoom', ''), @('Language', 'he'), @('Power', 'false'))) { $null = Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg }
     ($mo | ConvertTo-Json -Depth 5) | Should -Be $before   # the input itself: same table, same order
     [object]::ReferenceEquals($r.Choices, $mo.Choices) | Should -BeFalse; [object]::ReferenceEquals($r.Choices.Tweaks, $mo.Choices.Tweaks) | Should -BeFalse
     @($r.Choices.Tweaks) | Should -Not -Contain 'accessKeys'; @($mo.Choices.Tweaks) | Should -Contain 'accessKeys' }
@@ -151,4 +186,21 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     foreach ($p in 'home', 'business', 'clean') { (Update-ToolboxModel -Model $d -Action 'Profile' -Value $p -Config $cfg).Choices.WindowsUpdate | Should -BeExactly 'DRIVERS' -Because $p }
     $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[2] | Add-Member NoteProperty windowsUpdate 'FULL'
     (Update-ToolboxModel -Model $d -Action 'Profile' -Value 'clean' -Config $x).Choices.WindowsUpdate | Should -BeExactly 'FULL' }
+  It 'Zoom toggles on, then off; the value is ignored and the input is untouched (zoom spec 3.1)' {
+    $on = Update-ToolboxModel -Model $mo -Action 'Zoom' -Value 'false' -Config $cfg
+    $on.Choices.Zoom | Should -BeOfType [bool]; $on.Choices.Zoom | Should -BeTrue; $on.Choices.Profile | Should -Be 'home'
+    $mo.Choices.Zoom | Should -BeFalse
+    $off = Update-ToolboxModel -Model $on -Action 'Zoom' -Value 'true' -Config $cfg
+    $off.Choices.Zoom | Should -BeOfType [bool]; $off.Choices.Zoom | Should -BeFalse }
+  It 'Zoom toggles from Test-ZoomChosen: <Why> counts as off, so a click turns it on' -ForEach @(
+    @{ Why = 'the string true'; V = 'true' }, @{ Why = 'the number 1'; V = 1 }, @{ Why = '$null'; V = $null }, @{ Why = 'a missing key'; V = 'none' }) {
+    if ($V -is [string] -and $V -eq 'none') { $mo.Choices.Remove('Zoom') } else { $mo.Choices.Zoom = $V }
+    $r = Update-ToolboxModel -Model $mo -Action 'Zoom' -Config $cfg
+    $r.Choices.Zoom | Should -BeOfType [bool]; $r.Choices.Zoom | Should -BeTrue }
+  It 'a profile click after Zoom keeps it on, and the profile is not "changed" by it (Review Focus 5)' {
+    $z = Update-ToolboxModel -Model $mo -Action 'Zoom' -Config $cfg
+    foreach ($p in 'home', 'business', 'clean') {
+      $r = Update-ToolboxModel -Model $z -Action 'Profile' -Value $p -Config $cfg
+      $r.Choices.Profile | Should -Be $p; $r.Choices.Zoom | Should -BeTrue -Because $p
+      Test-ProfileChanged -Choices $r.Choices -Config $cfg -Machine $m | Should -BeFalse -Because $p } }
 }

@@ -419,14 +419,15 @@ function Update-ToolboxView {
     Renders Tag.Model into the window (spec 4.1). Returns nothing.
   .DESCRIPTION
     The language (Set-ToolboxLanguage); every tile's IsChecked (profiles, Type, Office, Remote, Updates through
-    Get-WindowsUpdateChoice, EN | HE) and both switches; each tweak row's visibility (Test-TweakAllowed) and
-    switch; the ScreenConnect reminder (Remote is not ANYDESK); the yellow banner, one line per warning (not
-    fresh, the previous run through Format-PreviousRun with the fallback words in the window's language, on
-    battery), collapsed when there is none; the red Administrator-protection banner and Start (disabled when
-    protection is On); the power chip; the plan column, rebuilt from Get-ToolboxPlanLines with the language's step
-    names (plus step.windows-update.drivers, the step's name on Drivers only: wu spec 3.1), its rows in the
-    language's direction. The machine values are New-ToolboxWindow's, set once. Last, the page the model names and
-    the Repair & diagnostics page (Update-RepairView, RepairPage.ps1).
+    Get-WindowsUpdateChoice, EN | HE) and the 7-Zip, Zoom (Test-ZoomChosen) and restore-point switches; each
+    tweak row's visibility (Test-TweakAllowed) and switch; the ScreenConnect reminder (Remote is not ANYDESK);
+    the yellow banner, one line per warning (not fresh, the previous run through Format-PreviousRun with the
+    fallback words in the window's language, on battery), collapsed when there is none; the red
+    Administrator-protection banner and Start (disabled when protection is On); the power chip; the plan
+    column, rebuilt from Get-ToolboxPlanLines with the language's step names (plus step.windows-update.drivers,
+    the step's name on Drivers only: wu spec 3.1), its rows in the language's direction. The machine values
+    are New-ToolboxWindow's, set once. Last, the page the model names and the Repair & diagnostics page
+    (Update-RepairView, RepairPage.ps1).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -449,7 +450,7 @@ function Update-ToolboxView {
     OfficeCraft = ($office -eq 'CRAFT'); OfficeBusiness = ($office -eq 'BUSINESS'); OfficeHome = ($office -eq 'HOME'); OfficeOff = ($office -eq 'OFF')
     RemoteAnyDesk = ($remote -eq 'ANYDESK'); RemoteScreenConnect = ($remote -eq 'SCREENCONNECT'); RemoteBoth = ($remote -eq 'BOTH')
     UpdatesFull = ($updates -eq 'FULL'); UpdatesDrivers = ($updates -eq 'DRIVERS')
-    SevenZipSwitch = ($choices['SevenZip'] -eq $true); RestoreSwitch = ($choices['RestorePoint'] -eq $true)
+    SevenZipSwitch = ($choices['SevenZip'] -eq $true); ZoomSwitch = (Test-ZoomChosen -Choices $choices); RestoreSwitch = ($choices['RestorePoint'] -eq $true)
     LangEn = ($language -ne 'he'); LangHe = ($language -eq 'he')
   }
   foreach ($name in $checks.Keys) { $Window.FindName($name).IsChecked = $checks[$name] }
@@ -617,8 +618,9 @@ function Invoke-ToolboxAction {
         page while nothing runs, ruling RD-R3), and the view when the power was read or the stick changed.
       - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
         handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
-      - Any other action (Profile, Mode, Office, Remote, WindowsUpdate, SevenZip, RestorePoint, Tweak, Language):
-        Update-ToolboxModel, then Update-ToolboxView. A control never decides its own state: the model does.
+      - Any other action (Profile, Mode, Office, Remote, WindowsUpdate, SevenZip, Zoom, RestorePoint, Tweak,
+        Language): Update-ToolboxModel, then Update-ToolboxView. A control never decides its own state: the
+        model does.
     Any exception: the window closes as Failed with the message in ASCII (Close-ToolboxWindow), and setup.log
     gets one ERROR line 'Toolbox action failed' with @{ action; error; type } (ASCII; type is the exception's
     .NET type name, review M3). A failure is never read as Cancel (spec 5.1).

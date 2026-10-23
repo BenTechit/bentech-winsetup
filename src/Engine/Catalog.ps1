@@ -22,6 +22,10 @@
 # Remote access (screenconnect spec 4.2): screenconnect runs right after anydesk. Choices.Remote, read through
 # Get-RemoteChoice, picks anydesk (ANYDESK or BOTH), screenconnect (SCREENCONNECT or BOTH) or both.
 #
+# Zoom (zoom spec 3.1, 3.2): zoom runs right after 7zip, before craft-apps and office, so its MSI never overlaps the
+# Office background install. Choices.Zoom, read through Test-ZoomChosen, plans it only when it is the bool $true: a
+# Choices without Zoom (an older state) plans none.
+#
 # Windows Update scope (wu spec 3.1, 3.2): Choices.WindowsUpdate, read through Get-WindowsUpdateChoice, is FULL
 # (software and drivers, as before) or DRIVERS (Type='Driver' only). It plans no step of its own: windows-update
 # runs in both, and its child round reads the choice from state.json.
@@ -43,6 +47,7 @@ $script:StepCatalog = @(
   @{ Id = 'anydesk';         Title = 'AnyDesk';                         Short = 'AnyDesk';              Function = 'Invoke-StepAnyDesk' }
   @{ Id = 'screenconnect';   Title = 'ScreenConnect';                   Short = 'ScreenConnect';        Function = 'Invoke-StepScreenConnect' }
   @{ Id = '7zip';            Title = '7-Zip';                           Short = '7-Zip';                Function = 'Invoke-StepSevenZip' }
+  @{ Id = 'zoom';            Title = 'Zoom';                            Short = 'Zoom';                 Function = 'Invoke-StepZoom' }
   @{ Id = 'craft-apps';      Title = 'Craft apps';                      Short = 'Craft apps';           Function = 'Invoke-StepCraftApps' }
   @{ Id = 'default-browser'; Title = 'Chrome as default browser';       Short = 'Default browser';      Function = 'Invoke-StepDefaultBrowser' }
   @{ Id = 'vendor-pass1';    Title = 'Vendor drivers + BIOS (pass 1)';  Short = 'Drivers (pass 1)';     Function = 'Invoke-StepVendorPass1' }
@@ -107,6 +112,24 @@ function Get-WindowsUpdateChoice {
     if ($script:WindowsUpdateChoices -contains $value) { return $value }
   }
   return 'FULL'
+}
+
+function Test-ZoomChosen {
+  <#
+  .SYNOPSIS
+    $true only when Choices is a table whose Zoom is the bool $true (zoom spec 3.1). Never throws.
+  .DESCRIPTION
+    Missing, $null or anything that is not a bool ('true', 1) is $false, which is what a run started by a
+    version without this choice did. Every reader (the plan, ConvertTo-ValidChoices, Test-ProfileChanged and the
+    toolbox) decides through this function, so they cannot disagree.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()]$Choices)
+
+  if ($Choices -isnot [System.Collections.IDictionary] -or -not $Choices.Contains('Zoom')) { return $false }
+  $value = $Choices['Zoom']
+  return (($value -is [bool]) -and $value)
 }
 
 function Test-HasConsumerApp {
@@ -345,6 +368,7 @@ function Get-StepPlan {
     Remote (a run started by an older version) is ANYDESK, which plans exactly what that version did.
     tweaks (toolbox spec 5.3) is planned only when Get-EffectiveTweaks names at least one tweak for these
     Choices on this Machine; Choices without Tweaks (an older state) plan exactly what that version did.
+    zoom (zoom spec 3.2) is planned only when Test-ZoomChosen; Choices without Zoom (an older state) plan none.
     The mode comes from Choices (what the technician picked), never from Machine.IsLaptop.
     The ids are emitted one by one, the normal PowerShell way, so `foreach`, the pipeline, `@(...)` and
     a `[string[]]` parameter such as New-RunState -Plan all see every id. A real plan always has at
@@ -373,6 +397,7 @@ function Get-StepPlan {
       'consumer-app'   { $isLaptopMode -and $hasConsumerApp }
       'vendor-cleanup' { $isLaptopMode -and $hasBusinessTool }
       '7zip'           { [bool]$Choices['SevenZip'] }
+      'zoom'           { Test-ZoomChosen -Choices $Choices }
       'craft-apps'     { $Choices['Office'] -eq 'CRAFT' }
       'office'         { $Choices['Office'] -notin 'OFF', 'CRAFT' }
       'office-finish'  { $Choices['Office'] -notin 'OFF', 'CRAFT' }

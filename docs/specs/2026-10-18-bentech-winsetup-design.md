@@ -287,6 +287,7 @@ No customer personal data.
 - Store apps use `--source msstore`.
 - Exit codes:
   - `0` and `0x8A150061` (already installed) = Done
+  - `0x8A15002B` (no applicable update) on `install` = Done, already installed *(amended by the zoom spec, ruling Z-R3: `winget install` of a package it finds installed tries an upgrade, and answers this code when none applies)*; on `uninstall` it stays Failed
   - `0x8A150109` / `0x8A15010B` = Done + reboot needed
   - `0x8A150014` / `0x8A150010` (no package / no installer for this system) = Skipped
   - anything else = Failed, with the hex code in the report
