@@ -746,5 +746,19 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
         Get-Mask (New-SafeMasker -Known @{}) $keep | Should -BeExactly $keep -Because $keep
       }
     }
+    It 'phones: also after the whole word fax, and after a letter run that follows _ or a digit when it ends in a phone word (final wave item 19)' {
+      foreach ($p in 'fax0501234567', 'Fax0501234567', 'FAX050-1234567', 'my_tel0501234567', '2tel0501234567', 'x_fax0501234567', 'id_phone0501234567',
+                     '9cell0501234567', 'a_mobile0501234567', 'my_TEL0501234567', 'n_telephone0501234567') {
+        $safe = Get-Mask (New-SafeMasker -Known @{}) "call $p now"
+        $safe | Should -Not -Match '0501234567|050-1234567' -Because $p; $safe | Should -Match 'PHONE-1' -Because $p
+      }
+      Get-Mask (New-SafeMasker -Known @{}) 'see my_tel0501234567' | Should -BeExactly 'see my_telPHONE-1'
+      # Hex runs and ids still stay: a run after '_' or a digit that does not end in a phone word, and fax glued to more
+      # hex letters ('afax' is no whole word).
+      foreach ($keep in 'id 0x0501234567', 'v_abc0501234567', 'h_deadbeef0501234567', '2fa0501234567', 'afax0501234567', 'guid {12345678-ab0501234567}',
+                        'ab_ex0501234567', '0xfa0501234567') {
+        Get-Mask (New-SafeMasker -Known @{}) $keep | Should -BeExactly $keep -Because $keep
+      }
+    }
   }
 }

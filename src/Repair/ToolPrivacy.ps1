@@ -109,10 +109,12 @@ $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'Micros
 #     seven digits; RD-R26 adds parentheses around the country or area code ("(+972) 50", "+972 (50)") and the 4-3 and
 #     2-2-3 groupings. No digit or '+' before it, and no digit (or '-'/'.' and a digit, a GUID's or a version's next
 #     part) after it. A Latin letter right before it counts only when its run of letters is a whole word holding a
-#     letter other than a-f and x (RD-R27): "tel0501234567", "Phone0501234567" and "cell..." are phones, a hex value
+#     letter other than a-f and x (RD-R27: "tel0501234567", "Phone0501234567", "cell..."), the whole word fax
+#     ("fax0501234567"), or a run right after '_' or a digit that ends in a phone word: tel, phone, cell, mob, mobile,
+#     fax, call, sms or whatsapp ("my_tel0501234567", "2tel0501234567"; final wave item 19). A hex value
 #     ("0x0501234567", "abc0501234567", "deadbeef...", a GUID group "ab0501234567") is not. A serial such as
 #     "SN0501234567" is masked as a phone too (over-masking, accepted). Every number the pinned pattern finds, this
-#     one finds, except those after a hex run.
+#     one finds, except one right after a Latin letter whose run of letters is none of these three.
 $script:SafeEmailPattern = '[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
 $script:SafeSidPattern = 'S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
 $script:SafeMacPattern = '(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])'
@@ -121,7 +123,7 @@ $script:SafeMacCompactPattern = '(?<![0-9A-Za-z-])[0-9A-Fa-f]{12}(?![0-9A-Za-z-]
 $script:SafeIpv4Pattern = '(?<!\d)(?<!\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)'
 $script:SafeIpv6Pattern = '(?<![0-9A-Za-z.%])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{1,4}|(?:\d{1,3}\.){3}\d{1,3})?(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:%]|\.\d)'
 $script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]*[^\\/:*?"<>|\r\n\s])(?=[\\/])|(?<eol>[^\\/:*?"<>|\r\n\s]+(?: [^\\/:*?"<>|\r\n\s]+)?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
-$script:SafePhonePattern = '(?<![\d+])(?:(?<![A-Za-z])|(?<=(?<![0-9A-Za-z_])[A-Za-z]*[G-WYZg-wyz][A-Za-z]*))(?:(?:\(?(?:\+|00)972\)?|972)[-. ]{0,3}(?:\(0\)[-. ]{0,2})?\(?(?:[23489]|5\d|7\d)\)?|\(?0(?:[23489]|5\d|7\d)\)?)[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2}|\d{4}[-. ]{1,3}\d{3}|\d{2}[-. ]{1,3}\d{2}[-. ]{1,3}\d{3})(?!\d|[-.]\d)'
+$script:SafePhonePattern = '(?<![\d+])(?:(?<![A-Za-z])|(?<=(?<![0-9A-Za-z_])[A-Za-z]*[G-WYZg-wyz][A-Za-z]*)|(?<=(?<![0-9A-Za-z_])(?i:fax))|(?<=[0-9_][A-Za-z]*(?i:tel|phone|cell|mob|mobile|fax|call|sms|whatsapp)))(?:(?:\(?(?:\+|00)972\)?|972)[-. ]{0,3}(?:\(0\)[-. ]{0,2})?\(?(?:[23489]|5\d|7\d)\)?|\(?0(?:[23489]|5\d|7\d)\)?)[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2}|\d{4}[-. ]{1,3}\d{3}|\d{2}[-. ]{1,3}\d{2}[-. ]{1,3}\d{3})(?!\d|[-.]\d)'
 
 # The second line of a SAFE copy (ASCII), for the AI and for Ben.
 $script:SafeCopyNote = 'PRIVACY-SAFE COPY: names, e-mail addresses, serial numbers, MAC and IP addresses, network names, SIDs and phone numbers are replaced by tokens (user1, PC-1, SERIAL-1, MAC-1, IP-1, SSID-1, EMAIL-1, PHONE-1, SID-1, ...); one token is always the same value.'
