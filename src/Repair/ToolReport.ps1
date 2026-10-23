@@ -11,8 +11,8 @@
 #                                        Missing = @( @{ What; Why } ) };
 #      Items (every section's Items in one table: the names are unique); Findings (Get-ReportFlags) }
 # Items that hold personal values, for the privacy-safe copy (Task 9 masks the parsed values, never the JSON text;
-# review M3):
-#   01 ComputerName, Serial, BiosUuid, Domain (a domain PC only); 02 BoardSerial, RamSerials, MonitorSerials,
+# review M3; ToolPrivacy.ps1's Get-ReportIdentifiers reads them):
+#   01 ComputerName, Serial, BiosUuid, Domain (a domain PC only), Workgroup; 02 BoardSerial, RamSerials, MonitorSerials,
 #      BatterySerials; 03 Disks[].Serial;
 #   06 ProblemDevices[] (Id: a USB instance ID holds the device's serial; Name: a Bluetooth name may hold its owner's);
 #   09 Adapters[] (Mac, Addresses, Gateways, Dns), CurrentAddresses, Gateways, DnsServers, Ssids, NetworkProfiles[].Name,
@@ -33,12 +33,16 @@
 #     header, the summary, the facts or the findings; the uncut text goes to raw_<stamp>\report-full.txt;
 #   - nothing on the stick is written through a link (V2-R13); result.json holds the findings and the paths only
 #     (the sections stay in the child: $script:ToolResultHiddenData, ruling RD-R21).
+# Task 9: reportWrite also writes the privacy-safe copy REPORT_SAFE_<stamp>.txt (ToolPrivacy.ps1: the core through one
+# masker; no PC name in its file name, ruling RD-R4) and, when the stick holds an earlier report of this PC, puts the
+# SINCE LAST VISIT section (ToolCompare.ps1) right after section 00.
 #
 # Needs ToolEngine (Add-ToolFinding, Add-ToolLog, Get-ToolText, Write-ToolJsonFile, Format-ToolTime,
 # ConvertTo-ToolDisplayText, Invoke-ToolJsonChild, Get-ToolRemainingSeconds), ToolCollect (New-ReportSection,
 # ConvertTo-ReportReason, $script:ReportSectionTitles), ToolSafety (Get-ToolRepairNumber), Report (Format-ReportDate),
-# Activity (Read-FileTail), Winget (ConvertTo-PowerShellLiteral), Cleanup (Test-StickReparsePoint), Logging and
-# StartScreen (ConvertTo-ScreenText). The bundle holds every file.
+# Activity (Read-FileTail), Winget (ConvertTo-PowerShellLiteral), Cleanup (Test-StickReparsePoint), ToolCompare
+# (Get-ToolRunSinceLastVisit), ToolPrivacy (Save-ToolSafeCopy), Logging and StartScreen (ConvertTo-ScreenText). The
+# bundle holds every file.
 
 # The facts of section 00, in order: '<section>|<fact name>' (a fact a section did not collect is left out).
 $script:ReportSummaryFacts = @(
@@ -533,6 +537,38 @@ function Format-ReportFactValue {
   return (ConvertTo-ToolDisplayText -Text $Value -MaxLength 400)
 }
 
+function Format-ReportHead {
+  <#
+  .SYNOPSIS
+    The first lines of a report's core or of a comparison (Task 9): 'BENTECH TOOLBOX <Title> | dd/MM/yyyy HH:mm | version
+    <v> | PC <name> | <maker> <model> | serial <serial>', an empty line, CUSTOMER COMPLAINT with the complaint as typed
+    (each line two spaces in) or '  (none)', and an empty line. Pure.
+  #>
+  [CmdletBinding()]
+  [OutputType([string[]])]
+  param(
+    [Parameter(Mandatory)]$Report,
+    [Parameter(Mandatory)][string]$Title
+  )
+
+  $lines = New-Object System.Collections.Generic.List[string]
+  $identity = Get-ReportEntry -From $Report -Name 'Identity'
+  $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Report -Name 'CreatedAt')
+  $lines.Add(('BENTECH TOOLBOX {0} | {1} | version {2} | PC {3} | {4} {5} | serial {6}' -f $Title, (Format-ReportDate -When $created),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $Report -Name 'ToolVersion') -MaxLength 40),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'ComputerName') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Manufacturer') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Model') -MaxLength 64),
+      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Serial') -MaxLength 64)))
+  $lines.Add('')
+  $lines.Add('CUSTOMER COMPLAINT')
+  $complaint = [string](Get-ReportEntry -From $Report -Name 'Complaint')
+  $complaintLines = @(foreach ($line in [regex]::Split($complaint, '\r?\n')) { $text = ConvertTo-ToolDisplayText -Text $line -MaxLength 2000; if ($text -ne '') { $text } })
+  if ($complaintLines.Count -eq 0) { $lines.Add('  (none)') } else { foreach ($line in $complaintLines) { $lines.Add('  ' + $line) } }
+  $lines.Add('')
+  return $lines.ToArray()
+}
+
 function Format-ReportCore {
   <#
   .SYNOPSIS
@@ -540,7 +576,8 @@ function Format-ReportCore {
   .DESCRIPTION
     The header (kind, dd/MM/yyyy HH:mm, version, PC, model, serial); CUSTOMER COMPLAINT (as typed, or '(none)'); THIS
     VISIT (the visit's earlier actions: time, name, outcome, colour; review 4.2); == 00 SUMMARY == (the key facts, then
-    every finding, CRIT > WARN > INFO, with its section); each section: == NN TITLE ==, its facts '  name = value', its
+    every finding, CRIT > WARN > INFO, with its section); -SinceLastVisit (Task 9: the SINCE LAST VISIT lines, when the
+    stick holds an earlier report of this PC); each section: == NN TITLE ==, its facts '  name = value', its
     findings (notCollected aside), '  Details:' with its grouped lines indented four spaces, and '  Not collected:
     <what> (<why>)'; then HOW TO USE, a fixed English paragraph for the AI (review 4.7). Headings, fact names and
     finding lines are ASCII; values, details and the complaint keep their real text.
@@ -549,25 +586,12 @@ function Format-ReportCore {
   [OutputType([string[]])]
   param(
     [Parameter(Mandatory)]$Report,
-    [Parameter(Mandatory)][ValidateSet('quick', 'full')][string]$Kind
+    [Parameter(Mandatory)][ValidateSet('quick', 'full')][string]$Kind,
+    [AllowNull()][AllowEmptyCollection()][string[]]$SinceLastVisit
   )
 
   $lines = New-Object System.Collections.Generic.List[string]
-  $identity = Get-ReportEntry -From $Report -Name 'Identity'
-  $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Report -Name 'CreatedAt')
-  $lines.Add(('BENTECH TOOLBOX {0} REPORT | {1} | version {2} | PC {3} | {4} {5} | serial {6}' -f $Kind.ToUpperInvariant(), (Format-ReportDate -When $created),
-      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $Report -Name 'ToolVersion') -MaxLength 40),
-      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'ComputerName') -MaxLength 64),
-      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Manufacturer') -MaxLength 64),
-      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Model') -MaxLength 64),
-      (ConvertTo-ToolDisplayText -Text (Get-ReportEntry -From $identity -Name 'Serial') -MaxLength 64)))
-  $lines.Add('')
-
-  $lines.Add('CUSTOMER COMPLAINT')
-  $complaint = [string](Get-ReportEntry -From $Report -Name 'Complaint')
-  $complaintLines = @(foreach ($line in [regex]::Split($complaint, '\r?\n')) { $text = ConvertTo-ToolDisplayText -Text $line -MaxLength 2000; if ($text -ne '') { $text } })
-  if ($complaintLines.Count -eq 0) { $lines.Add('  (none)') } else { foreach ($line in $complaintLines) { $lines.Add('  ' + $line) } }
-  $lines.Add('')
+  foreach ($line in (Format-ReportHead -Report $Report -Title ('{0} REPORT' -f $Kind.ToUpperInvariant()))) { $lines.Add($line) }
 
   $lines.Add('THIS VISIT')
   $done = @(ConvertTo-ReportList -Value (Get-ReportEntry -From $Report -Name 'Done'))
@@ -604,6 +628,10 @@ function Format-ReportCore {
   foreach ($m in $merged.Values) {
     $where = $(if ($m.Sections.Count -eq 1) { 'section ' + $m.Sections[0] } else { 'sections ' + ($m.Sections.ToArray() -join ', ') })
     $lines.Add(('  [{0}] {1} ({2})' -f $m.Level, $m.Text, $where))
+  }
+  if ($null -ne $SinceLastVisit -and $SinceLastVisit.Count -gt 0) {
+    $lines.Add('')
+    foreach ($line in $SinceLastVisit) { $lines.Add([string]$line) }
   }
 
   foreach ($id in @(@($sections.Keys) | ForEach-Object { [string]$_ } | Sort-Object)) {
@@ -809,12 +837,13 @@ function Get-ToolReportFolder {
 function Get-ToolReportStamp {
   <#
   .SYNOPSIS
-    The report's stamp: the run's start as 'yyyy-MM-dd_HHmm' (invariant), with '_2', '_3', ... when a report of that
-    minute (REPORT_<PC>_<stamp>.txt or raw_<stamp>) is already in the folder. Chosen once per run ($Run.Data.ReportStamp).
+    The report's stamp: the run's start as 'yyyy-MM-dd_HHmm' (invariant), with '_2', '_3', ... when a file of that
+    minute (<Prefix>_<PC>_<stamp>.txt, <Prefix>_SAFE_<stamp>.txt or raw_<stamp>) is already in the folder. -Prefix is
+    REPORT (Quick and Full) or COMPARE (Task 9). Chosen once per run ($Run.Data.ReportStamp).
   #>
   [CmdletBinding()]
   [OutputType([string])]
-  param([Parameter(Mandatory)][hashtable]$Run)
+  param([Parameter(Mandatory)][hashtable]$Run, [ValidateSet('REPORT', 'COMPARE')][string]$Prefix = 'REPORT')
 
   $known = [string]$Run.Data['ReportStamp']
   if ($known -ne '') { return $known }
@@ -825,7 +854,8 @@ function Get-ToolReportStamp {
   $pc = Get-ToolReportPcName -Run $Run
   $stamp = $base
   for ($n = 2; $n -le 99; $n++) {
-    $taken = [IO.File]::Exists([IO.Path]::Combine($folder, ('REPORT_{0}_{1}.txt' -f $pc, $stamp))) -or [IO.Directory]::Exists([IO.Path]::Combine($folder, ('raw_' + $stamp)))
+    $taken = [IO.File]::Exists([IO.Path]::Combine($folder, ('{0}_{1}_{2}.txt' -f $Prefix, $pc, $stamp))) -or
+      [IO.File]::Exists([IO.Path]::Combine($folder, ('{0}_SAFE_{1}.txt' -f $Prefix, $stamp))) -or [IO.Directory]::Exists([IO.Path]::Combine($folder, ('raw_' + $stamp)))
     if (-not $taken) { break }
     $stamp = '{0}_{1}' -f $base, $n
   }
@@ -943,12 +973,17 @@ function Invoke-ToolStepReportWrite {
   .SYNOPSIS
     Step reportWrite (Quick and Full; always runs, so a stopped report still writes what it collected): the report
     (New-ToolReport), its core cut to repair.reportMaxKB (150 KB) as REPORT_<PC>_<stamp>.txt (UTF-8 with a BOM), the
-    uncut core as raw_<stamp>\report-full.txt, and REPORT_<PC>_<stamp>_data.json (plain UTF-8, RD-R23). The report's
-    findings go into the run's findings (the window shows them). $Run.Files.Report, .Data and .Raw.
+    uncut core as raw_<stamp>\report-full.txt, REPORT_<PC>_<stamp>_data.json (plain UTF-8, RD-R23) and (Task 9) the
+    privacy-safe copy REPORT_SAFE_<stamp>.txt (Save-ToolSafeCopy: the cut core through one masker; no PC name in its
+    name, RD-R4). The report's findings go into the run's findings (the window shows them). $Run.Files.Report, .Data,
+    .Raw and .Safe.
   .DESCRIPTION
-    The core that cannot be written (a link, a pulled stick) is CRIT reportWriteFailed and 'failed'; a data file that
-    cannot be written is WARN reportWriteFailed ('the data file ...'), the core stays. Nothing is written through a
-    link (V2-R13).
+    When the stick holds an earlier report of this PC (Find-ToolEarlierReport, outside this visit's folder), the core
+    has the SINCE LAST VISIT section right after section 00; an earlier report file of this PC that cannot be read is
+    named there and is WARN earlierUnreadable (RD-R23: never a silent comparison with nothing).
+    The core that cannot be written (a link, a pulled stick) is CRIT reportWriteFailed and 'failed'; a data file or a
+    SAFE copy that cannot be written is WARN reportWriteFailed ('the data file ...', 'the privacy-safe copy ...'), the
+    core stays; a SAFE copy is never written unmasked. Nothing is written through a link (V2-R13).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -956,10 +991,12 @@ function Invoke-ToolStepReportWrite {
 
   try {
     $report = New-ToolReport -Run $Run
+    $data = ConvertTo-ReportData -Report $report
     $pc = Get-ToolReportPcName -Run $Run
     $stamp = Get-ToolReportStamp -Run $Run
     $folder = Get-ToolReportFolder -Run $Run
-    $lines = [string[]]@(Format-ReportCore -Report $report -Kind $report['Kind'])
+    $found = Get-ToolRunSinceLastVisit -Run $Run -Current $data
+    $lines = [string[]]@(Format-ReportCore -Report $report -Kind $report['Kind'] -SinceLastVisit $found.Lines)
     $rawDir = $null
     $rawFile = 'raw_{0}\report-full.txt' -f $stamp
     try {
@@ -984,11 +1021,16 @@ function Invoke-ToolStepReportWrite {
     $dataPath = [IO.Path]::Combine($folder, ('REPORT_{0}_{1}_data.json' -f $pc, $stamp))
     if (Test-StickReparsePoint -Path $dataPath) {
       Add-ToolFinding -Run $Run -Level WARN -Code 'reportWriteFailed' -Arguments @('the data file is a link')
-    } elseif (Write-ToolJsonFile -Path $dataPath -InputObject (ConvertTo-ReportData -Report $report) -Depth 10 -Utf8) {
+    } elseif (Write-ToolJsonFile -Path $dataPath -InputObject $data -Depth 10 -Utf8) {
       $Run.Files['Data'] = $dataPath
     } else {
       Add-ToolFinding -Run $Run -Level WARN -Code 'reportWriteFailed' -Arguments @('the data file could not be written')
     }
+    $safePath = [IO.Path]::Combine($folder, ('REPORT_SAFE_{0}.txt' -f $stamp))
+    $why = Save-ToolSafeCopy -Path $safePath -Lines $core -Report $report -Earlier $found.Earlier
+    if ($why -eq '') { $Run.Files['Safe'] = $safePath } else { Add-ToolFinding -Run $Run -Level WARN -Code 'reportWriteFailed' -Arguments @($why) }
+    $skipped = @($found.Skipped)
+    if ($skipped.Count -gt 0) { Add-ToolFinding -Run $Run -Level WARN -Code 'earlierUnreadable' -Arguments @($skipped.Count, (Format-ReportShortList -Values $skipped)) }
     # The window's list: each finding once (a stopped report's "not run" sections share one).
     $added = @{}
     foreach ($f in @($report['Findings'])) {

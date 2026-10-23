@@ -22,7 +22,8 @@
 #               (the BenTech stick among them) are only recorded in Detail, for the report.
 # Plus the disk check state: the system volume's dirty bit, and whether BootExecute excludes the drive (/k:).
 # Plus (repair Task 7) the saved network backup: this PC's newest valid one on the stick (Find-ToolNetBackup,
-# ToolAdvanced.ps1), for the Restore network settings button.
+# ToolAdvanced.ps1), for the Restore network settings button; and (Task 9) whether the stick holds an earlier report of
+# this PC (Find-ToolEarlierReport, ToolCompare.ps1), for the Compare with last visit tile.
 #
 # Every threshold comes from config.json's repair section; a missing key falls back to the values the spec pins
 # (repair is not a required config key). Needs ToolEngine (Invoke-ToolJsonChild, Add-ToolLog, Write-ToolProgress),
@@ -880,6 +881,40 @@ function Invoke-ToolStepSafetyNetBackup {
   } else {
     Add-ToolLog -Run $Run -Text ('Saved network settings: {0}' -f $backup['Path'])
   }
+  Write-ToolProgress -Run $Run
+  return 'done'
+}
+
+function Invoke-ToolStepSafetyEarlier {
+  <#
+  .SYNOPSIS
+    Step safetyEarlier (repair Task 9, spec 6.8): $Run.Data.HasEarlierReport = $true when the stick (Args.StickRoot) holds
+    an earlier report of this PC (Args.Identity.Key) outside this visit's folder (Args.SessionDir): one Find-ToolEarlierReport
+    (ToolCompare.ps1) can read, or one of this PC it cannot read (Compare then says why: never a silent "none", RD-R23).
+    $false without a stick, without an identity key, or when the search fails (a WARN in the log). The window enables
+    Compare with last visit only with it. Always 'done': the safety action never ends red because of it.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][hashtable]$Run)
+
+  $has = $false
+  $stickRoot = [string]$Run.Args['StickRoot']
+  $identity = $Run.Args['Identity']
+  $key = ''
+  if ($identity -is [System.Collections.IDictionary]) { $key = [string]$identity['Key'] }
+  if ($stickRoot -ne '' -and $key -ne '') {
+    try {
+      $skipped = New-Object System.Collections.Generic.List[string]
+      $earlier = Find-ToolEarlierReport -StickRoot $stickRoot -IdentityKey $key -CurrentSessionDir ([string]$Run.Args['SessionDir']) -Skipped $skipped
+      $has = ($null -ne $earlier) -or ($skipped.Count -gt 0)
+    } catch {
+      $has = $false
+      Write-SetupLog -Level WARN -Message 'Earlier reports could not be looked for' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+  }
+  $Run.Data['HasEarlierReport'] = $has
+  Add-ToolLog -Run $Run -Text ('Earlier report of this PC: {0}' -f $(if ($has) { 'found' } else { 'none' }))
   Write-ToolProgress -Run $Run
   return 'done'
 }

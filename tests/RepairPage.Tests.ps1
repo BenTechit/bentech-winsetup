@@ -595,6 +595,25 @@ Describe 'action runs (spec 7, 4.3, 4.4)' {
     $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
     Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; NetBackup = @{ Path = 'E:\x.json'; Adapters = 3 } }; $script:fake.HasExited = $true; Send-RunTick $w
     $w.Tag.Model.Repair.NetBackup | Should -BeNullOrEmpty }
+  It 'the safety child''s earlier report (Data.HasEarlierReport) enables Compare with last visit; false disables it; no answer keeps it (repair Task 9)' {
+    $chips = @{ Restart = @{ Level = 'ok' }; Free = @{ Level = 'ok'; Args = @('C:', '41') }; BitLocker = @{ Level = 'ok' }; Internet = @{ Level = 'ok' }; Disk = @{ Level = 'ok' } }
+    $w = New-RunWindow -Set @{ State = 'loading' }
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeFalse; $w.FindName('TileCompare').IsEnabled | Should -BeFalse
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; DiskCheck = @{ Dirty = $false; Excluded = $false }; HasEarlierReport = $true }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeTrue; $w.FindName('TileCompare').IsEnabled | Should -BeTrue
+    # A safety child that ends without an answer (killed, or no result) keeps what the last one found.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeTrue
+    # The next read finds none (another stick): disabled again, with its reason.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; HasEarlierReport = $false }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeFalse; $w.FindName('TileCompare').IsEnabled | Should -BeFalse
+    $w.FindName('TileCompare').ToolTip.Text | Should -Be 'No earlier report for this PC on the stick'
+    # Anything but a true boolean is none.
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety
+    Write-TestResult $w -Slot Safety -Data @{ Chips = $chips; HasEarlierReport = 'yes' }; $script:fake.HasExited = $true; Send-RunTick $w
+    $w.Tag.Model.Repair.HasEarlierReport | Should -BeFalse }
   It 'a safety child killed at its deadline, or gone without a result, keeps the chips it read and leaves the rest unknown (spec 5)' {
     foreach ($case in 'deadline', 'noResult') {
       $script:killed.Clear()

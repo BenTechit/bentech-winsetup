@@ -70,9 +70,15 @@
 # each stores its section in $Run.Data.Report), then reportWrite (ToolReport.ps1: the AI-ready core, the data JSON and
 # raw_<stamp>\ on the stick) and, Full only, reportZip. reportWrite always runs: a report stopped or out of time still
 # writes what it collected, and names the sections it did not reach.
+#
+# Task 9: compare (spec 6.8: the Quick sections, then compare, ToolCompare.ps1: this visit against this PC's newest
+# earlier report on the stick; its own files make it a visit too; no AlwaysRun: a part of a report is never compared).
+# reportWrite also writes the privacy-safe copy (ToolPrivacy.ps1) and the SINCE LAST VISIT section. The safety child
+# says whether the stick holds an earlier report of this PC (safetyEarlier), for the Compare tile.
 $script:ToolActionCatalog = [ordered]@{
   safety     = @{ Kind = 'info'; Confirm = 'none'; NeedsStick = $false; LogLocal = $true
-                  Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup') }
+                  Steps = [string[]]@('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup',
+                                      'safetyEarlier') }
   health     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $false; LogLocal = $false
                   Steps = [string[]]@('volumeState', 'imageCheck', 'imageScan', 'sfcVerify', 'winre', 'devices', 'activation') }
   standard   = @{ Kind = 'repair'; Confirm = 'confirm'; NeedsStick = $false; LogLocal = $false
@@ -102,6 +108,9 @@ $script:ToolActionCatalog = [ordered]@{
   fullReport  = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false
                    Steps = [string[]]@('report01', 'report02', 'report03', 'report04', 'report05', 'report06', 'report07', 'report08', 'report09', 'report10',
                                        'report11', 'report12', 'reportWrite', 'reportZip') }
+  compare     = @{ Kind = 'readonly'; Confirm = 'none'; NeedsStick = $true; LogLocal = $false
+                   Steps = [string[]]@('report01', 'report02', 'report03', 'report04', 'report05', 'report06', 'report07', 'report08', 'report09', 'report10',
+                                       'report11', 'compare') }
 }
 $script:ToolSteps = @{
   safetyRestart    = @{ Function = 'Invoke-ToolStepSafetyRestart'; Servicing = $false }
@@ -159,6 +168,8 @@ $script:ToolSteps = @{
   report12          = @{ Function = 'Invoke-ToolStepReport12'; Servicing = $false }
   reportWrite       = @{ Function = 'Invoke-ToolStepReportWrite'; Servicing = $false; AlwaysRun = $true }
   reportZip         = @{ Function = 'Invoke-ToolStepReportZip'; Servicing = $false }
+  compare           = @{ Function = 'Invoke-ToolStepCompare'; Servicing = $false }
+  safetyEarlier     = @{ Function = 'Invoke-ToolStepSafetyEarlier'; Servicing = $false }
 }
 
 # A failed progress write, or a failed tick, is logged once per run (New-ToolRun resets both).

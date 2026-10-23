@@ -309,7 +309,7 @@ Describe 'ToolAdvanced (repair Task 7)' {
       @{ Id = 'ghostList';   Kind = 'info';        Confirm = 'none'; Stick = $true;  Local = $true;  Steps = @('ghostList') }
       @{ Id = 'ghostRemove'; Kind = 'destructive'; Confirm = 'yes';  Stick = $true;  Local = $false; Steps = @('ghostCsv', 'ghostRemove') }
       @{ Id = 'safety';      Kind = 'info';        Confirm = 'none'; Stick = $false; Local = $true
-         Steps = @('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup') }
+         Steps = @('safetyRestart', 'safetyFree', 'safetyBitLocker', 'safetyInternet', 'safetyDisk', 'safetyDiskCheck', 'safetyNetBackup', 'safetyEarlier') }
     ) {
       $a = $script:ToolActionCatalog[$Id]
       $a | Should -Not -BeNullOrEmpty

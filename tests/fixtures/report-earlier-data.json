@@ -1,0 +1,92 @@
+{
+    "Version":  1,
+    "Kind":  "quick",
+    "CreatedAt":  "2026-10-01T09:00:00",
+    "ToolVersion":  "2026.09.30.1",
+    "Identity":  {
+                     "Key":  "SN-7HX2K93",
+                     "FolderPart":  "7HX2K93",
+                     "Serial":  "7HX2K93",
+                     "BiosUuid":  "4C4C4544-0048-5810-8032-B7C04F4B3933",
+                     "ComputerName":  "DELL-7HX2K93",
+                     "Manufacturer":  "Dell Inc.",
+                     "Model":  "Latitude 5440",
+                     "Brand":  "DELL"
+                 },
+    "Facts":  {
+                  "Windows":  "Windows 11 Pro 24H2",
+                  "Build":  "26100.1742",
+                  "Serial":  "7HX2K93",
+                  "Free space":  "C: 9.5 GB free of 475.8 GB (2%)"
+              },
+    "Findings":  [
+                     {
+                         "Code":  "lowSpace",
+                         "Level":  "WARN",
+                         "Args":  [ "C:", "9.5", "2" ],
+                         "Section":  "03"
+                     },
+                     {
+                         "Code":  "oemLeftover",
+                         "Level":  "WARN",
+                         "Args":  [ "HP Support Assistant" ],
+                         "Section":  "10"
+                     },
+                     {
+                         "Code":  "bitlockerOn",
+                         "Level":  "INFO",
+                         "Args":  [ ],
+                         "Section":  "03"
+                     },
+                     {
+                         "Code":  "wuDisabled",
+                         "Level":  "WARN",
+                         "Args":  [ ],
+                         "Section":  "05"
+                     }
+                 ],
+    "Disks":  {
+                  "S4EWNX0R123456":  {
+                                         "Number":  0,
+                                         "System":  true,
+                                         "Model":  "Samsung SSD 980 PRO 512GB",
+                                         "Health":  "Healthy",
+                                         "Wear":  61,
+                                         "Temperature":  41,
+                                         "ReadErrors":  0,
+                                         "WriteErrors":  0,
+                                         "PowerOnHours":  1500
+                                     },
+                  "WD-OLD123456":  {
+                                       "Number":  1,
+                                       "System":  false,
+                                       "Model":  "WD Elements",
+                                       "Health":  "Healthy",
+                                       "Wear":  null,
+                                       "Temperature":  null,
+                                       "ReadErrors":  null,
+                                       "WriteErrors":  null,
+                                       "PowerOnHours":  null
+                                   }
+              },
+    "FreeGB":  9.5,
+    "FreePercent":  2,
+    "ProblemDevices":  [
+                           {
+                               "Id":  "USB\\VID_046D&PID_C52B\\5&2A5B5C4E&0&1",
+                               "Name":  "Logitech USB Receiver",
+                               "Code":  43
+                           }
+                       ],
+    "Programs":  [
+                     "Google Chrome|129.0.6668.90",
+                     "חשבשבת 2026|1.2.3",
+                     "HP Support Assistant|9.1",
+                     "Old Toolbar|1.0"
+                 ],
+    "Crashes":  {
+                    "KernelPower":  [ "2026-09-20T10:00:00" ],
+                    "BugCheck":  [ ],
+                    "Whea":  [ ]
+                }
+}

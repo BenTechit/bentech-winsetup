@@ -13,7 +13,8 @@
 BeforeAll {
   foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'Common\Config', 'State\State', 'Steps\Winget', 'Engine\Reboot',
                  'UI\StartScreen', 'Toolbox\Strings', 'Entry\Cleanup', 'Detect\Detection', 'Detect\PcName', 'Report\Report', 'Repair\ToolEngine',
-                 'Repair\ToolChecks', 'Repair\ToolSafety', 'Repair\ToolRepairs', 'Repair\ToolAdvanced', 'Repair\ToolCollect', 'Repair\ToolReport') {
+                 'Repair\ToolChecks', 'Repair\ToolSafety', 'Repair\ToolRepairs', 'Repair\ToolAdvanced', 'Repair\ToolCollect', 'Repair\ToolReport',
+                 'Repair\ToolPrivacy', 'Repair\ToolCompare') {
     . "$PSScriptRoot\..\src\$f.ps1"
   }
   . "$PSScriptRoot\fixtures\ReportFakePc.ps1"

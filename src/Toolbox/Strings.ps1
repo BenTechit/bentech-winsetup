@@ -225,6 +225,10 @@ $script:ToolboxStrings = @{
     'finding.reportWriteFailed'      = 'The report could not be written ({0})'
     'finding.reportZipFailed'        = 'The raw files could not be zipped ({0}): they are in {1}'
     'finding.clockWrong'             = 'The clock is {0} min off Microsoft''s time: HTTPS, Windows Update and activation may fail until it is fixed (Standard repair syncs it)'
+    'finding.earlierUnreadable'      = '{0} earlier report files of this PC could not be read and were not compared: {1}'
+    'finding.compareNoEarlier'       = 'No earlier report of this PC on the stick: nothing to compare'
+    'finding.compareDone'            = 'Compared with the visit of {0}: {1} changes'
+    'finding.compareWriteFailed'     = 'The comparison could not be written ({0})'
 
     'repair.row.safety'     = 'SAFETY'
     'repair.row.check'      = 'CHECK'
@@ -616,6 +620,10 @@ $script:ToolboxStrings = @{
     'finding.reportWriteFailed'      = 'לא ניתן היה לכתוב את הדוח ({0})'
     'finding.reportZipFailed'        = 'לא ניתן היה לדחוס את הקבצים הגולמיים ({0}): הם נמצאים ב-{1}'
     'finding.clockWrong'             = 'השעון סוטה ב-{0} דקות מהשעה של Microsoft: חיבורי HTTPS, עדכוני Windows והפעלת Windows עלולים להיכשל עד שהשעון יתוקן (התיקון הרגיל מסנכרן אותו)'
+    'finding.earlierUnreadable'      = 'לא ניתן היה לקרוא {0} קבצי דוח קודמים של המחשב הזה, והם לא הושוו: {1}'
+    'finding.compareNoEarlier'       = 'אין בדיסק און קי דוח קודם של המחשב הזה: אין למה להשוות'
+    'finding.compareDone'            = 'הושווה לביקור מתאריך {0}: {1} שינויים'
+    'finding.compareWriteFailed'     = 'לא ניתן היה לכתוב את ההשוואה ({0})'
 
     'repair.row.safety'     = 'בטיחות'
     'repair.row.check'      = 'בדיקה'

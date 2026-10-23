@@ -17,7 +17,7 @@ Describe 'New-RepairModel (repair plan, The repair model)' {
   It 'opens loading, with the catalog''s ids, the machine''s type, no stick and nothing selected' {
     $r = New-RepairModel -Machine $m -SessionStamp '2026-10-22_1015'
     $r.Strip.State | Should -Be 'loading'; foreach ($c in 'Restart', 'Free', 'BitLocker', 'Internet', 'Disk') { $r.Strip[$c] | Should -BeNullOrEmpty -Because $c }
-    @($r.Available) | Should -Contain 'health'; @($r.Available) | Should -Contain 'safety'; @($r.Available) | Should -Not -Contain 'compare'
+    @($r.Available) | Should -Contain 'health'; @($r.Available) | Should -Contain 'safety'; @($r.Available) | Should -Contain 'compare'   # Task 9 adds compare
     foreach ($t in 'wuReset', 'diskCheck', 'netReset', 'ghosts', 'netRestore') { @($r.Available) | Should -Contain $t -Because "Task 7 adds $t" }
     $r.CanRun | Should -BeFalse; $r.IsLaptop | Should -BeTrue; $r.SessionStamp | Should -Be '2026-10-22_1015'
     $r.Stick.Root | Should -BeNullOrEmpty; $r.Selected | Should -BeExactly ''; $r.Complaint | Should -BeExactly ''; $r.BackedUp | Should -BeFalse

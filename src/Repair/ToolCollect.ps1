@@ -780,6 +780,8 @@ function Get-ReportData01 {
         $s.Items['Domain'] = ([string]$cs.Domain).Trim()
       } else {
         $s.Facts['Domain'] = '{0} (workgroup)' -f (ConvertTo-ToolDisplayText -Text $cs.Workgroup -MaxLength 300)
+        # A workgroup's own name (a family's or a firm's), for the privacy-safe copy (Task 9).
+        $s.Items['Workgroup'] = ([string]$cs.Workgroup).Trim()
       }
       $s.Items['ComputerName'] = [string]$cs.Name
     }
@@ -2011,16 +2013,21 @@ function Get-ReportData11 {
 
     $null = Invoke-ReportSource -Section $s -What 'Local users (CIM)' -Script {
       $names = New-Object System.Collections.Generic.List[string]
+      $builtin = New-Object System.Collections.Generic.List[string]
       $texts = New-Object System.Collections.Generic.List[string]
       $guest = $false
       foreach ($u in @(Get-ReportCim -ClassName 'Win32_UserAccount' -Filter 'LocalAccount=True')) {
         $name = ConvertTo-ToolDisplayText -Text $u.Name -MaxLength 100
         $sid = [string]$u.SID
         $names.Add($name)
+        # Guest, DefaultAccount and WDAGUtilityAccount by SID (their names are localized, never a person's), so the
+        # privacy-safe copy keeps them (Task 9). The built-in Administrator (-500) is left out: it may be renamed.
+        if ($sid -match '-50[134]\z') { $builtin.Add($name) }
         if ($sid -match '-501\z' -and $u.Disabled -ne $true) { $guest = $true }
         $texts.Add(('{0}{1}' -f $name, $(if ($u.Disabled -eq $true) { ' (disabled)' } elseif ($sid -match '-50[01]\z') { ' (on)' } else { '' })))
       }
       $s.Items['Users'] = [string[]]$names.ToArray()
+      $s.Items['BuiltinUsers'] = [string[]]$builtin.ToArray()
       $s.Items['GuestEnabled'] = $guest
       $s.Facts['Local users'] = $texts.ToArray() -join ', '
     }

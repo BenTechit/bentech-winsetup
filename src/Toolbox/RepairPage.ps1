@@ -889,7 +889,9 @@ function Complete-ToolboxSafetyRun {
   # into the model. Chips or a DiskCheck that are no object are not read. -Data (the result's Data) that holds the key
   # NetBackup (repair Task 7: this PC's newest saved network backup on the stick, or none) sets Repair.NetBackup
   # (ConvertTo-RepairNetBackup: $null when none or unusable, which hides Restore network settings); a result without
-  # the key (none at all: killed, or no result) leaves it as it was.
+  # the key (none at all: killed, or no result) leaves it as it was. The key HasEarlierReport (repair Task 9: the stick
+  # holds an earlier report of this PC) sets Repair.HasEarlierReport the same way, which the Compare with last visit tile
+  # needs (reason.noEarlier); anything but a true boolean is none.
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
@@ -906,6 +908,12 @@ function Complete-ToolboxSafetyRun {
   $hasBackup = ($Data -is [System.Collections.IDictionary] -and $Data.Contains('NetBackup')) -or
     ($Data -is [System.Management.Automation.PSCustomObject] -and $null -ne $Data.PSObject.Properties['NetBackup'])
   if ($hasBackup) { $values['NetBackup'] = ConvertTo-RepairNetBackup -Value (Get-RepairEntry -From $Data -Name 'NetBackup') }
+  $hasEarlier = ($Data -is [System.Collections.IDictionary] -and $Data.Contains('HasEarlierReport')) -or
+    ($Data -is [System.Management.Automation.PSCustomObject] -and $null -ne $Data.PSObject.Properties['HasEarlierReport'])
+  if ($hasEarlier) {
+    $earlier = Get-RepairEntry -From $Data -Name 'HasEarlierReport'
+    $values['HasEarlierReport'] = ($earlier -is [bool] -and $earlier)
+  }
   Set-ToolboxRepair -State $Window.Tag -Values $values
 }
 
