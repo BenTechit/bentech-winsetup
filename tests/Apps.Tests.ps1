@@ -749,23 +749,30 @@ Describe 'Invoke-StepZoom' {
     $null = Invoke-StepZoom -Context $script:ctx
     $script:wingetCalls[0].TimeoutMinutes | Should -Be 4
   }
-  It 'a config with <Why>: Zoom installs with the good tokens only, and the Note (Review Focus 3)' -ForEach @(
-    @{ Why = 'no custom';                         Custom = 'none';                                                            Kept = @() }
-    @{ Why = 'an empty custom list';              Custom = @();                                                               Kept = @() }
-    @{ Why = 'one bad token among good ones';     Custom = @('ZConfig=AU2_EnableAutoUpdate=true', 'ZConfig="x" & calc', 'B=c'); Kept = @('ZConfig=AU2_EnableAutoUpdate=true', 'B=c') }
-    @{ Why = 'a token that is not a string';      Custom = @(5, 'A=b');                                                       Kept = @('A=b') }
-    @{ Why = 'a null token';                      Custom = @($null, 'A=b');                                                   Kept = @('A=b') }
+  # Review Focus 3 and final review M3: a refused token is dropped and logged (by position); the Note says only
+  # what is true, so it comes only when no token that reaches winget carries AU2_EnableAutoUpdate.
+  It 'a config with <Why>: Zoom installs with the good tokens only; the Note: <Note>' -ForEach @(
+    @{ Why = 'no custom';                                Custom = 'none';                                                             Kept = @();                                                   Refused = $false; Note = $true }
+    @{ Why = 'an empty custom list';                     Custom = @();                                                                Kept = @();                                                   Refused = $false; Note = $true }
+    @{ Why = 'a refused second token';                   Custom = @('ZConfig=AU2_EnableAutoUpdate=true', 'ZConfig="x" & calc', 'B=c'); Kept = @('ZConfig=AU2_EnableAutoUpdate=true', 'B=c'); Refused = $true; Note = $false }
+    @{ Why = 'the auto-update token refused';            Custom = @('ZConfig="AU2_EnableAutoUpdate=true" & calc', 'B=c');              Kept = @('B=c');                                              Refused = $true;  Note = $true }
+    @{ Why = 'no token with the auto-update key';        Custom = @('ZConfig=nogoogle=1');                                            Kept = @('ZConfig=nogoogle=1');                               Refused = $false; Note = $true }
+    @{ Why = 'the key inside a combined ZConfig token';  Custom = @('ZConfig=nogoogle=1;AU2_EnableAutoUpdate=true');                  Kept = @('ZConfig=nogoogle=1;AU2_EnableAutoUpdate=true');     Refused = $false; Note = $false }
+    @{ Why = 'a token that is not a string';             Custom = @(5, 'A=b');                                                        Kept = @('A=b');                                              Refused = $true;  Note = $true }
+    @{ Why = 'a null token';                             Custom = @($null, 'A=b');                                                    Kept = @('A=b');                                              Refused = $true;  Note = $true }
   ) {
     if ($Custom -is [string] -and $Custom -eq 'none') { $script:ctx.Config.apps.zoom.PSObject.Properties.Remove('custom') } else { $script:ctx.Config.apps.zoom.custom = $Custom }
     $r = Invoke-StepZoom -Context $script:ctx
     $r.Status | Should -Be 'Done'
-    @($r.Notes) | Should -Be @('Zoom auto-update not set')
+    (@($r.Notes) -join '|') | Should -BeExactly $(if ($Note) { 'Zoom auto-update not set' } else { '' })
     $script:wingetCalls.Count | Should -Be 1
     (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly (@($Kept) -join '|')
     @($script:activity.Text) | Should -Be @('Zoom installed')
-    # A dropped token is logged by position, never by its text.
+    # A dropped token is logged by position, never by its text; a missing auto-update token is logged too.
     ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match 'calc'
-    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'refused' -and $null -ne $_.Data.droppedPositions }).Count | Should -Be ([int]$Refused)
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'AU2_EnableAutoUpdate' }).Count | Should -Be ([int]$Note)
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be ([int]$Refused + [int]$Note)
   }
   # Final review M2: --custom needs winget 1.5 or later; an older winget would refuse the whole command line.
   It 'winget <V>: the tokens go to winget, after one version probe of winget''s own path' -ForEach @(@{ V = '1.5.1572' }, @{ V = '1.28.190' }) {

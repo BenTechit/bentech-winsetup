@@ -386,11 +386,13 @@ function Invoke-StepZoom {
     is checked with Test-WingetCustomToken first, and one that fails is dropped and logged by its position,
     never by its text. The run waits at most timeoutsMinutes.zoom, so a msiexec help box from a wrong token
     costs minutes, not timeoutsMinutes.default.
-      - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When a
-        token was missing or dropped Zoom still installs, with the yellow Note 'Zoom auto-update not set'.
+      - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When no
+        token that reaches winget carries AU2_EnableAutoUpdate (missing, dropped, or winget too old) Zoom still
+        installs, with the yellow Note 'Zoom auto-update not set' (final review M3: another refused token
+        alone is only a WARN).
       - --custom needs winget 1.5 or later (final review M2): before passing tokens the step reads winget's
         version (Get-WingetVersion, one minute at most). Below 1.5, or unreadable, Zoom installs without the
-        tokens (a WARN), with the same yellow Note.
+        tokens (a WARN), so with the Note.
       - Already installed (Data.AlreadyInstalled: winget 0x8A150061, or 0x8A15002B "no applicable update" for a
         Zoom that is up to date or installed per user, ruling Z-R3; nothing ran, so auto-update was not
         touched) is Done '<id>: already installed' with the Note 'Zoom was already installed: auto-update not
@@ -416,6 +418,9 @@ function Invoke-StepZoom {
   for ($i = 0; $i -lt $given.Count; $i++) {
     if ($given[$i] -is [string] -and (Test-WingetCustomToken -Token $given[$i])) { $custom.Add($given[$i]) } else { $dropped.Add($i) }
   }
+  if ($dropped.Count -gt 0) {
+    Write-SetupLog -Message 'Zoom custom arguments refused by the token check; Zoom installs without them' -Level WARN -Data @{ given = $given.Count; droppedPositions = ($dropped.ToArray() -join ',') }
+  }
   # Final review M2: winget's --custom needs winget 1.5 or later; an older one refuses the whole command line.
   # With no winget at all there is nothing to ask: Invoke-WingetInstall then says 'winget unavailable'.
   if ($custom.Count -gt 0) {
@@ -428,9 +433,12 @@ function Invoke-StepZoom {
       }
     }
   }
-  $autoUpdateSet = ($custom.Count -gt 0) -and ($dropped.Count -eq 0)
+  # Final review M3: the Note says auto-update is not set only when no token that reaches winget carries the
+  # auto-update key; another refused token alone is only the WARN above.
+  $autoUpdateSet = $false
+  foreach ($token in $custom) { if ($token.Contains('AU2_EnableAutoUpdate')) { $autoUpdateSet = $true } }
   if (-not $autoUpdateSet) {
-    Write-SetupLog -Message 'Zoom auto-update arguments are missing or refused; Zoom installs without them' -Level WARN -Data @{ given = $given.Count; droppedPositions = ($dropped.ToArray() -join ',') }
+    Write-SetupLog -Message 'No Zoom custom argument with AU2_EnableAutoUpdate reaches winget; Zoom installs without auto-update' -Level WARN -Data @{ given = $given.Count; passed = $custom.Count }
   }
 
   $result = Invoke-WingetInstall -Id $id -Source winget -Context $Context -Custom $custom.ToArray() -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.zoom)
