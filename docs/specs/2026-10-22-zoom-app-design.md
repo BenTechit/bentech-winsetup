@@ -1,8 +1,8 @@
 # bentech-winsetup: Zoom as an optional app
 
-**Status:** Draft for Ben's approval (decisions Q49-Q52, 22/10/2026).
+**Status:** Draft for Ben's approval (decisions Q49-Q52 and Q55, 22-23/10/2026).
 **Amends:** the v1 spec, the toolbox spec ([2026-10-21-toolbox-design.md](2026-10-21-toolbox-design.md)) and the drivers-only spec ([2026-10-22-windows-update-option-design.md](2026-10-22-windows-update-option-design.md)). They stay binding wherever this document does not change them.
-**Builds on:** the drivers-only branch (`feat/wu-drivers`), which touches the same toolbox files; this work starts from it and ships after it.
+**Builds on:** main as released in v2026.10.22.2 (drivers-only), which touches the same toolbox files. The repair page (`feat/repair-tool`) touches them too; whichever of the two merges second takes the other in first.
 
 ## 1. Why
 Some customers need Zoom for work or family calls. Today Ben installs it by hand after the run. He wants it as a switch in the toolbox's APPS row, next to 7-Zip, so it installs with everything else when he turns it on.
@@ -15,6 +15,7 @@ Some customers need Zoom for work or family calls. Today Ben installs it by hand
 | Q50 | Auto-update | **On at install.** Zoom's per-machine MSI leaves auto-update off by default, so a customer's Zoom would go stale and, after a while, refuse to join meetings. Turning it on makes updates install quietly when Zoom restarts, never during a meeting. |
 | Q51 | Install route | **winget `Zoom.Zoom`,** like 7-Zip. It is the per-machine MSI from zoom.us (x64 and ARM64), hash-checked by winget. |
 | Q52 | Desktop icon | **Keep it.** The installer's Public desktop icon stays. |
+| Q55 | Proving the auto-update setting | **Build now on Zoom's documented value; the first customer laptop with Zoom on is the test.** No VM check first. |
 
 ## 3. Behaviour
 
@@ -37,7 +38,8 @@ Some customers need Zoom for work or family calls. Today Ben installs it by hand
   - The value lives in the signed `config.json` as `apps.zoom.custom`, a list of `NAME=VALUE` tokens, so it is never built from user input.
   - Each token must match a strict pattern: a name of letters, digits and `_`, then `=`, then letters, digits, `_`, `=` and `;`. No quotes and no spaces.
   - The tokens are joined with spaces, and our code passes them as one quoted `--custom` value. Quoting is where Zoom's own users went wrong (msiexec showed its help box), so no token ever holds a quote.
-  - **Proven first, on a VM (Ben, Q54).** Before the build, Ben runs one winget line on a test VM. It settles the exact token(s): the `ZConfig` value, and a property that stops Zoom from starting when Zoom opens on its own after install. It also settles the real DisplayName and whether the desktop icon appears. The plan uses what the VM showed.
+  - **Built on Zoom's documented value, proven on the first laptop (Ben, Q55 B).** The shipped token is `ZConfig=AU2_EnableAutoUpdate=true`. The first customer laptop with Zoom on is the test (5). If the token turns out wrong, it is fixed in the signed `config.json` of the next release, with no code change. `tools\spikes\Spike-ZoomInstall.ps1` stays for a VM check whenever one is at hand.
+  - **A wrong token must not stall the run** *(my call)*: the zoom step has its own short bound, `timeoutsMinutes.zoom` = 10. A msiexec help box waiting for a click then costs at most 10 minutes, not the 30 of `timeoutsMinutes.default`, and the step is red (`Zoom install timed out`).
   - **A token that is missing or fails the pattern at run time** (Config.Tests pins the shipped value, so this means a broken config): Zoom installs without it, and the step adds a yellow Note `Zoom auto-update not set` *(my call: Zoom itself is still useful)*.
 - **Already installed** *(my call)*: when winget reports the package as already installed (today Done, with no install and no `--custom` applied), the step is Done with a yellow Note: `Zoom was already installed: auto-update not changed`. The activity line then says `Zoom already installed`. A customer's own per-user Zoom is left alone (6).
 - **After a fresh install,** an activity line reads `Zoom installed`, as for 7-Zip.
@@ -45,10 +47,10 @@ Some customers need Zoom for work or family calls. Today Ben installs it by hand
   - The step does not open Zoom or sign in.
   - It does not set meeting or audio settings.
   - It does not create or remove shortcuts (Q52).
-  - If the VM test shows that Zoom starts on its own after a silent install, Zoom's documented property that stops it joins `apps.zoom.custom`, so no Zoom window pops up in the middle of the run.
+  - If the first laptop shows that Zoom starts on its own after a silent install, Zoom's documented property that stops it joins `apps.zoom.custom` in the next release (config only), so no Zoom window pops up in the middle of the run.
 
 ### 3.3 The report and the final screen
-- **Report:** the Apps list gains Zoom, read like 7-Zip from its Uninstall entry. The 64-bit HKLM entry is read first, so a per-machine install wins over a leftover per-user one. The pattern is the DisplayName the VM test shows (for example `Zoom Workplace*`), not a bare `Zoom*` that could match another product.
+- **Report:** the Apps list gains Zoom, read like 7-Zip from its Uninstall entry. The 64-bit HKLM entry is read first, so a per-machine install wins over a leftover per-user one. The patterns are Zoom's per-machine names, `Zoom Workplace*` and then `Zoom(64bit)*` / `Zoom (64-bit)*` *(my call; older builds used the latter)*, not a bare `Zoom*` that could match another product (an Outlook plug-in, say). The first laptop records the real name (5).
 - **The toolbox look** *(my call, as for the UPDATES row)*: re-render the preview PNGs, add one with Zoom switched on in English and Hebrew, and show them to Ben before the merge.
 - **Final screen and verdict:** nothing new. A failed Zoom is a red step, like 7-Zip.
 
@@ -58,9 +60,9 @@ Some customers need Zoom for work or family calls. Today Ben installs it by hand
 | The APPS row: Chrome (always) and 7-Zip | **Zoom** is added as a third item, off by default. |
 | `Get-WingetInstallArgs` takes only an id and a source | It also takes an optional custom string from the signed config, checked against a strict pattern. |
 
-## 5. To prove on a real machine (`docs/testing.md`)
-- **Install:** Zoom installs per-machine from winget on x64 (and on ARM64 when one is at hand), with no window and no prompt during the run.
-- **Auto-update:** in Zoom, Settings > General shows automatic updates on. Record the `ZConfig` value that worked.
+## 5. To prove on a real machine (`docs/testing.md`; the first laptop with Zoom on, Q55)
+- **Install:** Zoom installs per-machine from winget on x64 (and on ARM64 when one is at hand), with no window and no prompt during the run, well inside the 10-minute bound.
+- **Auto-update:** in Zoom, Settings > General shows automatic updates on. If not, or if the step timed out on a msiexec help box, the token is fixed in the next release's `config.json`.
 - **Zoom does not open by itself** during the run, and does not start at sign-in unless Zoom's default does. Record what Zoom does.
 - **The desktop icon** is on the Public desktop after the run.
 - **The report** shows Zoom's version. Record the real DisplayName.
