@@ -26,7 +26,7 @@
 #                         (Internet warn with Detail.Clock: the rescan fails until the clock is fixed; RD-R20),
 #                         confirm.noStickLog
 #   diskCheck             reason.checking; reason.restart; reason.diskFailing; warns: confirm.noStickLog
-#   netReset, ghosts      reason.noStickBackup (the backup must survive the restart)
+#   netReset, ghosts      reason.noStickBackup (the network and device backups are kept on the stick)
 #   netRestore            hidden without a saved backup (Repair.NetBackup); reason.noStickBackup
 #   quickReport,          reason.noStickReport
 #   fullReport

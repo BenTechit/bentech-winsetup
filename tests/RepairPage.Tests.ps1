@@ -1135,3 +1135,33 @@ Describe 'the page at work, review fixes (Task 5 review I1, M2, M4, M5; ruling R
     $w.Tag.Model.Repair.Result | Should -BeNullOrEmpty; $w.FindName('WhatPanel').Visibility | Should -Be 'Visible'
     @($script:logs | Where-Object { $_.Message -in 'Toolbox action finished', 'Toolbox info action failed' }).Count | Should -Be 0; @($script:started).Count | Should -Be 1 }
 }
+
+Describe 'the final wave (final-fixes.md): the window' {
+  BeforeEach { Set-RunTestMocks }
+  AfterEach { $script:ToolboxChildren.Clear() }
+
+  It 'New PC setup shows locked while an action runs and unlocks when it ends; the safety child alone locks nothing (item 3, spec 4.4)' {
+    $w = New-RunWindow; $w.FindName('NavSetup').IsEnabled | Should -BeTrue
+    $null = Start-ToolboxRun -Window $w -ActionId 'safety' -Slot Safety; $w.FindName('NavSetup').IsEnabled | Should -BeTrue
+    $null = Start-ToolboxRun -Window $w -ActionId 'health'; $proc = $script:fake
+    $w.FindName('NavSetup').IsEnabled | Should -BeFalse; $w.FindName('NavRepair').IsEnabled | Should -BeTrue
+    Send-RunTick $w; $w.FindName('NavSetup').IsEnabled | Should -BeFalse   # every render keeps it locked
+    Set-TestLayout $w 1100 760; $w.FindName('NavSetup').Opacity | Should -Be 0.5   # NavStyle's IsEnabled=False trigger: it looks locked
+    Click $w 'NavSetup'; $w.Tag.Model.Page | Should -Be 'repair'   # a click raised in code is still refused (the backstop)
+    Write-TestResult $w; $proc.HasExited = $true; Send-RunTick $w
+    $w.Tag.Runs.Action | Should -BeNullOrEmpty; $w.FindName('NavSetup').IsEnabled | Should -BeTrue
+    Set-TestLayout $w 1100 760; $w.FindName('NavSetup').Opacity | Should -Be 1
+    Click $w 'NavSetup'; $w.Tag.Model.Page | Should -Be 'setup'; $w.FindName('NavSetup').IsEnabled | Should -BeTrue }
+  It '"Stopping after ..." marks a step id the table does not know left-to-right in Hebrew, a Hebrew step name not (item 9, RD-R14)' {
+    $mark = [string][char]0x200E
+    $run = $runSample.Clone(); $run.Stopping = $true
+    $run.Steps = @(@{ Id = 'timeSync'; Status = 'done'; Percent = $null }, @{ Id = 'mysteryStep'; Status = 'running'; Percent = $null })
+    # Compared ordinally: a culture comparison (-BeExactly) ignores the marks.
+    $w = New-RepairWindow @{ Language = 'he'; Run = $run }
+    [string]::Equals($w.FindName('StoppingText').Text, ($script:ToolboxStrings.he['run.stopping'] -f ($mark + 'mysteryStep' + $mark)), [StringComparison]::Ordinal) | Should -BeTrue
+    $run2 = $runSample.Clone(); $run2.Stopping = $true
+    $x = New-RepairWindow @{ Language = 'he'; Run = $run2 }
+    [string]::Equals($x.FindName('StoppingText').Text, ($script:ToolboxStrings.he['run.stopping'] -f $script:ToolboxStrings.he['tool.step.dism']), [StringComparison]::Ordinal) | Should -BeTrue
+    $e = New-RepairWindow @{ Run = $run }
+    [string]::Equals($e.FindName('StoppingText').Text, ($script:ToolboxStrings.en['run.stopping'] -f 'mysteryStep'), [StringComparison]::Ordinal) | Should -BeTrue }
+}

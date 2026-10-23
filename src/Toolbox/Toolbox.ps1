@@ -586,7 +586,8 @@ function Invoke-ToolboxAction {
         always closes (its children are killed before anything else: Show-ToolboxWindow, Get-SetupChoices).
         Otherwise Tag.Closing = $true; a window that closes without an outcome (Alt+F4) is Cancel.
       - Page: refused while an action runs, with WARN 'Page change refused: an action is running' (the nav is
-        locked, spec 4.4); otherwise as below. On the repair page (repair Task 5) the stick is checked
+        locked, spec 4.4: Update-RepairView also shows New PC setup disabled then; this refusal is the backstop for
+        a click raised in code); otherwise as below. On the repair page (repair Task 5) the stick is checked
         (Update-ToolboxStick: the full search on the first visit) and the first visit starts the safety child that
         reads the strip (Start-ToolboxSafetyRun; once per window).
       - RunTick: the run timer's tick (Update-ToolboxRuns, RepairPage.ps1). Stop: Request-ToolboxStop.

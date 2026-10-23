@@ -429,7 +429,6 @@ function Set-RepairRunPanel {
 
   $state = $Window.Tag
   $model = $state.Model
-  $language = [string]$model.Language
   $visible = [System.Windows.Visibility]::Visible
   $collapsed = [System.Windows.Visibility]::Collapsed
   $run = ConvertTo-RepairEntry -Entry $model.Repair['Run']
@@ -484,7 +483,8 @@ function Set-RepairRunPanel {
   $Window.FindName('StopButton').IsEnabled = (-not $stopping)
   $stoppingText = $Window.FindName('StoppingText')
   $stoppingText.Visibility = $(if ($stopping) { $visible } else { $collapsed })
-  $stoppingText.Text = $(if ($stopping) { Get-ToolboxString -Table $state.Strings -Language $language -Key 'run.stopping' -Arguments @($current) } else { '' })
+  # Through Format-RepairText: a step id the table does not know reads left-to-right in Hebrew (RD-R14).
+  $stoppingText.Text = $(if ($stopping) { Format-RepairText -State $state -Key 'run.stopping' -Arguments @($current) } else { '' })
   $Window.FindName('CloseRefusedText').Visibility = $(if ($model.Repair['CloseRefused'] -eq $true) { $visible } else { $collapsed })
 }
 
@@ -582,7 +582,9 @@ function Update-RepairView {
   .SYNOPSIS
     Renders the model's page into the window (repair spec 4.1). Returns nothing. Update-ToolboxView calls it last.
   .DESCRIPTION
-    The page: NavSetup / NavRepair checked as Model.Page says, the chosen one's glyph in the accent colour; the setup
+    The page: NavSetup / NavRepair checked as Model.Page says, the chosen one's glyph in the accent colour; NavSetup
+    disabled while an action runs (Test-ToolboxActionRunning: spec 4.4 locks the page change; NavStyle's IsEnabled
+    trigger shows it, and the Page click guard stays as the backstop: final review Minor 3); the setup
     page shows AdminBanner, WarnPanel (as Update-ToolboxView set them), SetupOptions, SetupRight, the new name and the
     power chip of the machine card; the repair page shows RepairCenter, RepairRight and the PC's present name instead
     (its strip has the power chip).
@@ -606,6 +608,7 @@ function Update-RepairView {
   $onRepair = ($model['Page'] -ceq 'repair' -and $repair -is [System.Collections.IDictionary])
 
   $Window.FindName('NavSetup').IsChecked = (-not $onRepair)
+  $Window.FindName('NavSetup').IsEnabled = (-not (Test-ToolboxActionRunning -State $state))
   $Window.FindName('NavRepair').IsChecked = $onRepair
   $Window.FindName('NavSetupGlyph').Foreground = $Window.FindResource($(if ($onRepair) { 'SubtleTextBrush' } else { 'AccentBrush' }))
   $Window.FindName('NavRepairGlyph').Foreground = $Window.FindResource($(if ($onRepair) { 'AccentBrush' } else { 'SubtleTextBrush' }))
