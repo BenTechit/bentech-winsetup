@@ -653,10 +653,13 @@ Describe 'ToolChecks and ToolSafety (repair Task 2)' {
       (Get-ToolDiskChip -Run $run).Level | Should -Be 'ok'   # no offset known (no internet): the wall clock's 30 days miss it
       $run.Data['ClockOffsetSeconds'] = 730 * 86400.0
       $c = Get-ToolDiskChip -Run $run; $c.Level | Should -Be 'crit'; $c.Detail.Reasons | Should -Contain 'events'; $c.Detail.Events | Should -Be 1
+      @($run.Log | Where-Object { $_ -like 'The clock is 1051200 min ahead*' }).Count | Should -Be 1
       Should -Invoke Get-WinEvent -Times 1 -Exactly -ParameterFilter { [math]::Abs(((Get-Date) - $FilterHashtable.StartTime).TotalDays - 760) -lt 0.01 }
       # A clock behind already reaches further back (it can only count more): the wall clock's window stays.
       $run.Data['ClockOffsetSeconds'] = -730 * 86400.0; $null = Get-ToolDiskChip -Run $run
       Should -Invoke Get-WinEvent -Times 2 -Exactly -ParameterFilter { [math]::Abs(((Get-Date) - $FilterHashtable.StartTime).TotalDays - 30) -lt 0.01 }
+      $quiet = New-TestRun 'safetyDisk'; $quiet.Data['ClockOffsetSeconds'] = 0.4; $null = Get-ToolDiskChip -Run $quiet
+      @($quiet.Log | Where-Object { $_ -like 'The clock is*' }).Count | Should -Be 0   # an ordinary sub-minute offset is no news
       # The Internet step keeps the offset it measured for the Disk step.
       Mock Test-ToolInternet { @{ Tcp = $true; Https = $false; Probe = 'ok'; ClockOffsetSeconds = 63072000.0; Clock = $true; Chip = (New-TestChip 'warn') } }
       $s = New-TestRun 'safetyInternet'; $null = Invoke-ToolStepSafetyInternet -Run $s; $s.Data['ClockOffsetSeconds'] | Should -Be 63072000.0

@@ -669,7 +669,7 @@ function Get-ToolDiskChip {
     # The Internet step ran first and kept its clock offset: a clock ahead moves the event window back (final review
     # Minor 5); without internet the wall clock decides (docs\testing.md 1.21).
     $offset = $Run.Data['ClockOffsetSeconds']
-    if ($null -ne $offset -and [double]$offset -gt 0) {
+    if ($null -ne $offset -and [double]$offset -ge 60) {
       Add-ToolLog -Run $Run -Text ('The clock is {0} min ahead: the disk events are counted from Microsoft''s time' -f ([math]::Round([double]$offset / 60, 1)).ToString([Globalization.CultureInfo]::InvariantCulture))
     }
     $events = Get-ToolDiskEventCount -Days $days -SystemDisks $systemDisks -SystemDrive $systemDrive -ClockOffsetSeconds $offset
