@@ -151,10 +151,11 @@ function Limit-ReportMessage {
   <#
   .SYNOPSIS
     Private, pure. An event message for one report line: its whitespace collapsed to single spaces, as display text
-    (ConvertTo-ToolDisplayText), and, when longer than -MaxLength, cut between two words and marked ' ...' (review M3,
-    ruling RD-R26): a name is never cut inside a word, and the privacy-safe copy masks a known name whose last words
-    the cut took (the cut forms of ConvertTo-SafeText). Only a word longer than half the room is cut inside it (never
-    between the two halves of a surrogate pair).
+    (ConvertTo-ToolDisplayText), and, when longer than -MaxLength, cut at the last space that leaves room for the marker
+    ' ...' (review M3, rulings RD-R26 and RD-R27). It never keeps part of a word: the word the cut falls in is dropped
+    whole, and a message whose first word alone is longer than the room is just '...'. So no fragment of a known value
+    (a name, an e-mail address in a URL, a serial in a device path) reaches the report line, and the privacy-safe copy
+    masks a known name of two or more words whose last words the cut took (the cut forms of ConvertTo-SafeText).
   #>
   [CmdletBinding()]
   [OutputType([string])]
@@ -162,12 +163,8 @@ function Limit-ReportMessage {
 
   $value = ConvertTo-ToolDisplayText -Text ([regex]::Replace([string]$Text, '\s+', ' ')) -MaxLength 4096
   if ($value.Length -le $MaxLength) { return $value }
-  $room = $MaxLength - 4
-  $cut = $value.LastIndexOf(' ', $room)
-  if ($cut -lt [int][math]::Floor($room / 2)) {
-    $cut = $room
-    if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }
-  }
+  $cut = $value.LastIndexOf(' ', $MaxLength - 4)
+  if ($cut -le 0) { return '...' }
   return ($value.Substring(0, $cut).TrimEnd() + ' ...')
 }
 

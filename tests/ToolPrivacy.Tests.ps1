@@ -659,4 +659,71 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
       }
     }
   }
+
+  Describe 'the Task 9 re-review 2 fixes (ruling RD-R27)' {
+    BeforeAll { function Get-Mask { param($Masker, [string]$Text) ConvertTo-SafeText -Masker $Masker -Text $Text } }
+    It 'a profile folder whose first part is a known name is masked whole; only at the end of a line does a token and a space keep the words after it' {
+      $known = @{ User = @('Dana', 'דנה') }
+      $cases = [ordered]@{
+        'C:\Users\Dana Levi\Desktop'              = 'C:\Users\user3\Desktop'
+        'C:\Users\Dana.Levi\AppData'              = 'C:\Users\user3\AppData'
+        'C:\Users\Dana_Levi\x'                    = 'C:\Users\user3\x'
+        'C:\Users\Dana-Levi\x'                    = 'C:\Users\user3\x'
+        '\\SRV\c$\Users\Dana Levi\x'              = '\\SRV\c$\Users\user3\x'
+        'C:\Users\דנה לוי\x'                      = 'C:\Users\user3\x'
+        'C:\Users\Moshe Levi\AppData'             = 'C:\Users\user3\AppData'
+        '\\SRV\c$\Users\Rina Cohen\x'             = '\\SRV\c$\Users\user3\x'
+        'C:/Users/Yossi Ben David/Desktop'        = 'C:/Users/user3/Desktop'
+        # A folder name never ends with a space: the words before the next path are no folder name (review R09/R10).
+        'C:\Users\Yossi copied to \\NAS\backup'   = 'C:\Users\user3 copied to \\NAS\backup'
+        'C:\Users\Dana copied to \NAS\backup'     = 'C:\Users\user1 copied to \NAS\backup'
+        # A known user keeps its token, and the words after it stay (RD-R26).
+        'C:\Users\Dana\Desktop and C:\Users\Dana' = 'C:\Users\user1\Desktop and C:\Users\user1'
+        'X C:\Users\Dana loaded'                  = 'X C:\Users\user1 loaded'
+        'The profile C:\Users\Dana was not loaded properly' = 'The profile C:\Users\user1 was not loaded properly'
+        'C:\Users\Dana עדנה'                      = 'C:\Users\user1 עדנה'
+      }
+      foreach ($c in $cases.GetEnumerator()) { Get-Mask (New-SafeMasker -Known $known) $c.Key | Should -BeExactly $c.Value -Because $c.Key }
+    }
+    It 'an Azure AD (S-1-12-1) profile on the fake PC is a known user value, like a local one; the system profiles are not' {
+      $script:regSubkeys['HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'] = @(
+        @{ Name = 'S-1-5-18'; Values = @{ ProfileImagePath = 'C:\WINDOWS\system32\config\systemprofile' } }
+        @{ Name = $script:sid; Values = @{ ProfileImagePath = 'C:\Users\Dana' } }
+        @{ Name = 'S-1-12-1-1111111111-2222222222-3333333333-4444444444'; Values = @{ ProfileImagePath = 'C:\Users\AviBar' } })
+      $run = New-ReportActionRun -Action fullReport
+      $null = Invoke-ToolReportSection -Run $run -Id '11'
+      @($run.Data['Report']['11'].Items['Profiles']) | Should -Be @('C:\Users\Dana', 'C:\Users\AviBar')
+      $ids = Get-ReportIdentifiers -Report (New-ToolReport -Run $run)
+      @($ids.User) | Should -Contain 'AviBar'
+      @($ids.User) | Should -Not -Contain 'systemprofile'
+      Get-Mask (New-SafeMasker -Known $ids) 'Startup: C:\Users\AviBar.Contoso\x and AviBar signed in' | Should -Not -Match 'AviBar'
+    }
+    It 'Limit-ReportMessage never keeps part of a word: a word longer than the room is dropped to the ellipsis' {
+      Limit-ReportMessage -Text ('m' * 300) -MaxLength 200 | Should -BeExactly '...'
+      $url = ('A' * 50) + ' https://login.example.com/' + ('b' * 100) + '&login_hint=yossi.levi%40example.co.il&x=1 more'
+      Limit-ReportMessage -Text $url -MaxLength 200 | Should -BeExactly (('A' * 50) + ' ...')
+      foreach ($pad in 100, 105, 108, 112) {
+        $cut = Limit-ReportMessage -Text (('A' * 50) + ' https://login.example.com/' + ('b' * $pad) + '&login_hint=yossi.levi%40example.co.il&x=1 more') -MaxLength 200
+        $cut | Should -Not -Match 'yossi|login|example' -Because "pad $pad"
+      }
+      $events = @(@{ Provider = 'Microsoft-Windows-Kernel-PnP'; Id = 400; Level = 4; Time = '2026-10-20T10:00:00'
+                     Message = ('Device configured ' + ('x' * 40) + ' SWD\WPDBUSENUM\_??_USBSTOR#Disk&Ven_Acme&Prod_Stick&Rev_1.00#' + ('0' * 60) + 'S4EWNX0R123456&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b} was configured.') })
+      $line = @(ConvertTo-EventGroups -Events $events)[0]
+      $line | Should -Match ('Device configured ' + ('x' * 40) + ' \.\.\.$'); $line | Should -Not -Match 'S4EW|USBSTOR'
+      # Words that fit stay whole; a message that fits is not cut.
+      Limit-ReportMessage -Text ((('word ' * 50).Trim()) + ' end') -MaxLength 200 | Should -BeExactly ((('word ' * 39).Trim()) + ' ...')
+      Limit-ReportMessage -Text "a  short`r`nmessage" -MaxLength 200 | Should -BeExactly 'a short message'
+    }
+    It 'phones: a number glued to a word with a letter other than a-f or x (tel, Phone, cell) is masked; hex ids stay' {
+      foreach ($p in 'tel0501234567', 'Phone0501234567', 'cell0501234567', 'Phone:0501234567', 'TEL050-1234567') {
+        $safe = Get-Mask (New-SafeMasker -Known @{}) "call $p now"
+        $safe | Should -Not -Match '0501234567|050-1234567' -Because $p; $safe | Should -Match 'PHONE-1' -Because $p
+      }
+      Get-Mask (New-SafeMasker -Known @{}) 'call tel0501234567 now' | Should -BeExactly 'call telPHONE-1 now'
+      foreach ($keep in 'id 0x0501234567', '0X0501234567', 'abc0501234567', 'deadbeef0501234567', 'A0501234567', 'guid {12345678-ab0501234567}',
+                        'hash fab0501234567', 'build 10.0.26100.1', 'KB5044284', 'on 05.10.2026 09:15') {
+        Get-Mask (New-SafeMasker -Known @{}) $keep | Should -BeExactly $keep -Because $keep
+      }
+    }
+  }
 }

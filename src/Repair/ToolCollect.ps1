@@ -2044,7 +2044,9 @@ function Get-ReportData11 {
     }
     $null = Invoke-ReportSource -Section $s -What 'Profiles (registry)' -Script {
       $profiles = Read-ToolRegistrySubkeys -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-      $s.Items['Profiles'] = [string[]]@(foreach ($p in @($profiles)) { if ([string]$p['Name'] -match '^S-1-5-21-') { [string]$p['Values']['ProfileImagePath'] } })
+      # People's profiles: local and domain (S-1-5-21-...) and Azure AD (S-1-12-1-..., RD-R27), so their folder names are
+      # known values for the privacy-safe copy; the system's own (S-1-5-18/19/20) are left out.
+      $s.Items['Profiles'] = [string[]]@(foreach ($p in @($profiles)) { if ([string]$p['Name'] -match '^S-1-(?:5-21|12-1)-') { [string]$p['Values']['ProfileImagePath'] } })
     }
     $user = Get-ReportUser -Run $Run
     if ([string]$user['Name'] -ne '') { $s.Items['SignedInUser'] = [string]$user['Name']; $s.Facts['Signed in'] = ConvertTo-ToolDisplayText -Text $user['Name'] -MaxLength 100 }

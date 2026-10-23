@@ -59,7 +59,8 @@ $script:SafeWordBelow = 6
 $script:SafeRegexTimeout = [TimeSpan]::FromSeconds(10)
 # Every token, so a profile folder already masked is not masked again.
 $script:SafeTokenPattern = '^(user|PC-|DOMAIN-|SERIAL-|MAC-|IP-|IP6-|SSID-|EMAIL-|PHONE-|SID-)[0-9]+\z'
-# A text that starts with a token: a profile name a known value already masked ("user1 was ...", ruling RD-R26).
+# A text that starts with a token: at the end of a line, a profile name a known value already masked and the word after
+# it ("user1 loaded", rulings RD-R26 and RD-R27; the profile pass adds "(?= )").
 $script:SafeTokenStartPattern = '\A(?:user|PC-|DOMAIN-|SERIAL-|MAC-|IP-|IP6-|SSID-|EMAIL-|PHONE-|SID-)[0-9]+(?![0-9])'
 # Where a cut form of a known value may end (review M3, RD-R26): at the end of a line, with the cut marker " ..." or not.
 $script:SafeCutEnd = '(?=(?:[ \t]*\.\.\.)?[ \t]*(?:\r?\n|\z))'
@@ -97,15 +98,21 @@ $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'Micros
 #   IPv4 (a sentence's full stop after it does not hide it; five-part versions stay); IPv6 (also right after a colon:
 #     "Address:2a00::1");
 #   a profile folder: <drive>:\Users\<name>, c$\Users\<name>, %SystemDrive%\Users\<name>, with '\', '/' or a JSON-
-#     doubled '\\' (the name up to the next separator; else, when the line ends within two words, those words (a
-#     spaced name); else one word: the words after a name stay and go through every pass, RD-R26). A name that starts
-#     with a token was masked as a known value already and stays;
+#     doubled '\\' (the name up to the next separator, never ending with white space, as no folder name does: "C:\Users\
+#     Yossi copied to \\NAS" keeps "copied to", RD-R27; else, when the line ends within two words, those words (a
+#     spaced name, group eol); else one word: the words after a name stay and go through every pass, RD-R26). A name
+#     that is a whole token was masked as a known value already and stays; at the end of a line a token and a space
+#     ("user1 loaded") stay too, so "C:\Users\Dana loaded" keeps "loaded". Anywhere else a name that only starts with a
+#     token is a new name ("user1 Levi", "user1.Levi": the folder of a known first name, RD-R27), masked whole;
 #   an Israeli phone number: the spec's pinned pattern widened (review M1) to 972 / 00972 / +972 (with an optional
 #     "(0)"), an area code in parentheses, '.' or ' - ' as separators, and the 3-4 and 3-2-2 groupings of the last
 #     seven digits; RD-R26 adds parentheses around the country or area code ("(+972) 50", "+972 (50)") and the 4-3 and
-#     2-2-3 groupings. Every number the pinned pattern finds, this one finds, except one right after a letter or a "0x"
-#     (a hex value, a KB or product id). No digit, '+' or letter before it, and no digit (or '-'/'.' and a digit,
-#     a GUID's or a version's next part) after it.
+#     2-2-3 groupings. No digit or '+' before it, and no digit (or '-'/'.' and a digit, a GUID's or a version's next
+#     part) after it. A Latin letter right before it counts only when its run of letters is a whole word holding a
+#     letter other than a-f and x (RD-R27): "tel0501234567", "Phone0501234567" and "cell..." are phones, a hex value
+#     ("0x0501234567", "abc0501234567", "deadbeef...", a GUID group "ab0501234567") is not. A serial such as
+#     "SN0501234567" is masked as a phone too (over-masking, accepted). Every number the pinned pattern finds, this
+#     one finds, except those after a hex run.
 $script:SafeEmailPattern = '[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
 $script:SafeSidPattern = 'S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
 $script:SafeMacPattern = '(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])'
@@ -113,8 +120,8 @@ $script:SafeMacDottedPattern = '(?<![0-9A-Za-z.])[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\
 $script:SafeMacCompactPattern = '(?<![0-9A-Za-z-])[0-9A-Fa-f]{12}(?![0-9A-Za-z-])'
 $script:SafeIpv4Pattern = '(?<!\d)(?<!\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)'
 $script:SafeIpv6Pattern = '(?<![0-9A-Za-z.%])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{1,4}|(?:\d{1,3}\.){3}\d{1,3})?(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:%]|\.\d)'
-$script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]+)(?=[\\/])|(?<name>[^\\/:*?"<>|\r\n\s]+(?: [^\\/:*?"<>|\r\n\s]+)?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
-$script:SafePhonePattern = '(?<![\dA-Za-z+])(?:(?:\(?(?:\+|00)972\)?|972)[-. ]{0,3}(?:\(0\)[-. ]{0,2})?\(?(?:[23489]|5\d|7\d)\)?|\(?0(?:[23489]|5\d|7\d)\)?)[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2}|\d{4}[-. ]{1,3}\d{3}|\d{2}[-. ]{1,3}\d{2}[-. ]{1,3}\d{3})(?!\d|[-.]\d)'
+$script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]*[^\\/:*?"<>|\r\n\s])(?=[\\/])|(?<eol>[^\\/:*?"<>|\r\n\s]+(?: [^\\/:*?"<>|\r\n\s]+)?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
+$script:SafePhonePattern = '(?<![\d+])(?:(?<![A-Za-z])|(?<=(?<![0-9A-Za-z_])[A-Za-z]*[G-WYZg-wyz][A-Za-z]*))(?:(?:\(?(?:\+|00)972\)?|972)[-. ]{0,3}(?:\(0\)[-. ]{0,2})?\(?(?:[23489]|5\d|7\d)\)?|\(?0(?:[23489]|5\d|7\d)\)?)[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2}|\d{4}[-. ]{1,3}\d{3}|\d{2}[-. ]{1,3}\d{2}[-. ]{1,3}\d{3})(?!\d|[-.]\d)'
 
 # The second line of a SAFE copy (ASCII), for the AI and for Ben.
 $script:SafeCopyNote = 'PRIVACY-SAFE COPY: names, e-mail addresses, serial numbers, MAC and IP addresses, network names, SIDs and phone numbers are replaced by tokens (user1, PC-1, SERIAL-1, MAC-1, IP-1, SSID-1, EMAIL-1, PHONE-1, SID-1, ...); one token is always the same value.'
@@ -575,9 +582,12 @@ function ConvertTo-SafeText {
   $source = $value
   $value = (New-SafeRegex -Pattern $script:SafeProfilePattern).Replace($source, [Text.RegularExpressions.MatchEvaluator] {
       param($m)
-      $name = $m.Groups['name'].Value
+      # A whole token stays; at the end of a line (group eol) a token and the word after it stay too (RD-R27).
+      $eol = $m.Groups['eol'].Success
+      $name = $(if ($eol) { $m.Groups['eol'].Value } else { $m.Groups['name'].Value })
       $core = $name.TrimEnd('.', ' ', "`t")
-      if ($core -eq '' -or $core -match $script:SafeTokenStartPattern -or (Test-SafeGenericValue -Value $core)) { $m.Value }
+      if ($core -eq '' -or $core -match $script:SafeTokenPattern -or ($eol -and $core -match ($script:SafeTokenStartPattern + '(?= )')) -or
+          (Test-SafeGenericValue -Value $core)) { $m.Value }
       else {
         $token = Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category 'User' -Key $core.Trim()) -Source $source -End ($m.Index + $m.Length)
         $m.Groups['drive'].Value + $token + $name.Substring($core.Length)
