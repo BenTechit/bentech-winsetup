@@ -52,7 +52,7 @@ function Get-ProcessTreeId {
     try {
       $children = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$parent" -OperationTimeoutSec 10 -ErrorAction Stop)
     } catch {
-      Write-SetupLog -Message "Could not enumerate children of ${parent}: $($_.Exception.Message)" -Level WARN -Data @{ processId = $parent }
+      Write-SetupLog -Message "Could not enumerate children of ${parent}: $(ConvertTo-ScreenText -Text $_.Exception.Message)" -Level WARN -Data @{ processId = $parent }
       continue
     }
     foreach ($child in $children) {
@@ -70,6 +70,8 @@ function Stop-ProcessTree {
     The whole tree is collected BEFORE anything is killed, because killing a parent orphans its
     children and the walk would lose them. A hung installer usually hangs inside a child
     (msiexec, setup.exe) that Process.Kill() on the parent alone would leave running.
+    A logged exception text goes through ConvertTo-ScreenText (StartScreen.ps1; a Hebrew Windows
+    localizes it: repair Task 4 review M8); the bundle defines every function before it runs.
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][int]$ProcessId)
@@ -79,7 +81,7 @@ function Stop-ProcessTree {
   } catch {
     # Last resort: Get-ProcessTreeId handles failed queries itself, so this means something
     # unexpected. The root must still be killed.
-    Write-SetupLog -Message "Could not walk the process tree; killing the root only: $($_.Exception.Message)" -Level WARN -Data @{ processId = $ProcessId }
+    Write-SetupLog -Message "Could not walk the process tree; killing the root only: $(ConvertTo-ScreenText -Text $_.Exception.Message)" -Level WARN -Data @{ processId = $ProcessId }
     $ids = @($ProcessId)
   }
   # Root first, so it cannot start replacements while the children are being killed.
@@ -89,9 +91,36 @@ function Stop-ProcessTree {
     } catch {
       # Already gone is fine; still running means access denied or similar.
       if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
-        Write-SetupLog -Message 'Could not kill process' -Level WARN -Data @{ processId = $id; error = $_.Exception.Message }
+        Write-SetupLog -Message 'Could not kill process' -Level WARN -Data @{ processId = $id; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
       }
     }
+  }
+}
+
+function Wait-ProcessExit {
+  <#
+  .SYNOPSIS
+    $true once -Process has ended, waiting at most -Milliseconds (0 to 10000) for it. Never throws.
+  .DESCRIPTION
+    A kill is asynchronous (TerminateProcess returns before the process has ended), so a caller that would call a
+    child "still running" right after its kill first waits here, briefly and bounded (repair final wave item 11). A
+    real [Diagnostics.Process] is waited on with WaitForExit(-Milliseconds); any other object (a test's stand-in) has
+    its HasExited read once. $null has ended; a wait or a read that fails has not. The toolbox calls it only after its
+    window is gone (Get-SetupChoices' finally): the window never waits while it is shown.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [AllowNull()]$Process,
+    [ValidateRange(0, 10000)][int]$Milliseconds = 0
+  )
+
+  if ($null -eq $Process) { return $true }
+  try {
+    if ($Process -is [Diagnostics.Process]) { return [bool]$Process.WaitForExit($Milliseconds) }
+    return [bool]$Process.HasExited
+  } catch {
+    return $false
   }
 }
 
@@ -312,8 +341,12 @@ function Start-BackgroundExternal {
     Starts a program in the background and returns its System.Diagnostics.Process at once. The
     caller owns the wait and its deadline.
   .DESCRIPTION
-    The one exception to "every child goes through Invoke-External" (Global Constraints): its only
-    caller is the office step, whose Wait-OfficeBackground enforces timeoutsMinutes.office.
+    The named exception to "every child goes through Invoke-External" (Global Constraints). Its callers:
+    - the office step, whose Wait-OfficeBackground enforces timeoutsMinutes.office;
+    - the toolbox window (repair spec 7, 10), through its StartChild seam: the Repair & diagnostics action
+      child (setup.ps1 -ToolAction), whose deadline (timeoutsMinutes.tool.<id> + 3 minutes, on the run's own
+      Stopwatch) the window's run timer enforces with Stop-ProcessTree, and "Open folder" (explorer.exe),
+      which nobody waits for.
     - UseShellExecute = $true with a hidden window: the child gets its own (hidden) console and
       inherits no handles, so nothing it writes lands on the setup screen and the operator's keys
       never reach it.
@@ -343,7 +376,7 @@ function Start-BackgroundExternal {
     $null = $proc.Handle
   } catch {
     $proc.Dispose()
-    Write-SetupLog -Message 'Background process failed to start' -Level ERROR -Data @{ file = $FilePath; error = $_.Exception.Message }
+    Write-SetupLog -Message 'Background process failed to start' -Level ERROR -Data @{ file = $FilePath; error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     throw (New-Object InvalidOperationException ("Cannot start '$FilePath': $($_.Exception.Message)", $_.Exception))
   }
 

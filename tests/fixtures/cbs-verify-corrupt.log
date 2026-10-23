@@ -1,0 +1,15 @@
+2026-10-21 03:12:40, Info                  CSI    00000041 [SR] Verifying 100 components
+2026-10-21 03:12:42, Info                  CSI    00000042 [SR] Hashes for file member [l:7]'old.dll' do not match actual file [l:7]'old.dll'
+2026-10-21 03:12:44, Info                  CSI    00000045 [SR] Verify complete
+2026-10-22 10:00:02, Info                  CBS    TI: --- Initializing Trusted Installer ---
+2026-10-22 10:00:05, Info                  CSI    00000001 [SR] Verifying 100 components
+2026-10-22 10:00:05, Info                  CSI    00000002 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:07, Info                  CSI    00000003 [SR] Hashes for file member [l:12]'imageres.dll' do not match actual file [l:12]'imageres.dll'
+2026-10-22 10:00:07, Info                  CSI    00000004 [SR] Component Microsoft-Windows-imageres, file imageres.dll is corrupt
+2026-10-22 10:00:09, Info                  CSI    00000006 [SR] Verify complete
+2026-10-22 10:00:09, Info                  CSI    00000007 [SR] Verifying 100 components
+2026-10-22 10:00:09, Info                  CSI    00000008 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:12, Info                  CSI    0000000a [SR] Could not reproject corrupted file \??\C:\WINDOWS\System32\drivers\etc\hosts; source file in store is also corrupted
+2026-10-22 10:00:13, Info                  CSI    0000000b Hashes for file member [l:11]'shell32.dll' do not match actual file [l:11]'shell32.dll' :
+2026-10-22 10:00:13, Info                  CSI    0000000c [SR] Hashes for file member [l:11]'shell32.dll' do not match actual file [l:11]'shell32.dll'
+2026-10-22 10:00:15, Info                  CSI    0000000e [SR] Verify complete

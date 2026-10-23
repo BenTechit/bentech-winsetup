@@ -8,7 +8,8 @@
 # inside $TestDrive. Every refusal test mocks Invoke-External to throw.
 BeforeAll {
   # Steps\Prepare: Unregister-ResumeTask (final review I1), always mocked in the Invoke-SetupCleanup tests.
-  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'Steps\Prepare', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
+  # UI\StartScreen: ConvertTo-ScreenText, for the logged exception texts (Task 4 review M8).
+  foreach ($f in 'Common\Logging', 'Common\Activity', 'Common\Process', 'UI\StartScreen', 'Steps\Prepare', 'Entry\Cleanup') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Disk($id, $serial, $type = 2) { [pscustomobject]@{ DeviceID = $id; VolumeSerialNumber = $serial; DriveType = $type } }
 }
 Describe 'Get-LauncherInfo' {
@@ -23,6 +24,13 @@ Describe 'Get-LauncherInfo' {
     Get-LauncherInfo -Path $null | Should -BeNullOrEmpty
     $unc = Get-LauncherInfo -Path '\\server\share\BenTechSetup.cmd'; $unc.VolumeSerial | Should -BeNullOrEmpty; $unc.Drive | Should -BeNullOrEmpty
     Mock Get-CimInstance { throw 'WMI down' }; (Get-LauncherInfo -Path 'E:\BenTechSetup.cmd').VolumeSerial | Should -BeNullOrEmpty
+  }
+  It 'logs a failed query''s reason in ASCII (a Hebrew Windows localizes it: Task 4 review M8)' {
+    $script:logs = New-Object Collections.ArrayList; Mock Write-SetupLog { [void]$script:logs.Add(@{ Message = $Message; Level = $Level; Data = $Data }) }
+    Mock Get-CimInstance { throw ('WMI ' + [char]0x05D0 + [char]0x05D1) }
+    (Get-LauncherInfo -Path 'E:\BenTechSetup.cmd').VolumeSerial | Should -BeNullOrEmpty
+    $w = @($script:logs | Where-Object { $_.Message -eq 'Could not read the volume serial of the launcher drive' }); $w.Count | Should -Be 1
+    $w[0].Data.error | Should -BeExactly 'WMI ??'
   }
 }
 Describe 'Find-SetupStick (Review Focus 1)' {
@@ -328,6 +336,46 @@ Describe 'Invoke-SetupCleanup' {
   It 'Cancel without a state' {
     Invoke-SetupCleanup -Root 'C:\BenTech\Setup' -Mode Cancel -Write $run.Write -ProgramDataFolder $run.ProgramDataFolder -FlushInput { } -ReadKey { throw 'no key' }
     @($order) | Should -Be @('rd C:\BenTech')
+  }
+  # Pre-PR code review item 1: a process the toolbox started is still running (Main.ps1 passes -KeepFolder). Only the
+  # removal of C:\BenTech is skipped; the logs still go to the stick and the Desktop launcher still goes.
+  It 'Finish with -KeepFolder: the logs are copied and the Desktop launcher deleted, but C:\BenTech is not removed' {
+    Invoke-SetupCleanup @run -Mode Finish -KeepFolder -ReadKey { throw 'no key expected' }
+    @($order) | Should -Be @('copy DELL-J0C7QK4 logging=False', 'del C:\Users\ben\Desktop\BenTechSetup.cmd')
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+    Should -Invoke Copy-SetupLogsToStick -Times 1 -Exactly -ParameterFilter { $LogDir -eq 'C:\BenTech\Setup\Logs' -and $StickRoot -eq 'E:\' -and $StatePath -eq 'C:\BenTech\Setup\state.json' }
+    $lines | Should -Contain 'Logs saved to E:\BenTech-Logs\DELL-J0C7QK4'
+    $lines | Should -Contain 'Kept C:\BenTech: a process the toolbox started is still running'
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'Cleanup: saving the logs; C:\BenTech is kept' -and $Data.mode -eq 'Finish' }
+    Should -Invoke Write-SetupLog -Times 0 -Exactly -ParameterFilter { $Message -eq 'Cleanup: saving the logs and removing C:\BenTech' }
+    $script:SetupLogPath | Should -BeNullOrEmpty; $script:SetupActivityPath | Should -BeNullOrEmpty
+  }
+  It 'Cancel with -KeepFolder: no copy, the launcher stays, C:\BenTech is not removed, logging is stopped' {
+    Invoke-SetupCleanup @run -Mode Cancel -KeepFolder -ReadKey { throw 'no key' }
+    @($order) | Should -BeNullOrEmpty
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly; Should -Invoke Find-SetupStick -Times 0 -Exactly; Should -Invoke Test-DesktopLauncher -Times 0 -Exactly
+    $lines | Should -Contain 'Kept C:\BenTech: a process the toolbox started is still running'
+    $script:SetupLogPath | Should -BeNullOrEmpty
+  }
+  It '-KeepFolder never asks the Task Scheduler about the resume task (that check belongs to the removal)' {
+    foreach ($m in 'Finish', 'Cancel') { Invoke-SetupCleanup @run -Mode $m -KeepFolder -ReadKey { throw 'no key expected' } }
+    Should -Invoke Unregister-ResumeTask -Times 0 -Exactly
+  }
+  It 'Finish with -KeepFolder and a failed copy still shows it and waits for Enter, without offering a deletion' {
+    Mock Copy-SetupLogsToStick { @{ Ok = $false; Error = 'disk full' } }; $script:keys = New-Object Collections.Queue; 'X', 'Enter' | ForEach-Object { $script:keys.Enqueue($_) }
+    Invoke-SetupCleanup @run -Mode Finish -KeepFolder -ReadKey { $script:keys.Dequeue() }
+    $lines | Should -Contain 'Logs could not be saved to the USB stick: disk full'
+    $script:keys.Count | Should -Be 0
+    $lines | Should -Contain 'Press ENTER to continue (C:\BenTech is kept)'
+    @($lines | Where-Object { $_ -like '*delete*' }).Count | Should -Be 0
+    Should -Invoke Remove-SetupFolder -Times 0 -Exactly
+  }
+  It '-KeepFolder still removes an empty ProgramData\BenTech (it does not hold the child''s files)' {
+    [void][IO.Directory]::CreateDirectory("$TestDrive\pd"); Invoke-SetupCleanup @run -Mode Cancel -KeepFolder -ReadKey { }; "$TestDrive\pd" | Should -Not -Exist
+  }
+  It 'without -KeepFolder nothing changes: the removal runs and no Kept line is written' {
+    Invoke-SetupCleanup @run -Mode Cancel -ReadKey { throw 'no key' }
+    @($order) | Should -Be @('rd C:\BenTech'); @($lines | Where-Object { $_ -like 'Kept *' }).Count | Should -Be 0
   }
   It 'empties the key buffer right before each wait, so a key pressed earlier cannot skip it (V2-R13 I2)' {
     $script:events = New-Object System.Collections.ArrayList

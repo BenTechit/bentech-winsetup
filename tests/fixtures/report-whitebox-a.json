@@ -1,0 +1,28 @@
+{
+    "Version":  1,
+    "Kind":  "quick",
+    "CreatedAt":  "2026-10-10T10:00:00",
+    "ToolVersion":  "2026.10.09.1",
+    "Identity":  {
+                     "Key":  "UUID-8A3F2C105B6D4E7F90123456789ABCDE",
+                     "FolderPart":  "UUID-3456789ABCDE",
+                     "Serial":  "To Be Filled By O.E.M.",
+                     "BiosUuid":  "8A3F2C10-5B6D-4E7F-9012-3456789ABCDE",
+                     "ComputerName":  "PC-9ABCDE",
+                     "Manufacturer":  "To Be Filled By O.E.M.",
+                     "Model":  "To Be Filled By O.E.M.",
+                     "Brand":  "OTHER"
+                 },
+    "Facts":  { },
+    "Findings":  [ ],
+    "Disks":  { },
+    "FreeGB":  100,
+    "FreePercent":  40,
+    "ProblemDevices":  [ ],
+    "Programs":  [ "Old Toolbar|1.0" ],
+    "Crashes":  {
+                    "KernelPower":  [ ],
+                    "BugCheck":  [ ],
+                    "Whea":  [ ]
+                }
+}

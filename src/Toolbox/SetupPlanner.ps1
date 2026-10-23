@@ -7,8 +7,9 @@
 #
 # Pure: no logging, no I/O, no console. Values in, values out; the callers log (ConvertTo-ValidChoices returns
 # the dropped tweak ids for that). Needs Catalog.ps1 (Get-TweakCatalog, Get-EffectiveTweaks, Get-RemoteChoice,
-# Get-WindowsUpdateChoice, Get-StepPlan, $script:RemoteChoices, $script:StepCatalog) and StartScreen.ps1
-# (New-DefaultChoices, $script:OfficeChoices); the bundle holds every file.
+# Get-WindowsUpdateChoice, Get-StepPlan, $script:RemoteChoices, $script:StepCatalog), StartScreen.ps1
+# (New-DefaultChoices, $script:OfficeChoices) and RepairPlanner.ps1 (New-RepairModel: the repair page's part of
+# the model); the bundle holds every file.
 #
 # A profile only fills in the options (spec 5.2): Office, Remote, 7-Zip, the tweak selection and the restore
 # point, and the Windows Update choice only when it sets windowsUpdate (wu spec 3.1). The Type (laptop or
@@ -241,7 +242,11 @@ function New-ToolboxModel {
       - OnAC, IsFresh and Previous (@{ StartedAt; Color } or $null) are the values the console start screen
         shows; AdminProtection is Test-AdminProtection's answer ('On', 'Off' or 'Unknown'; anything else is
         'Unknown');
-      - MaxAgeDays is freshInstall.maxInstallAgeDays, for the "older than N days" warning.
+      - MaxAgeDays is freshInstall.maxInstallAgeDays, for the "older than N days" warning;
+      - Page is 'setup' (the window opens on New PC setup) and Repair is the Repair & diagnostics page's model
+        (New-RepairModel, RepairPlanner.ps1) with -CanRun ($false by default: Show-ToolboxWindow passes $true when
+        it has the setup files an action's child runs from, repair Task 4) and -SessionStamp, the visit's folder
+        stamp ('yyyy-MM-dd_HHmm', invariant; by default now, when the window opens).
     The window renders it (Update-ToolboxView); nothing here reads the machine.
   #>
   [CmdletBinding()]
@@ -252,7 +257,9 @@ function New-ToolboxModel {
     [AllowNull()][hashtable]$Previous,
     [Parameter(Mandatory)][bool]$IsFresh,
     [Parameter(Mandatory)][bool]$OnAC,
-    [Parameter(Mandatory)][AllowEmptyString()][string]$AdminProtection
+    [Parameter(Mandatory)][AllowEmptyString()][string]$AdminProtection,
+    [bool]$CanRun = $false,
+    [AllowEmptyString()][string]$SessionStamp = ([datetime]::Now.ToString('yyyy-MM-dd_HHmm', [Globalization.CultureInfo]::InvariantCulture))
   )
 
   $language = 'en'
@@ -269,6 +276,8 @@ function New-ToolboxModel {
     IsFresh         = $IsFresh
     Previous        = $Previous
     MaxAgeDays      = [int]$Config.freshInstall.maxInstallAgeDays
+    Page            = 'setup'
+    Repair          = (New-RepairModel -Machine $Machine -SessionStamp $SessionStamp -CanRun $CanRun)
   }
 }
 
@@ -291,6 +300,7 @@ function Update-ToolboxModel {
         comes back with Desktop. An id that is not in the catalog changes nothing.
       - Language en | he.
       - Power: OnAC = ($Value -eq 'true').
+      - Page setup | repair: the page the window shows (the left nav).
     Any other action or value changes nothing. A changed option never changes Profile (spec 5.2): the report
     shows the profile's name with "(changed)" (Test-ProfileChanged).
   #>
@@ -333,6 +343,7 @@ function Update-ToolboxModel {
     }
     'Language' { if ($Value -cin 'en', 'he') { $next['Language'] = $Value } }
     'Power' { $next['OnAC'] = ($Value -eq 'true') }
+    'Page' { if ($Value -cin 'setup', 'repair') { $next['Page'] = $Value } }
   }
   return $next
 }

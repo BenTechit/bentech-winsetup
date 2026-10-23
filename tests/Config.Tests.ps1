@@ -137,6 +137,30 @@ Describe 'config.json' {
       $v.path | Should -Not -Match '[\x00-\x1F]'   # a NUL cuts the name for Windows, after the Policies check (task 1 re-review N1)
       $owned | Should -Not -Contain $v.path; $managed | Should -Not -Contain ('{0}|{1}' -f $v.path, $v.name) } }
   It 'all nine tweaks pass Get-TweakCatalog''s checks' { . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; @(Get-TweakCatalog -Config $cfg).Id | Should -Be @($cfg.tweaks.id) }
+  It 'pins the repair values (repair spec 5, 6.2, 6.8)' {
+    $r = $cfg.repair
+    # Ruling RD-R11: TCP and HTTPS to www.microsoft.com (msftconnecttest.com has no valid HTTPS certificate of its own),
+    # then Windows' captive-portal probe over plain HTTP with its exact content.
+    $r.internet.host | Should -BeExactly 'www.microsoft.com'; $r.internet.url | Should -BeExactly 'https://www.microsoft.com/'
+    $r.internet.probeUrl | Should -BeExactly 'http://www.msftconnecttest.com/connecttest.txt'; $r.internet.probeContent | Should -BeExactly 'Microsoft Connect Test'
+    $r.internet.seconds | Should -Be 5; $r.freeSpace.minPercent | Should -Be 10; $r.freeSpace.minGB | Should -Be 15
+    $r.reportMaxKB | Should -Be 150; $r.thresholds.clockOffsetMinutes | Should -Be 2; $r.thresholds.clockWrongMinutes | Should -Be 60
+    # The fifteen action ids of the plan's table (ruling RD-R1 removed diskCheckCancel).
+    @($cfg.timeoutsMinutes.tool.PSObject.Properties.Name) | Should -Be @('safety', 'health', 'standard', 'postClone', 'dismSource', 'wuReset', 'diskCheck',
+      'netInfo', 'netReset', 'netRestore', 'ghostList', 'ghostRemove', 'quickReport', 'fullReport', 'compare')
+    @($cfg.timeoutsMinutes.toolStep.PSObject.Properties.Name) | Should -Be @('native', 'grandchild', 'disks', 'volumeScan', 'imageCheck', 'imageScan', 'dism', 'sfc',
+      'timeSync', 'pnpScan', 'componentCleanup', 'retrim', 'wuScan', 'service', 'pnputil', 'ghostList', 'drivers', 'printers', 'events', 'msinfo32', 'wuLog', 'zip')
+    # The report's raw zip runs in a grandchild bounded by toolStep.zip (review M5, ruling RD-R24).
+    $cfg.timeoutsMinutes.toolStep.zip | Should -Be 15
+    foreach ($section in $cfg.timeoutsMinutes.tool, $cfg.timeoutsMinutes.toolStep) {
+      foreach ($p in $section.PSObject.Properties) {
+        ($p.Value -is [int] -or $p.Value -is [long] -or $p.Value -is [double]) | Should -BeTrue -Because $p.Name; $p.Value | Should -BeGreaterThan 0 -Because $p.Name } }
+    @($r.oemUtilities.PSObject.Properties.Name) | Should -Be @('DELL', 'HP', 'LENOVO', 'ASUS', 'ACER', 'MSI')
+  }
+  It 'Read-SetupConfig does not require the repair section (its readers fall back to the plan''s values)' {
+    $c = Get-Content "$PSScriptRoot\..\config\config.json" -Raw -Encoding UTF8 | ConvertFrom-Json; $c.PSObject.Properties.Remove('repair')
+    $c | ConvertTo-Json -Depth 20 | Set-Content "$TestDrive\norepair.json" -Encoding UTF8
+    { Read-SetupConfig -Path "$TestDrive\norepair.json" } | Should -Not -Throw }
   It 'holds non-ASCII text only inside "he" values (toolbox spec 4.3)' {
     function Find-NonAscii($o, $path) {
       if ($o -is [string]) { if ($o -match '[^\x00-\x7F]' -and $path -notmatch '\.he$') { $path } }

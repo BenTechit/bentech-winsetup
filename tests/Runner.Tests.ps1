@@ -1,6 +1,6 @@
 ﻿# tests/Runner.Tests.ps1
 BeforeAll {
-  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','Common\Process','State\State','Engine\Reboot','Engine\Runner','Steps\Office') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\StepResult','Common\Logging','Common\Activity','Common\Process','State\State','Engine\Reboot','Engine\Runner','Steps\Office','UI\StartScreen') { . "$PSScriptRoot\..\src\$f.ps1" }
   function New-Ctx([string[]]$plan) {
     $root = Join-Path $TestDrive ([guid]::NewGuid()); New-Item -ItemType Directory "$root\Logs" -Force | Out-Null
     $st = New-RunState -Machine @{} -Choices @{} -Plan $plan -Version 'v'
@@ -338,21 +338,38 @@ Describe 'Restart failures (R10)' {
     $c.State.RebootCapHit | Should -BeFalse
     $c.State.Steps.b.Status | Should -Be 'Done'
   }
-  It 'the default fallback runs shutdown.exe /r /t 5 /f and treats any exit code other than 0/1115/1190 as failure' {
+  # Final wave item 13: the fallback runs through Invoke-External, bounded at 1 minute (never Start-Process -Wait).
+  It 'the default fallback runs shutdown.exe /r /t 5 /f through Invoke-External (1 minute) and treats any exit code other than 0/1115/1190, or a timeout, as failure' {
     $savedWindir = $env:windir
-    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked call cannot find shutdown.exe
     try {
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+      Mock Start-Process { throw 'blocked by the test: Start-Process' }
+      Mock Invoke-External { @{ ExitCode = 0; TimedOut = $false } }
       $c = New-Ctx @('a')
       Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeTrue
-      Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
-        $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $Wait -and $PassThru -and $NoNewWindow
+      Should -Invoke Invoke-External -Times 1 -Exactly -ParameterFilter {
+        $FilePath -eq (Join-Path $TestDrive 'fake-windows\System32\shutdown.exe') -and (@($ArgumentList) -join ' ') -eq '/r /t 5 /f' -and $TimeoutMinutes -eq 1
       }
-      Mock Start-Process { [pscustomobject]@{ ExitCode = 5 } }   # ERROR_ACCESS_DENIED
+      Mock Invoke-External { @{ ExitCode = 5; TimedOut = $false } }   # ERROR_ACCESS_DENIED
       $c = New-Ctx @('a')
       Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
       @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*code 5*' }).Count | Should -Be 1
+      Mock Invoke-External { @{ ExitCode = $null; TimedOut = $true } }   # shutdown.exe never answered: no wait without a deadline
+      $c = New-Ctx @('a')
+      Invoke-ControlledReboot -Context $c -CountdownSeconds 0 -RestartAction $throwRestart | Should -BeFalse
+      @($c.State.Errors | Where-Object { $_ -like 'Restart failed:*timed out*' }).Count | Should -Be 1
+      Should -Invoke Start-Process -Times 0 -Exactly
     } finally { $env:windir = $savedWindir }
+  }
+  It 'the default fallbacks of Invoke-ControlledReboot and Invoke-StatelessRestart are the one bounded shutdown (Invoke-ShutdownRestart)' {
+    foreach ($name in 'Invoke-ControlledReboot', 'Invoke-StatelessRestart') {
+      $ast = (Get-Command $name).ScriptBlock.Ast
+      if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $ast = $ast.Body }
+      $param = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'FallbackRestartAction' }
+      $param.DefaultValue.Extent.Text | Should -Be '{ Invoke-ShutdownRestart }' -Because $name
+    }
+    $file = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$PSScriptRoot\..\src\Engine\Reboot.ps1").Path, [ref]$null, [ref]$null)
+    @($file.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Process' }, $true)).Count | Should -Be 0
   }
   It 'Invoke-SetupRun: shutdown.exe exit code <Code> (<Meaning>) counts as a restart' -ForEach @(
     @{ Code = 1190; Meaning = 'ERROR_SHUTDOWN_IS_SCHEDULED' }
@@ -360,13 +377,14 @@ Describe 'Restart failures (R10)' {
   ) {
     function Step-A { param($Context) New-StepResult -Status Continue -Reboot Now }
     $savedWindir = $env:windir
-    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked Start-Process cannot find shutdown.exe
+    $env:windir = Join-Path $TestDrive 'fake-windows'   # even an unmocked call cannot find shutdown.exe
     try {
       $script:mockExitCode = $Code
-      Mock Start-Process { [pscustomobject]@{ ExitCode = $script:mockExitCode } }
+      Mock Start-Process { throw 'blocked by the test: Start-Process' }
+      Mock Invoke-External { @{ ExitCode = $script:mockExitCode; TimedOut = $false } }
       $c = New-Ctx @('a','b')
       Invoke-SetupRun -Context $c -Catalog $cat -RestartAction $throwRestart -CountdownSeconds 0 | Should -Be 'Rebooting'
-      Should -Invoke Start-Process -Times 1 -Exactly
+      Should -Invoke Invoke-External -Times 1 -Exactly
       @($c.State.Errors).Count | Should -Be 0
       $c.State.Steps.a.Status | Should -Be 'pending'; $c.State.RebootCapHit | Should -BeFalse
     } finally { $env:windir = $savedWindir }
@@ -547,6 +565,58 @@ Describe 'Get-PendingRebootSignals' {
     Mock Get-ItemProperty { [pscustomobject]@{ ComputerName = 'dell-7hx2k93' } } -ParameterFilter { $LiteralPath -like '*\ComputerName\ActiveComputerName' }
     $s = Get-PendingRebootSignals
     $s.PendingFileRename | Should -BeFalse; $s.ComputerRenamePending | Should -BeFalse
+  }
+}
+
+# Repair Task 1 (repair spec 5): only the signals that break servicing block DISM and SFC.
+Describe 'Get-ServicingRebootSignals' {
+  It 'returns the six signals as booleans without throwing (real registry, read only)' {
+    $s = Get-ServicingRebootSignals
+    @($s.Keys | Sort-Object) -join ',' | Should -Be 'CbsPackagesPending,CbsRebootPending,ComputerRenamePending,PendingFileRename,PendingXml,WuRebootRequired'
+    foreach ($v in $s.Values) { $v | Should -BeOfType [bool] }
+  }
+  It 'reads the PackagesPending key and WinSxS\pending.xml besides the four reboot signals' {
+    Mock Test-Path { $false }
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*Component Based Servicing\PackagesPending' }
+    Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like '*\WinSxS\pending.xml' -and $PathType -eq 'Leaf' }
+    Mock Get-ItemProperty { throw 'Property does not exist' }
+    $s = Get-ServicingRebootSignals
+    $s.CbsPackagesPending | Should -BeTrue; $s.PendingXml | Should -BeTrue
+    $s.CbsRebootPending | Should -BeFalse; $s.WuRebootRequired | Should -BeFalse; $s.PendingFileRename | Should -BeFalse; $s.ComputerRenamePending | Should -BeFalse
+    Should -Invoke Test-Path -ParameterFilter { $LiteralPath -eq (Join-Path $env:windir 'WinSxS\pending.xml') }
+  }
+  It 'passes the four reboot signals through' {
+    Mock Get-PendingRebootSignals { @{ CbsRebootPending = $true; WuRebootRequired = $true; PendingFileRename = $true; ComputerRenamePending = $true } }
+    Mock Test-Path { $false }
+    $s = Get-ServicingRebootSignals
+    $s.CbsRebootPending | Should -BeTrue; $s.WuRebootRequired | Should -BeTrue; $s.PendingFileRename | Should -BeTrue; $s.ComputerRenamePending | Should -BeTrue
+    $s.CbsPackagesPending | Should -BeFalse; $s.PendingXml | Should -BeFalse
+  }
+  It 'never throws: a failed read is no signal' {
+    Mock Get-PendingRebootSignals { throw 'registry gone' }
+    Mock Test-Path { throw 'access denied' }
+    { Get-ServicingRebootSignals } | Should -Not -Throw
+    $s = Get-ServicingRebootSignals
+    @($s.Values | Where-Object { $_ -ne $false }).Count | Should -Be 0; $s.Count | Should -Be 6
+  }
+  It 'logs a failed read as ASCII: a localized (Hebrew) message never reaches setup.log' {
+    Mock Get-PendingRebootSignals { throw 'שגיאה ברישום' }
+    Mock Test-Path { $false }
+    Mock Write-SetupLog { }
+    $null = Get-ServicingRebootSignals
+    Should -Invoke Write-SetupLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Data.error -ceq '????? ??????' }
+  }
+}
+
+Describe 'Test-ServicingRebootPending' {
+  BeforeAll {
+    function New-Signals { param([string]$On) $s = @{ CbsRebootPending = $false; CbsPackagesPending = $false; PendingXml = $false; WuRebootRequired = $false; PendingFileRename = $false; ComputerRenamePending = $false }; if ($On) { $s[$On] = $true }; $s }
+  }
+  It '<On> blocks servicing' -ForEach @(@{ On = 'CbsRebootPending' }, @{ On = 'CbsPackagesPending' }, @{ On = 'PendingXml' }, @{ On = 'WuRebootRequired' }) {
+    Test-ServicingRebootPending -Signals (New-Signals $On) | Should -BeTrue
+  }
+  It '<On> alone is a note only, never a block' -ForEach @(@{ On = 'PendingFileRename' }, @{ On = 'ComputerRenamePending' }, @{ On = '' }) {
+    Test-ServicingRebootPending -Signals (New-Signals $On) | Should -BeFalse
   }
 }
 

@@ -5,7 +5,9 @@
 #   - as the Windows Update child process the windows-update step starts (-WuRound -ResultPath <p>):
 #     one round, no lock, no screen;
 #   - as the un-hide child Finalize starts at the end of the run (-WuUnhide -ResultPath <p> -UpdateIds <ids>):
-#     no lock, no screen.
+#     no lock, no screen;
+#   - as the action child the toolbox window's Repair & diagnostics page starts (-ToolAction <id> -ToolArgs
+#     <args.json>, Invoke-SetupToolProcess in src\Repair\ToolEngine.ps1): no lock, no screen.
 #
 # The call itself, `exit (Start-BenTechSetup ...)`, is not in this file: it is src/Entry/Run.ps1, which
 # only tools\Build-Bundle.ps1 appends, as the bundle's last statement. That keeps this file safe to
@@ -258,11 +260,14 @@ function Complete-SetupRun {
 
 function Invoke-SetupMainFlow {
   # Private; Start-BenTechSetup is its only caller. Everything that runs while this process holds the run
-  # lock. Returns @{ Outcome; State; HadPrevious }: Outcome is 'Cancelled' (Cancel in the toolbox, or Escape
-  # on the console start screen it falls back to: a leftover resume task is removed, nothing else
+  # lock. Returns @{ Outcome; State; HadPrevious; Restart }: Outcome is 'Cancelled' (Cancel in the toolbox, or
+  # Escape on the console start screen it falls back to: a leftover resume task is removed, nothing else
   # changes), 'NoState' (resumed without a state), 'Rebooting' or 'Completed'; State is the run state
   # ($null when there is none); HadPrevious says whether a run state was already there when this process
-  # started (an earlier run on a new run, the saved run on a resume). Exceptions propagate to Start-BenTechSetup's crash handler.
+  # started (an earlier run on a new run, the saved run on a resume); Restart is $true only on 'Cancelled' when the
+  # toolbox closed with Restart PC (Get-ToolboxRestartRequest, repair spec 6.9). The toolbox gets Root and
+  # ScriptPath: its Repair & diagnostics actions run in children of this setup.ps1. Exceptions propagate to
+  # Start-BenTechSetup's crash handler.
   # A new run records the launcher (Get-LauncherInfo on $env:BT_SELF, which the launcher sets) in the
   # state, so the final screen can find the USB stick (spec 10.2). A resume records nothing: the resume
   # task has no BT_SELF.
@@ -300,13 +305,16 @@ function Invoke-SetupMainFlow {
     $fresh = Test-SetupMachineFresh -Machine $machine -Config $config
     # The toolbox window, or the console start screen when the window fails (Get-SetupChoices; the same
     # parameters and the same return contract as Show-StartScreen): Choices, or $null for Cancel.
-    $choices = Get-SetupChoices -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh
+    $choices = Get-SetupChoices -Machine $machine -Config $config -Version $Version -Previous $previousSummary -IsFresh $fresh -Root $Root -ScriptPath $ScriptPath
     if ($null -eq $choices) {
       # Ruling R27 (spec 8.1, 8.5): cancel (the toolbox's Cancel, X or Alt+F4, or Esc on the console) leaves no
       # changes and no resume task, so a task left by an earlier, unfinished run is removed too. No state is saved.
+      # Restart PC in the toolbox (repair spec 6.9) ends here too, with a request Start-BenTechSetup performs last.
+      $restart = ((Get-ToolboxRestartRequest) -eq $true)
       Write-SetupLog -Message 'Cancelled on the start screen; removing any leftover resume task, nothing else is changed'
+      if ($restart) { Write-SetupLog -Message 'Restart requested in the toolbox' }
       $null = Unregister-ResumeTask
-      return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious }
+      return @{ Outcome = 'Cancelled'; State = $null; HadPrevious = $hadPrevious; Restart = $restart }
     }
     # A new run starts an empty feed: the previous run's activity.txt is archived under its RunId.
     $previousRunId = if ($null -ne $previous) { [string]$previous['RunId'] } else { $null }
@@ -337,8 +345,8 @@ function Invoke-SetupMainFlow {
 function Start-BenTechSetup {
   <#
   .SYNOPSIS
-    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, or a failed -WuRound or
-    -WuUnhide child) or 2 (another run holds the lock).
+    The entry point of setup.ps1. Returns the process exit code: 0, 1 (crash, a failed -WuRound or
+    -WuUnhide child, or a Restart PC whose restarts both failed) or 2 (another run holds the lock).
   .DESCRIPTION
     -WuRound: one Windows Update round (Invoke-WuRound) with the config's wuFailuresBeforeHide and
     windowsUpdate.installMode, the state's Machine.IsWindows10 and the power status read now (-OnAC; a
@@ -349,6 +357,11 @@ function Start-BenTechSetup {
     -WuUnhide (final review C1): the end-of-run un-hide child that Restore-WuHiddenUpdates starts with
     -ResultPath and -UpdateIds (Invoke-SetupWuUnhideProcess): the same rules as -WuRound (no lock, no
     transcript, no screen, no state); 0 when its result JSON was written, 1 when not.
+
+    -ToolAction (repair spec 7, 10): the action child the toolbox window starts for one Repair & diagnostics
+    action, with -ToolArgs, the path of its args.json (Invoke-SetupToolProcess). The same rules as -WuRound: no
+    lock, no transcript, no QuickEdit change, no screen, no activity feed; it never prompts. 0 when its
+    result.json was written, 1 when not. An empty -ToolAction is a normal start.
 
     Otherwise:
       1. Logging: Initialize-SetupLog <Root>\Logs; the activity feed (Initialize-SetupActivity, its
@@ -380,7 +393,14 @@ function Start-BenTechSetup {
     toolbox's, or Escape on the console) with no earlier run state runs -Mode Cancel (C:\BenTech deleted,
     because nothing ran). A crash, 'Rebooting', 'NoState', a cancel after an unfinished earlier run and a
     lock held by another run delete nothing.
-    The exit code does not change.
+    While a process the toolbox window started still runs (Test-ToolboxChildrenRunning: one its kills could not
+    end), C:\BenTech is never removed: WARN, and the cleanup runs with -KeepFolder, so the logs still go to the
+    stick and the Desktop launcher is still deleted (repair Task 4 review M3; pre-PR code review item 1).
+    Last, Restart PC in the toolbox (repair spec 6.9, ruling RD-R5): a 'Cancelled' flow whose Restart is set
+    restarts the PC through Invoke-StatelessRestart, after the cleanup when there was one (after an unfinished
+    earlier run its folder stays, and the restart still happens). Never after a crash. When both restarts fail
+    (one red line on the console), the exit code is 1, so the launcher keeps its window open (review M2).
+    Otherwise the exit code does not change.
 
     Any other unexpected exception is a crash: the tick unregistered first, logged as ERROR, the red crash
     text "Setup crashed: <message> - see <Root>\Logs" (-CrashScreen), then a key press (skipped with
@@ -401,6 +421,8 @@ function Start-BenTechSetup {
     [AllowNull()][AllowEmptyString()][string]$ResultPath,
     [bool]$WuUnhide,
     [AllowNull()][AllowEmptyString()][string]$UpdateIds,
+    [AllowNull()][AllowEmptyString()][string]$ToolAction,
+    [AllowNull()][AllowEmptyString()][string]$ToolArgs,
     [ValidateNotNullOrEmpty()][string]$Root = 'C:\BenTech\Setup',
     [AllowNull()][AllowEmptyString()][string]$ScriptPath,
     [scriptblock]$CrashScreen = {
@@ -419,6 +441,7 @@ function Start-BenTechSetup {
 
   if ($WuRound) { return (Invoke-SetupWuRoundProcess -Root $Root -ResultPath $ResultPath -SearchOnly $SearchOnly) }
   if ($WuUnhide) { return (Invoke-SetupWuUnhideProcess -Root $Root -ResultPath $ResultPath -UpdateIds $UpdateIds) }
+  if (-not [string]::IsNullOrEmpty($ToolAction)) { return (Invoke-SetupToolProcess -Root $Root -ActionId $ToolAction -ArgsPath $ToolArgs) }
 
   if ([string]::IsNullOrEmpty($ScriptPath)) { $ScriptPath = Join-Path $Root 'setup.ps1' }
   $version = if ([string]::IsNullOrEmpty([string]$script:SetupVersion)) { 'dev' } else { [string]$script:SetupVersion }
@@ -429,6 +452,7 @@ function Start-BenTechSetup {
   $keepLock = $false
   $transcriptStarted = $false
   $cleanup = $null
+  $restartAfter = $false
   try {
     $null = Initialize-SetupLog -LogDirectory $logDir
     # The activity feed reads its history back from Logs\activity.txt, so it survives a restart.
@@ -458,14 +482,16 @@ function Start-BenTechSetup {
         Write-SetupLog -Message 'Restarting; the run lock is kept until the machine restarts'
       } elseif ($flow.Outcome -eq 'Completed') {
         $cleanup = @{ Mode = 'Finish'; State = $flow.State }
-      } elseif ($flow.Outcome -eq 'Cancelled' -and -not $flow.HadPrevious) {
-        $cleanup = @{ Mode = 'Cancel' }
+      } elseif ($flow.Outcome -eq 'Cancelled') {
+        if (-not $flow.HadPrevious) { $cleanup = @{ Mode = 'Cancel' } }
+        $restartAfter = ($flow.Restart -eq $true)
       }
       $exitCode = 0
     }
   } catch {
-    # A crash keeps everything for diagnosis (spec 10.6).
+    # A crash keeps everything for diagnosis (spec 10.6), and never restarts.
     $cleanup = $null
+    $restartAfter = $false
     # First: no progress-screen redraw may land on the crash text.
     Unregister-SetupTick
     $message = $_.Exception.Message
@@ -500,6 +526,13 @@ function Start-BenTechSetup {
 
   # Only now: the tick is gone, the run lock and its mutex are released and the transcript (a file in
   # Logs) is closed, so nothing of this run holds the folder open.
+  # Repair Task 4 review M3: a toolbox child that its kills could not end may still write into C:\BenTech; then the
+  # folder is kept (its own deadline ends it; the next run's cleanup removes the folder). Only the removal is skipped
+  # (-KeepFolder): the logs still go to the stick and a Desktop launcher is still deleted (pre-PR code review item 1).
+  if ($null -ne $cleanup -and (Test-ToolboxChildrenRunning)) {
+    Write-SetupLog -Level WARN -Message 'A toolbox child process is still running; the setup folder is kept' -Data @{ mode = $cleanup.Mode }
+    $cleanup['KeepFolder'] = $true
+  }
   if ($null -ne $cleanup) {
     try {
       $null = Invoke-SetupCleanup -Root $Root @cleanup
@@ -510,5 +543,8 @@ function Start-BenTechSetup {
       Write-Host ('Cleanup failed: {0}' -f $_.Exception.Message) -ForegroundColor White -BackgroundColor DarkRed
     }
   }
+  # Restart PC (repair spec 6.9): the last thing this process does. Invoke-StatelessRestart never throws. When both
+  # restarts failed it showed one red line: exit 1, so the launcher keeps the window open to read it (review M2).
+  if ($restartAfter -and -not (Invoke-StatelessRestart)) { $exitCode = 1 }
   return $exitCode
 }

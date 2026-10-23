@@ -10,12 +10,15 @@ BeforeAll { $script:out = Join-Path $TestDrive 'dist'; & "$PSScriptRoot\..\tools
 Describe 'bundle' {
   It 'is UTF-8 with BOM' { $b[0..2] | Should -Be @(0xEF,0xBB,0xBF) }
   It 'parses without errors' { $err | Should -BeNullOrEmpty }
-  It 'has the param block first' { $ast.ParamBlock.Parameters.Name.VariablePath.UserPath | Should -Be @('Resume','WuRound','SearchOnly','ResultPath','WuUnhide','UpdateIds') }
+  It 'has the param block first' { $ast.ParamBlock.Parameters.Name.VariablePath.UserPath | Should -Be @('Resume','WuRound','SearchOnly','ResultPath','WuUnhide','UpdateIds','ToolAction','ToolArgs') }
   It 'stamps the version' { [Text.Encoding]::UTF8.GetString($b) | Should -Match "\`$script:SetupVersion = '2026\.10\.18\.9'" }
   It 'includes every src file' { $order = (Get-Content "$PSScriptRoot\..\tools\Build-Bundle.ps1" -Raw)
     Get-ChildItem "$PSScriptRoot\..\src" -Recurse -Filter *.ps1 | ForEach-Object { $order | Should -Match ([regex]::Escape($_.Name)) } }
   It 'defines every catalog function' { . "$PSScriptRoot\..\src\Engine\Catalog.ps1"; $names = $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $true).Name
     foreach ($s in $script:StepCatalog) { $names | Should -Contain $s.Function } }
+  # Repair Task 1: every step of every tool action has its row in $script:ToolSteps and its function in the bundle.
+  It 'defines every tool action''s step functions' { . "$PSScriptRoot\..\src\Repair\ToolEngine.ps1"; $names = $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $true).Name
+    foreach ($a in $script:ToolActionCatalog.Values) { foreach ($s in $a.Steps) { $script:ToolSteps.Keys | Should -Contain $s; $names | Should -Contain $script:ToolSteps[$s].Function } } }
   It 'copies config byte-for-byte' { (Get-FileHash "$out\config.json").Hash | Should -Be (Get-FileHash "$PSScriptRoot\..\config\config.json").Hash }
 }
 
@@ -36,11 +39,11 @@ Describe 'bundle layout' {
   }
   It 'starts with the header comment, then the param block, then the version' {
     $lines[0] | Should -Be '# BenTech Windows Setup 2026.10.18.9'
-    $codeLines[0] | Should -Be 'param([switch]$Resume, [switch]$WuRound, [switch]$SearchOnly, [string]$ResultPath, [switch]$WuUnhide, [string]$UpdateIds)'
+    $codeLines[0] | Should -Be 'param([switch]$Resume, [switch]$WuRound, [switch]$SearchOnly, [string]$ResultPath, [switch]$WuUnhide, [string]$UpdateIds, [string]$ToolAction, [string]$ToolArgs)'
     $codeLines[1] | Should -Be "`$script:SetupVersion = '2026.10.18.9'"
   }
   It 'ends with the entry call as its last non-empty line and last statement' {
-    $call = 'exit (Start-BenTechSetup -Resume:$Resume -WuRound:$WuRound -SearchOnly:$SearchOnly -ResultPath $ResultPath -WuUnhide:$WuUnhide -UpdateIds $UpdateIds)'
+    $call = 'exit (Start-BenTechSetup -Resume:$Resume -WuRound:$WuRound -SearchOnly:$SearchOnly -ResultPath $ResultPath -WuUnhide:$WuUnhide -UpdateIds $UpdateIds -ToolAction $ToolAction -ToolArgs $ToolArgs)'
     @($lines | Where-Object { $_.Trim() })[-1] | Should -Be $call
     $ast.EndBlock.Statements[-1].Extent.Text | Should -Be $call
     @($lines | Where-Object { $_ -match 'Start-BenTechSetup -Resume' }).Count | Should -Be 1

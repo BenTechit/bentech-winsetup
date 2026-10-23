@@ -2,7 +2,8 @@
 # BenTech Toolbox, Task 1: the profiles and the Choices check (toolbox spec 5.2, 10b.6). SetupPlanner.ps1 is
 # pure (no logging, no I/O), so nothing here needs a mock: it only reads config.json and synthetic configs.
 BeforeAll {
-  foreach ($f in 'Common\Config', 'Engine\Catalog', 'UI\StartScreen', 'Toolbox\SetupPlanner') { . "$PSScriptRoot\..\src\$f.ps1" }
+  # Repair Task 3: the model also holds the repair page's (RepairPlanner.ps1; its Available comes from ToolEngine's catalog).
+  foreach ($f in 'Common\Config', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   $script:m = @{ IsLaptop = $true; IsVM = $false; OsBuild = 26200 }
   # A model as JSON with every table's keys sorted: Hashtable.Clone() re-inserts the keys, so a copy can list
@@ -126,6 +127,12 @@ Describe 'Update-ToolboxModel (pure, like Update-StartChoices)' {
     foreach ($a in @(@('Tweak', 'widgets'), @('Office', 'PLATINUM'), @('Mode', 'TABLET'), @('Profile', 'nope'), @('Language', 'fr'), @('Explode', ''),
                      @('WindowsUpdate', 'drivers'), @('WindowsUpdate', 'NONE'))) {
       ConvertTo-SortedJson (Update-ToolboxModel -Model $mo -Action $a[0] -Value $a[1] -Config $cfg) | Should -Be (ConvertTo-SortedJson $mo) -Because ($a -join ' ') } }
+  It 'opens on the setup page with the repair page''s model; Page switches to repair and back, nothing else (repair plan Task 3)' {
+    $mo.Page | Should -Be 'setup'; $mo.Repair.Strip.State | Should -Be 'loading'; $mo.Repair.IsLaptop | Should -BeTrue
+    $mo.Repair.SessionStamp | Should -Match '^\d{4}-\d\d-\d\d_\d{4}$'
+    $r = Update-ToolboxModel -Model $mo -Action 'Page' -Value 'repair' -Config $cfg; $r.Page | Should -Be 'repair'; $mo.Page | Should -Be 'setup'
+    (Update-ToolboxModel -Model $r -Action 'Page' -Value 'setup' -Config $cfg).Page | Should -Be 'setup'
+    foreach ($v in 'nope', 'Repair', '') { ConvertTo-SortedJson (Update-ToolboxModel -Model $mo -Action 'Page' -Value $v -Config $cfg) | Should -Be (ConvertTo-SortedJson $mo) -Because $v } }
   It 'toggles 7-Zip and the restore point, sets the language and the power' {
     (Update-ToolboxModel -Model $mo -Action 'SevenZip' -Config $cfg).Choices.SevenZip | Should -BeFalse
     (Update-ToolboxModel -Model $mo -Action 'RestorePoint' -Config $cfg).Choices.RestorePoint | Should -BeFalse

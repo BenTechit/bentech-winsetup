@@ -1,0 +1,37 @@
+{
+  "Version": 1,
+  "CreatedAt": "2026-10-20T09:05:00",
+  "Identity": { "Key": "SN-7HX2K93", "ComputerName": "DESKTOP-4F7K2LQ" },
+  "Adapters": [
+    {
+      "Alias": "Ethernet",
+      "Guid": "{4D36E972-E325-11CE-BFC1-08002BE10318}",
+      "Mac": "A4-BB-6D-12-34-56",
+      "Ipv4Dhcp": false,
+      "Ipv6Dhcp": true,
+      "Addresses": [ { "Ip": "192.168.1.10", "Prefix": 24 } ],
+      "Gateways": [ "192.168.1.1" ],
+      "Dns": [ "8.8.8.8", "8.8.4.4" ]
+    },
+    {
+      "Alias": "Wi-Fi",
+      "Guid": "{5D36E972-E325-11CE-BFC1-08002BE10318}",
+      "Mac": "A4-BB-6D-12-34-57",
+      "Ipv4Dhcp": true,
+      "Ipv6Dhcp": true,
+      "Addresses": [],
+      "Gateways": [],
+      "Dns": [ "1.1.1.1", "2606:4700:4700::1111" ]
+    },
+    {
+      "Alias": "Ethernet 2",
+      "Guid": "{6D36E972-E325-11CE-BFC1-08002BE10318}",
+      "Mac": "A4-BB-6D-12-34-58",
+      "Ipv4Dhcp": true,
+      "Ipv6Dhcp": true,
+      "Addresses": [],
+      "Gateways": [],
+      "Dns": []
+    }
+  ]
+}

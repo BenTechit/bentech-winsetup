@@ -10,7 +10,8 @@
 #
 # And it runs the window (Task 3): the handlers (Register-ToolboxHandlers), the one function every handler calls
 # (Invoke-ToolboxAction: the model changes through Update-ToolboxModel, then the view follows), the outcome
-# (Close-ToolboxWindow: Start, Cancel or Failed; a failure is never read as Cancel), the dispatcher backstop
+# (Close-ToolboxWindow: Start, Cancel, Failed or, repair Task 4, Restart; a failure is never read as Cancel), the
+# close guard (repair spec 4.4: no close while an action runs, except Failed), the dispatcher backstop
 # (Invoke-ToolboxUnhandled), the work-area clamp (Set-ToolboxWindowSize), the power timer (New-ToolboxPowerTimer)
 # and the dialog itself (Show-ToolboxWindow, which never throws and shows the window only through its -ShowDialog
 # seam).
@@ -19,6 +20,8 @@
 # Main.ps1 calls where it called Show-StartScreen: the window, or the console start screen when the host check or
 # the window fails (with -NoAutoStart: it waits for Enter, ruling TB-R8), with the same parameters and the same
 # return contract (Choices, or $null for Cancel). It is also the one place that stops WPF once the window is gone.
+# Repair Task 4 (repair spec 6.9): Restart PC returns $null too and leaves a request (Get-ToolboxRestartRequest)
+# that Main.ps1 performs after its Cancel path; every child the window started is killed before WPF stops.
 #
 # The WPF rules (spec 5.1; the plan's Global Constraints), which every later addition keeps:
 #   - The window's state lives in $window.Tag (the plan's "Toolbox model and window state"). Every handler is one
@@ -41,16 +44,58 @@
 #
 # Needs: Toolbox\Strings.ps1 ($script:ToolboxStrings), Toolbox\Xaml.ps1 ($script:ToolboxXaml),
 # Toolbox\SetupPlanner.ps1 (Get-SetupProfiles, New-ToolboxModel, Update-ToolboxModel, ConvertTo-ValidChoices,
-# Get-ToolboxPlanLines), Engine\Catalog.ps1 (Get-TweakCatalog, Test-TweakAllowed, Get-RemoteChoice,
-# Get-WindowsUpdateChoice, $script:StepCatalog), UI\StartScreen.ps1 (Format-PreviousRun, ConvertTo-ScreenText, and
-# Show-StartScreen: Get-SetupChoices' console fallback), Common\Logging.ps1
+# Get-ToolboxPlanLines), Toolbox\RepairPlanner.ps1 and Toolbox\RepairPage.ps1 (the Repair & diagnostics page:
+# New-RepairModel through New-ToolboxModel, Update-RepairView), Engine\Catalog.ps1 (Get-TweakCatalog,
+# Test-TweakAllowed, Get-RemoteChoice, Get-WindowsUpdateChoice, $script:StepCatalog), UI\StartScreen.ps1
+# (Format-PreviousRun, ConvertTo-ScreenText, and Show-StartScreen: Get-SetupChoices' console fallback), Common\Logging.ps1
 # (Write-SetupLog), Detect\Detection.ps1 (Test-OnACPower, Test-AdminProtection: Show-ToolboxWindow's seam
-# defaults) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the caller. The bundle holds
-# every file.
+# defaults), Entry\Cleanup.ps1 (Get-LauncherInfo, Find-SetupStick) and Common\Process.ps1 (Start-BackgroundExternal:
+# the seam defaults of repair Task 4) and WPF (PresentationFramework, PresentationCore, WindowsBase), loaded by the
+# caller. The bundle holds every file.
 
 # The window that is open, for the dispatcher backstop only: the dispatcher's event has no window (the plan's one
 # exception to "no outer variables"). Show-ToolboxWindow sets it around the dialog and clears it after.
 $script:ToolboxOpenWindow = $null
+
+# Restart PC (repair spec 6.9): set by Get-SetupChoices when the window closed as Restart, read by Main.ps1 after its
+# Cancel path (Get-ToolboxRestartRequest). A script-scope exception to "no outer variables" (repair plan, WPF rules);
+# no handler reads it.
+$script:ToolboxRestartRequested = $false
+
+function Get-ToolboxRestartRequest {
+  # $true when the last Get-SetupChoices ended with Restart PC (the window's fourth outcome, repair spec 6.9).
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  return ($script:ToolboxRestartRequested -eq $true)
+}
+
+function Test-ToolboxChildrenRunning {
+  <#
+  .SYNOPSIS
+    $true while a process the toolbox window started still runs (one its kills could not end: Task 4 review M3).
+    Start-BenTechSetup removes no folder then: C:\BenTech is never deleted under a running child. Never throws.
+  .DESCRIPTION
+    Reads $script:ToolboxChildren (RepairPage.ps1; none when that file is not loaded). A process whose state cannot be
+    read counts as running.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param()
+
+  $children = $script:ToolboxChildren
+  if ($null -eq $children) { return $false }
+  foreach ($process in $children.ToArray()) {
+    if ($null -eq $process) { continue }
+    try {
+      if (-not [bool]$process.HasExited) { return $true }
+    } catch {
+      return $true
+    }
+  }
+  return $false
+}
 
 # Display problems already logged (TB-R7): the window redraws on every click and every power tick, so the same
 # problem is logged once, not on every redraw. Diagnostics only; no decision depends on it.
@@ -235,6 +280,17 @@ function New-ToolboxWindow {
     Choices and Error $null, Closing $false, Timer $null; PowerWarned $false until a failed power read is logged,
     review M2) and calls Update-ToolboxView. No handlers (Task 3).
     -ReadOnAC is what the power timer will call (Task 3).
+    Repair Task 4: Tag also holds what the window needs to run actions: Root and ScriptPath (the setup files a child
+    runs from; empty: no action can start), Launcher (Get-LauncherInfo's answer, read once), the seams StartChild
+    (starts a child without waiting) and FindStick (the full stick search), Runs = @{ Action; Safety } (the children
+    running, RepairPage.ps1) and RunTimer (Show-ToolboxWindow's 500 ms timer; $null until it makes one). The seams'
+    defaults are Show-ToolboxWindow's. KillChecks (final wave item 11): the children the run tick killed that had not
+    ended yet, judged on the next ticks (Add-ToolboxKillCheck, Update-ToolboxKillChecks).
+    Repair Task 5: the seam StickPresent (the cheap 5-second stick presence check, ruling RD-R3; it gets the launcher
+    and StickKnown, its memory between checks: final review Minor 4) with its last answer
+    (StickPresence; StickChecked $false until the first check, StickWarned / StickSearchWarned once a failure is
+    logged), SafetyStarted ($false until the page's first visit starts the strip's child) and RepairItemsShape (what
+    the confirmation's items show, so they are rebuilt only when it changes).
   #>
   [CmdletBinding()]
   [OutputType([System.Windows.Window])]
@@ -243,7 +299,13 @@ function New-ToolboxWindow {
     [Parameter(Mandatory)][hashtable]$Machine,
     [Parameter(Mandatory)]$Config,
     [Parameter(Mandatory)][AllowEmptyString()][string]$Version,
-    [scriptblock]$ReadOnAC = { Test-OnACPower }
+    [scriptblock]$ReadOnAC = { Test-OnACPower },
+    [AllowEmptyString()][string]$Root = '',
+    [AllowEmptyString()][string]$ScriptPath = '',
+    [AllowNull()][hashtable]$Launcher = $null,
+    [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
+    [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
+    [scriptblock]$StickPresent = { param($l, $k) Get-ToolboxStickPresence -Launcher $l -Known $k }
   )
 
   $window = [System.Windows.Markup.XamlReader]::Parse($script:ToolboxXaml, (New-ToolboxParserContext))
@@ -272,6 +334,7 @@ function New-ToolboxWindow {
   $window.FindName('MachineModel').Text = ('{0} {1}' -f $Machine['Manufacturer'], $friendly).Trim()
   $window.FindName('MachineSerial').Text = [string]$Machine['Serial']
   $window.FindName('MachineNewName').Text = [string]$Machine['NewName']
+  $window.FindName('MachinePcName').Text = [string]$Machine['ComputerName']
   $window.FindName('MachineGlyph').Text = $(if ($Machine['IsLaptop'] -eq $true) { [string][char]0xE7F8 } else { [string][char]0xE7F4 })
   $window.FindName('VersionText').Text = $(if ($Version -match '^[vV]' -or $Version -eq '') { $Version } else { 'v' + $Version })
 
@@ -281,6 +344,11 @@ function New-ToolboxWindow {
     ProfileTiles = $tiles; TweakRows = $rows
     ReadOnAC = $ReadOnAC; Timer = $null; PowerWarned = $false
     Outcome = $null; Choices = $null; Error = $null; Closing = $false
+    RepairConfirmKey = ''; RepairItemsShape = ''
+    Root = $Root; ScriptPath = $ScriptPath; Launcher = $Launcher; StartChild = $StartChild; FindStick = $FindStick
+    Runs = @{ Action = $null; Safety = $null }; RunTimer = $null; KillChecks = (New-Object 'System.Collections.Generic.List[object]')
+    StickPresent = $StickPresent; StickKnown = @{}; StickPresence = ''; StickChecked = $false; StickWarned = $false; StickSearchWarned = $false; StickSearchClock = $null
+    SafetyStarted = $false
   }
   Update-ToolboxView -Window $window
   return $window
@@ -357,7 +425,8 @@ function Update-ToolboxView {
     battery), collapsed when there is none; the red Administrator-protection banner and Start (disabled when
     protection is On); the power chip; the plan column, rebuilt from Get-ToolboxPlanLines with the language's step
     names (plus step.windows-update.drivers, the step's name on Drivers only: wu spec 3.1), its rows in the
-    language's direction. The machine values are New-ToolboxWindow's, set once.
+    language's direction. The machine values are New-ToolboxWindow's, set once. Last, the page the model names and
+    the Repair & diagnostics page (Update-RepairView, RepairPage.ps1).
   #>
   [CmdletBinding()]
   param([Parameter(Mandatory)][System.Windows.Window]$Window)
@@ -442,6 +511,9 @@ function Update-ToolboxView {
     $null = $block.TextEffects.Add($number)
     $null = $plan.Children.Add($block)
   }
+
+  # The page the model names, and the Repair & diagnostics page itself (RepairPage.ps1).
+  Update-RepairView -Window $Window
 }
 
 function Register-ToolboxHandlers {
@@ -449,12 +521,18 @@ function Register-ToolboxHandlers {
   .SYNOPSIS
     Wires the window's handlers (spec 5.1). Each is one line that calls Invoke-ToolboxAction. Returns nothing.
   .DESCRIPTION
-    - Click on every element whose Tag starts 'a:': the tiles, the switches, EN | HE, Start, Cancel and the X,
-      the generated profile tiles and tweak switches too;
+    - Click on every button whose Tag starts 'a:' (a ButtonBase: the tiles, the switches, EN | HE, the nav, Start,
+      Cancel and the X, the generated profile tiles and tweak switches too, the repair page's tiles and buttons). The
+      Ghost devices switches (a:GhostTick:) are skipped: the view makes them and wires each itself, so one already on
+      screen never gets a second handler (Task 5 review M4);
+    - TextChanged on every TextBox whose Tag starts 'a:' (Text: the repair page's complaint and YES boxes, repair
+      Task 5);
+    - MouseEnter on the repair page's ten tiles (Hover: what the tile does, spec 4.1);
     - MouseLeftButtonDown on the title bar (Drag; a button in the bar handles its own press first);
     - PreviewMouseWheel on the plan's scroller (Wheel: the wheel passes on to the body when the plan cannot
       scroll, TB-R7);
-    - ContentRendered (Rendered) and Closing (Closing) on the window.
+    - ContentRendered (Rendered) and Closing (Closing, with its event arguments: the close guard may cancel it,
+      repair Task 4) on the window.
     No key handler and no key binding: Esc and Enter do nothing (spec 4.1). The handlers use no outer variable:
     the window's state is in its Tag, and the sender ($this) leads back to the window.
   #>
@@ -465,17 +543,29 @@ function Register-ToolboxHandlers {
   $pending.Push($Window)
   while ($pending.Count -gt 0) {
     $node = $pending.Pop()
-    if ($node -is [System.Windows.FrameworkElement] -and $node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal)) {
+    $tagged = ($node.Tag -is [string] -and $node.Tag.StartsWith('a:', [StringComparison]::Ordinal))
+    # The Ghost devices switches (a:GhostTick:) are the view's: it wires each as it makes it (one handler each; review
+    # M4, RD-R19). Click exists on buttons only; the repair page's text boxes (a:Complaint:, a:YesText:) report their
+    # text instead.
+    if ($tagged -and $node.Tag.StartsWith('a:GhostTick:', [StringComparison]::Ordinal)) {
+      # left to Set-RepairConfirmPanel
+    } elseif ($node -is [System.Windows.Controls.Primitives.ButtonBase] -and $tagged) {
       $node.Add_Click({ Invoke-ToolboxAction -Sender $this })
+    } elseif ($node -is [System.Windows.Controls.TextBox] -and $tagged) {
+      $node.Add_TextChanged({ Invoke-ToolboxAction -Sender $this -Action 'Text' })
     }
     foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($node)) {
       if ($child -is [System.Windows.DependencyObject]) { $pending.Push($child) }
     }
   }
+  foreach ($id in @($script:RepairTileRows.Values | ForEach-Object { $_ })) {
+    $tile = $Window.FindName((Get-RepairElementName -Id $id))
+    if ($null -ne $tile) { $tile.Add_MouseEnter({ Invoke-ToolboxAction -Sender $this -Action 'Hover' }) }
+  }
   $Window.FindName('TitleBar').Add_MouseLeftButtonDown({ Invoke-ToolboxAction -Sender $this -Action 'Drag' })
   $Window.FindName('PlanScroll').Add_PreviewMouseWheel({ Invoke-ToolboxAction -Sender $this -Action 'Wheel' -EventArgs $_ })
   $Window.Add_ContentRendered({ Invoke-ToolboxAction -Sender $this -Action 'Rendered' })
-  $Window.Add_Closing({ Invoke-ToolboxAction -Sender $this -Action 'Closing' })
+  $Window.Add_Closing({ Invoke-ToolboxAction -Sender $this -Action 'Closing' -EventArgs $_ })
 }
 
 function Invoke-ToolboxAction {
@@ -486,20 +576,45 @@ function Invoke-ToolboxAction {
     The window is the sender itself (a Window), the sender's Tag (the power timer's) or the window the sender is
     in ([Windows.Window]::GetWindow); only a window whose Tag is the toolbox state counts. The action and its value
     are -Action and -Value, else the sender's a:<Action>:<Value> Tag. -EventArgs is the event's arguments, for
-    the one action that needs them (Wheel).
-      - Start: refused while Administrator protection is On, with WARN 'Start refused: Administrator protection
-        is on' (spec 5.3; a click raised on the disabled button still lands here). Otherwise Tag.Choices is the
-        validated Choices (ConvertTo-ValidChoices; dropped tweak ids are logged WARN) and the window closes as
-        Start.
+    the actions that need them (Wheel, Closing).
+      - Start: refused while an action runs (repair spec 4.4), with WARN 'Start refused: an action is running', and
+        while Administrator protection is On, with WARN 'Start refused: Administrator protection is on' (spec 5.3; a
+        click raised on the disabled button still lands here). Otherwise Tag.Choices is the validated Choices
+        (ConvertTo-ValidChoices; dropped tweak ids are logged WARN) and the window closes as Start.
       - Cancel: the window closes as Cancel (the Cancel button and the X).
-      - Closing: Tag.Closing = $true; a window that closes without an outcome (Alt+F4) is Cancel.
+      - Closing: while an action runs (Test-ToolboxActionRunning) and the outcome is not Failed, the close is
+        cancelled (repair spec 4.4: X, Alt+F4 and Cancel; "press Stop, then close"): the outcome goes back to
+        $null, Model.Repair.CloseRefused shows why, WARN 'Close refused: an action is running'. A Failed window
+        always closes (its children are killed before anything else: Show-ToolboxWindow, Get-SetupChoices).
+        Otherwise Tag.Closing = $true; a window that closes without an outcome (Alt+F4) is Cancel.
+      - Page: refused while an action runs, with WARN 'Page change refused: an action is running' (the nav is
+        locked, spec 4.4: Update-RepairView also shows New PC setup disabled then; this refusal is the backstop for
+        a click raised in code); otherwise as below. On the repair page (repair Task 5) the stick is checked
+        (Update-ToolboxStick: the full search on the first visit) and the first visit starts the safety child that
+        reads the strip (Start-ToolboxSafetyRun; once per window).
+      - RunTick: the run timer's tick (Update-ToolboxRuns, RepairPage.ps1). Stop: Request-ToolboxStop.
+      - Restart (Restart PC): refused while an action runs (WARN 'Restart refused: an action is running') and when its
+        gate refuses (WARN 'Restart refused: <the gate's reason key>', e.g. reason.running);
+        otherwise the restart question opens (Model.Repair.Confirm, Kind 'restart', spec 6.9: it always asks).
+        Confirm on it closes the window as Restart when Test-RepairConfirmReady still allows it (nothing runs).
+      - Repair Task 5, through Update-RepairModel (RepairPlanner.ps1), then the repair page is rendered:
+          Tile <id>, Offer dismSource: then Start-ToolboxPendingRun (the action the model asks for, with the
+            confirmation's Options; the gate checked again) and Start-ToolboxInfoRun (the info child an opened
+            Network reset or Ghost devices confirmation waits for);
+          Confirm (any other confirmation): Pending only when it may be confirmed now, then Start-ToolboxPendingRun;
+          AtPc, GhostTick <index>, ConfirmCancel; BackedUp (also INFO 'Toolbox backed-up tick changed' @{ ticked });
+          Text (a TextChanged): the sender's text into Complaint or YesText, as its a: tag names; text the model
+            already holds changes nothing; the complaint renders nothing;
+          Hover (a tile's MouseEnter): the tile id of the sender's a:Tile:<id> tag becomes Selected.
+        OpenFolder: Open-ToolboxFolder (explorer.exe, never tracked as a child).
       - Rendered: the window is activated, then no longer Topmost (it opens Topmost so it never opens behind the
         console after UAC; spec 5.1).
       - Drag: DragMove(). Its InvalidOperationException (the button is already up) is ignored: the one benign
         exception.
       - Power: Tag.ReadOnAC. A read that throws keeps the last value and logs WARN 'Could not read the power
         state for the toolbox', once per window (Tag.PowerWarned; review M2: not on every 5-second tick);
-        otherwise the model (Update-ToolboxModel -Action Power), then the view.
+        otherwise the model (Update-ToolboxModel -Action Power). Then the stick (Update-ToolboxStick: on the repair
+        page while nothing runs, ruling RD-R3), and the view when the power was read or the stick changed.
       - Wheel: when the plan cannot scroll in the wheel's direction (it fits, or it is at that end), the wheel is
         handled here and raised on the body (ContentScroll) instead, so the body scrolls (TB-R7).
       - Any other action (Profile, Mode, Office, Remote, WindowsUpdate, SevenZip, RestorePoint, Tweak, Language):
@@ -535,7 +650,9 @@ function Invoke-ToolboxAction {
 
     switch -CaseSensitive ($Action) {
       'Start' {
-        if ($state.Model.AdminProtection -eq 'On') {
+        if (Test-ToolboxActionRunning -State $state) {
+          Write-SetupLog -Level WARN -Message 'Start refused: an action is running'
+        } elseif ($state.Model.AdminProtection -eq 'On') {
           Write-SetupLog -Level WARN -Message 'Start refused: Administrator protection is on'
         } else {
           $valid = ConvertTo-ValidChoices -Choices $state.Model.Choices -Config $state.Config -Machine $state.Machine
@@ -548,8 +665,117 @@ function Invoke-ToolboxAction {
       }
       'Cancel' { Close-ToolboxWindow -Window $window -Outcome 'Cancel' }
       'Closing' {
-        $state.Closing = $true
-        if ($null -eq $state.Outcome) { $state.Outcome = 'Cancel' }
+        if ((Test-ToolboxActionRunning -State $state) -and $state.Outcome -ne 'Failed' -and $EventArgs -is [System.ComponentModel.CancelEventArgs]) {
+          # Repair spec 4.4: an action runs, so the window stays (C:\BenTech must never go under a running child).
+          $EventArgs.Cancel = $true
+          $state.Outcome = $null
+          Set-ToolboxRepair -State $state -Values @{ CloseRefused = $true }
+          Write-SetupLog -Level WARN -Message 'Close refused: an action is running'
+          Update-RepairView -Window $window
+        } else {
+          $state.Closing = $true
+          if ($null -eq $state.Outcome) { $state.Outcome = 'Cancel' }
+        }
+      }
+      'Page' {
+        if ((Test-ToolboxActionRunning -State $state) -and $Value -cne [string]$state.Model.Page) {
+          # The nav is locked while an action runs (spec 4.4); the view puts the nav's check back.
+          Write-SetupLog -Level WARN -Message 'Page change refused: an action is running'
+          Update-RepairView -Window $window
+        } else {
+          $state.Model = Update-ToolboxModel -Model $state.Model -Action $Action -Value $Value -Config $state.Config
+          if ([string]$state.Model.Page -ceq 'repair') {
+            # Repair Task 5: the stick (the full search on the first visit, RD-R3), and the strip's child once.
+            Update-ToolboxStick -Window $window
+            if ($state['SafetyStarted'] -ne $true) {
+              $state['SafetyStarted'] = $true
+              Start-ToolboxSafetyRun -Window $window
+            }
+          }
+          Update-ToolboxView -Window $window
+        }
+      }
+      'RunTick' { Update-ToolboxRuns -Window $window }
+      'Stop' { Request-ToolboxStop -Window $window }
+      'Text' {
+        # Repair Task 5: the complaint or the YES box (its a:Complaint: / a:YesText: tag). Text the model already
+        # holds changes nothing (the view emptying the YES box for a new confirmation raises this too).
+        $parts = ([string]$Sender.Tag).Split([char]':', 3)
+        $target = if ($parts.Count -eq 3) { $parts[1] } else { '' }
+        $text = [string]$Sender.Text
+        $repair = $state.Model['Repair']
+        if ($target -ceq 'Complaint') {
+          if ($text -cne [string]$repair['Complaint']) { $state.Model = Update-RepairModel -Model $state.Model -Action 'Complaint' -Value $text }
+        } elseif ($target -ceq 'YesText') {
+          $confirm = $repair['Confirm']
+          if ($confirm -is [System.Collections.IDictionary] -and $text -cne [string]$confirm['Typed']) {
+            $state.Model = Update-RepairModel -Model $state.Model -Action 'YesText' -Value $text
+            Update-RepairView -Window $window
+          }
+        }
+      }
+      'Hover' {
+        # Repair Task 5: the tile the mouse is on (its a:Tile:<id> tag) is what the right column explains.
+        $parts = ([string]$Sender.Tag).Split([char]':', 3)
+        if ($parts.Count -eq 3 -and $parts[1] -ceq 'Tile' -and $parts[2] -cne [string]$state.Model['Repair']['Selected']) {
+          $state.Model = Update-RepairModel -Model $state.Model -Action 'Hover' -Value $parts[2]
+          Update-RepairView -Window $window
+        }
+      }
+      { $_ -cin 'Tile', 'Offer' } {
+        # Repair Task 5: start at once (Pending), or open the confirmation and, for Network reset and Ghost devices,
+        # the info child it waits for. Every start re-checks its gate (RepairPage.ps1).
+        $state.Model = Update-RepairModel -Model $state.Model -Action $Action -Value $Value
+        Start-ToolboxPendingRun -Window $window
+        Start-ToolboxInfoRun -Window $window
+        Update-RepairView -Window $window
+      }
+      { $_ -cin 'AtPc', 'GhostTick' } {
+        $state.Model = Update-RepairModel -Model $state.Model -Action $Action -Value $Value
+        Update-RepairView -Window $window
+      }
+      'BackedUp' {
+        $state.Model = Update-RepairModel -Model $state.Model -Action 'BackedUp'
+        # Shop rule (spec 5): the tick unlocks repairs on a failing disk, so it is on record.
+        Write-SetupLog -Level INFO -Message 'Toolbox backed-up tick changed' -Data @{ ticked = ($state.Model['Repair']['BackedUp'] -eq $true) }
+        Update-RepairView -Window $window
+      }
+      'OpenFolder' { Open-ToolboxFolder -Window $window }
+      'Restart' {
+        $restartGate = Get-RepairGate -Model $state.Model -ActionId 'restart'
+        if (Test-ToolboxActionRunning -State $state) {
+          Write-SetupLog -Level WARN -Message 'Restart refused: an action is running'
+        } elseif (-not $restartGate.Enabled) {
+          # Pre-PR code review item 3: the gate's own reason key (ASCII, e.g. reason.running), not a guess.
+          $restartReason = if ([string]$restartGate.Reason -ne '') { [string]$restartGate.Reason } else { 'the gate is closed' }
+          Write-SetupLog -Level WARN -Message ('Restart refused: ' + $restartReason)
+        } else {
+          # Spec 6.9: Restart PC always asks first.
+          Set-ToolboxRepair -State $state -Values @{ Confirm = @{ Action = 'restart'; Kind = 'restart'; Typed = ''; AtPc = $false; Loading = $false
+                                                                  Lines = @(); Remote = $null; Items = @(); Options = @{} } }
+        }
+        Update-RepairView -Window $window
+      }
+      'Confirm' {
+        $confirm = $state.Model.Repair['Confirm']
+        if ($confirm -is [System.Collections.IDictionary] -and [string]$confirm['Kind'] -ceq 'restart') {
+          if (-not (Test-ToolboxActionRunning -State $state) -and (Test-RepairConfirmReady -Model $state.Model)) {
+            Close-ToolboxWindow -Window $window -Outcome 'Restart'
+          } else {
+            Write-SetupLog -Level WARN -Message 'Restart refused: an action is running'
+            Update-RepairView -Window $window
+          }
+        } else {
+          # Repair Task 5: the model sets Pending only when the confirmation may be confirmed now (its gate at this
+          # moment, YES, the at-PC tick, a ticked device); the start checks the gate once more.
+          $state.Model = Update-RepairModel -Model $state.Model -Action 'Confirm'
+          Start-ToolboxPendingRun -Window $window
+          Update-RepairView -Window $window
+        }
+      }
+      'ConfirmCancel' {
+        $state.Model = Update-RepairModel -Model $state.Model -Action 'ConfirmCancel'
+        Update-RepairView -Window $window
       }
       'Rendered' {
         $null = $window.Activate()
@@ -569,10 +795,11 @@ function Invoke-ToolboxAction {
             Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
           }
         }
-        if ($null -ne $onAC) {
-          $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config
-          Update-ToolboxView -Window $window
-        }
+        if ($null -ne $onAC) { $state.Model = Update-ToolboxModel -Model $state.Model -Action 'Power' -Value ([string]$onAC) -Config $state.Config }
+        # Repair Task 5 (ruling RD-R3): the stick, on the repair page while nothing runs.
+        $stickBefore = $state.Model['Repair']['Stick']
+        Update-ToolboxStick -Window $window
+        if ($null -ne $onAC -or -not [object]::ReferenceEquals($stickBefore, $state.Model['Repair']['Stick'])) { Update-ToolboxView -Window $window }
       }
       'Wheel' {
         $wheel = [System.Windows.Input.MouseWheelEventArgs]$EventArgs
@@ -603,15 +830,17 @@ function Close-ToolboxWindow {
   .SYNOPSIS
     Records the window's outcome in its Tag and closes it. Returns nothing; never throws.
   .DESCRIPTION
-    Tag.Outcome becomes -Outcome, except that Failed always wins: once Failed, the outcome stays Failed and keeps
-    its first Error (the cause, not a later consequence). Failed sets Tag.Error to -ErrorText (ASCII).
+    Tag.Outcome becomes -Outcome (Start, Cancel, Failed, or Restart: Restart PC, repair spec 6.9), except that
+    Failed always wins: once Failed, the outcome stays Failed and keeps its first Error (the cause, not a later
+    consequence). Failed sets Tag.Error to -ErrorText (ASCII). While an action runs the Closing handler refuses any
+    outcome but Failed and puts the outcome back to $null (repair spec 4.4).
     Close() is called only while Tag.Closing is $false (a Close() while the window is closing would throw), inside
     try: a Close() that fails anyway is logged WARN. The Closing handler then marks the window as closing.
   #>
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][System.Windows.Window]$Window,
-    [Parameter(Mandatory)][ValidateSet('Start', 'Cancel', 'Failed')][string]$Outcome,
+    [Parameter(Mandatory)][ValidateSet('Start', 'Cancel', 'Failed', 'Restart')][string]$Outcome,
     [AllowEmptyString()][string]$ErrorText = ''
   )
 
@@ -710,22 +939,29 @@ function New-ToolboxPowerTimer {
 function Show-ToolboxWindow {
   <#
   .SYNOPSIS
-    Shows the toolbox and returns @{ Outcome = 'Start'|'Cancel'|'Failed'; Choices; Error }. Never throws.
+    Shows the toolbox and returns @{ Outcome = 'Start'|'Cancel'|'Failed'|'Restart'; Choices; Error }. Never throws.
   .DESCRIPTION
-    The same inputs as Show-StartScreen. In order:
+    The same inputs as Show-StartScreen, plus (repair Task 4) -Root and -ScriptPath, the setup files an action's
+    child runs from (empty: the repair page can start nothing, Model.Repair.CanRun $false). In order:
       1. software rendering for the whole process (spec 5.1: the PC has no GPU driver yet);
       2. the power state (a read that throws counts as on AC, logged WARN, and the window's power timer then
          logs no second one: Tag.PowerWarned) and Administrator protection (logged WARN when it is not Off);
-      3. the model, the window (its power timer reads -OnAC), the handlers and the work-area clamp;
-      4. the power timer, started (Tag.Timer);
+      3. the launcher (-Launcher, read once for the stick search; a read that throws is WARN 'Could not read the
+         launcher for the toolbox' and no launcher), the model, the window (its power timer reads -OnAC; Tag keeps
+         Root, ScriptPath, the launcher and the StartChild and FindStick seams), the handlers and the work-area clamp;
+      4. the power timer and the run timer (500 ms: the children's progress, repair spec 7), started (Tag.Timer,
+         Tag.RunTimer);
       5. the dispatcher backstop (Invoke-ToolboxUnhandled), for exceptions no handler caught;
       6. the dialog, through the -ShowDialog seam, with $script:ToolboxOpenWindow set for the backstop. A dialog
          that returns while the Outcome is still empty (the window was not closed: WPF's modal loop ended some
          other way) is Failed at once, BEFORE the cleanup below closes the window, so the Closing handler (which
          reads an empty Outcome as Cancel) can never turn it into Cancel (review M1: failure is never Cancel, by
          construction);
-      7. finally: the timer stops, the backstop is removed, $script:ToolboxOpenWindow is cleared and the window
-         is closed (a Close() that fails is logged WARN).
+      7. finally: both timers stop; every child the window started is killed (Stop-ToolboxChildren -Quiet: no wait;
+         one not ended yet stays tracked for Get-SetupChoices' finally to judge) BEFORE the
+         window is closed (repair spec 4.4, Review Focus 2); an Outcome still empty (the dialog threw) is Failed, so
+         the close guard lets the window go; the backstop is removed, $script:ToolboxOpenWindow is cleared and the
+         window is closed (a Close() that fails is logged WARN).
     The result is Tag's Outcome, Choices and Error. Any exception is Failed with its message in ASCII, logged
     ERROR 'Toolbox window failed' with @{ error; line; type }. WPF is not shut down here (Get-SetupChoices does
     that).
@@ -735,6 +971,12 @@ function Show-ToolboxWindow {
       -OnAC             $true when on mains power (also what the power timer reads)
       -AdminProtection  'On', 'Off' or 'Unknown'
       -WorkArea         the screen's work area, in device-independent pixels
+      -Launcher         Get-LauncherInfo of the launcher ($env:BT_SELF), kept in Tag.Launcher
+      -FindStick        Find-SetupStick, the full stick search (when the repair page opens, and when the presence
+                        check's answer changes: ruling RD-R3)
+      -StartChild       starts an action's child without waiting: Start-BackgroundExternal (also Open folder's
+                        explorer.exe, which is never tracked)
+      -StickPresent     Get-ToolboxStickPresence, the cheap stick presence check of the 5-second tick (no CIM, RD-R3)
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -747,7 +989,13 @@ function Show-ToolboxWindow {
     [scriptblock]$ShowDialog = { param($w) $w.ShowDialog() },
     [scriptblock]$OnAC = { Test-OnACPower },
     [scriptblock]$AdminProtection = { Test-AdminProtection },
-    [scriptblock]$WorkArea = { [Windows.SystemParameters]::WorkArea }
+    [scriptblock]$WorkArea = { [Windows.SystemParameters]::WorkArea },
+    [AllowEmptyString()][string]$Root = '',
+    [AllowEmptyString()][string]$ScriptPath = '',
+    [scriptblock]$Launcher = { Get-LauncherInfo -Path $env:BT_SELF },
+    [scriptblock]$FindStick = { param($l) Find-SetupStick -Launcher $l },
+    [scriptblock]$StartChild = { param($file, $arguments) Start-BackgroundExternal -FilePath $file -ArgumentList $arguments },
+    [scriptblock]$StickPresent = { param($l, $k) Get-ToolboxStickPresence -Launcher $l -Known $k }
   )
 
   try {
@@ -761,12 +1009,24 @@ function Show-ToolboxWindow {
       $powerWarned = $true
       Write-SetupLog -Level WARN -Message 'Could not read the power state for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
     }
-    $model = New-ToolboxModel -Machine $Machine -Config $Config -Previous $Previous -IsFresh $IsFresh -OnAC $onACNow -AdminProtection ([string](& $AdminProtection))
+    $canRun = (-not [string]::IsNullOrEmpty($Root)) -and (-not [string]::IsNullOrEmpty($ScriptPath))
+    $model = New-ToolboxModel -Machine $Machine -Config $Config -Previous $Previous -IsFresh $IsFresh -OnAC $onACNow -AdminProtection ([string](& $AdminProtection)) -CanRun $canRun
     if ($model.AdminProtection -ne 'Off') { Write-SetupLog -Level WARN -Message 'Administrator protection is not off' -Data @{ state = $model.AdminProtection } }
 
-    $window = New-ToolboxWindow -Model $model -Machine $Machine -Config $Config -Version $Version -ReadOnAC $OnAC
+    # The launcher, once (the stick is found by its volume serial): a read that fails only loses that.
+    $launcherInfo = $null
+    try {
+      $found = @(& $Launcher)
+      if ($found.Count -eq 1 -and $found[0] -is [hashtable]) { $launcherInfo = $found[0] }
+    } catch {
+      Write-SetupLog -Level WARN -Message 'Could not read the launcher for the toolbox' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+
+    $window = New-ToolboxWindow -Model $model -Machine $Machine -Config $Config -Version $Version -ReadOnAC $OnAC -Root $Root -ScriptPath $ScriptPath `
+      -Launcher $launcherInfo -StartChild $StartChild -FindStick $FindStick -StickPresent $StickPresent
     $window.Tag.PowerWarned = $powerWarned
     $timer = $null
+    $runTimer = $null
     $backstop = { Invoke-ToolboxUnhandled -EventArgs $_ }
     try {
       Register-ToolboxHandlers -Window $window
@@ -774,6 +1034,9 @@ function Show-ToolboxWindow {
       $timer = New-ToolboxPowerTimer -Window $window
       $window.Tag.Timer = $timer
       $timer.Start()
+      $runTimer = New-ToolboxRunTimer -Window $window
+      $window.Tag.RunTimer = $runTimer
+      $runTimer.Start()
       $window.Dispatcher.Add_UnhandledException($backstop)
       $script:ToolboxOpenWindow = $window
       $null = & $ShowDialog $window
@@ -784,6 +1047,15 @@ function Show-ToolboxWindow {
       }
     } finally {
       if ($null -ne $timer) { $timer.Stop() }
+      if ($null -ne $runTimer) { $runTimer.Stop() }
+      # Repair spec 4.4 (Review Focus 2): no child of the window may run on once it is gone; killed before it closes.
+      # Quiet: the window is still there, so nothing waits; Get-SetupChoices' finally judges a child not ended yet.
+      Stop-ToolboxChildren -Quiet
+      # A dialog that threw (the catch below reports it) is Failed here too, so the close guard lets the window go.
+      if ($null -eq $window.Tag.Outcome) {
+        $window.Tag.Outcome = 'Failed'
+        $window.Tag.Error = 'The toolbox dialog failed'
+      }
       $window.Dispatcher.Remove_UnhandledException($backstop)
       $script:ToolboxOpenWindow = $null
       try {
@@ -861,15 +1133,23 @@ function Get-SetupChoices {
     cannot be used. Returns the Choices to run with, or $null when the technician cancels.
   .DESCRIPTION
     The same parameters and the same return contract as Show-StartScreen, which it replaces at Main.ps1's
-    call. Exactly one value is returned: a Choices hashtable (always through ConvertTo-ValidChoices) or $null.
+    call, plus (repair Task 4) -Root and -ScriptPath, which go to the window only (an action's child runs from them).
+    Exactly one value is returned: a Choices hashtable (always through ConvertTo-ValidChoices) or $null.
+      0. The restart request is cleared ($script:ToolboxRestartRequested = $false).
       1. Host check (Test-ToolboxHost). Not Ok: WARN 'Toolbox not available; using the console start screen'
          with @{ reason }, then the console (step 4).
       2. The window (Show-ToolboxWindow), in try/finally. An exception becomes Failed (its message in ASCII).
-         Whatever happens, the WPF dispatcher is stopped exactly once afterwards, so the main thread does not keep
-         a hidden WPF window for the hours the run takes (spec 5.1); a failure of that stop is only a WARN.
+         Whatever happens, every child the window started is killed first (Stop-ToolboxChildren: repair spec 4.4,
+         Review Focus 2, before WPF stops, the console fallback and any cleanup; it waits at most 2 s for each kill to
+         land, $script:ToolboxCloseGraceMilliseconds, the window being gone), then the WPF dispatcher is
+         stopped exactly once, so the main thread does not keep a hidden WPF window for the hours the run takes
+         (spec 5.1); a failure of that stop is only a WARN.
       3. The outcome:
            Start   INFO 'Toolbox closed' with @{ outcome; profile }; the Choices are returned.
            Cancel  INFO 'Toolbox closed' with @{ outcome }; $null is returned (Esc on the console does the same).
+           Restart INFO 'Toolbox closed' with @{ outcome = 'Restart' }; the restart request is set
+                   (Get-ToolboxRestartRequest) and $null is returned: Main.ps1 takes the Cancel path, then
+                   restarts the PC (repair spec 6.9).
            Failed  ERROR 'Toolbox failed; using the console start screen' with @{ error } (and type, the .NET
                    type name, when the window threw), then the console. So does anything else: no result, more
                    than one value, an unknown outcome, or a Start without Choices. A failure is never read as a
@@ -897,13 +1177,20 @@ function Get-SetupChoices {
     [Parameter(Mandatory)][string]$Version,
     [AllowNull()][hashtable]$Previous,
     [Parameter(Mandatory)][bool]$IsFresh,
+    [AllowEmptyString()][string]$Root = '',
+    [AllowEmptyString()][string]$ScriptPath = '',
     [scriptblock]$TestHost = { Test-ToolboxHost },
     [scriptblock]$ShowToolbox = { param($p) Show-ToolboxWindow @p },
     [scriptblock]$ShowConsole = { param($p) Show-StartScreen @p },
     [scriptblock]$ShutdownDispatcher = { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() }
   )
 
+  $script:ToolboxRestartRequested = $false
   $p = @{ Machine = $Machine; Config = $Config; Version = $Version; Previous = $Previous; IsFresh = $IsFresh }
+  # The window also gets the setup files its actions' children run from; the console keeps Show-StartScreen's five.
+  $windowParams = $p.Clone()
+  $windowParams.Root = $Root
+  $windowParams.ScriptPath = $ScriptPath
   $raw = $null
   $fromToolbox = $false
   $thrownType = ''
@@ -915,12 +1202,16 @@ function Get-SetupChoices {
   } else {
     $result = $null
     try {
-      $outputs = @(& $ShowToolbox $p)
+      $outputs = @(& $ShowToolbox $windowParams)
       if ($outputs.Count -eq 1) { $result = $outputs[0] }
     } catch {
       $result = @{ Outcome = 'Failed'; Error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
       $thrownType = ConvertTo-ScreenText -Text $_.Exception.GetType().FullName
     } finally {
+      # Repair spec 4.4 (Review Focus 2): a child left by the window is killed before anything else happens. The window
+      # is gone, so this last close may wait briefly (bounded) for each kill to land before it calls a child still
+      # running (a kill is asynchronous; final wave item 11).
+      Stop-ToolboxChildren -GraceMilliseconds $script:ToolboxCloseGraceMilliseconds
       try {
         $null = & $ShutdownDispatcher
       } catch {
@@ -933,6 +1224,11 @@ function Get-SetupChoices {
       $outcome = $result['Outcome']
       if ($outcome -ceq 'Cancel') {
         Write-SetupLog -Level INFO -Message 'Toolbox closed' -Data @{ outcome = 'Cancel' }
+        return $null
+      } elseif ($outcome -ceq 'Restart') {
+        # Repair spec 6.9: no setup run; Main.ps1 takes the Cancel path, then restarts the PC.
+        Write-SetupLog -Level INFO -Message 'Toolbox closed' -Data @{ outcome = 'Restart' }
+        $script:ToolboxRestartRequested = $true
         return $null
       } elseif ($outcome -ceq 'Start') {
         if ($result['Choices'] -is [System.Collections.IDictionary]) {
