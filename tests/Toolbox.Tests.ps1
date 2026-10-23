@@ -10,8 +10,8 @@
 # into $TestDrive.
 BeforeAll {
   Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Engine\Catalog', 'UI\StartScreen',
-                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox') { . "$PSScriptRoot\..\src\$f.ps1" }
+  foreach ($f in 'Common\Config', 'Common\Logging', 'Common\Activity', 'Detect\Detection', 'Detect\PcName', 'State\State', 'Engine\Catalog', 'UI\StartScreen', 'Repair\ToolEngine',
+                 'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\RepairPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Toolbox\RepairPage') { . "$PSScriptRoot\..\src\$f.ps1" }
   $script:cfg = Read-SetupConfig -Path "$PSScriptRoot\..\config\config.json"
   # The Dell sample machine of tools\Preview-Toolbox.ps1.
   $script:m = @{ Manufacturer = 'Dell Inc.'; Model = 'Latitude 5440'; FriendlyModel = 'Latitude 5440'; Serial = '7HX2K93'; NewName = 'DELL-7HX2K93'
@@ -420,7 +420,8 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
     @($script:logs | Where-Object { $_.Message -eq 'Start refused: Administrator protection is on' }).Count | Should -Be 1
     @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -eq 'Administrator protection is not off' -and $_.Data.state -eq 'On' }).Count | Should -Be 1 }
   It 'calls ShowDialog only through the seam; no key handlers, no closures (Toolbox.ps1 and Xaml.ps1, TB-R7, Task 3 M6)' {
-    $src = Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw
+    # Repair Task 4: RepairPage.ps1 (the action runs) shows no dialog either.
+    $src = (Get-Content "$PSScriptRoot\..\src\Toolbox\Toolbox.ps1" -Raw) + (Get-Content "$PSScriptRoot\..\src\Toolbox\RepairPage.ps1" -Raw)
     ([regex]::Matches($src, '\.ShowDialog\(')).Count | Should -Be 1; $src | Should -Match '\$ShowDialog = \{ param\(\$w\) \$w\.ShowDialog\(\) \}'
     # Any key-handler wiring, in code or in XAML (Should -Match ignores case): an event or its routed event (KeyDown, PreviewKeyDown,
     # KeyUp, PreviewKeyUp, KeyDownEvent ...), a key binding, a default or a cancel button.
@@ -428,7 +429,7 @@ Describe 'Show-ToolboxWindow (seams only; never ShowDialog)' {
     foreach ($sample in 'Add_KeyDown(', 'Add_PreviewKeyDown(', 'Add_KeyUp(', '$w.AddHandler([Windows.UIElement]::KeyDownEvent, $h)', 'KeyDown="OnKey"',
                         'PreviewKeyUp="OnKey"', '$w.InputBindings.Add($b)', '<KeyBinding Key="Enter"/>', 'IsDefault="True"', 'IsCancel="true"') {
       $sample | Should -Match $keyWiring -Because 'the guard must catch every kind of key wiring' }
-    foreach ($file in 'Toolbox', 'Xaml') {
+    foreach ($file in 'Toolbox', 'Xaml', 'RepairPlanner', 'RepairPage') {
       Get-Content "$PSScriptRoot\..\src\Toolbox\$file.ps1" -Raw | Should -Not -Match "$keyWiring|GetNewClosure" -Because $file }
     $script:ToolboxXaml | Should -Not -Match 'IsCancel|IsDefault="True"' }
 }
@@ -507,7 +508,7 @@ Describe 'Get-SetupChoices (toolbox spec 5.1)' {
     foreach ($tb in { param($p) @{ Outcome = 'Failed'; Error = 'view broke' } }, { param($p) throw 'boom' }) {
       $script:consoleArgs = $null; $null = Get $tb; $script:consoleArgs.NoAutoStart | Should -BeTrue }
     $null = Get { param($p) $script:toolboxArgs = $p; @{ Outcome = 'Cancel' } }
-    $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse   # the window gets Show-StartScreen's five parameters only
+    $script:toolboxArgs.Contains('NoAutoStart') | Should -BeFalse   # the window gets Show-StartScreen's five parameters (and, repair Task 4, Root and ScriptPath)
     # The real Show-StartScreen takes the splat (its other seams given, so it reads no console): Escape is $null.
     Get { param($p) @{ Outcome = 'Failed' } } -Console { param($p) Show-StartScreen @p -ReadKey { 'Escape' } -Now { [datetime]'2026-10-22' } -Sleep { } -OnAC { $true } -Write { } -FlushInput { } } |
       Should -BeNullOrEmpty }
@@ -596,12 +597,13 @@ Describe 'every test passes the WPF seams (final review M5)' {
     $script:callsSeen | Should -BeGreaterOrEqual 5 }   # not vacuous: it sees the real calls in Toolbox.Tests and Entry.Tests
 }
 Describe 'tools\Preview-Toolbox.ps1' {
-  It 'renders the eight PNGs at 1000x680 without showing a window, and prints their paths' {
+  It 'renders the fifteen PNGs (the eight setup views, the seven repair views) at 1000x680 without showing a window, and prints their paths' {
     $out = Join-Path $TestDrive 'preview'; $printed = @(& "$PSScriptRoot\..\tools\Preview-Toolbox.ps1" -OutDir $out)
     $files = @('toolbox-en.png', 'toolbox-he.png', 'toolbox-en-business-desktop.png', 'toolbox-en-blocked.png', 'toolbox-en-drivers.png', 'toolbox-he-drivers.png',
-               'toolbox-en-zoom.png', 'toolbox-he-zoom.png')
+               'toolbox-en-zoom.png', 'toolbox-he-zoom.png',
+               'repair-en.png', 'repair-he.png', 'repair-en-blocked.png', 'repair-en-confirm.png', 'repair-en-running.png', 'repair-he-running.png', 'repair-en-result.png')
     @($printed | ForEach-Object { Split-Path -Leaf $_ }) | Should -Be $files
-    @(Get-ChildItem $out -Filter *.png).Count | Should -Be 8
+    @(Get-ChildItem $out -Filter *.png).Count | Should -Be 15
     foreach ($f in $files) {
       $s = [IO.File]::OpenRead((Join-Path $out $f))
       try { $frame = [Windows.Media.Imaging.BitmapDecoder]::Create($s, 'None', 'OnLoad').Frames[0]; $frame.PixelWidth | Should -Be 1000; $frame.PixelHeight | Should -Be 680 }

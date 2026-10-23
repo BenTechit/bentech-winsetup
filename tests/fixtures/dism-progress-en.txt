@@ -1,0 +1,7 @@
+﻿
+Deployment Image Servicing and Management tool
+Version: 10.0.26100.1150
+
+Image Version: 10.0.26100.4061
+
+[                           1.2%                           ][==                         4.8%                           ][========                   15.0%                          ][===============            27.3%                          ][==========================45.0%                           ]

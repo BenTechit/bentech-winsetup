@@ -1,5 +1,7 @@
 ﻿# src/Engine/Reboot.ps1
-# Pending-reboot detection and the one controlled way this tool restarts the machine.
+# Pending-reboot detection and the one controlled way this tool restarts the machine during a run
+# (Invoke-ControlledReboot), plus the stateless restart of the toolbox's Restart PC (Invoke-StatelessRestart, repair
+# spec 6.9: no run, so no state, no cap and no countdown).
 #
 # Detection reads only registry keys and values, never command output: target machines may run a
 # Hebrew display language. Every read is guarded, so a missing key or value is simply "no signal".
@@ -86,6 +88,84 @@ function Test-PendingReboot {
   return $false
 }
 
+function Get-ServicingRebootSignals {
+  <#
+  .SYNOPSIS
+    The pending-restart signals the repair page and the action child read (repair spec 5). Never throws.
+  .DESCRIPTION
+    @{ CbsRebootPending; CbsPackagesPending; PendingXml; WuRebootRequired; PendingFileRename; ComputerRenamePending },
+    every value a bool:
+      CbsPackagesPending : the Component Based Servicing\PackagesPending key exists.
+      PendingXml         : %windir%\WinSxS\pending.xml exists.
+      the other four     : as Get-PendingRebootSignals reads them.
+    Only the first four break servicing (Test-ServicingRebootPending); a pending file or computer rename is set on
+    most PCs and is a grey note only. A read that fails is "no signal", like Get-PendingRebootSignals.
+  #>
+  [CmdletBinding()]
+  [OutputType([hashtable])]
+  param()
+
+  $signals = @{
+    CbsRebootPending      = $false
+    CbsPackagesPending    = $false
+    PendingXml            = $false
+    WuRebootRequired      = $false
+    PendingFileRename     = $false
+    ComputerRenamePending = $false
+  }
+  try {
+    $reboot = Get-PendingRebootSignals
+    foreach ($name in 'CbsRebootPending', 'WuRebootRequired', 'PendingFileRename', 'ComputerRenamePending') {
+      $signals[$name] = ($reboot[$name] -eq $true)
+    }
+  } catch {
+    # ConvertTo-ScreenText (UI\StartScreen.ps1; the bundle holds every file): a Hebrew Windows can localize the message.
+    Write-SetupLog -Level WARN -Message 'Could not read the pending-restart signals; treating them as none' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+  }
+  $signals['CbsPackagesPending'] = Test-RebootRegistryKey -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+  try {
+    $signals['PendingXml'] = [bool](Test-Path -LiteralPath (Join-Path $env:windir 'WinSxS\pending.xml') -PathType Leaf -ErrorAction Stop)
+  } catch {
+    $signals['PendingXml'] = $false
+  }
+  return $signals
+}
+
+function Test-ServicingRebootPending {
+  <#
+  .SYNOPSIS
+    $true when a signal that breaks servicing is set: CbsRebootPending, CbsPackagesPending, PendingXml or
+    WuRebootRequired (repair spec 5). A pending file or computer rename alone is $false.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][hashtable]$Signals)
+
+  foreach ($name in 'CbsRebootPending', 'CbsPackagesPending', 'PendingXml', 'WuRebootRequired') {
+    if ($Signals[$name] -eq $true) { return $true }
+  }
+  return $false
+}
+
+function Invoke-ShutdownRestart {
+  <#
+  .SYNOPSIS
+    Private. The fallback restart of Invoke-ControlledReboot and Invoke-StatelessRestart: shutdown.exe /r /t 5 /f through
+    Invoke-External, bounded at 1 minute (nothing waits without a deadline; final wave item 13: never Start-Process
+    -Wait). Returns nothing; throws 'shutdown.exe exited with code <n>' unless the exit code is 0 (restart scheduled),
+    1115 (ERROR_SHUTDOWN_IN_PROGRESS) or 1190 (ERROR_SHUTDOWN_IS_SCHEDULED): the machine restarts either way. A timeout
+    (no exit code) throws too.
+  #>
+  [CmdletBinding()]
+  param()
+
+  $shutdown = Invoke-External -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -TimeoutMinutes 1
+  if ($null -eq $shutdown -or $shutdown['TimedOut'] -eq $true -or $null -eq $shutdown['ExitCode'] -or [int]$shutdown['ExitCode'] -notin 0, 1115, 1190) {
+    $code = if ($null -ne $shutdown -and $null -ne $shutdown['ExitCode']) { [string]$shutdown['ExitCode'] } else { 'none (timed out)' }
+    throw ('shutdown.exe exited with code {0}' -f $code)
+  }
+}
+
 function Invoke-ControlledReboot {
   <#
   .SYNOPSIS
@@ -107,8 +187,9 @@ function Invoke-ControlledReboot {
     once per second (only when CountdownSeconds is above 0) and calls RestartAction.
     A restart must never fail silently (the machine would sit idle), so RestartAction must throw on
     failure (hence -ErrorAction Stop). When it throws, a WARN is logged and FallbackRestartAction
-    (shutdown.exe /r /t 5 /f; exit code 0, 1190 "shutdown already scheduled" or 1115 "shutdown in
-    progress" is success, anything else a failure) is tried. Either one succeeding
+    (Invoke-ShutdownRestart: shutdown.exe /r /t 5 /f through Invoke-External, bounded at 1 minute; exit
+    code 0, 1190 "shutdown already scheduled" or 1115 "shutdown in progress" is success, anything else
+    or a timeout a failure) is tried. Either one succeeding
     returns $true; the caller must then return straight away, because Windows is shutting down.
     When both fail: "Restart failed: ..." is appended to State.Errors, the state is saved, an ERROR
     is logged and $false is returned. RebootCount stays incremented and RebootCapHit stays $false,
@@ -120,14 +201,7 @@ function Invoke-ControlledReboot {
     [Parameter(Mandatory)][hashtable]$Context,
     [int]$CountdownSeconds = 15,
     [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
-    [scriptblock]$FallbackRestartAction = {
-      $shutdown = Start-Process -FilePath "$env:windir\System32\shutdown.exe" -ArgumentList '/r /t 5 /f' -Wait -PassThru -NoNewWindow
-      # 0 = restart scheduled; 1190 = ERROR_SHUTDOWN_IS_SCHEDULED and 1115 = ERROR_SHUTDOWN_IN_PROGRESS:
-      # a restart is already pending, so the machine will reboot either way. Anything else fails.
-      if ($null -eq $shutdown -or $shutdown.ExitCode -notin 0, 1115, 1190) {
-        throw ('shutdown.exe exited with code {0}' -f $(if ($null -ne $shutdown) { $shutdown.ExitCode } else { 'unknown' }))
-      }
-    }
+    [scriptblock]$FallbackRestartAction = { Invoke-ShutdownRestart }
   )
 
   $runState = $Context.State
@@ -186,5 +260,60 @@ function Invoke-ControlledReboot {
   $runState.Errors = @(@(@($runState.Errors) | Where-Object { $null -ne $_ }) + ('Restart failed: {0} (fallback: {1})' -f $primaryError, $fallbackError))
   Save-RunState -State $runState -Root $Context.Root
   Write-SetupLog -Level ERROR -Message 'Restart failed; the fallback failed too' -Data @{ error = $primaryError; fallbackError = $fallbackError; rebootCount = $runState.RebootCount }
+  return $false
+}
+
+function Invoke-StatelessRestart {
+  <#
+  .SYNOPSIS
+    Restart PC from the toolbox (repair spec 6.9): restarts the machine without any run state. $true when a restart
+    was started. Never throws.
+  .DESCRIPTION
+    Start-BenTechSetup calls it after the Cancel path (the transcript stopped, the lock released, C:\BenTech removed
+    when no earlier run exists). Not Invoke-ControlledReboot: there is no run state, so no reboot cap, no
+    RebootCount, no resume task and no countdown (the technician confirmed in the window).
+    RestartAction first (Restart-Computer -Force; it must throw on failure, hence -ErrorAction Stop); when it throws,
+    a WARN and FallbackRestartAction (Invoke-ShutdownRestart: shutdown.exe /r /t 5 /f through Invoke-External, bounded
+    at 1 minute; exit code 0, 1115 "shutdown in progress" or 1190 "shutdown already scheduled" is success, anything
+    else or a timeout throws). When both fail: an ERROR, one line 'Could not restart the PC: <reasons in ASCII>' White
+    on DarkRed (the window is gone, and after a cleanup the log is too, so the console is the one place it shows), and
+    $false.
+    Logging is a no-op after the cleanup stopped it.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [scriptblock]$RestartAction = { Restart-Computer -Force -ErrorAction Stop },
+    [scriptblock]$FallbackRestartAction = { Invoke-ShutdownRestart }
+  )
+
+  $primaryError = ''
+  $fallbackError = ''
+  try {
+    Write-SetupLog -Message 'Restarting the computer (Restart PC in the toolbox)'
+    try {
+      $null = & $RestartAction
+      return $true
+    } catch {
+      $primaryError = ConvertTo-ScreenText -Text $_.Exception.Message
+      Write-SetupLog -Level WARN -Message 'Restart failed; trying shutdown.exe' -Data @{ error = $primaryError }
+    }
+    try {
+      $null = & $FallbackRestartAction
+      Write-SetupLog -Message 'Restart started by the fallback (shutdown.exe)'
+      return $true
+    } catch {
+      $fallbackError = ConvertTo-ScreenText -Text $_.Exception.Message
+    }
+    Write-SetupLog -Level ERROR -Message 'Restart failed; the fallback failed too' -Data @{ error = $primaryError; fallbackError = $fallbackError }
+    Write-Host ('Could not restart the PC: {0} (fallback: {1})' -f $primaryError, $fallbackError) -ForegroundColor White -BackgroundColor DarkRed
+  } catch {
+    # Not expected (each step above catches its own failure); still never thrown.
+    try {
+      Write-Host ('Could not restart the PC: {0}' -f (ConvertTo-ScreenText -Text $_.Exception.Message)) -ForegroundColor White -BackgroundColor DarkRed
+    } catch {
+      Write-SetupLog -Level ERROR -Message 'Could not show the restart failure' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) }
+    }
+  }
   return $false
 }

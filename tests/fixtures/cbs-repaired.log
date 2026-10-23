@@ -1,0 +1,18 @@
+2026-10-21 03:12:40, Info                  CSI    00000041 [SR] Verifying 100 components
+2026-10-21 03:12:44, Info                  CSI    00000045 [SR] Verify complete
+2026-10-22 10:00:02, Info                  CBS    TI: --- Initializing Trusted Installer ---
+2026-10-22 10:00:05, Info                  CSI    00000001 [SR] Verifying 100 components
+2026-10-22 10:00:05, Info                  CSI    00000002 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:07, Info                  CSI    00000003 Hashes for file member [l:11]'shell32.dll' do not match actual file [l:11]'shell32.dll' :
+2026-10-22 10:00:09, Info                  CSI    00000004 [SR] Verify complete
+2026-10-22 10:00:09, Info                  CSI    00000005 [SR] Verifying 64 components
+2026-10-22 10:00:09, Info                  CSI    00000006 [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:15, Info                  CSI    00000008 [SR] Verify complete
+2026-10-22 10:00:15, Info                  CSI    00000009 [SR] Repairing 3 components
+2026-10-22 10:00:15, Info                  CSI    0000000a [SR] Beginning Verify and Repair transaction
+2026-10-22 10:00:16, Info                  CSI    0000000c [SR] Repairing corrupted file \??\C:\WINDOWS\System32\shell32.dll from store
+2026-10-22 10:00:16, Info                  CSI    0000000e [SR] Repairing corrupted file \??\C:\WINDOWS\System32\imageres.dll from store
+2026-10-22 10:00:17, Info                  CSI    00000010 [SR] Repairing corrupted file \??\C:\WINDOWS\System32\drivers\etc\hosts from store
+2026-10-22 10:00:18, Info                  CSI    00000012 [SR] Repair complete
+2026-10-22 10:00:18, Info                  CSI    00000013 [SR] Committing transaction
+2026-10-22 10:00:19, Info                  CSI    00000014 [SR] Verify and Repair Transaction completed. All files and registry keys listed in this transaction  have been successfully repaired

@@ -1,0 +1,23 @@
+{
+  "note": "The dev PC on 22/10/2026 (Task 2 review I2): disk 0 is the system NVMe, disk 1 the BenTech stick, and the only disk events of the last 30 days are the stick's (\\Device\\Harddisk1). Kernel-Boot 153 and Kernel-Processor-Power 55 share the IDs. Disk 0's counters are illustrative (the reading needs admin).",
+  "disks": {
+    "SystemDisks": [ 0 ],
+    "Items": [
+      { "DeviceId": "1", "FriendlyName": "USB SanDisk 3.2Gen1", "MediaType": "Unspecified", "BusType": "USB", "HealthStatus": "Healthy", "Size": 30784094208 },
+      { "DeviceId": "0", "FriendlyName": "SAMSUNG MZVL2512HDJD-00BLL", "MediaType": "SSD", "BusType": "NVMe", "HealthStatus": "Healthy", "Size": 512110190592 }
+    ]
+  },
+  "reliability": {
+    "Items": [
+      { "DeviceId": "1", "Wear": null, "Temperature": null, "ReadErrorsUncorrected": null, "WriteErrorsUncorrected": null },
+      { "DeviceId": "0", "Wear": 2, "Temperature": 41, "ReadErrorsUncorrected": 0, "WriteErrorsUncorrected": 0 }
+    ]
+  },
+  "events": [
+    { "ProviderName": "disk", "Id": 51, "Properties": [ "\\Device\\Harddisk1\\DR5", "4 1 128 0 1 0 0 0" ] },
+    { "ProviderName": "disk", "Id": 51, "Properties": [ "\\Device\\Harddisk1\\DR5", "4 0 128 0 1 0 0 0" ] },
+    { "ProviderName": "disk", "Id": 153, "Properties": [ "\\Device\\Harddisk1\\DR5", "0x508810", "1", "\\Device\\00000c61" ] },
+    { "ProviderName": "Microsoft-Windows-Kernel-Boot", "Id": 153, "Properties": [ "1" ] },
+    { "ProviderName": "Microsoft-Windows-Kernel-Processor-Power", "Id": 55, "Properties": [ "0", "8" ] }
+  ]
+}
