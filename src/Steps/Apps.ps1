@@ -385,7 +385,8 @@ function Invoke-StepZoom {
     apps.zoom.custom tokens (Zoom's ZConfig MSI property, Q50) travel on winget's --custom argument; each
     is checked with Test-WingetCustomToken first, and one that fails is dropped and logged by its position,
     never by its text. The run waits at most timeoutsMinutes.zoom, so a msiexec help box from a wrong token
-    costs minutes, not timeoutsMinutes.default.
+    costs minutes, not timeoutsMinutes.default (a missing or unusable timeoutsMinutes.zoom falls back to
+    timeoutsMinutes.default, with a WARN).
       - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When no
         token that reaches winget carries AU2_EnableAutoUpdate (missing, dropped, or winget too old) Zoom still
         installs, with the yellow Note 'Zoom auto-update not set' (final review M3: another refused token
@@ -441,7 +442,16 @@ function Invoke-StepZoom {
     Write-SetupLog -Message 'No Zoom custom argument with AU2_EnableAutoUpdate reaches winget; Zoom installs without auto-update' -Level WARN -Data @{ given = $given.Count; passed = $custom.Count }
   }
 
-  $result = Invoke-WingetInstall -Id $id -Source winget -Context $Context -Custom $custom.ToArray() -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.zoom)
+  # Task 1 review M2: a limit that is missing or not a usable number of minutes (a broken config; Invoke-External
+  # takes 0.001 to 10080) falls back to timeoutsMinutes.default, so Zoom still installs.
+  $limit = 0.0
+  $parsed = [double]::TryParse([string]$Context.Config.timeoutsMinutes.zoom, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$limit)
+  if (-not ($parsed -and $limit -ge 0.001 -and $limit -le 10080)) {
+    Write-SetupLog -Message 'timeoutsMinutes.zoom is missing or not a usable number of minutes; using timeoutsMinutes.default' -Level WARN
+    $limit = [double]$Context.Config.timeoutsMinutes.default
+  }
+
+  $result = Invoke-WingetInstall -Id $id -Source winget -Context $Context -Custom $custom.ToArray() -TimeoutMinutes $limit
   $data = if ($result.Data -is [hashtable]) { $result.Data } else { @{} }
 
   if ($result.Status -eq 'Done' -and $data['AlreadyInstalled'] -eq $true) {

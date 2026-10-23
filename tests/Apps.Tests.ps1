@@ -744,10 +744,24 @@ Describe 'Invoke-StepZoom' {
     $r.Message | Should -BeExactly 'Zoom install timed out'
     $script:activity.Count | Should -Be 0
   }
-  It 'the limit comes from timeoutsMinutes.zoom' {
-    $script:ctx.Config.timeoutsMinutes.zoom = 4
+  It 'the limit comes from timeoutsMinutes.zoom: <Value>' -ForEach @(@{ Value = 4; Minutes = 4 }, @{ Value = 2.5; Minutes = 2.5 }, @{ Value = '6'; Minutes = 6 }) {
+    $script:ctx.Config.timeoutsMinutes.zoom = $Value
     $null = Invoke-StepZoom -Context $script:ctx
-    $script:wingetCalls[0].TimeoutMinutes | Should -Be 4
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be $Minutes
+    @($script:logs | Where-Object { $_.Message -match 'timeoutsMinutes' }).Count | Should -Be 0
+  }
+  # Task 1 review M2: a broken config's limit falls back to timeoutsMinutes.default, with a WARN, so Zoom still
+  # installs instead of failing 'winget could not be started' (or throwing).
+  It 'a timeoutsMinutes.zoom that is <Why> falls back to timeoutsMinutes.default, with a WARN' -ForEach @(
+    @{ Why = 'missing'; Value = 'none' }, @{ Why = '$null'; Value = $null }, @{ Why = '0'; Value = 0 }, @{ Why = 'negative'; Value = -5 }
+    @{ Why = 'not a number'; Value = 'ten' }, @{ Why = 'longer than Invoke-External allows'; Value = 20000 }, @{ Why = 'NaN'; Value = 'NaN' }
+  ) {
+    if ($Value -is [string] -and $Value -eq 'none') { $script:ctx.Config.timeoutsMinutes.PSObject.Properties.Remove('zoom') } else { $script:ctx.Config.timeoutsMinutes.zoom = $Value }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $script:wingetCalls.Count | Should -Be 1
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 30
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' -and $_.Message -match 'timeoutsMinutes\.zoom' }).Count | Should -Be 1
   }
   # Review Focus 3 and final review M3: a refused token is dropped and logged (by position); the Note says only
   # what is true, so it comes only when no token that reaches winget carries AU2_EnableAutoUpdate.
