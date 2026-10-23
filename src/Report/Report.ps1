@@ -109,7 +109,9 @@ function Get-InstalledAppVersions {
     version. The views are read in that order, so a per-machine install wins over a per-user one; within a
     view, an entry matching an earlier pattern wins (Zoom Workplace before Zoom(64bit)). Microsoft 365:
     VersionToReport under ClickToRun\Configuration. An app that is not found is left out. A registry view
-    that cannot be read is a WARN; the rest is still read.
+    that cannot be read is a WARN; the rest is still read. An entry that throws is skipped on its own (one
+    WARN per view): the view's other entries still count. A Craft displayName that is not a valid regex
+    throws only after the entry has counted for the fixed apps and ScreenConnect.
 
     With Config, the Craft apps too: each item of apps.craft.items is reported under its name, from the
     first Uninstall entry that has a version and whose DisplayName matches (-match, case-insensitive) the
@@ -137,22 +139,36 @@ function Get-InstalledAppVersions {
     try {
       # This view's entries that have a name and a version, in registry order, for the fixed apps below.
       $named = New-Object System.Collections.Generic.List[hashtable]
+      # Task 1 review M3: an entry that throws is skipped on its own, so the view's other entries, and the fixed
+      # apps matched after this loop, are still read. One WARN per view, with the count and the first error.
+      $skipped = 0
+      $firstError = ''
       foreach ($entry in @(Get-ItemProperty -Path (Join-Path $key '*') -ErrorAction SilentlyContinue)) {
-        if ($null -eq $entry) { continue }
-        $nameProperty = $entry.PSObject.Properties['DisplayName']
-        $versionProperty = $entry.PSObject.Properties['DisplayVersion']
-        if ($null -eq $nameProperty -or $null -eq $versionProperty) { continue }
-        $version = ([string]$versionProperty.Value).Trim()
-        if ($version -eq '') { continue }
-        $named.Add(@{ Name = [string]$nameProperty.Value; Version = $version })
-        foreach ($item in $craftItems) {
-          if (-not $versions.ContainsKey([string]$item.name) -and [string]$nameProperty.Value -match [string]$item.displayName) {
-            $versions[[string]$item.name] = $version
+        try {
+          if ($null -eq $entry) { continue }
+          $nameProperty = $entry.PSObject.Properties['DisplayName']
+          $versionProperty = $entry.PSObject.Properties['DisplayVersion']
+          if ($null -eq $nameProperty -or $null -eq $versionProperty) { continue }
+          $version = ([string]$versionProperty.Value).Trim()
+          if ($version -eq '') { continue }
+          $named.Add(@{ Name = [string]$nameProperty.Value; Version = $version })
+          if ($screenConnectName -ne '' -and -not $versions.ContainsKey('ScreenConnect') -and [string]$nameProperty.Value -eq $screenConnectName) {
+            $versions['ScreenConnect'] = $version
           }
+          # Last, because a displayName from the config that is not a valid regex throws here: the entry has
+          # already counted for the fixed apps and ScreenConnect.
+          foreach ($item in $craftItems) {
+            if (-not $versions.ContainsKey([string]$item.name) -and [string]$nameProperty.Value -match [string]$item.displayName) {
+              $versions[[string]$item.name] = $version
+            }
+          }
+        } catch {
+          $skipped++
+          if ($skipped -eq 1) { $firstError = ConvertTo-ScreenText $_.Exception.Message }
         }
-        if ($screenConnectName -ne '' -and -not $versions.ContainsKey('ScreenConnect') -and [string]$nameProperty.Value -eq $screenConnectName) {
-          $versions['ScreenConnect'] = $version
-        }
+      }
+      if ($skipped -gt 0) {
+        Write-SetupLog -Message 'Installed program entries could not be read; skipped' -Level WARN -Data @{ key = $key; skipped = $skipped; error = $firstError }
       }
       foreach ($app in $script:ReportedUninstallApps.Keys) {
         if ($versions.ContainsKey($app)) { continue }
