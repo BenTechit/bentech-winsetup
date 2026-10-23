@@ -107,7 +107,8 @@ Describe 'config.json' {
     $cfg.defaults.zoom -is [bool] | Should -BeTrue; $cfg.defaults.zoom | Should -BeFalse
     $cfg.apps.zoom.wingetId | Should -BeExactly 'Zoom.Zoom'
     @($cfg.apps.zoom.custom).Count | Should -Be 1
-    (@($cfg.apps.zoom.custom) -join '|') | Should -BeExactly 'ZConfig=AU2_EnableAutoUpdate=true'
+    # Auto-update on, on Zoom's documented default channel 0 ("slow"): a per-machine install reportedly needs the channel too.
+    (@($cfg.apps.zoom.custom) -join '|') | Should -BeExactly 'ZConfig=AU2_EnableAutoUpdate=true;AU2_SetUpdateChannel=0'
     foreach ($t in @($cfg.apps.zoom.custom)) { Test-WingetCustomToken -Token $t | Should -BeTrue -Because $t }
     $cfg.timeoutsMinutes.zoom | Should -Be 10
     @($cfg.profiles | Where-Object { $null -ne $_.PSObject.Properties['zoom'] }).Count | Should -Be 0 }

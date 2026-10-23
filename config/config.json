@@ -26,7 +26,7 @@
       "sha256": "74E058E0F597CF197132775552FBB6F4BDD21F8A0870E1A638D41A63F7C3FD99",
       "serviceName": "ScreenConnect Client (b58e7c32699a96bf)" },
     "sevenZip": { "wingetId": "7zip.7zip" },
-    "zoom": { "wingetId": "Zoom.Zoom", "custom": ["ZConfig=AU2_EnableAutoUpdate=true"] },
+    "zoom": { "wingetId": "Zoom.Zoom", "custom": ["ZConfig=AU2_EnableAutoUpdate=true;AU2_SetUpdateChannel=0"] },
     "office": {
       "signer": "microsoft", "odtWingetId": "Microsoft.OfficeDeploymentTool",
       "odtSetupPath": "C:\\Program Files\\OfficeDeploymentTool\\setup.exe",

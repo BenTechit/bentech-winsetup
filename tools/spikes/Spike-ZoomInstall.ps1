@@ -2,7 +2,7 @@
 # It installs Zoom per-machine through winget exactly as the setup tool would, then prints what Ben reports back.
 $ErrorActionPreference = 'Continue'
 $start = Get-Date
-winget install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true"
+winget install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true;AU2_SetUpdateChannel=0"
 $code = $LASTEXITCODE
 '--- 1. winget exit code: {0} (0x{1:X8}), {2:N0} s' -f $code, $code, ((Get-Date) - $start).TotalSeconds
 '--- 2. Zoom processes running now (did it open by itself?):'

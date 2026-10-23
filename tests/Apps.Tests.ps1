@@ -721,7 +721,7 @@ Describe 'Invoke-StepZoom' {
     $script:wingetCalls.Count | Should -Be 1
     $script:wingetCalls[0].Id | Should -BeExactly 'Zoom.Zoom'
     $script:wingetCalls[0].Source | Should -BeExactly 'winget'
-    @($script:wingetCalls[0].Custom) | Should -Be @('ZConfig=AU2_EnableAutoUpdate=true')
+    @($script:wingetCalls[0].Custom) | Should -Be @('ZConfig=AU2_EnableAutoUpdate=true;AU2_SetUpdateChannel=0')
     $script:wingetCalls[0].TimeoutMinutes | Should -Be 10
   }
   It 'writes its version when it is known, as 7-Zip does' {
