@@ -93,6 +93,45 @@ Describe 'Get-WingetInstallArgs' {
   It 'rejects an unknown source' {
     { Get-WingetInstallArgs -Id '7zip.7zip' -Source 'evil' } | Should -Throw
   }
+
+  # Zoom spec 3.2: the signed config's custom tokens travel as one quoted --custom value.
+  It 'appends one quoted --custom value for a custom token' {
+    Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true' |
+      Should -BeExactly 'install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true"'
+  }
+  It 'joins two custom tokens with one space' {
+    Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true', 'ZSSOHOST=x' |
+      Should -BeExactly 'install --id Zoom.Zoom -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --custom "ZConfig=AU2_EnableAutoUpdate=true ZSSOHOST=x"'
+  }
+  It 'throws for a custom token that could change the command line, and never echoes it: <t>' -ForEach @(
+    @{ t = 'ZConfig="x" & calc' }, @{ t = 'A B=c' }, @{ t = '=x' }, @{ t = '' }
+  ) {
+    $err = $null
+    try { Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'A=b', $t } catch { $err = $_.Exception.Message }
+    $err | Should -Not -BeNullOrEmpty
+    if ($t -ne '') { $err | Should -Not -Match ([regex]::Escape($t)) }
+  }
+  It 'without -Custom, or with an empty list, the args are byte-identical to today''s' {
+    $today = 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+    Get-WingetInstallArgs -Id '7zip.7zip' | Should -BeExactly $today
+    Get-WingetInstallArgs -Id '7zip.7zip' -Custom @() | Should -BeExactly $today
+    Get-WingetInstallArgs -Id '9WZDNCRFJ4MV' -Source msstore | Should -BeExactly ($today -replace '7zip\.7zip', '9WZDNCRFJ4MV' -replace '--source winget', '--source msstore')
+  }
+}
+
+Describe 'Test-WingetCustomToken' {
+  It 'accepts <t>' -ForEach @(@{ t = 'ZConfig=AU2_EnableAutoUpdate=true' }, @{ t = 'A=b;c=d' }, @{ t = 'NAME_1=x_2' }) {
+    Test-WingetCustomToken -Token $t | Should -BeTrue
+  }
+  It 'refuses <Why>' -ForEach @(
+    @{ Why = 'a quote and an ampersand'; t = 'ZConfig="x" & calc' }, @{ Why = 'a space'; t = 'A B=c' }, @{ Why = 'no name'; t = '=x' }
+    @{ Why = 'no value'; t = 'A=' }, @{ Why = 'no equals sign'; t = 'ABC' }, @{ Why = 'a leading dash'; t = '-A=b' }
+    @{ Why = 'a slash'; t = 'A=/b' }, @{ Why = 'a trailing newline'; t = "A=b`n" }, @{ Why = 'empty'; t = '' }, @{ Why = '$null'; t = $null }
+    @{ Why = 'a Kelvin sign (a letter only a case-insensitive match takes for k)'; t = ('A=' + [char]0x212A) }
+    @{ Why = 'a Hebrew letter'; t = ('A=' + [char]0x05D0) }
+  ) {
+    Test-WingetCustomToken -Token $t | Should -BeFalse
+  }
 }
 
 Describe 'Get-WingetUninstallArgs' {
@@ -296,6 +335,53 @@ Describe 'Invoke-WingetInstall' {
     $r = Invoke-WingetInstall -Id $id -Context $ctx
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Match 'invalid winget package id'
+    $extCalls.Count | Should -Be 0
+  }
+
+  # Zoom spec 3.2: custom args and a per-call limit; the already-installed and timed-out answers carry Data.
+  It 'passes the custom tokens on the command line and -TimeoutMinutes to Invoke-External' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true' -TimeoutMinutes 10 -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -Be 'Zoom.Zoom: installed'
+    $extCalls.Count | Should -Be 1
+    $extCalls[0].ArgumentList | Should -BeExactly (Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'ZConfig=AU2_EnableAutoUpdate=true')
+    $extCalls[0].TimeoutMinutes | Should -Be 10
+  }
+  It 'without -TimeoutMinutes it waits timeoutsMinutes.default, and without -Custom it runs today''s command line' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    $extCalls[0].TimeoutMinutes | Should -Be 7
+    $extCalls[0].ArgumentList | Should -BeExactly 'install --id 7zip.7zip -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity'
+  }
+  It 'the source reset and the retry keep the given limit and the custom tokens' {
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult 0))
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'A=b' -TimeoutMinutes 10 -Context $ctx).Status | Should -Be 'Done'
+    @($extCalls.TimeoutMinutes) | Should -Be @(10, 10, 10)
+    $extCalls[2].ArgumentList | Should -BeExactly (Get-WingetInstallArgs -Id 'Zoom.Zoom' -Custom 'A=b')
+  }
+  It 'a Done from 0x8A150061 (already installed) carries Data.AlreadyInstalled; a plain 0 does not' {
+    Set-ExternalQueue @(New-ExternalResult -1978335135)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx
+    $r.Status | Should -Be 'Done'
+    $r.Data.AlreadyInstalled | Should -BeTrue
+    Set-ExternalQueue @(New-ExternalResult 0)
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.Contains('AlreadyInstalled') | Should -BeFalse
+  }
+  It 'a timed-out run carries Data.TimedOut, on the first run and on the retry' {
+    Set-ExternalQueue @(New-ExternalResult $null $true)
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -TimeoutMinutes 10 -Context $ctx
+    $r.Status | Should -Be 'Failed'; $r.Message | Should -Be 'Zoom.Zoom: winget timed out'; $r.Data.TimedOut | Should -BeTrue
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 0), (New-ExternalResult $null $true))
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.TimedOut | Should -BeTrue
+    Set-ExternalQueue @(New-ExternalResult 0x8A15001E)
+    (Invoke-WingetInstall -Id 'Zoom.Zoom' -Context $ctx).Data.Contains('TimedOut') | Should -BeFalse
+  }
+  It 'returns Failed (it does not throw) for a custom token that fails the pattern, runs nothing and never echoes it' {
+    Set-ExternalQueue @()
+    $r = Invoke-WingetInstall -Id 'Zoom.Zoom' -Custom 'A=b', 'ZConfig="x" & calc' -Context $ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: invalid winget custom argument'
     $extCalls.Count | Should -Be 0
   }
 }

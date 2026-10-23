@@ -56,10 +56,16 @@ Describe 'ConvertTo-ValidChoices (toolbox spec 5.2)' {
     $r.Choices.SevenZip | Should -BeTrue; $r.Choices.Profile | Should -BeExactly ''; $r.Choices.RestorePoint | Should -BeTrue
     $r.Choices.WindowsUpdate | Should -BeExactly 'FULL'
     @($r.Choices.Tweaks) | Should -Be @('noAds', 'classicOutlook'); @($r.Dropped) | Should -Be @('widgets') }
-  It 'keeps DRIVERS in any case and returns exactly eight keys' {
+  It 'keeps DRIVERS in any case and returns exactly nine keys' {
     $c = New-DefaultChoices -Machine $m -Config $cfg; $c.WindowsUpdate = 'drivers'
     $r = ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m; $r.Choices.WindowsUpdate | Should -BeExactly 'DRIVERS'
-    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate') }
+    @($r.Choices.Keys | Sort-Object) | Should -Be @('Mode', 'Office', 'Profile', 'Remote', 'RestorePoint', 'SevenZip', 'Tweaks', 'WindowsUpdate', 'Zoom') }
+  It 'Zoom is Test-ZoomChosen: only the bool $true stays on; <Why> is $false (zoom spec 3.1)' -ForEach @(
+    @{ Why = 'a missing key'; V = 'none' }, @{ Why = 'the string true'; V = 'true' }, @{ Why = 'the number 1'; V = 1 }, @{ Why = '$null'; V = $null }, @{ Why = '$false'; V = $false }) {
+    $c = New-DefaultChoices -Machine $m -Config $cfg; if ($V -is [string] -and $V -eq 'none') { $c.Remove('Zoom') } else { $c.Zoom = $V }
+    $z = (ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m).Choices.Zoom
+    $z | Should -BeOfType [bool]; $z | Should -BeFalse
+    $c.Zoom = $true; (ConvertTo-ValidChoices -Choices $c -Config $cfg -Machine $m).Choices.Zoom | Should -BeTrue }
   It 'keeps only ASCII ids in the Choices (nothing Hebrew reaches state.json or setup.log)' {
     $r = ConvertTo-ValidChoices -Choices (New-DefaultChoices -Machine $m -Config $cfg) -Config $cfg -Machine $m
     ($r.Choices | ConvertTo-Json -Compress) | Should -Not -Match '[^\x00-\x7F]' }
@@ -77,6 +83,35 @@ Describe 'Test-ProfileChanged (spec 10b.6)' {
     $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty windowsUpdate 'FULL'
     $c.WindowsUpdate = 'DRIVERS'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
     $c.WindowsUpdate = 'FULL'; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
+  It 'Zoom on is no change for a profile that does not set zoom (Review Focus 5)' { $c.Zoom = $true; Test-ProfileChanged -Choices $c -Config $cfg -Machine $m | Should -BeFalse }
+  It 'a profile that sets zoom: another value is a change, its own is not; a missing Zoom reads $false' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.profiles[0] | Add-Member NoteProperty zoom $true
+    $c.Zoom = $false; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.Remove('Zoom'); Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeTrue
+    $c.Zoom = $true; Test-ProfileChanged -Choices $c -Config $x -Machine $m | Should -BeFalse }
+}
+Describe 'Zoom in the profiles and the default choices (zoom spec 3.1)' {
+  It 'the shipped profiles do not set zoom: no Zoom key among their choices, and $null in Get-SetupProfiles' {
+    foreach ($p in @(Get-SetupProfiles -Config $cfg)) { $p.Contains('Zoom') | Should -BeTrue; $p.Zoom | Should -BeNullOrEmpty }
+    foreach ($id in 'home', 'business', 'clean') { (Get-ProfileChoices -Config $cfg -ProfileId $id).Contains('Zoom') | Should -BeFalse -Because $id } }
+  It 'a profile with "zoom": true or false sets it; a value that is not a bool does not' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $x.profiles[0] | Add-Member NoteProperty zoom $true; $x.profiles[1] | Add-Member NoteProperty zoom $false; $x.profiles[2] | Add-Member NoteProperty zoom 'true'
+    (Get-ProfileChoices -Config $x -ProfileId 'home').Zoom | Should -BeTrue
+    $b = Get-ProfileChoices -Config $x -ProfileId 'business'; $b.Contains('Zoom') | Should -BeTrue; $b.Zoom | Should -BeFalse
+    (Get-ProfileChoices -Config $x -ProfileId 'clean').Contains('Zoom') | Should -BeFalse
+    @(Get-SetupProfiles -Config $x)[2].Zoom | Should -BeNullOrEmpty }
+  It 'New-DefaultChoices opens with Zoom off (Q49)' {
+    $d = New-DefaultChoices -Machine $m -Config $cfg; $d.Zoom | Should -BeOfType [bool]; $d.Zoom | Should -BeFalse }
+  It 'New-DefaultChoices takes defaults.zoom only when it is the bool true' -ForEach @(
+    @{ V = $true; E = $true }, @{ V = $false; E = $false }, @{ V = 'true'; E = $false }, @{ V = 1; E = $false }, @{ V = $null; E = $false }) {
+    $x = [pscustomobject]@{ defaults = [pscustomobject]@{ sevenZip = $true; office = 'CRAFT'; zoom = $V } }
+    $z = (New-DefaultChoices -Machine $m -Config $x).Zoom; $z | Should -BeOfType [bool]; $z | Should -Be $E }
+  It 'a default profile that sets zoom wins over defaults.zoom; one that does not leaves it' {
+    $x = $cfg | ConvertTo-Json -Depth 20 | ConvertFrom-Json; $x.defaults.zoom = $true
+    (New-DefaultChoices -Machine $m -Config $x).Zoom | Should -BeTrue
+    $x.profiles[0] | Add-Member NoteProperty zoom $false
+    (New-DefaultChoices -Machine $m -Config $x).Zoom | Should -BeFalse }
 }
 Describe 'New-ToolboxModel and Get-ToolboxPlanLines' {
   It 'opens on the default profile in the configured language' {

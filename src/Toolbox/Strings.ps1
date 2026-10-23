@@ -65,6 +65,7 @@ $script:ToolboxStrings = @{
     'step.anydesk'          = 'AnyDesk'
     'step.screenconnect'    = 'ScreenConnect'
     'step.7zip'             = '7-Zip'
+    'step.zoom'             = 'Zoom'
     'step.craft-apps'       = 'Craft apps'
     'step.default-browser'  = 'Chrome as default browser'
     'step.vendor-pass1'     = 'Vendor drivers + BIOS (pass 1)'
@@ -129,6 +130,7 @@ $script:ToolboxStrings = @{
     'step.screenconnect'    = 'ScreenConnect'
     # A left-to-right mark first: in a right-to-left row the '-' would otherwise turn "7-Zip" into "Zip-7".
     'step.7zip'             = ([string][char]0x200E + '7-Zip')
+    'step.zoom'             = 'Zoom'
     'step.craft-apps'       = 'אפליקציות Craft'
     'step.default-browser'  = 'Chrome כדפדפן ברירת המחדל'
     'step.vendor-pass1'     = 'דרייברי יצרן ו-BIOS (סבב 1)'

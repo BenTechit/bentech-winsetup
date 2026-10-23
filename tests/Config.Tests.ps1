@@ -102,6 +102,15 @@ Describe 'config.json' {
   It 'pins defaults.windowsUpdate FULL; no shipped profile sets windowsUpdate (wu spec 3.1, Q37)' {
     $cfg.defaults.windowsUpdate | Should -BeExactly 'FULL'
     @($cfg.profiles | Where-Object { $null -ne $_.PSObject.Properties['windowsUpdate'] }).Count | Should -Be 0 }
+  It 'pins the Zoom values: off by default, Zoom.Zoom, the auto-update token, a 10-minute bound; no profile sets zoom (zoom spec 3.1, 3.2, Q49, Q55)' {
+    . "$PSScriptRoot\..\src\Steps\Winget.ps1"   # Test-WingetCustomToken
+    $cfg.defaults.zoom -is [bool] | Should -BeTrue; $cfg.defaults.zoom | Should -BeFalse
+    $cfg.apps.zoom.wingetId | Should -BeExactly 'Zoom.Zoom'
+    @($cfg.apps.zoom.custom).Count | Should -Be 1
+    (@($cfg.apps.zoom.custom) -join '|') | Should -BeExactly 'ZConfig=AU2_EnableAutoUpdate=true'
+    foreach ($t in @($cfg.apps.zoom.custom)) { Test-WingetCustomToken -Token $t | Should -BeTrue -Because $t }
+    $cfg.timeoutsMinutes.zoom | Should -Be 10
+    @($cfg.profiles | Where-Object { $null -ne $_.PSObject.Properties['zoom'] }).Count | Should -Be 0 }
   It 'lists the nine shipped tweaks with their defaults and rules (spec 6.3, Q27: file extensions off everywhere)' {
     @($cfg.tweaks | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.id, $_.default, [bool]$_.desktopOnly, [bool]$_.office365Only, [int]$_.minBuild }) | Should -Be @(
       'accessKeys|True|False|False|0', 'numLock|True|True|False|0', 'startClean|True|False|False|0', 'noAds|True|False|False|0',

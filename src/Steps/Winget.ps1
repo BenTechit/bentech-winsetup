@@ -80,21 +80,49 @@ function Test-WingetPackageId {
   return ($Id -match '^[A-Za-z0-9][A-Za-z0-9._-]*\z')
 }
 
+function Test-WingetCustomToken {
+  <#
+  .SYNOPSIS
+    $true when Token may travel on winget's --custom argument: NAME=VALUE, a name of letters, digits and
+    '_', a value of letters, digits, '_', '=' and ';' (zoom spec 3.2).
+  .DESCRIPTION
+    The tokens are spliced into one quoted command-line value, so anything else (a quote, a space, '&', a
+    leading '-', a non-ASCII letter) is refused. -cmatch, not -match: a case-insensitive [A-Za-z] also
+    takes the Kelvin sign (U+212A) for a k. \z, not $, so a trailing newline does not pass.
+  #>
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param([AllowNull()][AllowEmptyString()][string]$Token)
+
+  return ($Token -cmatch '^[A-Za-z0-9_]+=[A-Za-z0-9_=;]+\z')
+}
+
 function Get-WingetInstallArgs {
   <#
   .SYNOPSIS
     The winget command line for a silent, non-interactive install. Throws for an id that is not a
-    plain package id.
+    plain package id, or for a custom token that fails Test-WingetCustomToken.
+  .DESCRIPTION
+    Custom (zoom spec 3.2): tokens from the signed config that winget adds to the installer's command
+    line. Joined with one space and passed as one quoted value, ` --custom "<tokens>"`, only when at
+    least one token is given; without them the command line is exactly what it always was. The error
+    never repeats a refused token.
   #>
   [CmdletBinding()]
   [OutputType([string])]
   param(
     [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Id,
-    [ValidateSet('winget', 'msstore')][string]$Source = 'winget'
+    [ValidateSet('winget', 'msstore')][string]$Source = 'winget',
+    [string[]]$Custom
   )
 
   if (-not (Test-WingetPackageId -Id $Id)) { throw "invalid winget package id '$Id'" }
-  return "install --id $Id -e --source $Source --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
+  $line = "install --id $Id -e --source $Source --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
+  if ($null -eq $Custom -or $Custom.Count -eq 0) { return $line }
+  foreach ($token in $Custom) {
+    if (-not (Test-WingetCustomToken -Token $token)) { throw 'invalid winget custom argument' }
+  }
+  return $line + ' --custom "' + ($Custom -join ' ') + '"'
 }
 
 function Get-WingetUninstallArgs {
@@ -195,11 +223,14 @@ function Invoke-WingetOperation {
   .SYNOPSIS
     Private. Runs one winget install or uninstall and turns its exit code into a StepResult.
   .DESCRIPTION
-    The timeout is timeoutsMinutes.default. Output is captured only so a short tail can be logged
-    when the run fails; it is never parsed (Windows may be Hebrew). 0x8A15000F ("source data
-    missing") runs `winget source reset --force` once (same timeout) and repeats the command
-    once; a second 0x8A15000F is a failure. A "done, reboot needed" is Done with Reboot 'None': the
-    Windows Update loop reboots. A program that cannot be started is a Failed result, not a throw.
+    The timeout is TimeoutMinutes when given, else timeoutsMinutes.default. Output is captured only so
+    a short tail can be logged when the run fails; it is never parsed (Windows may be Hebrew).
+    0x8A15000F ("source data missing") runs `winget source reset --force` once (same timeout) and
+    repeats the command once; a second 0x8A15000F is a failure. A "done, reboot needed" is Done with
+    Reboot 'None': the Windows Update loop reboots. A program that cannot be started is a Failed
+    result, not a throw. Two answers carry Data for the caller (zoom spec 3.2): a Done from 0x8A150061
+    (the package was already installed and winget ran nothing) has @{ AlreadyInstalled = $true }, and
+    a run that timed out has @{ TimedOut = $true }.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
@@ -207,13 +238,15 @@ function Invoke-WingetOperation {
     [Parameter(Mandatory)][string]$Id,
     [Parameter(Mandatory)][ValidateSet('install', 'uninstall')][string]$Verb,
     [Parameter(Mandatory)][string]$ArgumentList,
-    [Parameter(Mandatory)][hashtable]$Context
+    [Parameter(Mandatory)][hashtable]$Context,
+    [Nullable[double]]$TimeoutMinutes
   )
 
   $winget = Get-WingetPath
   if (-not $winget) { return New-StepResult -Status Failed -Message 'winget unavailable' }
 
   $timeout = [double]$Context.Config.timeoutsMinutes.default
+  if ($null -ne $TimeoutMinutes) { $timeout = [double]$TimeoutMinutes }
   $resetDone = $false
   while ($true) {
     try {
@@ -222,7 +255,7 @@ function Invoke-WingetOperation {
       Write-SetupLog -Message "winget $Verb could not be started" -Level ERROR -Data @{ id = $Id; winget = $winget; error = $_.Exception.Message }
       return New-StepResult -Status Failed -Message "${Id}: winget could not be started"
     }
-    if ($run.TimedOut) { return New-StepResult -Status Failed -Message "${Id}: winget timed out" }
+    if ($run.TimedOut) { return New-StepResult -Status Failed -Message "${Id}: winget timed out" -Data @{ TimedOut = $true } }
     if ($null -eq $run.ExitCode) { return New-StepResult -Status Failed -Message "${Id}: winget returned no exit code" }
 
     $outcome = Convert-WingetExitCode -ExitCode $run.ExitCode
@@ -243,7 +276,11 @@ function Invoke-WingetOperation {
     switch ($outcome) {
       'Done' {
         $doneText = if ($Verb -eq 'install') { 'installed' } else { 'uninstalled' }
-        return New-StepResult -Status Done -Message "${Id}: $doneText"
+        # 0x8A150061: already installed, nothing ran (so no custom argument was applied). The message stays
+        # as it always was; the caller that cares reads Data.
+        $data = @{}
+        if ((Format-WingetExitCode -ExitCode $run.ExitCode) -ceq '0x8A150061') { $data['AlreadyInstalled'] = $true }
+        return New-StepResult -Status Done -Message "${Id}: $doneText" -Data $data
       }
       'DoneReboot' {
         $doneText = if ($Verb -eq 'install') { 'installed' } else { 'uninstalled' }
@@ -271,19 +308,29 @@ function Invoke-WingetInstall {
     Failed('winget unavailable') when winget is missing; Failed('<id>: winget 0x<code>') for an
     unexpected exit code; Failed('<id>: winget timed out'); Skipped when winget has no package or
     installer for this system. A package id that is not a plain id (or an unknown source) is a
-    Failed result and nothing is run. See Invoke-WingetOperation for the source-reset retry.
+    Failed result and nothing is run. See Invoke-WingetOperation for the source-reset retry and the
+    Data of an already-installed or timed-out answer.
+    Custom and TimeoutMinutes (zoom spec 3.2): the tokens for winget's --custom argument
+    (Get-WingetInstallArgs) and this call's own limit instead of timeoutsMinutes.default. A custom
+    token that fails Test-WingetCustomToken is a Failed result and nothing is run (the message does not
+    repeat it). Without them the call is exactly what it always was.
   #>
   [CmdletBinding()]
   [OutputType([pscustomobject])]
   param(
     [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Id,
     [string]$Source = 'winget',
-    [Parameter(Mandatory)][hashtable]$Context
+    [Parameter(Mandatory)][hashtable]$Context,
+    [string[]]$Custom,
+    [Nullable[double]]$TimeoutMinutes
   )
 
   if (-not (Test-WingetPackageId -Id $Id)) { return New-StepResult -Status Failed -Message "invalid winget package id '$Id'" }
   if ($Source -notin 'winget', 'msstore') { return New-StepResult -Status Failed -Message "${Id}: invalid winget source '$Source'" }
-  Invoke-WingetOperation -Id $Id -Verb install -ArgumentList (Get-WingetInstallArgs -Id $Id -Source $Source) -Context $Context
+  foreach ($token in $Custom) {
+    if (-not (Test-WingetCustomToken -Token $token)) { return New-StepResult -Status Failed -Message "${Id}: invalid winget custom argument" }
+  }
+  Invoke-WingetOperation -Id $Id -Verb install -ArgumentList (Get-WingetInstallArgs -Id $Id -Source $Source -Custom $Custom) -Context $Context -TimeoutMinutes $TimeoutMinutes
 }
 
 function Invoke-WingetUninstall {

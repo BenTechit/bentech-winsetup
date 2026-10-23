@@ -1,5 +1,6 @@
 ﻿# src/Steps/Apps.ps1
-# Steps 7-9 (spec 8.3): Google Chrome, AnyDesk and 7-Zip. Needs StepResult.ps1, Logging.ps1, Process.ps1,
+# Steps 7-9 (spec 8.3): Google Chrome, AnyDesk and 7-Zip, and the optional Zoom (zoom spec 3.2, winget like 7-Zip).
+# Needs StepResult.ps1, Logging.ps1, Process.ps1,
 # Download.ps1, Config.ps1 (Get-Signers) and Winget.ps1 (Invoke-WingetInstall); the bundle holds every file.
 # Office.ps1 and DefaultBrowser.ps1 also use Test-ChromeInstalled and Write-TextFileUtf8NoBom from here.
 #
@@ -369,5 +370,65 @@ function Invoke-StepSevenZip {
 
   $result = Invoke-WingetInstall -Id ([string]$Context.Config.apps.sevenZip.wingetId) -Source winget -Context $Context
   if ($result.Status -eq 'Done') { Add-SetupActivity -Text ((Get-AppLabel -Name '7-Zip') + ' installed') }
+  return $result
+}
+
+# --- Zoom (zoom spec 3.2) ---------------------------------------------------------------------
+
+function Invoke-StepZoom {
+  <#
+  .SYNOPSIS
+    Installs Zoom per-machine with winget (apps.zoom.wingetId), auto-update on. Returns a StepResult.
+  .DESCRIPTION
+    Like 7-Zip: winget's hash check against the manifest is the integrity check. The signed config's
+    apps.zoom.custom tokens (Zoom's ZConfig MSI property, Q50) travel on winget's --custom argument; each
+    is checked with Test-WingetCustomToken first, and one that fails is dropped and logged by its position,
+    never by its text. The run waits at most timeoutsMinutes.zoom, so a msiexec help box from a wrong token
+    costs minutes, not timeoutsMinutes.default.
+      - A fresh install is Done (winget's result) with the activity line '<Zoom [version]> installed'. When a
+        token was missing or dropped Zoom still installs, with the yellow Note 'Zoom auto-update not set'.
+      - Already installed (winget 0x8A150061: nothing ran, so auto-update was not touched) is Done
+        '<id>: already installed' with the Note 'Zoom was already installed: auto-update not changed' and the
+        activity line 'Zoom already installed'. A customer's own per-user Zoom is left alone.
+      - A timed-out install is Failed 'Zoom install timed out'.
+      - Anything else (another Failed, Skipped) is winget's own result, unchanged; a failure is red.
+    It never opens Zoom, signs in, or creates or removes shortcuts (Q52).
+  #>
+  [CmdletBinding()]
+  [OutputType([pscustomobject])]
+  param([Parameter(Mandatory)][hashtable]$Context)
+
+  $zoom = $Context.Config.apps.zoom
+  $id = [string]$zoom.wingetId
+  $given = @()
+  if ($null -ne $zoom) {
+    $property = $zoom.PSObject.Properties['custom']
+    if ($null -ne $property -and $null -ne $property.Value) { $given = @($property.Value) }
+  }
+  $custom = New-Object System.Collections.Generic.List[string]
+  $dropped = New-Object System.Collections.Generic.List[int]
+  for ($i = 0; $i -lt $given.Count; $i++) {
+    if ($given[$i] -is [string] -and (Test-WingetCustomToken -Token $given[$i])) { $custom.Add($given[$i]) } else { $dropped.Add($i) }
+  }
+  $autoUpdateSet = ($custom.Count -gt 0) -and ($dropped.Count -eq 0)
+  if (-not $autoUpdateSet) {
+    Write-SetupLog -Message 'Zoom auto-update arguments are missing or refused; Zoom installs without them' -Level WARN -Data @{ given = $given.Count; droppedPositions = ($dropped.ToArray() -join ',') }
+  }
+
+  $result = Invoke-WingetInstall -Id $id -Source winget -Context $Context -Custom $custom.ToArray() -TimeoutMinutes ([double]$Context.Config.timeoutsMinutes.zoom)
+  $data = if ($result.Data -is [hashtable]) { $result.Data } else { @{} }
+
+  if ($result.Status -eq 'Done' -and $data['AlreadyInstalled'] -eq $true) {
+    Add-SetupActivity -Text 'Zoom already installed'
+    return New-StepResult -Status Done -Message "${id}: already installed" -Notes @('Zoom was already installed: auto-update not changed') -Data @{ AlreadyInstalled = $true }
+  }
+  if ($result.Status -eq 'Done') {
+    Add-SetupActivity -Text ((Get-AppLabel -Name 'Zoom') + ' installed')
+    if ($autoUpdateSet) { return $result }
+    return New-StepResult -Status Done -Message $result.Message -Reboot $result.Reboot -Notes (@($result.Notes) + 'Zoom auto-update not set') -Errors $result.Errors -Data $data
+  }
+  if ($result.Status -eq 'Failed' -and $data['TimedOut'] -eq $true) {
+    return New-StepResult -Status Failed -Message 'Zoom install timed out' -Data @{ TimedOut = $true }
+  }
   return $result
 }

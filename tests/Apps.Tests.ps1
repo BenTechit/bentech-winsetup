@@ -126,7 +126,7 @@ BeforeAll {
       return (-not ($script:sigBad -contains (Split-Path -Leaf $Path)))
     }
     Mock Invoke-WingetInstall {
-      [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source })
+      [void]$script:wingetCalls.Add(@{ Id = $Id; Source = $Source; Custom = $Custom; TimeoutMinutes = $TimeoutMinutes })
       return $script:wingetResult
     }
     Mock Get-ItemProperty {
@@ -686,6 +686,95 @@ Describe 'Invoke-StepSevenZip' {
   It 'a skipped winget install writes no line' {
     $script:wingetResult = New-StepResult -Status Skipped -Message '7zip.7zip: no package or installer for this system'
     $null = Invoke-StepSevenZip -Context $script:ctx
+    $script:activity.Count | Should -Be 0
+  }
+  It 'calls winget exactly as before: no custom tokens, the default limit' {
+    $null = Invoke-StepSevenZip -Context $script:ctx
+    $script:wingetCalls[0].Custom | Should -BeNullOrEmpty
+    $script:wingetCalls[0].TimeoutMinutes | Should -BeNullOrEmpty
+  }
+}
+
+# --- Invoke-StepZoom (zoom spec 3.2) ------------------------------------------------------------
+Describe 'Invoke-StepZoom' {
+  BeforeEach {
+    Initialize-AppMocks
+    $script:ctx = New-AppContext -Dir (New-TestDir)
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed'
+  }
+  It 'a fresh install: Done, no Note, the activity line; winget gets Zoom.Zoom, the config''s tokens and the 10-minute limit' {
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: installed'
+    @($r.Notes).Count | Should -Be 0
+    @($r.Errors).Count | Should -Be 0
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+    $script:wingetCalls.Count | Should -Be 1
+    $script:wingetCalls[0].Id | Should -BeExactly 'Zoom.Zoom'
+    $script:wingetCalls[0].Source | Should -BeExactly 'winget'
+    @($script:wingetCalls[0].Custom) | Should -Be @('ZConfig=AU2_EnableAutoUpdate=true')
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 10
+  }
+  It 'writes its version when it is known, as 7-Zip does' {
+    Mock Get-InstalledAppVersions { @{ 'Zoom' = '6.6.0.1234' } }
+    $null = Invoke-StepZoom -Context $script:ctx
+    @($script:activity.Text) | Should -Be @('Zoom 6.6.0.1234 installed')
+  }
+  It 'already installed (0x8A150061): Done, the yellow Note, the already-installed line, no claim of a fresh install (Review Focus 1)' {
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: already installed'
+    @($r.Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+    @($script:activity.Text) | Should -Be @('Zoom already installed')
+  }
+  It 'a timed-out install is Failed "Zoom install timed out", with no activity line (Review Focus 2)' {
+    $script:wingetResult = New-StepResult -Status Failed -Message 'Zoom.Zoom: winget timed out' -Data @{ TimedOut = $true }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom install timed out'
+    $script:activity.Count | Should -Be 0
+  }
+  It 'the limit comes from timeoutsMinutes.zoom' {
+    $script:ctx.Config.timeoutsMinutes.zoom = 4
+    $null = Invoke-StepZoom -Context $script:ctx
+    $script:wingetCalls[0].TimeoutMinutes | Should -Be 4
+  }
+  It 'a config with <Why>: Zoom installs with the good tokens only, and the Note (Review Focus 3)' -ForEach @(
+    @{ Why = 'no custom';                         Custom = 'none';                                                            Kept = @() }
+    @{ Why = 'an empty custom list';              Custom = @();                                                               Kept = @() }
+    @{ Why = 'one bad token among good ones';     Custom = @('ZConfig=AU2_EnableAutoUpdate=true', 'ZConfig="x" & calc', 'B=c'); Kept = @('ZConfig=AU2_EnableAutoUpdate=true', 'B=c') }
+    @{ Why = 'a token that is not a string';      Custom = @(5, 'A=b');                                                       Kept = @('A=b') }
+    @{ Why = 'a null token';                      Custom = @($null, 'A=b');                                                   Kept = @('A=b') }
+  ) {
+    if ($Custom -is [string] -and $Custom -eq 'none') { $script:ctx.Config.apps.zoom.PSObject.Properties.Remove('custom') } else { $script:ctx.Config.apps.zoom.custom = $Custom }
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r.Status | Should -Be 'Done'
+    @($r.Notes) | Should -Be @('Zoom auto-update not set')
+    $script:wingetCalls.Count | Should -Be 1
+    (@($script:wingetCalls[0].Custom) -join '|') | Should -BeExactly (@($Kept) -join '|')
+    @($script:activity.Text) | Should -Be @('Zoom installed')
+    # A dropped token is logged by position, never by its text.
+    ($script:logs | ConvertTo-Json -Depth 5) | Should -Not -Match 'calc'
+    @($script:logs | Where-Object { $_.Level -eq 'WARN' }).Count | Should -Be 1
+  }
+  It 'already installed with a broken config: only the already-installed Note' {
+    $script:ctx.Config.apps.zoom.custom = @('A B=c')
+    $script:wingetResult = New-StepResult -Status Done -Message 'Zoom.Zoom: installed' -Data @{ AlreadyInstalled = $true }
+    @((Invoke-StepZoom -Context $script:ctx).Notes) | Should -Be @('Zoom was already installed: auto-update not changed')
+  }
+  It 'another winget failure is passed through unchanged: winget''s own message, red' {
+    $script:wingetResult = New-StepResult -Status Failed -Message 'Zoom.Zoom: winget 0x8A15001E'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r | Should -Be $script:wingetResult
+    $r.Status | Should -Be 'Failed'
+    $r.Message | Should -BeExactly 'Zoom.Zoom: winget 0x8A15001E'
+    $script:activity.Count | Should -Be 0
+  }
+  It 'a skipped winget install is passed through, with no activity line' {
+    $script:wingetResult = New-StepResult -Status Skipped -Message 'Zoom.Zoom: no package or installer for this system'
+    $r = Invoke-StepZoom -Context $script:ctx
+    $r | Should -Be $script:wingetResult
     $script:activity.Count | Should -Be 0
   }
 }

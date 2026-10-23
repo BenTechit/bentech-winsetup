@@ -28,11 +28,15 @@ $script:UninstallRegistryKeys = @(
   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
 )
 
-# The name the report uses -> the DisplayName pattern of its Uninstall entry.
+# The name the report uses -> the DisplayName pattern of its Uninstall entry, or several patterns tried in order
+# (within one registry view, an entry matching an earlier pattern wins).
 $script:ReportedUninstallApps = [ordered]@{
   'Google Chrome' = 'Google Chrome*'
   'AnyDesk'       = 'AnyDesk*'
   '7-Zip'         = '7-Zip*'
+  # Zoom's per-machine names (zoom spec 3.3): Zoom Workplace, then the older builds' names. Never a bare Zoom*,
+  # which could match another product (an Outlook plug-in, Zoom Rooms).
+  'Zoom'          = @('Zoom Workplace*', 'Zoom(64bit)*', 'Zoom (64-bit)*')
 }
 $script:ReportedOfficeName = 'Microsoft 365'
 
@@ -99,11 +103,13 @@ function Get-InstalledAppVersions {
   .SYNOPSIS
     The versions of the apps this tool installs, as @{ <name> = <version> }. Read-only; never throws.
   .DESCRIPTION
-    Google Chrome, AnyDesk and 7-Zip: DisplayVersion of the first Uninstall entry (64-bit view, then
+    Google Chrome, AnyDesk, 7-Zip and Zoom: DisplayVersion of the first Uninstall entry (64-bit view, then
     the 32-bit WOW6432Node view, then the per-user HKCU view) whose DisplayName matches 'Google Chrome*',
-    'AnyDesk*' or '7-Zip*' and that has a version. Microsoft 365: VersionToReport under
-    ClickToRun\Configuration. An app that is not found is left out. A registry view that cannot be read
-    is a WARN; the rest is still read.
+    'AnyDesk*', '7-Zip*' or, for Zoom, 'Zoom Workplace*', 'Zoom(64bit)*' or 'Zoom (64-bit)*', and that has a
+    version. The views are read in that order, so a per-machine install wins over a per-user one; within a
+    view, an entry matching an earlier pattern wins (Zoom Workplace before Zoom(64bit)). Microsoft 365:
+    VersionToReport under ClickToRun\Configuration. An app that is not found is left out. A registry view
+    that cannot be read is a WARN; the rest is still read.
 
     With Config, the Craft apps too: each item of apps.craft.items is reported under its name, from the
     first Uninstall entry that has a version and whose DisplayName matches (-match, case-insensitive) the
@@ -129,6 +135,8 @@ function Get-InstalledAppVersions {
   $versions = @{}
   foreach ($key in $script:UninstallRegistryKeys) {
     try {
+      # This view's entries that have a name and a version, in registry order, for the fixed apps below.
+      $named = New-Object System.Collections.Generic.List[hashtable]
       foreach ($entry in @(Get-ItemProperty -Path (Join-Path $key '*') -ErrorAction SilentlyContinue)) {
         if ($null -eq $entry) { continue }
         $nameProperty = $entry.PSObject.Properties['DisplayName']
@@ -136,11 +144,7 @@ function Get-InstalledAppVersions {
         if ($null -eq $nameProperty -or $null -eq $versionProperty) { continue }
         $version = ([string]$versionProperty.Value).Trim()
         if ($version -eq '') { continue }
-        foreach ($app in $script:ReportedUninstallApps.Keys) {
-          if (-not $versions.ContainsKey($app) -and [string]$nameProperty.Value -like $script:ReportedUninstallApps[$app]) {
-            $versions[$app] = $version
-          }
-        }
+        $named.Add(@{ Name = [string]$nameProperty.Value; Version = $version })
         foreach ($item in $craftItems) {
           if (-not $versions.ContainsKey([string]$item.name) -and [string]$nameProperty.Value -match [string]$item.displayName) {
             $versions[[string]$item.name] = $version
@@ -148,6 +152,14 @@ function Get-InstalledAppVersions {
         }
         if ($screenConnectName -ne '' -and -not $versions.ContainsKey('ScreenConnect') -and [string]$nameProperty.Value -eq $screenConnectName) {
           $versions['ScreenConnect'] = $version
+        }
+      }
+      foreach ($app in $script:ReportedUninstallApps.Keys) {
+        if ($versions.ContainsKey($app)) { continue }
+        foreach ($pattern in @($script:ReportedUninstallApps[$app])) {
+          $match = $null
+          foreach ($candidate in $named) { if ($candidate.Name -like $pattern) { $match = $candidate; break } }
+          if ($null -ne $match) { $versions[$app] = $match.Version; break }
         }
       }
     } catch {
