@@ -38,6 +38,44 @@ $script:CompareListMax = 40
 
 # --- Finding the earlier report ------------------------------------------------------------------------------------
 
+function ConvertTo-ToolReadProblem {
+  <#
+  .SYNOPSIS
+    Private, pure. Why a file could not be opened, from -Exception (review M5, ruling RD-R26), for the "could not be
+    read" list: 'could not be read: access denied' (UnauthorizedAccessException, SecurityException), 'could not be
+    read: in use' (an IOException with a sharing or lock violation, Win32 error 32 or 33) or 'could not be read'. The
+    inner exceptions count (PowerShell wraps a .NET constructor's exception). Decided by type and error code, never by
+    the (localized) message.
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][Exception]$Exception)
+
+  $e = $Exception
+  while ($null -ne $e) {
+    if ($e -is [UnauthorizedAccessException] -or $e -is [Security.SecurityException]) { return 'could not be read: access denied' }
+    if ($e -is [IO.IOException] -and (($e.HResult -band 0xFFFF) -in 32, 33)) { return 'could not be read: in use' }
+    $e = $e.InnerException
+  }
+  return 'could not be read'
+}
+
+function ConvertTo-ToolCrashDays {
+  # Private, pure. -Value (repair.thresholds.crashDays) as whole days within 1-3650 (ruling RD-R26): rounded, then
+  # clamped. $null, or anything that is not a finite number, is 60 (the default).
+  [CmdletBinding()]
+  [OutputType([int])]
+  param([AllowNull()]$Value)
+
+  $number = 0.0
+  if ($null -eq $Value -or -not [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or
+      [double]::IsNaN($number) -or [double]::IsInfinity($number)) { return 60 }
+  $days = [math]::Round($number, [MidpointRounding]::AwayFromZero)
+  if ($days -lt 1) { return 1 }
+  if ($days -gt 3650) { return 3650 }
+  return [int]$days
+}
+
 function Get-ToolIdentityFolderPart {
   <#
   .SYNOPSIS
@@ -146,9 +184,19 @@ function Find-ToolEarlierReport {
         try {
           if (Test-StickReparsePoint -Path $path) { $why = 'a link' } else { $length = (New-Object IO.FileInfo $path).Length }
         } catch {
-          $why = 'could not be read'
+          $why = ConvertTo-ToolReadProblem -Exception $_.Exception
         }
         if ($why -eq '' -and $length -gt $script:ToolReportDataMaxBytes) { $why = 'too big' }
+        if ($why -eq '') {
+          # Opened the way Read-ToolJsonFile opens it, so a file in use or denied is named as such (review M5), never
+          # "not a report data file".
+          try {
+            $probe = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            $probe.Dispose()
+          } catch {
+            $why = ConvertTo-ToolReadProblem -Exception $_.Exception
+          }
+        }
         if ($why -eq '') {
           $reads++
           $bytes += $length
@@ -215,7 +263,12 @@ function Get-ToolRunSinceLastVisit {
   $diff = $null
   if ($null -ne $earlier) {
     try {
-      $crashDays = [int](Get-ToolRepairNumber -Config $Run.Config -Path 'thresholds', 'crashDays' -Default 60)
+      # A crashDays outside 1-3650 is clamped (ruling RD-R26): the comparison never fails because of the config.
+      $configured = Get-ToolRepairNumber -Config $Run.Config -Path 'thresholds', 'crashDays' -Default 60
+      $crashDays = ConvertTo-ToolCrashDays -Value $configured
+      if ($configured -lt 1 -or $configured -gt 3650) {
+        Write-SetupLog -Level WARN -Message 'repair.thresholds.crashDays is outside 1-3650; the comparison uses the nearest' -Data @{ configured = [string]$configured; used = $crashDays }
+      }
       $diff = Compare-ToolReportData -Earlier $earlier -Current $Current -CrashDays $crashDays
     } catch {
       $name = ConvertTo-ScreenText -Text ('{0} (not a report data file)' -f [IO.Path]::GetFileName([string]$earlier['File']))
@@ -308,23 +361,25 @@ function Compare-ToolReportData {
     Quick sections), the codes only a Full report gives ($script:ReportFullOnlyCodes, ToolReport.ps1) are neither new
     nor resolved: one of the two never checked them (KindsDiffer, and a note says so). Review M6: the crash events cover
     the current report's last -CrashDays (repair.thresholds.crashDays, 60); when the last visit is older than that,
-    CrashWindowShort is $true (a note says so).
+    CrashWindowShort is $true (a note says so). A -CrashDays outside 1-3650 is clamped (ConvertTo-ToolCrashDays, ruling
+    RD-R26), never an error; CrashDays is the number used.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)]$Earlier,
     [Parameter(Mandatory)]$Current,
-    [ValidateRange(1, 3650)][int]$CrashDays = 60
+    [double]$CrashDays = 60
   )
 
+  $days = ConvertTo-ToolCrashDays -Value $CrashDays   # [int]
   $since = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Earlier -Name 'CreatedAt')
   $count = 0
   $kindBefore = ([string](Get-ReportEntry -From $Earlier -Name 'Kind')).Trim()
   $kindNow = ([string](Get-ReportEntry -From $Current -Name 'Kind')).Trim()
   $kindsDiffer = ($kindBefore -eq '' -or -not [string]::Equals($kindBefore, $kindNow, [StringComparison]::OrdinalIgnoreCase))
   $created = ConvertTo-ReportDateTime -Value (Get-ReportEntry -From $Current -Name 'CreatedAt')
-  $crashWindowShort = ($null -ne $since -and $null -ne $created -and ($created - $since).TotalDays -gt $CrashDays)
+  $crashWindowShort = ($null -ne $since -and $null -ne $created -and ($created - $since).TotalDays -gt $days)
 
   # New crashes: the current events after the earlier report.
   $crashes = [ordered]@{}
@@ -444,7 +499,7 @@ function Compare-ToolReportData {
     Since = $since; Crashes = $crashes; Disks = $disks.ToArray(); DisksCompared = $disksCompared; Free = $free
     DevicesAdded = $added; DevicesGone = $gone
     ProgramsAdded = $installed.ToArray(); ProgramsRemoved = $removed.ToArray(); ProgramsUpdated = $updated.ToArray(); ProgramsCompared = $programsCompared
-    FindingsNew = $new; FindingsResolved = $resolved; KindsDiffer = $kindsDiffer; CrashWindowShort = $crashWindowShort; CrashDays = $CrashDays
+    FindingsNew = $new; FindingsResolved = $resolved; KindsDiffer = $kindsDiffer; CrashWindowShort = $crashWindowShort; CrashDays = $days
     Count = $count
   }
 }

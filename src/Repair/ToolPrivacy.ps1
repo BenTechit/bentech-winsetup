@@ -26,8 +26,13 @@
 #     number (no digit beside it);
 #   - a user or network name, a computer or domain name made of letters only, and any value under 6 characters is
 #     masked only as a whole word (no letter or digit beside it: "Ben" never turns "Bench" into "user1ch", a PC named
-#     COHENPC never cuts "cohenpcx"). A whole word that starts with a Hebrew letter may carry up to three of the Hebrew
-#     prefix letters (b, h, v, k, l, m, sh: "to Dana" is one word in Hebrew), which stay outside the token;
+#     COHENPC never cuts "cohenpcx"). A whole word may carry up to three of the Hebrew prefix letters (b, h, v, k, l,
+#     m, sh: "to Dana" is one word in Hebrew), which stay outside the token, a Latin name too ("lDana", ruling RD-R26);
+#   - a known SID only where no digit follows (S-1-...-1001 never masks the start of S-1-...-10012, RD-R26);
+#   - a line that ends inside a known value of two or more words (the event-message cut, Limit-ReportMessage, or a
+#     line that ends with a first name) gets that value's token: "Moshe ..." and "Moshe Le" at the end of a line are
+#     "Moshe Levi" (review M3, RD-R26). A leading part that is generic ("Home" of "Home Cohen 5G") or a known value of
+#     its own is left to its own rule;
 #   - every other known value is masked wherever it appears, longest first (a serial inside the PC name is masked as
 #     the PC name, then everywhere else as the serial);
 #   - a token that a letter or a digit follows gets an underscore after it ("SERIAL-2_99", never "SERIAL-299", which
@@ -54,6 +59,10 @@ $script:SafeWordBelow = 6
 $script:SafeRegexTimeout = [TimeSpan]::FromSeconds(10)
 # Every token, so a profile folder already masked is not masked again.
 $script:SafeTokenPattern = '^(user|PC-|DOMAIN-|SERIAL-|MAC-|IP-|IP6-|SSID-|EMAIL-|PHONE-|SID-)[0-9]+\z'
+# A text that starts with a token: a profile name a known value already masked ("user1 was ...", ruling RD-R26).
+$script:SafeTokenStartPattern = '\A(?:user|PC-|DOMAIN-|SERIAL-|MAC-|IP-|IP6-|SSID-|EMAIL-|PHONE-|SID-)[0-9]+(?![0-9])'
+# Where a cut form of a known value may end (review M3, RD-R26): at the end of a line, with the cut marker " ..." or not.
+$script:SafeCutEnd = '(?=(?:[ \t]*\.\.\.)?[ \t]*(?:\r?\n|\z))'
 
 # Account and profile folder names that are the same on every PC (never a person's): kept as they are.
 $script:SafeGenericAccounts = @('Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'defaultuser0', 'defaultuser100000', 'Public', 'Default',
@@ -70,17 +79,17 @@ $script:SafeStopWords = @('user', 'users', 'admin', 'administrator', 'owner', 'g
 $script:SafeHebrewNetwork = [string]::new([char[]]@(0x05E8, 0x05E9, 0x05EA))
 $script:SafeHebrewUnidentified = [string]::new([char[]]@(0x05DC, 0x05D0, 0x20, 0x05DE, 0x05D6, 0x05D5, 0x05D4, 0x05D4))
 $script:SafeGenericNetworkPattern = '\A(?:Network|Unidentified network|' + $script:SafeHebrewNetwork + '(?: ' + $script:SafeHebrewUnidentified + ')?)(?: [0-9]+)?\z'
-# The Hebrew prefix letters a word may carry (b, h, v, k, l, m, sh), up to three of them, before a Hebrew name.
+# The Hebrew prefix letters a word may carry (b, h, v, k, l, m, sh), up to three of them, before a known name (a
+# Latin one too, RD-R26), and no letter or digit before them.
 $script:SafeHebrewPrefixBoundary = '(?<=(?:^|[^\p{L}\p{Nd}])[' + [string]::new([char[]]@(0x05D1, 0x05D4, 0x05D5, 0x05DB, 0x05DC, 0x05DE, 0x05E9)) + ']{0,3})'
-# A Hebrew letter (alef to tav), for the left boundary's choice.
-$script:SafeHebrewLetter = '\A[' + [char]0x05D0 + '-' + [char]0x05EA + ']'
 # The part before '\' of an account that names no domain of the customer's.
 $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'MicrosoftAccount', 'NT SERVICE', 'Window Manager', 'Font Driver Host',
   'IIS APPPOOL', 'NT VIRTUAL MACHINE')
 
 # The patterns, in the order they run (after the known values). Spec 6.8, the Task 8 review and ruling RD-R25:
 #   e-mail (also URL-encoded, %40);
-#   SID (S-1-5-21-..., S-1-12-1-...) wherever it is, after a letter or a dash too (a per-user task's name holds one),
+#   SID (S-1-5-21-..., S-1-12-1-...) wherever it is, after a letter, a digit or a dash too (a per-user task's name
+#     holds one),
 #     before the phone numbers (a SID holds long digit runs); well-known SIDs (S-1-5-18, S-1-5-32-544) stay;
 #   MAC with ':' or '-'; MAC as aaaa.bbbb.cccc; MAC as 12 hex digits (only beside no letter, digit or '-', so a GUID's
 #     last group and a 0x number stay); the last two only with a hex letter in them unless the MAC is known, so plain
@@ -88,19 +97,24 @@ $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'Micros
 #   IPv4 (a sentence's full stop after it does not hide it; five-part versions stay); IPv6 (also right after a colon:
 #     "Address:2a00::1");
 #   a profile folder: <drive>:\Users\<name>, c$\Users\<name>, %SystemDrive%\Users\<name>, with '\', '/' or a JSON-
-#     doubled '\\' (the name up to the next separator, or to the end of the line, or a word);
+#     doubled '\\' (the name up to the next separator; else, when the line ends within two words, those words (a
+#     spaced name); else one word: the words after a name stay and go through every pass, RD-R26). A name that starts
+#     with a token was masked as a known value already and stays;
 #   an Israeli phone number: the spec's pinned pattern widened (review M1) to 972 / 00972 / +972 (with an optional
 #     "(0)"), an area code in parentheses, '.' or ' - ' as separators, and the 3-4 and 3-2-2 groupings of the last
-#     seven digits. Every number the pinned pattern finds, this one finds.
+#     seven digits; RD-R26 adds parentheses around the country or area code ("(+972) 50", "+972 (50)") and the 4-3 and
+#     2-2-3 groupings. Every number the pinned pattern finds, this one finds, except one right after a letter or a "0x"
+#     (a hex value, a KB or product id). No digit, '+' or letter before it, and no digit (or '-'/'.' and a digit,
+#     a GUID's or a version's next part) after it.
 $script:SafeEmailPattern = '[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
-$script:SafeSidPattern = '(?<![0-9])S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
+$script:SafeSidPattern = 'S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){1,14}(?![0-9])'
 $script:SafeMacPattern = '(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])'
 $script:SafeMacDottedPattern = '(?<![0-9A-Za-z.])[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}(?![0-9A-Za-z]|\.[0-9A-Za-z])'
 $script:SafeMacCompactPattern = '(?<![0-9A-Za-z-])[0-9A-Fa-f]{12}(?![0-9A-Za-z-])'
 $script:SafeIpv4Pattern = '(?<!\d)(?<!\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)'
 $script:SafeIpv6Pattern = '(?<![0-9A-Za-z.%])(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9A-Fa-f]{1,4}|(?:\d{1,3}\.){3}\d{1,3})?(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:%]|\.\d)'
-$script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]+)(?=[\\/])|(?<name>[^\\/:*?"<>|\r\n]+?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
-$script:SafePhonePattern = '(?<![\d+])(?:(?:\+|00)?972[-. ]{0,3}(?:\(0\)[-. ]{0,2})?|\(?0)(?:[23489]|5\d|7\d)\)?[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2})(?!\d)'
+$script:SafeProfilePattern = '(?<drive>(?:[A-Za-z]:|[A-Za-z]\$|%SystemDrive%)[\\/]{1,2}Users[\\/]{1,2})(?:(?<name>[^\\/:*?"<>|\r\n]+)(?=[\\/])|(?<name>[^\\/:*?"<>|\r\n\s]+(?: [^\\/:*?"<>|\r\n\s]+)?)(?=[ \t]*(?:\r?\n|\z))|(?<name>[^\\/:*?"<>|\r\n\s,;''()\[\]]*[^\\/:*?"<>|\r\n\s,;''()\[\].]))'
+$script:SafePhonePattern = '(?<![\dA-Za-z+])(?:(?:\(?(?:\+|00)972\)?|972)[-. ]{0,3}(?:\(0\)[-. ]{0,2})?\(?(?:[23489]|5\d|7\d)\)?|\(?0(?:[23489]|5\d|7\d)\)?)[-. ]{0,3}(?:\d{3}[-. ]{0,3}\d{4}|\d{3}[-. ]{1,3}\d{2}[-. ]{1,3}\d{2}|\d{4}[-. ]{1,3}\d{3}|\d{2}[-. ]{1,3}\d{2}[-. ]{1,3}\d{3})(?!\d|[-.]\d)'
 
 # The second line of a SAFE copy (ASCII), for the AI and for Ben.
 $script:SafeCopyNote = 'PRIVACY-SAFE COPY: names, e-mail addresses, serial numbers, MAC and IP addresses, network names, SIDs and phone numbers are replaced by tokens (user1, PC-1, SERIAL-1, MAC-1, IP-1, SSID-1, EMAIL-1, PHONE-1, SID-1, ...); one token is always the same value.'
@@ -395,7 +409,7 @@ function New-SafeMasker {
   [OutputType([hashtable])]
   param([AllowNull()]$Known)
 
-  $masker = @{ Tokens = @{}; Counts = @{}; Literals = $null; LiteralTokens = (New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)) }
+  $masker = @{ Tokens = @{}; Counts = @{}; Literals = $null; Cuts = $null; CutTokens = @(); LiteralTokens = (New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)) }
   foreach ($c in @($script:SafeTokenFormats.Keys)) {
     $masker['Tokens'][$c] = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
     $masker['Counts'][$c] = 0
@@ -413,10 +427,11 @@ function New-SafeMasker {
         if ($form.Length -lt $script:SafeMinLength -or $masker['LiteralTokens'].ContainsKey($form)) { continue }
         $masker['LiteralTokens'][$form] = $token
         $mode = 'Anywhere'
-        if ($form -match '\A[0-9]+\z') { $mode = 'Number' }
+        if ($category -ceq 'Sid') { $mode = 'Sid' }
+        elseif ($form -match '\A[0-9]+\z') { $mode = 'Number' }
         elseif (($script:SafeWordCategories -ccontains $category) -or $form.Length -lt $script:SafeWordBelow -or
                 ($category -cin 'Computer', 'Domain' -and $form -match '\A\p{L}+\z')) { $mode = 'Word' }
-        $entries.Add(@{ Value = $form; Mode = $mode })
+        $entries.Add(@{ Value = $form; Mode = $mode; Token = $token })
       }
     }
   }
@@ -437,15 +452,47 @@ function New-SafeMasker {
       $escaped = [regex]::Escape($e.Value)
       switch -CaseSensitive ($e.Mode) {
         'Number' { '(?<![0-9])' + $escaped + '(?![0-9])' }
+        'Sid' { $escaped + '(?![0-9])' }   # never the start of a longer SID (RD-R26)
         'Word' {
-          # A Hebrew name may carry up to three prefix letters ("to Dana" is one Hebrew word; review I3).
-          $left = $(if ($e.Value -match $script:SafeHebrewLetter) { $script:SafeHebrewPrefixBoundary } else { '(?<![\p{L}\p{Nd}])' })
+          # A name may carry up to three Hebrew prefix letters ("to Dana" is one Hebrew word; review I3), a Latin one
+          # too (RD-R26); a letter or a digit before them is no word start.
+          $left = $script:SafeHebrewPrefixBoundary
           $left + $escaped + '(?![\p{L}\p{Nd}])'
         }
         default { $escaped }
       }
     }
     $masker['Literals'] = New-SafeRegex -Pattern (@($parts) -join '|')
+    # The cut forms (review M3, RD-R26): a line that ends after the first words of a known value of two or more words,
+    # and maybe the start of the next word ("Moshe", "Moshe Le" of "Moshe Levi"), gets that value's token. A leading
+    # part that is generic or a known value of its own is left to its own rule. One regex for all of them: group c<n>
+    # is value n (longest first), CutTokens[n] its token.
+    $groups = New-Object System.Collections.Generic.List[string]
+    $cutTokens = New-Object System.Collections.Generic.List[string]
+    foreach ($e in $sorted) {
+      $words = @([regex]::Split($e.Value, '\s+'))
+      if ($words.Count -lt 2) { continue }
+      $alts = New-Object System.Collections.Generic.List[string]
+      for ($k = $words.Count - 1; $k -ge 1; $k--) {
+        $lead = $words[0..($k - 1)] -join ' '
+        if ($lead.Length -lt $script:SafeMinLength -or (Test-SafeGenericValue -Value $lead) -or $masker['LiteralTokens'].ContainsKey($lead)) { continue }
+        $next = $words[$k]
+        $partial = ''
+        if ($next.Length -ge 2) {
+          $inner = ''
+          for ($i = $next.Length - 2; $i -ge 1; $i--) { $inner = '(?:' + [regex]::Escape([string]$next[$i]) + $inner + ')?' }
+          $partial = '(?:[ \t]+' + [regex]::Escape([string]$next[0]) + $inner + ')?'
+        }
+        $alts.Add(((@(foreach ($w in $words[0..($k - 1)]) { [regex]::Escape($w) }) -join '[ \t]+') + $partial))
+      }
+      if ($alts.Count -eq 0) { continue }
+      $groups.Add(('(?<c{0}>{1})' -f $cutTokens.Count, ($alts.ToArray() -join '|')))
+      $cutTokens.Add([string]$e.Token)
+    }
+    if ($groups.Count -gt 0) {
+      $masker['Cuts'] = New-SafeRegex -Pattern ($script:SafeHebrewPrefixBoundary + '(?:' + ($groups.ToArray() -join '|') + ')' + $script:SafeCutEnd)
+      $masker['CutTokens'] = $cutTokens.ToArray()
+    }
   }
   return $masker
 }
@@ -456,7 +503,8 @@ function ConvertTo-SafeText {
     -Text with every personal value turned into its token (see the top of this file), through -Masker (New-SafeMasker),
     whose tokens it extends. Throws when a regex runs out of time: the caller writes no SAFE copy then.
   .DESCRIPTION
-    First the known values (longest first, case-insensitive), then the patterns (see the top of this file): e-mail
+    First the known values (longest first, case-insensitive), then their cut forms at the end of a line (RD-R26), then
+    the patterns (see the top of this file): e-mail
     (also %40); SID (S-1-5-21-..., S-1-12-1-..., after a letter too; well-known SIDs such as S-1-5-18 stay); MAC
     (aa:bb:..., aa-bb-..., aaaa.bbbb.cccc and 12 hex digits); IPv4 and IPv6 (each confirmed with [ipaddress]::TryParse,
     so times and versions stay; 0.0.0.0, 127.0.0.1, 255.255.255.255, masks, :: and ::1 stay); a profile folder (C:\Users\,
@@ -480,6 +528,14 @@ function ConvertTo-SafeText {
         param($m)
         $token = $null
         if (-not $Masker['LiteralTokens'].TryGetValue($m.Value, [ref]$token)) { $token = '[masked]' }
+        Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
+  }
+  if ($null -ne $Masker['Cuts']) {
+    $source = $value
+    $value = $Masker['Cuts'].Replace($source, [Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $token = '[masked]'
+        for ($n = 0; $n -lt $Masker['CutTokens'].Count; $n++) { if ($m.Groups[('c' + $n)].Success) { $token = $Masker['CutTokens'][$n]; break } }
         Get-SafeTokenText -Token $token -Source $source -End ($m.Index + $m.Length) })
   }
   $source = $value
@@ -521,7 +577,7 @@ function ConvertTo-SafeText {
       param($m)
       $name = $m.Groups['name'].Value
       $core = $name.TrimEnd('.', ' ', "`t")
-      if ($core -eq '' -or $core -match $script:SafeTokenPattern -or (Test-SafeGenericValue -Value $core)) { $m.Value }
+      if ($core -eq '' -or $core -match $script:SafeTokenStartPattern -or (Test-SafeGenericValue -Value $core)) { $m.Value }
       else {
         $token = Get-SafeTokenText -Token (Get-SafeToken -Masker $Masker -Category 'User' -Key $core.Trim()) -Source $source -End ($m.Index + $m.Length)
         $m.Groups['drive'].Value + $token + $name.Substring($core.Length)

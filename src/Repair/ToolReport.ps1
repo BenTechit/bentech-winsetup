@@ -147,6 +147,30 @@ function ConvertTo-ReportList {
 
 # --- Event groups --------------------------------------------------------------------------------------------------
 
+function Limit-ReportMessage {
+  <#
+  .SYNOPSIS
+    Private, pure. An event message for one report line: its whitespace collapsed to single spaces, as display text
+    (ConvertTo-ToolDisplayText), and, when longer than -MaxLength, cut between two words and marked ' ...' (review M3,
+    ruling RD-R26): a name is never cut inside a word, and the privacy-safe copy masks a known name whose last words
+    the cut took (the cut forms of ConvertTo-SafeText). Only a word longer than half the room is cut inside it (never
+    between the two halves of a surrogate pair).
+  #>
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()]$Text, [ValidateRange(8, 4096)][int]$MaxLength = 200)
+
+  $value = ConvertTo-ToolDisplayText -Text ([regex]::Replace([string]$Text, '\s+', ' ')) -MaxLength 4096
+  if ($value.Length -le $MaxLength) { return $value }
+  $room = $MaxLength - 4
+  $cut = $value.LastIndexOf(' ', $room)
+  if ($cut -lt [int][math]::Floor($room / 2)) {
+    $cut = $room
+    if ([char]::IsHighSurrogate($value[$cut - 1])) { $cut-- }
+  }
+  return ($value.Substring(0, $cut).TrimEnd() + ' ...')
+}
+
 function ConvertTo-EventGroups {
   <#
   .SYNOPSIS
@@ -198,7 +222,7 @@ function ConvertTo-EventGroups {
                                                    @{ Expression = { $_.Count }; Descending = $true }, @{ Expression = { $_.Key }; Descending = $false })
   foreach ($g in $sorted) {
     ('{0}x {1}/{2} [{3}] {4} - {5}  {6}' -f $g.Count, (ConvertTo-ToolDisplayText -Text $g.Provider -MaxLength 100), $g.Id, $g.Level,
-      (Format-ReportDate -When $g.First), (Format-ReportDate -When $g.Last), (ConvertTo-ToolDisplayText -Text ([regex]::Replace([string]$g.Message, '\s+', ' ')) -MaxLength 200)).TrimEnd()
+      (Format-ReportDate -When $g.First), (Format-ReportDate -When $g.Last), (Limit-ReportMessage -Text $g.Message -MaxLength 200)).TrimEnd()
   }
 }
 

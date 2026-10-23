@@ -585,4 +585,78 @@ Describe 'ToolPrivacy and ToolCompare (repair Task 9)' {
       Test-Path $r2.Files.Safe | Should -BeTrue; Test-Path $r2.Files.Data | Should -BeTrue
     }
   }
+
+  Describe 'the Task 9 re-review fixes (ruling RD-R26)' {
+    BeforeAll { function Get-Mask { param($Masker, [string]$Text) ConvertTo-SafeText -Masker $Masker -Text $Text } }
+    It 'a profile path at the end of a line takes at most the folder name: the words after it stay and go through every pass; a known user keeps its token' {
+      $m = New-SafeMasker -Known @{ User = @('Dana'); Sid = @('S-1-5-21-1-2-3-1001') }
+      Get-Mask $m 'The profile C:\Users\Dana was not loaded properly' | Should -BeExactly 'The profile C:\Users\user1 was not loaded properly'
+      Get-Mask $m 'Profile C:\Users\Dana (12 GB)' | Should -BeExactly 'Profile C:\Users\user1 (12 GB)'
+      Get-Mask $m 'C:\Users\Dana is S-1-5-21-1-2-3-1001' | Should -BeExactly 'C:\Users\user1 is SID-1'
+      Get-Mask $m 'C:\Users\Dana עדנה לרון' | Should -BeExactly 'C:\Users\user1 עדנה לרון'
+      Get-Mask $m 'C:\Users\Dana call 0501234567' | Should -BeExactly 'C:\Users\user1 call PHONE-1'
+      Get-Mask $m 'C:\Users\Dana עדנה' | Should -BeExactly 'C:\Users\user1 עדנה'   # a match that starts with a token is no new name
+      Get-Mask $m 'Folder C:\Users\Yossi has 3 files' | Should -BeExactly 'Folder C:\Users\user2 has 3 files'
+      Get-Mask $m "path C:\Users\Moshe Levi`nnext line" | Should -BeExactly "path C:\Users\user3`nnext line"   # a spaced name at the end of a line
+    }
+    It 'M3: a known name the 200-character event-message cut would split is masked whole: the cut falls between words and is marked' {
+      $events = @(@{ Provider = 'P'; Id = 1; Level = 2; Time = '2026-10-20T10:00:00'; Message = (('A' * 190) + ' Moshe Levi logged on') })
+      $line = @(ConvertTo-EventGroups -Events $events)[0]
+      $line | Should -Match ' \.\.\.$'; $line | Should -Not -Match 'Levi'   # never a part of a word
+      $safe = Get-Mask (New-SafeMasker -Known @{ User = @('Moshe Levi') }) $line
+      $safe | Should -Not -Match 'Moshe'; $safe | Should -Not -Match 'Lev'; $safe | Should -Match ' user1 \.\.\.$'
+      # Hebrew too, with a prefix letter on the cut part.
+      $heb = @(ConvertTo-EventGroups -Events @(@{ Provider = 'P'; Id = 2; Level = 2; Time = '2026-10-20T10:00:00'; Message = (('B' * 190) + ' לדנה כהן התקשרה') }))[0]
+      $hs = Get-Mask (New-SafeMasker -Known @{ User = @('דנה כהן') }) $heb
+      $hs | Should -Not -Match 'דנה'; $hs | Should -Match ' לuser1 \.\.\.$'
+      # A line that only ends with the name's first word (no cut) is masked the same way; a generic first word is not.
+      Get-Mask (New-SafeMasker -Known @{ User = @('Moshe Levi'); Ssid = @('Home Cohen 5G') }) "signed in: Moshe`nWindows 11 Home" | Should -BeExactly "signed in: user1`nWindows 11 Home"
+    }
+    It 'M5: a data file found but not readable is named with the reason (in use, access denied), never "not a report data file"' {
+      $s = New-CompareStick -Name 'CmpStickLocked'
+      $path = Join-Path $s.Reports 'DELL-7HX2K93_7HX2K93_2026-10-01_0900\REPORT_DELL-7HX2K93_2026-10-01_0900_data.json'
+      $lock = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+      try {
+        $skipped = New-Object System.Collections.Generic.List[string]
+        (Find-ToolEarlierReport -StickRoot $s.Root -IdentityKey 'SN-7HX2K93' -CurrentSessionDir $s.Current -Skipped $skipped).CreatedAt | Should -Be '2026-09-01T09:00:00'
+        @($skipped) | Should -Be @('REPORT_DELL-7HX2K93_2026-10-01_0900_data.json (could not be read: in use)')
+      } finally { $lock.Dispose() }
+      ConvertTo-ToolReadProblem -Exception (New-Object UnauthorizedAccessException 'denied') | Should -BeExactly 'could not be read: access denied'
+      ConvertTo-ToolReadProblem -Exception (New-Object IO.IOException 'odd') | Should -BeExactly 'could not be read'
+    }
+    It 'a Latin name glued to a Hebrew prefix letter is masked like one after a dash; a Latin letter before the prefix is no word start' {
+      $m = New-SafeMasker -Known @{ User = @('Dana') }
+      Get-Mask $m 'לDana and ל-Dana and ושDana' | Should -BeExactly 'לuser1 and ל-user1 and ושuser1'
+      Get-Mask $m 'xלDana' | Should -BeExactly 'xלDana'
+    }
+    It 'a crashDays outside 1-3650 is clamped: a comparison never throws because of it, and says the days it used' {
+      { Compare-ToolReportData -Earlier $earlier -Current $now -CrashDays 5000 } | Should -Not -Throw
+      { Compare-ToolReportData -Earlier $earlier -Current $now -CrashDays 0 } | Should -Not -Throw
+      (Compare-ToolReportData -Earlier $earlier -Current $now -CrashDays 0).CrashDays | Should -Be 1
+      (Compare-ToolReportData -Earlier $earlier -Current $now -CrashDays 5000).CrashDays | Should -Be 3650
+      $s = New-CompareStick -Name 'CmpStickDays'
+      foreach ($days in 5000, 0.4, -3) {
+        $run = @{ Args = @{ StickRoot = $s.Root; SessionDir = $s.Current; Identity = @{ Key = 'SN-7HX2K93' } }; Config = @{ repair = @{ thresholds = @{ crashDays = $days } } } }
+        $f = Get-ToolRunSinceLastVisit -Run $run -Current $now
+        $f.Diff | Should -Not -BeNullOrEmpty -Because "crashDays $days"; @($f.Skipped).Count | Should -Be 0 -Because "crashDays $days"
+      }
+    }
+    It 'a SID glued after a digit is masked; a known SID never masks the start of a longer one' {
+      $m = New-SafeMasker -Known @{ Sid = @('S-1-5-21-111-222-333-1001') }
+      Get-Mask $m 'x1S-1-5-21-444-555-666-1003' | Should -BeExactly 'x1SID-2'
+      Get-Mask $m 'S-1-5-21-111-222-333-10012 and S-1-5-21-111-222-333-1001' | Should -BeExactly 'SID-3 and SID-1'
+    }
+    It 'phones: parentheses around the country or area code, 4-3 and 2-2-3 groupings; ordinary numbers never become a phone' {
+      $m = New-SafeMasker -Known @{}
+      foreach ($p in '(+972) 50 1234567', '+972 (50) 1234567', '050 1234 567', '050-12-34-567', '050-1234567', '+972 (0)50-1234567', '00972501234567', '(050)1234567') {
+        Get-Mask $m "call $p." | Should -BeExactly 'call PHONE-1.' -Because $p
+      }
+      Get-Mask $m 'or +972 3 6123456 / 054-7654321' | Should -BeExactly 'or PHONE-2 / PHONE-3'
+      foreach ($keep in 'on 05.10.2026 09:15', 'at 03.12.2026 10:15:45', 'version 05.12.3456789', 'KB0501234', 'id 0x0501234567', 'guid {0501234567-1234}',
+                        '0501234567890', 'Product ID 00330-80000-00000-AAOEM', 'size 512110190592', 'on 02.10.2026 1:15', 'build 10.0.26100.1', 'code 0x80070005 0xC0000005',
+                        'F03 is a label', 'at 04/10/2026 09:00', 'KB5044284') {
+        Get-Mask $m $keep | Should -BeExactly $keep -Because $keep
+      }
+    }
+  }
 }

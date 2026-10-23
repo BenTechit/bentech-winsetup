@@ -556,14 +556,14 @@ Describe 'ToolReport (repair Task 8)' {
       $g[1] | Should -BeExactly '2x disk/7 [2] 20/10/2026 08:00 - 22/10/2026 09:30  newest text'
       $g[2] | Should -BeExactly '1x disk/7 [3] 21/10/2026 10:00 - 21/10/2026 10:00  a warning'
     }
-    It 'cuts the message to 200 characters, reads event records too, and ignores a Hebrew calendar on the thread' {
+    It 'cuts the message to 200 characters (with " ..." where it was cut: RD-R26), reads event records too, and ignores a Hebrew calendar on the thread' {
       $culture = [Threading.Thread]::CurrentThread.CurrentCulture
       try {
         $he = New-Object Globalization.CultureInfo 'he-IL'; $he.DateTimeFormat.Calendar = New-Object Globalization.HebrewCalendar
         [Threading.Thread]::CurrentThread.CurrentCulture = $he
         $g = @(ConvertTo-EventGroups -Events @([pscustomobject]@{ ProviderName = 'x'; Id = 1; Level = 2; TimeCreated = [datetime]::new(2026, 10, 22, 9, 5, 0); Message = ('m' * 500) }))
       } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $culture }
-      $g[0] | Should -BeExactly ('1x x/1 [2] 22/10/2026 09:05 - 22/10/2026 09:05  ' + ('m' * 200))
+      $g[0] | Should -BeExactly ('1x x/1 [2] 22/10/2026 09:05 - 22/10/2026 09:05  ' + ('m' * 196) + ' ...')
       @(ConvertTo-EventGroups -Events @()).Count | Should -Be 0
     }
   }
