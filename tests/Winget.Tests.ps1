@@ -3,6 +3,7 @@
 # mocks Invoke-External, Add-AppxPackage, Get-RemoteFile and Get-WingetPath.
 BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Process', 'Common\Download', 'Steps\Winget') { . "$PSScriptRoot\..\src\$f.ps1" }
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: winget's output tail is logged as ASCII (final review M1)
 
   function New-WingetContext {
     param([double]$ReadyMinutes = 5)
@@ -277,6 +278,29 @@ Describe 'Invoke-WingetInstall' {
     $r = Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx
     $r.Status | Should -Be 'Failed'
     $r.Message | Should -Be '7zip.7zip: winget timed out'
+  }
+  # Final review M1: a timeout logs what winget had printed, so setup.log tells a slow download from a
+  # msiexec help box. ASCII, like the failure tail: a Hebrew Windows prints Hebrew.
+  It 'logs the last five lines of the output, as ASCII, at WARN, when winget times out' {
+    $out = ((1..6 | ForEach-Object { "line-$_" }) + ('Starting package install... ' + [char]0x05D0 + [char]0x05D1)) -join "`r`n"
+    Set-ExternalQueue @(New-ExternalResult $null $true $out)
+    Invoke-WingetInstall -Id 'Zoom.Zoom' -TimeoutMinutes 10 -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter {
+      $Message -eq 'winget install timed out' -and $Level -eq 'WARN' -and $Data.id -eq 'Zoom.Zoom' -and $Data.timeoutMinutes -eq 10 -and
+      $Data.tail -ceq 'line-3 | line-4 | line-5 | line-6 | Starting package install... ??'
+    } -Times 1 -Exactly
+  }
+  It 'logs the timeout with an empty tail when winget printed nothing' {
+    Set-ExternalQueue @(New-ExternalResult $null $true '')
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install timed out' -and $Data.timeoutMinutes -eq 7 -and $Data.tail -ceq '' } -Times 1 -Exactly
+  }
+  It 'logs a failure''s tail and a failed source reset''s tail as ASCII too' {
+    $hebrew = [string][char]0x05D0
+    Set-ExternalQueue @((New-ExternalResult 0x8A15000F), (New-ExternalResult 5 $false "reset $hebrew"), (New-ExternalResult 0x8A15001E $false "line-1`r`nfailed $hebrew"))
+    Invoke-WingetInstall -Id '7zip.7zip' -Context $ctx | Out-Null
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget source reset did not succeed; retrying anyway' -and $Data.tail -ceq 'reset ?' } -Times 1 -Exactly
+    Should -Invoke Write-SetupLog -ParameterFilter { $Message -eq 'winget install failed' -and $Data.tail -ceq 'line-1 | failed ?' } -Times 1 -Exactly
   }
   It 'is Failed, with the number as text, for an exit code that is not a 32-bit value' {
     Set-ExternalQueue @(New-ExternalResult 99999999999)

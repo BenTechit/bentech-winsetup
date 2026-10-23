@@ -18,6 +18,7 @@ BeforeAll {
   # State.ps1 holds Save-RunState, which the Office background wait and office-finish call (mocked below).
   . "$PSScriptRoot\..\src\State\State.ps1"
   . "$PSScriptRoot\..\src\Steps\Winget.ps1"
+  . "$PSScriptRoot\..\src\UI\StartScreen.ps1"   # ConvertTo-ScreenText: the real winget path (-RealWinget) logs its output tail as ASCII
   foreach ($f in 'Apps', 'Office', 'DefaultBrowser') { . "$PSScriptRoot\..\src\Steps\$f.ps1" }
   # Report.ps1 holds Get-InstalledAppVersions, which the steps read for the activity feed (mocked below).
   . "$PSScriptRoot\..\src\Report\Report.ps1"

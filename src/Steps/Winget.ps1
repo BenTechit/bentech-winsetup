@@ -218,13 +218,24 @@ function Get-OutputTail {
   return (($lines | ForEach-Object { if ($_.Length -gt 200) { $_.Substring(0, 200) } else { $_ } }) -join ' | ')
 }
 
+function Get-WingetLogTail {
+  # Private. Get-OutputTail of winget's captured output as plain ASCII (ConvertTo-ScreenText, StartScreen.ps1;
+  # the bundle holds every file): a Hebrew Windows prints Hebrew, and Hebrew never reaches setup.log.
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([AllowNull()][AllowEmptyString()][string]$Output)
+
+  return (ConvertTo-ScreenText (Get-OutputTail -Output $Output))
+}
+
 function Invoke-WingetOperation {
   <#
   .SYNOPSIS
     Private. Runs one winget install or uninstall and turns its exit code into a StepResult.
   .DESCRIPTION
     The timeout is TimeoutMinutes when given, else timeoutsMinutes.default. Output is captured only so
-    a short tail can be logged when the run fails; it is never parsed (Windows may be Hebrew).
+    a short tail can be logged, as ASCII (Get-WingetLogTail), when the run fails or times out; it is
+    never parsed (Windows may be Hebrew).
     0x8A15000F ("source data missing") runs `winget source reset --force` once (same timeout) and
     repeats the command once; a second 0x8A15000F is a failure. A "done, reboot needed" is Done with
     Reboot 'None': the Windows Update loop reboots. A program that cannot be started is a Failed
@@ -260,7 +271,11 @@ function Invoke-WingetOperation {
       Write-SetupLog -Message "winget $Verb could not be started" -Level ERROR -Data @{ id = $Id; winget = $winget; error = $_.Exception.Message }
       return New-StepResult -Status Failed -Message "${Id}: winget could not be started"
     }
-    if ($run.TimedOut) { return New-StepResult -Status Failed -Message "${Id}: winget timed out" -Data @{ TimedOut = $true } }
+    if ($run.TimedOut) {
+      # What winget had printed tells a slow download from an installer waiting on a window (final review M1).
+      Write-SetupLog -Message "winget $Verb timed out" -Level WARN -Data @{ id = $Id; timeoutMinutes = $timeout; tail = (Get-WingetLogTail -Output $run.Output) }
+      return New-StepResult -Status Failed -Message "${Id}: winget timed out" -Data @{ TimedOut = $true }
+    }
     if ($null -eq $run.ExitCode) { return New-StepResult -Status Failed -Message "${Id}: winget returned no exit code" }
 
     $outcome = Convert-WingetExitCode -ExitCode $run.ExitCode
@@ -278,7 +293,7 @@ function Invoke-WingetOperation {
       try {
         $reset = Invoke-External -FilePath $winget -ArgumentList 'source reset --force' -TimeoutMinutes $timeout -CaptureOutput
         if ($reset.TimedOut -or $reset.ExitCode -ne 0) {
-          Write-SetupLog -Message 'winget source reset did not succeed; retrying anyway' -Level WARN -Data @{ id = $Id; timedOut = [bool]$reset.TimedOut; exitCode = $reset.ExitCode; tail = (Get-OutputTail -Output $reset.Output) }
+          Write-SetupLog -Message 'winget source reset did not succeed; retrying anyway' -Level WARN -Data @{ id = $Id; timedOut = [bool]$reset.TimedOut; exitCode = $reset.ExitCode; tail = (Get-WingetLogTail -Output $reset.Output) }
         }
       } catch {
         Write-SetupLog -Message 'winget source reset could not be started; retrying anyway' -Level WARN -Data @{ id = $Id; error = $_.Exception.Message }
@@ -304,7 +319,7 @@ function Invoke-WingetOperation {
       }
       default {
         # Failed, or SourceReset again after the one reset.
-        Write-SetupLog -Message "winget $Verb failed" -Level WARN -Data @{ id = $Id; exitCode = $hex; tail = (Get-OutputTail -Output $run.Output) }
+        Write-SetupLog -Message "winget $Verb failed" -Level WARN -Data @{ id = $Id; exitCode = $hex; tail = (Get-WingetLogTail -Output $run.Output) }
         return New-StepResult -Status Failed -Message "${Id}: winget $hex"
       }
     }
