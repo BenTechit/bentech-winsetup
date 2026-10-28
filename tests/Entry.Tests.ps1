@@ -16,7 +16,7 @@
 BeforeAll {
   foreach ($f in 'Common\StepResult', 'Common\Logging', 'Common\Activity', 'Common\Config', 'State\State', 'Detect\PcName', 'Detect\Detection',
                  'Engine\Catalog', 'Engine\Verdict', 'Engine\Reboot', 'Engine\Runner', 'Report\Report',
-                 'Steps\Prepare', 'Steps\WindowsUpdate', 'Steps\Finalize',
+                 'Steps\Prepare', 'Steps\Winget', 'Steps\WindowsUpdate', 'Steps\Finalize',
                  'UI\ConsoleFrame', 'UI\StartScreen', 'UI\ProgressScreen', 'UI\FinalScreen',
                  'Toolbox\Strings', 'Toolbox\SetupPlanner', 'Toolbox\Xaml', 'Toolbox\Toolbox', 'Entry\Cleanup', 'Repair\ToolEngine', 'Entry\Main') {
     . "$PSScriptRoot\..\src\$f.ps1"
@@ -523,6 +523,13 @@ Describe 'Start-BenTechSetup' {
       foreach ($c in 'Enter-RunLock','Start-Transcript','Disable-ConsoleQuickEdit','Resize-SetupConsole','Get-SetupChoices','Initialize-SetupActivity',
                      'Initialize-SetupLog','Read-RunState','Invoke-SetupRun','Invoke-SetupCleanup') { Should -Invoke $c -Times 0 -Exactly -Because $c } }
     It 'returns the child''s exit code' { Mock Invoke-SetupToolProcess { 1 }; Invoke-Entry -ToolAction 'health' -ToolArgs 'x' | Should -Be 1 }
+    It 'points the PowerShell children at <Root>\Child before it dispatches (CLAUDE.md, "Plain code only")' {
+      $script:PowerShellChildDirectory = $null
+      Mock Invoke-SetupToolProcess { $script:childDirSeen = $script:PowerShellChildDirectory; 0 }
+      Invoke-Entry -ToolAction 'health' -ToolArgs 'x' | Should -Be 0
+      $script:childDirSeen | Should -Be (Join-Path $TestDrive 'Child')
+      (Join-Path $TestDrive 'Child') | Should -Not -Exist   # only recorded; made on first use
+    }
     It 'an empty -ToolAction is a normal start, not the child' {
       Mock Invoke-SetupToolProcess { 0 }; Invoke-Entry -ToolAction '' -ToolArgs 'x' | Should -Be 0
       Should -Invoke Invoke-SetupToolProcess -Times 0 -Exactly; Should -Invoke Enter-RunLock -Times 1 -Exactly }

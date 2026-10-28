@@ -23,9 +23,8 @@ $script:StartBarWidth = 20
 # The Office choices in the order the O key cycles them (CRAFT is the default).
 $script:OfficeChoices = @('CRAFT', 'BUSINESS', 'HOME', 'OFF')
 # The direction and format marks Hebrew Windows adds around some values (spec 9.5): U+200E, U+200F,
-# U+202A-U+202E and U+2066-U+2069, as a regex character class built from the code points so that this
-# file stays ASCII.
-$script:DirectionMarksPattern = '[' + (-join (@(0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069) | ForEach-Object { [char]$_ })) + ']'
+# U+202A-U+202E and U+2066-U+2069, as a regex character class with \u escapes so that this file stays ASCII.
+$script:DirectionMarksPattern = '[\u200E\u200F\u202A-\u202E\u2066-\u2069]'
 
 function ConvertTo-ScreenText {
   # One line of plain ASCII: direction marks are dropped, line breaks and tabs become a space, every

@@ -439,6 +439,8 @@ function Start-BenTechSetup {
     [switch]$NoWait
   )
 
+  # Every process kind (main, -WuRound, -WuUnhide, -ToolAction) runs its PowerShell children from <Root>\Child.
+  Set-PowerShellChildDirectory -Path (Join-Path $Root 'Child')
   if ($WuRound) { return (Invoke-SetupWuRoundProcess -Root $Root -ResultPath $ResultPath -SearchOnly $SearchOnly) }
   if ($WuUnhide) { return (Invoke-SetupWuUnhideProcess -Root $Root -ResultPath $ResultPath -UpdateIds $UpdateIds) }
   if (-not [string]::IsNullOrEmpty($ToolAction)) { return (Invoke-SetupToolProcess -Root $Root -ActionId $ToolAction -ArgsPath $ToolArgs) }

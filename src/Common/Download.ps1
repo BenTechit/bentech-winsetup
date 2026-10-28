@@ -190,7 +190,7 @@ function Get-RemoteText {
     $result.Bytes = $client.DownloadData($Url)
   }
   $bytes = [byte[]]$result.Bytes
-  # GetString does not strip the BOM, and WebClient.DownloadString depends on the response headers.
+  # GetString does not strip the BOM, and WebClient's own string download depends on the response headers.
   $skip = 0
   if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $skip = 3 }
   return [Text.Encoding]::UTF8.GetString($bytes, $skip, $bytes.Length - $skip)

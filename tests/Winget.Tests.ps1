@@ -19,11 +19,17 @@ BeforeAll {
     param($Code, [bool]$TimedOut = $false, [string]$Output = '')
     @{ ExitCode = $Code; TimedOut = $TimedOut; Output = $Output }
   }
-  # The command line a child powershell.exe was given: the text inside -EncodedCommand (Base64 of UTF-16LE).
+  # The command a child powershell.exe was given: the .ps1 named by -File, without the $ProgressPreference line in
+  # front and the exit-code line behind it. Read it inside the Invoke-External mock: the file is deleted afterwards.
   function ConvertFrom-ChildArgument {
     param([string]$ArgumentList)
-    if ($ArgumentList -notmatch '-EncodedCommand ([A-Za-z0-9+/=]+)$') { return $null }
-    [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
+    if ($ArgumentList -notmatch '-File "([^"]+)"$') { return $null }
+    if (-not [IO.File]::Exists($Matches[1])) { return $null }
+    $text = [IO.File]::ReadAllText($Matches[1])
+    $head = "`$ProgressPreference = 'SilentlyContinue'`r`n"
+    $tail = "`r`nif (-not `$?) { exit 1 }`r`n"
+    if (-not ($text.StartsWith($head) -and $text.EndsWith($tail))) { return $null }
+    $text.Substring($head.Length, $text.Length - $head.Length - $tail.Length)
   }
   # Queues the results the mocked Invoke-External hands back, one per call, and records the calls.
   function Set-ExternalQueue {
@@ -619,27 +625,66 @@ Describe 'ConvertTo-PowerShellLiteral' {
 Describe 'Invoke-PowerShellChild' {
   BeforeEach {
     Mock Write-SetupLog {}
+    $script:childDir = Join-Path $TestDrive 'Child'
+    Remove-Item -LiteralPath $script:childDir -Recurse -Force -ErrorAction SilentlyContinue
+    Set-PowerShellChildDirectory -Path $script:childDir
+    # The script is read here: Invoke-PowerShellChild deletes it once the child is done.
     Mock Invoke-External {
-      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
+      $file = if ($ArgumentList -match '-File "([^"]+)"$') { $Matches[1] } else { $null }
+      $bytes = if ($file -and [IO.File]::Exists($file)) { [IO.File]::ReadAllBytes($file) } else { $null }
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput
+                                    File = $file; Bytes = $bytes; Command = (ConvertFrom-ChildArgument $ArgumentList) })
       $script:extQueue.Dequeue()
     }
   }
+  AfterAll { $script:PowerShellChildDirectory = $null }
 
-  It 'starts Windows PowerShell 5.1 with the fixed switches and the command as -EncodedCommand, with the given timeout' {
+  It 'starts Windows PowerShell 5.1 with the fixed switches and the command as a .ps1 run with -File, with the given timeout' {
     Set-ExternalQueue @(New-ExternalResult 0)
     Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 3.5 | Out-Null
     $extCalls.Count | Should -Be 1
     $extCalls[0].FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    $extCalls[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
+    $extCalls[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "[^"]+\\child-[0-9a-f]{32}\.ps1"$'
+    $extCalls[0].ArgumentList | Should -Not -Match 'EncodedCommand'
     $extCalls[0].TimeoutMinutes | Should -Be 3.5
     $extCalls[0].Capture | Should -BeTrue
-    (ConvertFrom-ChildArgument $extCalls[0].ArgumentList) | Should -Match 'Get-Date$'
+    $extCalls[0].Command | Should -Be 'Get-Date'
+  }
+  It 'writes the script into the child folder as UTF-8 with BOM, the command between the progress and the exit-code lines' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 1 | Out-Null
+    (Split-Path -Parent $extCalls[0].File) | Should -Be $script:childDir
+    $b = $extCalls[0].Bytes
+    ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) | Should -BeTrue
+    (New-Object Text.UTF8Encoding $false).GetString($b, 3, $b.Length - 3) | Should -Be "`$ProgressPreference = 'SilentlyContinue'`r`nGet-Date`r`nif (-not `$?) { exit 1 }`r`n"
   }
   It 'carries any text unharmed, including quotes, Hebrew and spaces' {
     $cmd = 'Add-AppxPackage -Path ''C:\Users\בן גולדנברג\O''''Brien\a b.msixbundle'' -ErrorAction Stop; "x" | Out-Null'
     Set-ExternalQueue @(New-ExternalResult 0)
     Invoke-PowerShellChild -Command $cmd -TimeoutMinutes 1 | Out-Null
-    (ConvertFrom-ChildArgument $extCalls[0].ArgumentList).EndsWith($cmd) | Should -BeTrue
+    $extCalls[0].Command | Should -BeExactly $cmd
+  }
+  It 'deletes the script after the child, and also when the child cannot be started' {
+    Set-ExternalQueue @(New-ExternalResult 0)
+    Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 1 | Out-Null
+    $extCalls[0].File | Should -Not -Exist
+    Mock Invoke-External { throw 'Cannot start' }
+    { Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 1 } | Should -Throw '*Cannot start*'
+    @(Get-ChildItem -LiteralPath $script:childDir -File).Count | Should -Be 0
+  }
+  It 'throws, and starts nothing, when the child folder is not set' {
+    $script:PowerShellChildDirectory = $null
+    Set-ExternalQueue @(New-ExternalResult 0)
+    { Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 1 } | Should -Throw '*not set*'
+    $extCalls.Count | Should -Be 0
+  }
+  It 'never makes a missing parent (it would inherit the drive root''s rights), and starts nothing' {
+    $missing = Join-Path $TestDrive 'no-such-root\Child'
+    Set-PowerShellChildDirectory -Path $missing
+    Set-ExternalQueue @(New-ExternalResult 0)
+    { Invoke-PowerShellChild -Command 'Get-Date' -TimeoutMinutes 1 } | Should -Throw '*parent does not exist*'
+    (Join-Path $TestDrive 'no-such-root') | Should -Not -Exist
+    $extCalls.Count | Should -Be 0
   }
   It 'passes the exit code, the timeout flag and the output back' {
     Set-ExternalQueue @((New-ExternalResult 1 $false 'boom'), (New-ExternalResult $null $true 'partial'))
@@ -653,8 +698,10 @@ Describe 'Invoke-PowerShellChild' {
   }
 }
 Describe 'Invoke-StepWinget' {
+  AfterAll { $script:PowerShellChildDirectory = $null }
   BeforeEach {
     Mock Write-SetupLog {}
+    Set-PowerShellChildDirectory -Path (Join-Path $TestDrive 'Child')
     $script:pathCalls = 0
     $script:bundleInstalled = $false
     $script:registerResult = @{ ExitCode = 0; TimedOut = $false }
@@ -780,12 +827,12 @@ Describe 'Invoke-StepWinget' {
     Should -Invoke Write-SetupLog -ParameterFilter { $Level -eq 'WARN' -and $Data.exitCode -eq 7 } -Times 1
   }
 
-  It 'runs the registration as a child Windows PowerShell with -EncodedCommand, limited to timeoutsMinutes.default' {
+  It 'runs the registration as a child Windows PowerShell with a .ps1 and -File, limited to timeoutsMinutes.default' {
     Mock Get-WingetPath { $script:pathCalls++; if ($script:pathCalls -ge 3) { 'C:\registered\winget.exe' } }
     Invoke-StepWinget -Context (New-WingetContext -ReadyMinutes 1) -PollSeconds 0.01 | Out-Null
     $appx.Count | Should -Be 1
     $appx[0].FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    $appx[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
+    $appx[0].ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "[^"]+\\child-[0-9a-f]{32}\.ps1"$'
     $appx[0].Command | Should -Match '-RegisterByFamilyName'
     $appx[0].Command | Should -Match '-MainPackage Microsoft\.DesktopAppInstaller_8wekyb3d8bbwe'
     $appx[0].Command | Should -Match '-ErrorAction Stop$'

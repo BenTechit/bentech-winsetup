@@ -1259,7 +1259,7 @@ function Invoke-ToolJsonChild {
     The grandchild sets $ErrorActionPreference = 'Stop' and $out to <Dir>\gc-<Name>-<n>.json (the first free n, as a
     single-quoted literal), evaluates & { <Command> }, writes its value as compressed JSON (depth 6, UTF-8 without a
     BOM) and exits 0; a throw writes @{ Error = <message> } and exits 1. Commands return a hashtable (lists go inside
-    Items), never a bare array, and stay short (the command line carries them encoded).
+    Items), never a bare array, and stay short (they are written to a .ps1 the grandchild runs with -File).
     Then Read-ToolJsonFile: exit 0 and an object is Ok with Data. Anything else is Ok = $false with Error: 'timed
     out', 'output too large' (the result file is over Read-ToolJsonFile's 1 MB), the grandchild's own message
     (ASCII), 'exit 0x...', or 'no result'. The grandchild's console output is

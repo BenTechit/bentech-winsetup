@@ -10,7 +10,11 @@
 #      certificate end date is printed, with a warning inside 60 days. -DryRun only warns.
 #   1. tools\Invoke-Tests.ps1 on tests\ (in a child Windows PowerShell 5.1)
 #   2. tools\Build-Bundle.ps1 -> dist\setup.ps1, dist\config.json; the installer is copied to dist\ and, on a
-#      real publish, checked again there (same pin and signers as step 0), so the uploaded bytes are the checked ones
+#      real publish, checked again there (same pin and signers as step 0), so the uploaded bytes are the checked ones.
+#      Then Microsoft Defender scans dist\setup.ps1 (MpCmdRun -Scan -ScanType 3; -DefenderScanner): anything but a
+#      clean result (exit 0), a missing scanner included, refuses a real publish before signing and is a warning
+#      under -DryRun (CLAUDE.md, "Plain code only": v2026.10.23.1 was blocked on customer PCs). Update Defender's
+#      definitions first. A file scan is not the AMSI scan setup.ps1 gets when it runs: docs\testing.md has that check.
 #   3. tools\Sign-File.ps1 on both (the DPAPI-protected private key; never leaves this PC)
 #   4. both signatures verified against keys\public-key.xml with Test-DetachedSignature
 #   5. tools\Build-Launcher.ps1 -> dist\BenTechSetup.cmd, pointing at <repo>'s latest release. Its SHA-256
@@ -31,7 +35,10 @@ param(
   [switch]$DryRun,
   # Ben's installer; empty means %USERPROFILE%\.bentech-winsetup\ScreenConnect.ClientSetup.exe (resolved in the body).
   # A parameter so the tests point it into $TestDrive and never read the real file.
-  [string]$ScreenConnectInstaller
+  [string]$ScreenConnectInstaller,
+  # Microsoft Defender's command-line scanner; empty means the newest MpCmdRun.exe (resolved in the body). A parameter
+  # so the tests point it at a stub and never start a real scan.
+  [string]$DefenderScanner
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +57,15 @@ $installerName = 'ScreenConnect.ClientSetup.exe'
 $launcherName = 'BenTechSetup.cmd'
 if ([string]::IsNullOrWhiteSpace($ScreenConnectInstaller)) {
   $ScreenConnectInstaller = Join-Path $env:USERPROFILE ('.bentech-winsetup\' + $installerName)
+}
+
+if ([string]::IsNullOrWhiteSpace($DefenderScanner)) {
+  # The platform folder holds the current scanner; the Program Files one is the copy Windows shipped with.
+  $platform = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+  $newest = @(Get-ChildItem -LiteralPath $platform -Directory -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'MpCmdRun.exe') -PathType Leaf } |
+    Sort-Object { try { [version]($_.Name -replace '-.*$', '') } catch { [version]'0.0' } } -Descending)   # 4.18.24090.11-0
+  $DefenderScanner = if ($newest.Count -gt 0) { Join-Path $newest[0].FullName 'MpCmdRun.exe' } else { Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe' }
 }
 
 $step = 'checks'
@@ -163,6 +179,40 @@ function Get-CertificateEndWarning {
   return "WARNING: the ScreenConnect installer's certificate ends $end ($([int][Math]::Floor($days)) days from now): build a new installer before then (README `"A new ScreenConnect installer`")"
 }
 
+function Get-DefenderScanCheck {
+  # Returns @{ Problems = <string[]> }: empty only when Microsoft Defender's scanner scanned Path and found nothing
+  # (exit code 0). Exit code 2 is a detection or a scan error and both refuse (fail closed), as does a scanner that
+  # is missing or cannot start: an unscanned bundle is not a clean one. -DisableRemediation: the scan reports, it
+  # never quarantines dist\. The scanner's text is shown, never parsed.
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Scanner
+  )
+
+  $ErrorActionPreference = 'Continue'   # the scanner may write to stderr; its exit code decides
+  $problems = New-Object System.Collections.Generic.List[string]
+  if (-not (Test-Path -LiteralPath $Scanner -PathType Leaf)) {
+    $problems.Add("Microsoft Defender's scanner was not found ($Scanner), so $Path was not scanned")
+    return @{ Problems = $problems.ToArray() }
+  }
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    $problems.Add("$Path is missing (Defender's real-time protection may have quarantined it)")
+    return @{ Problems = $problems.ToArray() }
+  }
+  $global:LASTEXITCODE = -1   # a scanner that cannot even start must not leave a stale 0 behind
+  try {
+    $output = @(& $Scanner -Scan -ScanType 3 -File $Path -DisableRemediation 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+  } catch {
+    $problems.Add("Microsoft Defender's scanner could not start ($Scanner): $($_.Exception.Message)")
+    return @{ Problems = $problems.ToArray() }
+  }
+  $code = $LASTEXITCODE
+  if ($code -ne 0) {
+    $problems.Add("Microsoft Defender did not pass $Path (MpCmdRun exit $code`: a detection or a scan error): $($output -join ' / ')")
+  }
+  return @{ Problems = $problems.ToArray() }
+}
+
 try {
   # Same rule as Build-Bundle.ps1, checked up front so a typo fails before the slow test run.
   if ($Version -cnotmatch '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+\z') {
@@ -227,6 +277,12 @@ try {
     $distCheck = Get-ScreenConnectInstallerCheck -Path (Join-Path $dist $installerName) -Sha256 ([string]$appConfig.apps.screenconnect.sha256) -Signers @($appConfig.signers.connectwise)
     if ($distCheck.Problems.Count -gt 0) { throw "ScreenConnect installer in dist failed its check: $($distCheck.Problems -join '; ')" }
   }
+  # Defender scans the bundle before it is signed, so a flagged setup.ps1 never gets a signature (CLAUDE.md, "Plain
+  # code only").
+  $defenderCheck = Get-DefenderScanCheck -Path (Join-Path $dist 'setup.ps1') -Scanner $DefenderScanner
+  if ($defenderCheck.Problems.Count -gt 0 -and -not $DryRun) { throw "refusing to publish: $($defenderCheck.Problems -join '; ')" }
+  if ($defenderCheck.Problems.Count -gt 0) { foreach ($problem in $defenderCheck.Problems) { Write-Host "WARNING: $problem" -ForegroundColor Yellow } }
+  else { Write-Host 'Microsoft Defender: dist\setup.ps1 scanned clean' }
 
   $step = '3/6 sign'
   Write-PublishStep '3/6 Signing'

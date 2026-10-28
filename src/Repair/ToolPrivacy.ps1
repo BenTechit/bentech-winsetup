@@ -75,14 +75,13 @@ $script:SafeStopWords = @('user', 'users', 'admin', 'administrator', 'owner', 'g
   'desktop', 'computer', 'windows', 'microsoft', 'workgroup', 'mshome', 'lan', 'local', 'localdomain', 'home.arpa', 'wifi', 'wi-fi', 'internet', 'default',
   'public', 'system', 'service', 'server', 'client', 'unknown', 'none', 'dell', 'hp', 'lenovo', 'asus', 'acer', 'msi', 'surface', 'samsung', 'toshiba',
   'apple', 'intel', 'huawei', 'xiaomi', 'gigabyte')
-# Windows' own names of a network that has no name of its own (the Hebrew network and unidentified network built
-# from code points: this file stays ASCII), with an optional number (Network 2).
-$script:SafeHebrewNetwork = [string]::new([char[]]@(0x05E8, 0x05E9, 0x05EA))
-$script:SafeHebrewUnidentified = [string]::new([char[]]@(0x05DC, 0x05D0, 0x20, 0x05DE, 0x05D6, 0x05D5, 0x05D4, 0x05D4))
-$script:SafeGenericNetworkPattern = '\A(?:Network|Unidentified network|' + $script:SafeHebrewNetwork + '(?: ' + $script:SafeHebrewUnidentified + ')?)(?: [0-9]+)?\z'
-# The Hebrew prefix letters a word may carry (b, h, v, k, l, m, sh), up to three of them, before a known name (a
-# Latin one too, RD-R26), and no letter or digit before them.
-$script:SafeHebrewPrefixBoundary = '(?<=(?:^|[^\p{L}\p{Nd}])[' + [string]::new([char[]]@(0x05D1, 0x05D4, 0x05D5, 0x05DB, 0x05DC, 0x05DE, 0x05E9)) + ']{0,3})'
+# Windows' own names of a network that has no name of its own, with an optional number (Network 2). The Hebrew
+# "network" (U+05E8 U+05E9 U+05EA) and "unidentified" (U+05DC U+05D0, space, U+05DE U+05D6 U+05D5 U+05D4 U+05D4)
+# are regex \u escapes: this file stays ASCII (CLAUDE.md, "Plain code only").
+$script:SafeGenericNetworkPattern = '\A(?:Network|Unidentified network|\u05E8\u05E9\u05EA(?: \u05DC\u05D0 \u05DE\u05D6\u05D5\u05D4\u05D4)?)(?: [0-9]+)?\z'
+# The Hebrew prefix letters a word may carry (b, h, v, k, l, m, sh: U+05D1 U+05D4 U+05D5 U+05DB U+05DC U+05DE
+# U+05E9), up to three of them, before a known name (a Latin one too, RD-R26), and no letter or digit before them.
+$script:SafeHebrewPrefixBoundary = '(?<=(?:^|[^\p{L}\p{Nd}])[\u05D1\u05D4\u05D5\u05DB\u05DC\u05DE\u05E9]{0,3})'
 # The part before '\' of an account that names no domain of the customer's.
 $script:SafeGenericAuthorities = @('NT AUTHORITY', 'BUILTIN', 'AzureAD', 'MicrosoftAccount', 'NT SERVICE', 'Window Manager', 'Font Driver Host',
   'IIS APPPOOL', 'NT VIRTUAL MACHINE')
