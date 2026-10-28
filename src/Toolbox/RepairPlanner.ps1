@@ -56,9 +56,9 @@ $script:RepairChipNames = @('Restart', 'Free', 'BitLocker', 'Internet', 'Disk')
 # Each chip's glyph (Segoe Fluent Icons / MDL2 Assets code points) and the part of its string keys.
 $script:RepairChipGlyphs = @{ Restart = 0xE777; Free = 0xE8B7; BitLocker = 0xE72E; Internet = 0xE774; Disk = 0xEDA2; Stick = 0xE88E }
 
-# The Hebrew-layout YES: the three keys Y, E, S typed on a Hebrew keyboard (spec 4.2), written as code points so this
-# file stays ASCII (plan call).
-$script:RepairHebrewYes = [string]::new([char[]]@(0x05D8, 0x05E7, 0x05D3))
+# The Hebrew-layout YES: the three keys Y, E, S typed on a Hebrew keyboard (spec 4.2), U+05D8 U+05E7 U+05D3, as an
+# exact-match regex with \u escapes so this file stays ASCII (plan call; CLAUDE.md, "Plain code only").
+$script:RepairHebrewYesPattern = '\A\u05D8\u05E7\u05D3\z'
 
 function Get-RepairAvailable {
   <#
@@ -381,7 +381,7 @@ function Test-RepairYes {
   param([AllowNull()][AllowEmptyString()][string]$Text)
 
   $t = ([string]$Text).Trim()
-  return ($t -ieq 'YES' -or $t -ceq $script:RepairHebrewYes)
+  return ($t -ieq 'YES' -or $t -cmatch $script:RepairHebrewYesPattern)
 }
 
 function Test-RepairConfirmReady {

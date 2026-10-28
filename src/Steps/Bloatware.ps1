@@ -41,7 +41,7 @@ $script:BloatwareFallbackTimeoutMinutes = 30
 
 function Invoke-BloatwareChild {
   # Private. Runs one Appx/DISM command line in a child Windows PowerShell with a time limit
-  # (Invoke-PowerShellChild: -EncodedCommand, the whole process tree is killed on timeout). The Appx
+  # (Invoke-PowerShellChild: a .ps1 run with -File, the whole process tree is killed on timeout). The Appx
   # and DISM cmdlets have no timeout of their own and the runner has none per step, so a wedged
   # AppX or DISM queue would otherwise freeze the unattended run for good.
   # Returns @{ Ok; TimedOut; Output }. Ok is $true only for exit code 0 without a timeout. A failure,

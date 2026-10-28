@@ -1108,25 +1108,30 @@ Describe 'Invoke-StepBloatware through the real Invoke-PowerShellChild' {
     Mock Get-AppxProvisionedPackage { [void]$script:tripwire.Add('prov-list') }
     Mock Remove-AppxPackage { [void]$script:tripwire.Add('appx-remove') }
     Mock Remove-AppxProvisionedPackage { [void]$script:tripwire.Add('prov-remove') }
+    Set-PowerShellChildDirectory -Path (Join-Path $TestDrive 'Child')
+    # The child's .ps1 is read here: Invoke-PowerShellChild deletes it once the child is done.
     Mock Invoke-External {
-      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput })
-      $text = if ($ArgumentList -match 'EncodedCommand (?<b>\S+)$') { [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches['b'])) } else { '' }
+      $text = if ($ArgumentList -match '-File "(?<f>[^"]+)"$' -and [IO.File]::Exists($Matches['f'])) { [IO.File]::ReadAllText($Matches['f']) } else { '' }
+      [void]$script:extCalls.Add(@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMinutes = $TimeoutMinutes; Capture = [bool]$CaptureOutput; Text = $text })
       $out = if ($text -like '*Get-AppxProvisionedPackage*') { "king.com.CandyCrushSaga|king.com.CandyCrushSaga_1.0_x64__abc`r`n" } else { '' }
       return @{ ExitCode = 0; TimedOut = $false; Output = $out }
     }
   }
+  AfterAll { $script:PowerShellChildDirectory = $null }
 
-  It 'each Appx/DISM call is its own -EncodedCommand powershell.exe with the configured timeout, and nothing runs in-process' {
+  It 'each Appx/DISM call is its own powershell.exe running a .ps1 with -File, with the configured timeout, and nothing runs in-process' {
     $r = Invoke-StepBloatware -Context (New-SysContext)
     $r.Message | Should -Be 'Removed 1 packages'
     $script:tripwire.Count | Should -Be 0
     $script:extCalls.Count | Should -Be 3
+    $tail = "`r`nif (-not `$?) { exit 1 }`r`n"
     $decoded = foreach ($c in $script:extCalls) {
       $c.FilePath | Should -Be (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe')
       $c.TimeoutMinutes | Should -Be 7
       $c.Capture | Should -BeTrue
-      $c.ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$'
-      [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($c.ArgumentList -split ' ')[-1]))
+      $c.ArgumentList | Should -Match '^-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "[^"]+\\child-[0-9a-f]{32}\.ps1"$'
+      $c.Text.EndsWith($tail) | Should -BeTrue
+      $c.Text.Substring(0, $c.Text.Length - $tail.Length)
     }
     $decoded[1].EndsWith("Get-AppxPackage -Name 'king.com.CandyCrushSaga' -ErrorAction Stop | Remove-AppxPackage -ErrorAction Stop") | Should -BeTrue
     $decoded[2].EndsWith("Remove-AppxProvisionedPackage -Online -PackageName 'king.com.CandyCrushSaga_1.0_x64__abc' -ErrorAction Stop | Out-Null") | Should -BeTrue

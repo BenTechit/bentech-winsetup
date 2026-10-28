@@ -467,6 +467,17 @@ With the toolbox's **Zoom** switch on ([zoom spec](specs/2026-10-22-zoom-app-des
 - [ ] **The toolbox.** The APPS row has a **Zoom** switch after 7-Zip, in the same style, off when the window opens, labelled `Zoom` in English and in Hebrew (in Hebrew it sits to the left of 7-Zip, mirrored like the rest of the row). With it on, the "What will happen" list shows `Zoom` right after `7-Zip` in both languages. A click on Home, Business or Clean leaves it as it is, and the report's `Profile` line then has no `(changed)` for it. Start runs it (`state.json` `Choices.Zoom` is `true`). The console fallback has no Zoom line and no key, and runs without Zoom.
 - [ ] **Proven by mocks only:** a config token with a quote, a space or `&` never reaches the command line (Zoom installs without it; the yellow note `Zoom auto-update not set` comes only when no token with `AU2_EnableAutoUpdate` is left); a winget older than 1.5 gets no `--custom`, and the version is read only from a whole `v<digits>.<digits>...` line of `winget --version`; the 10-minute bound and its red `Zoom install timed out`; a run state from before this version (no `Zoom` in `Choices`) resumes with no zoom step; the report's choice between a per-machine and a per-user entry (the 64-bit HKLM entry first).
 
+### 1.23 Microsoft Defender passes the bundle (CLAUDE.md, "Plain code only")
+
+v2026.10.23.1 was blocked by Defender on customer PCs (`Trojan:PowerShell/DownloadObfus.A!MTB`, `amsi: C:\BenTech\Setup\setup.ps1`). `Publish.ps1` now scans `dist\setup.ps1` with Defender's command-line scanner before signing, but that is a file scan: the block came from the AMSI scan when the script runs, which only a real run shows.
+
+- [ ] **No Defender exclusion over the repo or `dist\`** on the dev PC (`(Get-MpPreference).ExclusionPath`): an excluded file is skipped and the publish gate would pass without a real scan.
+- [ ] **Up-to-date definitions first.** On the test VM or laptop: Windows Security, Virus & threat protection updates, Check for updates (or `Update-MpSignature`). Record the definition version (`(Get-MpComputerStatus).AntivirusSignatureVersion`).
+- [ ] **The real run is not blocked.** Run the launcher as usual: the window shows the toolbox, not `ScriptContainedMaliciousContent`. Afterwards `Get-MpThreatDetection | Where-Object { $_.Resources -match 'BenTech' }` is empty.
+- [ ] **A repair action runs its grandchildren.** On the Repair & diagnostics page run Health check: every step finishes with a verdict (no `no result`), and `C:\BenTech\Setup\Child` holds no `child-*.ps1` afterwards (a repair child the window kills at its budget can leave one behind, inside the admin-only folder; the final cleanup removes it).
+- [ ] **Setup's own children.** A run with the bloatware step, the restore point and the activation (or App Installer registration on a PC without winget) completes as before: those use the same file-based child.
+- [ ] **Proven by mocks and a pwsh harness only:** the exit codes of a `-File` child (0 done, 1 on a terminating error or a failed last statement, the command's own `exit N`) equal what `-Command` gave; Windows PowerShell 5.1 itself has not run it yet.
+
 ---
 
 ## 2. Per VM type

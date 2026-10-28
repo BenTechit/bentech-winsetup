@@ -388,23 +388,43 @@ function ConvertTo-PowerShellLiteral {
   [OutputType([string])]
   param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
-  # The apostrophe and the four typographic quotes, written as code points so this file stays ASCII.
-  $quotes = -join ([char]0x27, [char]0x2018, [char]0x2019, [char]0x201A, [char]0x201B)
-  return "'" + [regex]::Replace($Text, "[$quotes]", '$0$0') + "'"
+  # The apostrophe and the four typographic quotes U+2018-U+201B, as a regex class with \u escapes so this file
+  # stays ASCII (CLAUDE.md, "Plain code only").
+  return "'" + [regex]::Replace($Text, '[''\u2018-\u201B]', '$0$0') + "'"
+}
+
+# The folder Invoke-PowerShellChild writes its child scripts to. Start-BenTechSetup sets it to <Root>\Child: <Root>
+# (C:\BenTech\Setup) is admin-only (the launcher made it), and the folder inherits that, so no other user can swap
+# a script between its write and its run. Unset ($null) means no child can start.
+$script:PowerShellChildDirectory = $null
+
+function Set-PowerShellChildDirectory {
+  <#
+  .SYNOPSIS
+    Sets the folder Invoke-PowerShellChild writes its child scripts to. Only records the path: the folder is made
+    on first use, and only when its parent exists.
+  #>
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Path)
+
+  $script:PowerShellChildDirectory = $Path
 }
 
 function Invoke-PowerShellChild {
   <#
   .SYNOPSIS
-    Runs a PowerShell command line in a child Windows PowerShell 5.1 process with a timeout.
+    Runs a PowerShell command in a child Windows PowerShell 5.1 process with a timeout.
     Returns @{ ExitCode = <int|$null>; TimedOut = <bool>; Output = <string> }.
   .DESCRIPTION
-    Used for cmdlets that have no timeout of their own (Add-AppxPackage). The process is started
-    through Invoke-External, which kills the whole tree on timeout. The command travels as
-    -EncodedCommand (Base64 of UTF-16LE text), so no quoting of the command, or of a path inside
-    it, can go wrong. $ProgressPreference is silenced so a captured pipe does not fill with
-    progress records. The child's exit code is 0 for a command that finished and 1 when it
-    stopped on an error, which is what callers should test. Output is never parsed.
+    Used for cmdlets that have no timeout of their own (Add-AppxPackage). The command is written as a plain
+    .ps1 file (UTF-8 with BOM, so any path in it survives) into $script:PowerShellChildDirectory and run with
+    -File; the file is deleted afterwards. The command is never packed into the command line (CLAUDE.md,
+    "Plain code only"). The process is started through Invoke-External, which kills the whole tree on timeout.
+    $ProgressPreference is silenced so a captured pipe does not fill with progress records. The child's exit
+    code is 0 for a command that finished and 1 when it stopped on an error (a terminating error, or a last
+    statement that failed, as -Command reported it), or the command's own exit code; that is what callers
+    should test. Output is never parsed. Throws when the folder is not set or its parent does not exist
+    (it is never created with C:\'s inherited rights); callers catch.
   #>
   [CmdletBinding()]
   [OutputType([hashtable])]
@@ -413,9 +433,21 @@ function Invoke-PowerShellChild {
     [Parameter(Mandatory)][double]$TimeoutMinutes
   )
 
-  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ProgressPreference = 'SilentlyContinue'; $Command"))
-  $exe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
-  $run = Invoke-External -FilePath $exe -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded" -TimeoutMinutes $TimeoutMinutes -CaptureOutput
+  $dir = $script:PowerShellChildDirectory
+  if ([string]::IsNullOrEmpty($dir)) { throw 'the child script folder is not set (Set-PowerShellChildDirectory)' }
+  $parent = [IO.Path]::GetDirectoryName($dir)
+  if ([string]::IsNullOrEmpty($parent) -or -not [IO.Directory]::Exists($parent)) { throw "the child script folder's parent does not exist: $parent" }
+  if (-not [IO.Directory]::Exists($dir)) { $null = [IO.Directory]::CreateDirectory($dir) }
+  $file = [IO.Path]::Combine($dir, ('child-{0}.ps1' -f [guid]::NewGuid().ToString('N')))
+  $text = "`$ProgressPreference = 'SilentlyContinue'`r`n" + $Command + "`r`nif (-not `$?) { exit 1 }`r`n"
+  try {
+    [IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding $true))
+    $exe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $run = Invoke-External -FilePath $exe -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $file) -TimeoutMinutes $TimeoutMinutes -CaptureOutput
+  } finally {
+    # A failed delete, or a failed log line about it, must never replace the child's own result.
+    try { [IO.File]::Delete($file) } catch { try { Write-SetupLog -Level WARN -Message 'Could not delete a child script' -Data @{ error = (ConvertTo-ScreenText -Text $_.Exception.Message) } } catch { } }
+  }
   return @{ ExitCode = $run.ExitCode; TimedOut = [bool]$run.TimedOut; Output = [string]$run.Output }
 }
 

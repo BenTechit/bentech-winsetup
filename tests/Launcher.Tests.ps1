@@ -835,6 +835,52 @@ Describe 'Publish.ps1' {
       @((Get-ScreenConnectInstallerCheck -Path $fakeExe -Sha256 $fakeHash -Signers @($null, '', '"ConnectWise, LLC"')).Problems).Count | Should -Be 0 }
   }
 
+  Context 'the Defender scan of the bundle (CLAUDE.md, "Plain code only")' {
+    BeforeAll {
+      # Dot-source Get-DefenderScanCheck from the AST of tools\Publish.ps1. The scanner is a stub .cmd that exits
+      # with a chosen code: no test starts a real Defender scan.
+      $tok = $null; $err = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+      $fn = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-DefenderScanCheck' }, $true))
+      $fn.Count | Should -Be 1
+      . ([ScriptBlock]::Create($fn[0].Extent.Text))
+      $script:scanDir = Join-Path $TestDrive 'defender'; New-Item -ItemType Directory $scanDir -Force | Out-Null
+      $script:scanned = Join-Path $scanDir 'setup.ps1'; [IO.File]::WriteAllText($scanned, '# stub')
+      function New-StubScanner([int]$Code) {
+        $path = Join-Path $script:scanDir "MpCmdRun-$Code.cmd"
+        "@echo off`r`necho %*> `"%~dp0args-$Code.txt`"`r`necho stub scan exit $Code`r`nexit /b $Code`r`n" | Set-Content $path -Encoding ASCII -NoNewline
+        $path
+      }
+    }
+    It 'passes a clean scan (exit 0), and scans exactly that file without remediation' {
+      @((Get-DefenderScanCheck -Path $scanned -Scanner (New-StubScanner 0)).Problems).Count | Should -Be 0
+      $args0 = [IO.File]::ReadAllText((Join-Path $scanDir 'args-0.txt')).Trim()
+      $args0 | Should -Match '^-Scan -ScanType 3 -File (\S+|"[^"]+") -DisableRemediation$'
+      $args0 | Should -Match ([regex]::Escape($scanned))
+    }
+    It 'refuses a detection or a scan error (exit 2), and any other non-zero exit' {
+      (@((Get-DefenderScanCheck -Path $scanned -Scanner (New-StubScanner 2)).Problems) -join "`n") | Should -Match 'did not pass .*exit 2.*stub scan exit 2'
+      @((Get-DefenderScanCheck -Path $scanned -Scanner (New-StubScanner 5)).Problems).Count | Should -Be 1
+    }
+    It 'refuses when the scanner is missing, or the file is gone' {
+      (@((Get-DefenderScanCheck -Path $scanned -Scanner (Join-Path $scanDir 'none.exe')).Problems) -join "`n") | Should -Match 'scanner was not found'
+      (@((Get-DefenderScanCheck -Path (Join-Path $scanDir 'gone.ps1') -Scanner (New-StubScanner 0)).Problems) -join "`n") | Should -Match 'is missing'
+    }
+    It 'a real publish refuses a failed scan, and the scan comes after the build and before any signing' {
+      $text = Get-Content -LiteralPath "$PSScriptRoot\..\tools\Publish.ps1" -Raw
+      $text | Should -Match 'if \(\$defenderCheck\.Problems\.Count -gt 0 -and -not \$DryRun\) \{\s*throw'
+      $tok = $null; $err = $null
+      $ast = [Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\tools\Publish.ps1", [ref]$tok, [ref]$err)
+      $scan = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'Get-DefenderScanCheck' }, $true))
+      $scan.Count | Should -Be 1
+      $scan[0].Extent.Text | Should -Match "-Path \(Join-Path \`$dist 'setup\.ps1'\)"
+      $build = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] -and $args[0].Extent.Text -match 'Build-Bundle\.ps1' }, $true))
+      $sign = @($ast.FindAll({ $args[0] -is [Management.Automation.Language.CommandAst] -and $args[0].Extent.Text -match 'Sign-File\.ps1' }, $true))
+      $scan[0].Extent.StartOffset | Should -BeGreaterThan $build[0].Extent.StartOffset
+      $scan[0].Extent.StartOffset | Should -BeLessThan $sign[0].Extent.StartOffset
+    }
+  }
+
   Context 'Publish and the step agree on the installer signature (F-M4)' {
     # tools\Publish.ps1 keeps its own copy of the signer rule (it cannot dot-source src\ in a user's checkout run).
     # The same fake signatures go to Test-FileSignature (the rule the run applies) and to Get-ScreenConnectInstallerCheck
@@ -953,14 +999,16 @@ Describe 'Publish.ps1' {
       $script:ghDir = Join-Path $TestDrive 'ghstub'; New-Item -ItemType Directory $ghDir | Out-Null
       "@echo off`r`necho %*> `"%~dp0gh-called.txt`"`r`nexit /b 0`r`n" | Set-Content "$ghDir\gh.cmd" -Encoding ASCII -NoNewline
       function RunPublish {
-        # The installer path is always a parameter into $TestDrive: a test never reads Ben's real file.
-        param([string]$Installer = (Join-Path $TestDrive 'no-installer\ScreenConnect.ClientSetup.exe'))
+        # The installer path is always a parameter into $TestDrive: a test never reads Ben's real file. So is the
+        # Defender scanner: a stub that is missing by default (a warning under -DryRun), never a real scan.
+        param([string]$Installer = (Join-Path $TestDrive 'no-installer\ScreenConnect.ClientSetup.exe'),
+              [string]$Scanner = (Join-Path $TestDrive 'no-defender\MpCmdRun.exe'))
         Remove-Item -LiteralPath "$pr\dist" -Recurse -Force -ErrorAction SilentlyContinue
         $oldPath = $env:PATH; $oldToken = $env:GH_TOKEN; $oldCeiling = $env:GIT_CEILING_DIRECTORIES
         try {
           # The stub repo is not a git repository; the ceiling stops git from finding one above $TestDrive.
           $env:PATH = "$ghDir;$oldPath"; $env:GH_TOKEN = 'invalid-test-token'; $env:GIT_CEILING_DIRECTORIES = $TestDrive
-          $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pr\tools\Publish.ps1" -Version 2026.10.18.7 -DryRun -ScreenConnectInstaller $Installer 2>&1 | Out-String
+          $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pr\tools\Publish.ps1" -Version 2026.10.18.7 -DryRun -ScreenConnectInstaller $Installer -DefenderScanner $Scanner 2>&1 | Out-String
           @{ Code = $LASTEXITCODE; Out = $out }
         } finally { $env:PATH = $oldPath; $env:GH_TOKEN = $oldToken; $env:GIT_CEILING_DIRECTORIES = $oldCeiling }
       }
@@ -993,6 +1041,17 @@ Describe 'Publish.ps1' {
       $line = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^DRY RUN - not run: gh ' })[0]
       $tokens = @(($line -replace '^DRY RUN - not run: gh ', '') -split ' ')
       $tokens[7] | Should -Be "$pr\dist\ScreenConnect.ClientSetup.exe"; $tokens[8] | Should -Be '--repo' }
+    It 'warns, but goes on, when Defender cannot scan or does not pass the bundle under -DryRun' {
+      $r = RunPublish
+      $r.Code | Should -Be 0
+      $r.Out | Should -Match "WARNING: Microsoft Defender's scanner was not found"
+      $stub = Join-Path $TestDrive 'stub-defender\MpCmdRun.cmd'; New-Item -ItemType Directory (Split-Path $stub) -Force | Out-Null
+      "@echo off`r`nexit /b 2`r`n" | Set-Content $stub -Encoding ASCII -NoNewline
+      $r = RunPublish -Scanner $stub
+      $r.Code | Should -Be 0
+      $r.Out | Should -Match 'WARNING: Microsoft Defender did not pass .*exit 2'
+      "$pr\dist\setup.ps1.sig" | Should -Exist
+    }
     It 'warns, but goes on, when the source cannot be verified under -DryRun (no git repository here)' {
       $r = RunPublish
       $r.Code | Should -Be 0
